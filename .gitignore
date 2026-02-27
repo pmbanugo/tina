@@ -1,3 +1,7 @@
+nbio/
+notes/
+ADR/
+specification_protocol_(unfinished)
 .DS_Store
 
 # Prerequisites

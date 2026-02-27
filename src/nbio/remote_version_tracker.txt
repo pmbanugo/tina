@@ -1,3 +1,0 @@
-This file tracks the changes in the upstream implementation where I copied this from: https://github.com/odin-lang/Odin/tree/master/core/nbio. More information below
-
-Last applied commit: [0a05ff0](https://github.com/odin-lang/Odin/commit/0a05ff05a391673b7f9d095d76485706ba50e0bb)
