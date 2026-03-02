@@ -3,8 +3,11 @@ package tina
 import "core:mem"
 import "core:testing"
 
-// Used to denote the end of the free list.
-POOL_NULL_INDEX :: 0xFFFF_FFFF
+// POOL_NONE_INDEX is a sentinel value representing the end of an index-based linked list.
+// Because index 0 is a valid array position,
+// we use max(u32) to explicitly mean "empty" or "no next item". It is shared across
+// the Message Pool free-list, the Isolate Mailbox queues, and the Timer Wheel spokes.
+POOL_NONE_INDEX :: 0xFFFF_FFFF
 
 Message_Pool :: struct {
     buffer: []u8,
@@ -32,7 +35,7 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, chunk_size: int) {
     p.chunk_size = chunk_size
     p.total_slots = len(backing) / chunk_size
     p.free_slots = 0
-    p.head_index = POOL_NULL_INDEX
+    p.head_index = POOL_NONE_INDEX
 
     // Intrusive push. We loop backwards so that slot 0 is at the head of the list,
     // pointing to slot 1, which points to 2, etc. This should improve initial cache locality.
@@ -49,7 +52,7 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, chunk_size: int) {
 }
 
 pool_alloc :: proc(p: ^Message_Pool) -> (rawptr, Pool_Error) {
-    if p.head_index == POOL_NULL_INDEX {
+    if p.head_index == POOL_NONE_INDEX {
         return nil, .Empty
     }
 

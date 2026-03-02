@@ -2,17 +2,20 @@ package tina
 
 import "core:testing"
 
-// Intended to match the spatial prefetcher pair size on modern x64/ARM64.
 CACHE_LINE_SIZE :: 128 // CPU Cache Line size for alignment.
-MESSAGE_ENVELOPE_SIZE :: 128 // Fixed size message envelope for Isolates mailbox
+
+Init_Fn :: #type proc(self: rawptr, args:[]u8, ctx: ^TinaContext) -> Effect
+Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
 
 TypeDescriptor :: struct {
-    id: u16,
+    id: u8,
     slot_count: int,
     stride: int,
     soa_metadata_size: int,
     working_memory_size: int,
     max_scratch_requirement: int,
+    init_fn: Init_Fn,
+    handler_fn: Handler_Fn,
 }
 
 ShardSpec :: struct {
@@ -37,11 +40,15 @@ SystemSpec :: struct {
 SystemSpecError :: enum u8 {
     None,
     ScratchArenaTooSmall,
+    SlotCountExceedsHandleCapacity,
 }
 
 validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
     max_scratch := 0
     for t in spec.types {
+	    if t.slot_count > MAX_ISOLATES_PER_TYPE {
+	            return .SlotCountExceedsHandleCapacity
+	        }
         if t.max_scratch_requirement > max_scratch {
             max_scratch = t.max_scratch_requirement
         }
