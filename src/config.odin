@@ -1,6 +1,7 @@
 package tina
 
 import "core:testing"
+import "core:mem"
 
 CACHE_LINE_SIZE :: 128 // CPU Cache Line size for alignment.
 
@@ -35,6 +36,11 @@ SystemSpec :: struct {
     log_ring_size: int,
     supervision_group_table_memory: int,
     scratch_arena_size: int,
+
+    shard_count: u16,
+    default_ring_size: u32,
+    ring_overrides:[]Ring_Override,
+    simulation: ^SimulationConfig, // nil means production
 }
 
 SystemSpecError :: enum u8 {
@@ -127,4 +133,80 @@ test_system_spec_validation :: proc(t: ^testing.T) {
     spec.scratch_arena_size = 4096 // Exactly enough
     err = validate_system_spec(&spec)
     testing.expect_value(t, err, SystemSpecError.None)
+}
+
+// --- Simulation Configuration ---
+
+Ratio :: struct {
+    numerator:   u32,
+    denominator: u32,
+}
+
+FaultConfig :: struct {
+    io_error_rate:               Ratio,
+    io_delay_range_ticks:        [2]u32,
+    network_drop_rate:           Ratio,
+    network_delay_range_ticks:   [2]u32,
+    network_partition_rate:      Ratio,
+    network_partition_heal_rate: Ratio,
+    isolate_crash_rate:          Ratio,
+    init_failure_rate:           Ratio,
+}
+
+SimulationConfig :: struct {
+    seed:                   u64,
+    max_ticks:              u64,
+    shuffle_shard_order:    bool,
+    faults:                 FaultConfig,
+    checker_interval_ticks: u32,
+    terminate_on_quiescent: bool,
+}
+
+// --- Topology / Painter's Algorithm ---
+
+Ring_Override_Type :: enum u8 { Pair, All_Inbound_To, All_Outbound_From }
+
+Ring_Override :: struct {
+    type:        Ring_Override_Type,
+    source:      u16, // Valid for .Pair and .All_Outbound_From
+    destination: u16, // Valid for .Pair and .All_Inbound_To
+    size:        u32, // Must be power of 2 in production, but used as capacity here
+}
+
+// Painter's Algorithm: Computes a 2D matrix of ring capacities.
+// Returns a slice of slices: sizes[src_shard][dst_shard]
+compute_ring_sizes :: proc(shard_count: u16, default_size: u32, overrides: []Ring_Override, allocator: mem.Allocator) -> [][]u32 {
+    sizes := make([][]u32, shard_count, allocator)
+
+    for i in 0..<shard_count {
+        sizes[i] = make([]u32, shard_count, allocator)
+        for j in 0..<shard_count {
+            if i != j {
+                sizes[i][j] = default_size
+            }
+        }
+    }
+
+    // Apply overrides. Last match wins.
+    for o in overrides {
+        switch o.type {
+        case .Pair:
+            if o.source < shard_count && o.destination < shard_count && o.source != o.destination {
+                sizes[o.source][o.destination] = o.size
+            }
+        case .All_Inbound_To:
+            if o.destination < shard_count {
+                for i in 0..<shard_count {
+                    if u16(i) != o.destination { sizes[i][o.destination] = o.size }
+                }
+            }
+        case .All_Outbound_From:
+            if o.source < shard_count {
+                for j in 0..<shard_count {
+                    if o.source != u16(j) { sizes[o.source][j] = o.size }
+                }
+            }
+        }
+    }
+    return sizes
 }

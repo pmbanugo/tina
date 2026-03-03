@@ -8,8 +8,9 @@ Simulated_Clock :: struct {
 
 Timer_Entry :: struct {
     deliver_at: u64,
-    target: Handle,
     next: u32,
+    correlation: u32,
+    target: Handle,
     tag: Message_Tag,
 }
 
@@ -59,6 +60,35 @@ ctx_register_timer :: proc(ctx: ^TinaContext, delay_ticks: u64, tag: Message_Tag
 }
 
 @(private="package")
+_register_system_timer :: proc(shard: ^Shard, target: Handle, delay_ticks: u64, tag: Message_Tag, correlation: u32) {
+    wheel := &shard.timer_wheel
+    // SAFETY CHECK: If timer pool is exhausted, we MUST not fail silently.
+    // In production, we might drop, but for this test, we expect capacity.
+    if wheel.free_head == POOL_NONE_INDEX {
+        // Force a panic or error log to make debugging obvious
+        // fmt.eprintln("[PANIC] Timer pool exhausted! Isolate will deadlock.")
+        // return
+        panic("[PANIC] Timer pool exhausted! Isolate will deadlock.")
+    }
+
+    index := wheel.free_head
+    wheel.free_head = wheel.entries[index].next
+
+    deliver_at := shard.clock.current_tick + delay_ticks
+    wheel.entries[index] = Timer_Entry{
+        deliver_at = deliver_at,
+        target = target,
+        tag = tag,
+        correlation = correlation,
+        next = POOL_NONE_INDEX,
+    }
+
+    spoke_index := deliver_at & (TIMER_WHEEL_SPOKE_COUNT - 1)
+    wheel.entries[index].next = wheel.spokes[spoke_index]
+    wheel.spokes[spoke_index] = index
+}
+
+@(private="package")
 _advance_timers :: proc(shard: ^Shard) {
     now := shard.clock.current_tick
     for shard.timer_wheel.last_tick < now {
@@ -74,11 +104,12 @@ _advance_timers :: proc(shard: ^Shard) {
             next := entry.next
 
             if entry.deliver_at <= tick {
-                env: Message_Envelope
-                env.source = HANDLE_NONE
-                env.destination = entry.target
-                env.tag = entry.tag
-                _enqueue(shard, entry.target, &env)
+                envelope: Message_Envelope
+                envelope.source = HANDLE_NONE
+                envelope.destination = entry.target
+                envelope.tag = entry.tag
+                envelope.correlation = entry.correlation
+                _enqueue(shard, entry.target, &envelope)
 
                 if prev == POOL_NONE_INDEX {
                     shard.timer_wheel.spokes[spoke_index] = next

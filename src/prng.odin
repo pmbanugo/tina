@@ -1,6 +1,7 @@
 package tina
 
 import "core:testing"
+import "core:mem"
 
 Prng :: struct {
     state: u64,
@@ -28,6 +29,68 @@ derive_shard_seed :: proc(master_seed: u64, shard_id: u16) -> u64 {
     z = (z ~ (z >> 30)) * 0xBF58476D1CE4E5B9
     z = (z ~ (z >> 27)) * 0x94D049BB133111EB
     return z ~ (z >> 31)
+}
+
+// --- Deterministic Fault Math ---
+
+// Evaluates a fractional probability using pure integer math
+ratio_chance :: proc(r: Ratio, p: ^Prng) -> bool {
+    if r.denominator == 0 || r.numerator == 0 do return false
+    if r.numerator >= r.denominator do return true
+
+    // Uses the fast range instead of modulo
+    val := prng_uint_less_than(p, r.denominator)
+    return val < r.numerator
+}
+
+// --- The PRNG Tree ---
+
+Prng_Tree :: struct {
+    master:       Prng,
+
+    // System-wide domains
+    scheduling:   Prng,
+    network_drop: Prng,
+    partition:    Prng,
+
+    // Per-Shard domains
+    shard_io:     []Prng,
+    shard_crash:[]Prng,
+}
+
+// Initializes the entire tree from a single master seed.
+// Note: Derivation order is STRICT and APPEND-ONLY to maintain determinism guarantees.
+prng_tree_init :: proc(tree: ^Prng_Tree, seed: u64, shard_count: int, allocator: mem.Allocator) {
+    prng_init(&tree.master, seed)
+
+    // Helper to extract 64-bits from the 32-bit output of our Prng
+    next_u64 :: proc(p: ^Prng) -> u64 {
+        low := u64(prng_step(p))
+        high := u64(prng_step(p))
+        return (high << 32) | low
+    }
+
+    // Fixed Derivation Order
+    prng_init(&tree.scheduling, next_u64(&tree.master))
+    prng_init(&tree.network_drop, next_u64(&tree.master))
+    prng_init(&tree.partition, next_u64(&tree.master))
+
+    tree.shard_io = make([]Prng, shard_count, allocator)
+    tree.shard_crash = make([]Prng, shard_count, allocator)
+
+    // Derive per-shard PRNGs sequentially
+    for i in 0..<shard_count {
+        prng_init(&tree.shard_io[i], next_u64(&tree.master))
+        prng_init(&tree.shard_crash[i], next_u64(&tree.master))
+    }
+}
+
+// Returns a random u32 in the range[0, bound)
+prng_uint_less_than :: proc(p: ^Prng, bound: u32) -> u32 {
+    if bound == 0 do return 0
+    // Daniel Lemire's fast range algorithm (avoids modulo)
+    random32 := prng_step(p)
+    return u32((u64(random32) * u64(bound)) >> 32)
 }
 
 // === TEST ===

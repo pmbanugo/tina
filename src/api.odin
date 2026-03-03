@@ -49,4 +49,6 @@ TinaContext :: struct {
     shard: ^Shard,
     self_handle: Handle,
     current_message_source: Handle,
+    current_correlation: u32,
+    is_call: bool,
 }

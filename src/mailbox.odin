@@ -10,6 +10,9 @@ TAG_TIMER        : Message_Tag : 0x0002
 // Application message tags can start from here (0x0040 - 0xFFFF)
 USER_MESSAGE_TAG_BASE : Message_Tag : 0x0040
 
+ENVELOPE_FLAG_IS_CALL  : u16 : 1 << 0
+ENVELOPE_FLAG_IS_REPLY : u16 : 1 << 1
+
 // Structured to cleanly separate User payloads from I/O completions
 Message :: struct {
     body: struct #raw_union {
