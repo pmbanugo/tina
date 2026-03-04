@@ -12,6 +12,12 @@ Crash_Reason :: enum u8 {
     Init_Failed = 3,
 }
 
+Exit_Kind :: enum u8 {
+    Normal,   // Child returned Effect_Done (clean shutdown)
+    Crashed,  // Child returned Effect_Crash or panicked (Tier 1 / Tier 2)
+    Shutdown, // Child was torn down by supervisor strategy (recursion guard)
+}
+
 // Explicitly sized variants for the Effect tagged union. Empty structs (should) cost 0 bytes.
 Effect_Done    :: struct {}
 Effect_Crash   :: struct { reason: Crash_Reason }
@@ -38,11 +44,12 @@ Spawn_Result :: union { Handle, Spawn_Error }
 Restart_Type :: enum u8 { permanent, transient, temporary }
 
 Spawn_Spec :: struct {
-    group: u32,
     args_payload:[MAX_INIT_ARGS_SIZE]u8,
+    group_index: u16,
     type_id: u8,
     restart_type: Restart_Type,
     args_size: u8,
+    _padding: [3]u8,                      // 3 bytes padding -> 72 bytes total
 }
 
 TinaContext :: struct {

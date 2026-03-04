@@ -20,7 +20,8 @@ TypeDescriptor :: struct {
 }
 
 ShardSpec :: struct {
-    shard_id: u16,
+    shard_id: u16, // TODO: I can turn this later to distinct type
+    root_group: Group_Spec, // The root of the supervision tree for this Shard
 }
 
 SystemSpec :: struct {
@@ -47,6 +48,32 @@ SystemSpecError :: enum u8 {
     None,
     ScratchArenaTooSmall,
     SlotCountExceedsHandleCapacity,
+}
+
+Supervision_Strategy :: enum u8 {
+    One_For_One,
+    One_For_All,
+    Rest_For_One,
+}
+
+Static_Child_Spec :: struct {
+    type_id: u8,
+    restart_type: Restart_Type,
+    args_size: u8,
+    args_payload:[MAX_INIT_ARGS_SIZE]u8,
+}
+
+Group_Spec :: struct {
+    strategy: Supervision_Strategy,
+    restart_count_max: u16,
+    window_duration_ticks: u32,
+    children:[]Child_Spec,
+    dynamic_child_count_max: u16, // > 0 implies a dynamic one_for_one group
+}
+
+Child_Spec :: union {
+    Static_Child_Spec,
+    Group_Spec,
 }
 
 validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
