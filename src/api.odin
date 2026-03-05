@@ -25,7 +25,7 @@ Effect_Yield   :: struct {}
 Effect_Receive :: struct {}
 Effect_Call    :: struct { to: Handle, message: Message, timeout: u64 }
 Effect_Reply   :: struct { message: Message }
-Effect_Io      :: struct { operation: u32 } // Phase 4 placeholder
+Effect_Io      :: struct { operation: IoOp }
 
 Effect :: union {
     Effect_Done,
@@ -49,7 +49,9 @@ Spawn_Spec :: struct {
     type_id: u8,
     restart_type: Restart_Type,
     args_size: u8,
-    _padding: [3]u8,                      // 3 bytes padding -> 72 bytes total
+    handoff_mode: Handoff_Mode,
+    _padding: [2]u8,                      // 2 bytes padding -> makes 72 to this point
+    handoff_fd: FD_Handle,                // FD to transfer (FD_HANDLE_NONE if no transfer)
 }
 
 TinaContext :: struct {

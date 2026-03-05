@@ -14,3 +14,11 @@
 - shard.odin: The core scheduler loop, SOA implementation (via #soa), and the Active Context API (ctx_send, ctx_spawn).
 - sim_network.odin: contains the delay queue, the network structure, and the fault engine that injects chaos deterministically.
 - tina_phase1_test.odin:  A ping-pong test verifying the implementation details for milestone in phase 1 (based on roadmap).
+- io_types.odin: Core I/O subsystem types — FD_Handle (generational index), IoOp sub-union, Socket_Address, Submission_Token (64-bit packed correlation), Submission/Raw_Completion backend types, IO_Completion_Tag, FD_Entry with direction-partitioned ownership, Peer_Address (28-byte compact SOA), IO_Error codes, OS_FD platform type.
+- io_fd_table.odin: FD Table — Shard-owned fixed-size registry mapping FD_Handle to OS file descriptors. LIFO free list with u16 indices, generational stale detection, direction-aware affinity validation, handoff for ownership transfer, close-on-completion marking.
+- io_buffer_pool.odin: Reactor Buffer Pool — pre-allocated contiguous buffer slots for I/O data transfer. LIFO free list with u16 indices, copy-on-submit support, read-slice accessor for handlers.
+- io_backend.odin: Platform Backend common types (Backend_Error, Backend_Config, Platform_Backend) and public API that delegates to platform-specific _backend_* procs via compile-time dispatch. Procedural batch interface — no callbacks.
+- io_backend_simulated.odin: SimulatedIO backend (TINA_SIM=true) — deterministic testing with PRNG-driven delays, fault injection, reordering. No kernel interaction. Same seed + same submit/collect sequence = same completions.
+- io_backend_posix.odin: kqueue backend (Darwin/FreeBSD/OpenBSD/NetBSD, TINA_SIM=false) — emulates completion semantics on top of readiness notifications. Optimistic syscall strategy with ONESHOT fallback. EVFILT_USER for cross-shard wake.
+- io_backend_linux.odin: io_uring backend (Linux, TINA_SIM=false) — batch SQE submission with CQE harvesting. SUBMIT_ALL|COOP_TASKRUN|SINGLE_ISSUER flags. Persistent addr entry pool for stable pointers. Eventfd for cross-shard wake.
+- io_backend_windows.odin: IOCP backend (Windows, TINA_SIM=false) — overlapped I/O with completion port. Pre-allocated overlapped entry pool. AcceptEx/ConnectEx via WSAIoctl. PostQueuedCompletionStatus for cross-shard wake.

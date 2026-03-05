@@ -22,10 +22,10 @@ Message :: struct {
             payload: [MAX_PAYLOAD_SIZE]u8,
         },
         io: struct {
-            peer_address: u64, // Placeholder for Phase 4
-            result: i32,
-            fd: u32,
-            buffer_index: u16,
+            peer_address: Peer_Address, // 28 bytes — peer address from accept/recvfrom
+            fd: FD_Handle,              // 4 bytes — which FD completed (or new client FD for accept)
+            result: i32,                // 4 bytes — bytes transferred or negative error
+            buffer_index: u16,          // 2 bytes — reactor buffer pool index
         },
     },
     tag: Message_Tag,

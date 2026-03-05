@@ -75,19 +75,30 @@ Isolate_Metadata :: struct {
     inbox_head: u32,
     inbox_tail: u32,
     pending_correlation: u32,
+    // I/O completion SOA fields (§6.6.1 §5) — 13 bytes core + 28 bytes peer address
+    io_fd: FD_Handle,                     // which FD completed (4 bytes)
+    io_result: i32,                       // bytes transferred or negative error (4 bytes)
+    io_peer_address: Peer_Address,        // peer address from accept/recvfrom (28 bytes)
     generation: u16,
     inbox_count: u16,
-    group_index: u16,      // Index into the Shard's supervision_groups table
+    group_index: u16,                     // Index into the Shard's supervision_groups table
+    io_completion_tag: IO_Completion_Tag, // completion type discriminant (0 = none) (2 bytes)
+    io_buffer_index: u16,                 // reactor buffer pool index
     state: Isolate_State,
-    shutdown_pending: u8,  // For Graceful Shutdown
+    shutdown_pending: u8,                 // For Graceful Shutdown
+    io_sequence: u8,                      // I/O operation epoch — incremented on each Effect.io (1 byte)
+    _io_padding: u8,
 }
 
 Shard_Counters :: struct {
-    stale_delivery_drops:  u64,
-    ring_full_drops:       u64,
-    quarantine_drops:      u64,
-    pool_exhaustion_drops: u64,
-    mailbox_full_drops:    u64,
+    stale_delivery_drops:    u64,
+    ring_full_drops:         u64,
+    quarantine_drops:        u64,
+    pool_exhaustion_drops:   u64,
+    mailbox_full_drops:      u64,
+    io_buffer_exhaustions:   u64, // buffer pool exhausted on I/O submit (§6.6.1 §8)
+    io_submission_exhaustions: u64, // submission queue full (§6.6.1 §8)
+    io_stale_completions:    u64, // generation/sequence mismatch discards (§6.6.1 §10)
 }
 
 Dynamic_Child_Spec :: struct {
@@ -469,60 +480,60 @@ _dequeue :: proc(shard: ^Shard, type_id: u16, slot: u16, out_message: ^Message, 
 _interpret_effect :: proc(shard: ^Shard, type_id: u16, slot: u16, effect: Effect, ctx: ^TinaContext) {
     soa_meta := shard.metadata[type_id]
     switch e in effect {
-        case Effect_Done:
-            _teardown_isolate(shard, type_id, slot, .Normal)
-        case Effect_Yield:
-            soa_meta[slot].state = .Runnable
-        case Effect_Receive:
-            soa_meta[slot].state = .Waiting
-        case Effect_Crash:
-            ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Voluntary crash"))
+    case Effect_Done:
+        _teardown_isolate(shard, type_id, slot, .Normal)
+    case Effect_Yield:
+        soa_meta[slot].state = .Runnable
+    case Effect_Receive:
+        soa_meta[slot].state = .Waiting
+    case Effect_Crash:
+        ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Voluntary crash"))
+        _teardown_isolate(shard, type_id, slot, .Crashed)
+    case Effect_Call:
+        shard.next_correlation_id += 1
+        if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
+        corr := shard.next_correlation_id
+
+        soa_meta[slot].pending_correlation = corr
+        soa_meta[slot].state = .Waiting_For_Reply
+
+        _register_system_timer(shard, ctx.self_handle, e.timeout, TAG_CALL_TIMEOUT, corr)
+
+        local_msg := e.message // Make "e.message" it addressable
+        envelope: Message_Envelope
+        envelope.source = ctx.self_handle
+        envelope.destination = e.to
+        envelope.correlation = corr
+        envelope.flags |= ENVELOPE_FLAG_IS_CALL
+        envelope.tag = local_msg.tag
+        envelope.payload_size = local_msg.body.user.payload_size
+        copy(envelope.payload[:], local_msg.body.user.payload[:])
+
+        _route_envelope(shard, e.to, &envelope)
+
+    case Effect_Reply:
+        if !ctx.is_call {
+            ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Reply effect without call context"))
             _teardown_isolate(shard, type_id, slot, .Crashed)
-        case Effect_Call:
-            shard.next_correlation_id += 1
-            if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
-            corr := shard.next_correlation_id
+            return
+        }
+        soa_meta[slot].state = .Waiting
 
-            soa_meta[slot].pending_correlation = corr
-            soa_meta[slot].state = .Waiting_For_Reply
+        local_msg := e.message // Make "e.message" it addressable
+        envelope: Message_Envelope
+        envelope.source = ctx.self_handle
+        envelope.destination = ctx.current_message_source
+        envelope.correlation = ctx.current_correlation
+        envelope.flags |= ENVELOPE_FLAG_IS_REPLY
+        envelope.tag = local_msg.tag
+        envelope.payload_size = local_msg.body.user.payload_size
+        copy(envelope.payload[:], local_msg.body.user.payload[:])
 
-            _register_system_timer(shard, ctx.self_handle, e.timeout, TAG_CALL_TIMEOUT, corr)
+        _route_envelope(shard, ctx.current_message_source, &envelope)
 
-            local_msg := e.message // Make "e.message" it addressable
-            envelope: Message_Envelope
-            envelope.source = ctx.self_handle
-            envelope.destination = e.to
-            envelope.correlation = corr
-            envelope.flags |= ENVELOPE_FLAG_IS_CALL
-            envelope.tag = local_msg.tag
-            envelope.payload_size = local_msg.body.user.payload_size
-            copy(envelope.payload[:], local_msg.body.user.payload[:])
-
-            _route_envelope(shard, e.to, &envelope)
-
-        case Effect_Reply:
-            if !ctx.is_call {
-                ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Reply effect without call context"))
-                _teardown_isolate(shard, type_id, slot, .Crashed)
-                return
-            }
-            soa_meta[slot].state = .Waiting
-
-            local_msg := e.message // Make "e.message" it addressable
-            envelope: Message_Envelope
-            envelope.source = ctx.self_handle
-            envelope.destination = ctx.current_message_source
-            envelope.correlation = ctx.current_correlation
-            envelope.flags |= ENVELOPE_FLAG_IS_REPLY
-            envelope.tag = local_msg.tag
-            envelope.payload_size = local_msg.body.user.payload_size
-            copy(envelope.payload[:], local_msg.body.user.payload[:])
-
-            _route_envelope(shard, ctx.current_message_source, &envelope)
-
-        case Effect_Io:
-            ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Unimplemented Effect"))
-            _teardown_isolate(shard, type_id, slot, .Crashed)
+    case Effect_Io:
+        ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Unimplemented Effect"))
+        _teardown_isolate(shard, type_id, slot, .Crashed)
     }
 }
 
@@ -675,9 +686,9 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, crashed_index:
     restart_end: u16
 
     switch group.strategy {
-        case .One_For_One:  restart_start = crashed_index; restart_end = crashed_index + 1
-        case .One_For_All:  restart_start = 0;             restart_end = group.child_count
-        case .Rest_For_One: restart_start = crashed_index; restart_end = group.child_count
+    case .One_For_One:  restart_start = crashed_index; restart_end = crashed_index + 1
+    case .One_For_All:  restart_start = 0;             restart_end = group.child_count
+    case .Rest_For_One: restart_start = crashed_index; restart_end = group.child_count
     }
 
     for i in restart_start..<restart_end {
@@ -702,9 +713,9 @@ _on_child_exit :: proc(shard: ^Shard, group_index: u16, child_handle: Handle, ex
 
     should_restart := false
     switch exit_kind {
-        case .Normal:   should_restart = (restart_type == .permanent)
-        case .Crashed:  should_restart = (restart_type != .temporary)
-        case .Shutdown:
+    case .Normal:   should_restart = (restart_type == .permanent)
+    case .Crashed:  should_restart = (restart_type != .temporary)
+    case .Shutdown:
     }
 
     if !should_restart {
