@@ -287,7 +287,6 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 	}
 }
 
-// Step 4 of the Scheduler Loop: Flush accumulated submissions to kernel
 reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) {
 	if reactor.pending_count == 0 do return
 
@@ -347,9 +346,11 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 	sub: Submission
 	sub_op_tag: u8
 	buf_idx: u16 = BUFFER_INDEX_NONE
+	target_fd: FD_Handle = FD_HANDLE_NONE
 
 	switch op in io_op {
 	case IoOp_Read:
+		target_fd = op.fd
 		sub_op_tag = u8(IO_TAG_READ_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -367,6 +368,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		}
 
 	case IoOp_Write:
+		target_fd = op.fd
 		sub_op_tag = u8(IO_TAG_WRITE_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -391,6 +393,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		}
 
 	case IoOp_Accept:
+		target_fd = op.listen_fd
 		sub_op_tag = u8(IO_TAG_ACCEPT_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.listen_fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -398,6 +401,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		sub.operation = Submission_Op_Accept{ listen_fd = entry.os_fd }
 
 	case IoOp_Connect:
+		target_fd = op.fd
 		sub_op_tag = u8(IO_TAG_CONNECT_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -405,6 +409,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		sub.operation = Submission_Op_Connect{ socket_fd = entry.os_fd, address = op.address }
 
 	case IoOp_Send:
+		target_fd = op.fd
 		sub_op_tag = u8(IO_TAG_SEND_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -428,6 +433,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		}
 
 	case IoOp_Recv:
+		target_fd = op.fd
 		sub_op_tag = u8(IO_TAG_RECV_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -444,6 +450,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		}
 
 	case IoOp_Sendto:
+		target_fd = op.fd
 		sub_op_tag = u8(IO_TAG_SENDTO_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -468,6 +475,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		}
 
 	case IoOp_Recvfrom:
+		target_fd = op.fd
 		sub_op_tag = u8(IO_TAG_RECVFROM_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -484,6 +492,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 		}
 
 	case IoOp_Close:
+		target_fd = FD_HANDLE_NONE
 		sub_op_tag = u8(IO_TAG_CLOSE_COMPLETE)
 		entry, err := fd_table_lookup(&reactor.fd_table, op.fd)
 		if err != .None do return IO_ERR_STALE_FD
@@ -506,6 +515,7 @@ reactor_submit_io :: proc(reactor: ^Reactor, shard: ^Shard, owner: Handle, io_op
 
 	reactor.pending_submissions[reactor.pending_count] = sub
 	reactor.pending_count += 1
+	soa_meta[slot_idx].io_fd = target_fd
 
 	return IO_ERR_NONE
 }

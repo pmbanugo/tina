@@ -1,6 +1,7 @@
 package tina
 
 TIMER_WHEEL_SPOKE_COUNT :: 4096
+TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256
 
 Simulated_Clock :: struct {
     current_tick: u64,
@@ -89,21 +90,30 @@ _register_system_timer :: proc(shard: ^Shard, target: Handle, delay_ticks: u64, 
 }
 
 @(private="package")
-_advance_timers :: proc(shard: ^Shard) {
+_advance_timers :: proc(shard: ^Shard, max_expirations: u32 = TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT) {
     now := shard.clock.current_tick
-    for shard.timer_wheel.last_tick < now {
-        shard.timer_wheel.last_tick += 1
-        tick := shard.timer_wheel.last_tick
+    expirations: u32 = 0
 
+    tick_loop: for shard.timer_wheel.last_tick < now {
+        if expirations >= max_expirations do break
+
+        tick := shard.timer_wheel.last_tick + 1
         spoke_index := tick & (TIMER_WHEEL_SPOKE_COUNT - 1)
         curr := shard.timer_wheel.spokes[spoke_index]
         prev: u32 = POOL_NONE_INDEX
+
+        spoke_finished := true
 
         for curr != POOL_NONE_INDEX {
             entry := &shard.timer_wheel.entries[curr]
             next := entry.next
 
             if entry.deliver_at <= tick {
+                if expirations >= max_expirations {
+                    spoke_finished = false
+                    break
+                }
+
                 // --- Timerwheel WAITING_FOR_IO Integration (§6.6.3 §12) ---
                 target_type := extract_type_id(entry.target)
                 target_slot := extract_slot(entry.target)
@@ -135,6 +145,7 @@ _advance_timers :: proc(shard: ^Shard) {
 
                 // Deliver the timeout message
                 _enqueue(shard, entry.target, &envelope)
+                expirations += 1
 
                 // Unlink from spoke
                 if prev == POOL_NONE_INDEX {
@@ -150,6 +161,14 @@ _advance_timers :: proc(shard: ^Shard) {
                 prev = curr
                 curr = next
             }
+        }
+
+        if spoke_finished {
+            shard.timer_wheel.last_tick = tick
+        } else {
+            // Budget exhausted before we could finish evaluating this spoke.
+            // Do not advance last_tick so we resume this spoke on the next scheduler loop.
+            break tick_loop
         }
     }
 }

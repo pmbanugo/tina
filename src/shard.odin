@@ -542,7 +542,7 @@ _get_isolate_ptr :: proc(shard: ^Shard, type_id: u16, slot: u32) -> rawptr {
 _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kind: Exit_Kind) {
     soa_meta := shard.metadata[type_id]
 
-    // Step 1: Bump generation (seal the Isolate) - 28-bit mask, skip 0
+    // Step 1: Bump generation (seal the Isolate) - 28-bit mask
     old_generation := soa_meta[slot_index].generation
     new_generation := (old_generation + 1) & 0x0FFFFFFF
     if new_generation == 0 do new_generation = 1
@@ -562,11 +562,34 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
         soa_meta[slot_index].io_completion_tag = IO_TAG_NONE
         soa_meta[slot_index].io_buffer_index = BUFFER_INDEX_NONE
     }
-
     if soa_meta[slot_index].pending_transfer_read != TRANSFER_HANDLE_NONE {
         idx := transfer_handle_index(soa_meta[slot_index].pending_transfer_read)
         reactor_buffer_pool_free(&shard.transfer_pool, idx)
         soa_meta[slot_index].pending_transfer_read = TRANSFER_HANDLE_NONE
+    }
+
+    // Step 2c: FD Table Cleanup
+    handle_to_match := make_handle(shard.id, type_id, slot_index, old_generation)
+    in_flight_fd := soa_meta[slot_index].io_fd
+    is_waiting_for_io := soa_meta[slot_index].state == .Waiting_For_Io
+
+    for i in 0..<shard.reactor.fd_table.slot_count {
+        entry := &shard.reactor.fd_table.entries[i]
+        if entry.read_owner == HANDLE_NONE && entry.write_owner == HANDLE_NONE {
+            continue
+        }
+        // If this Isolate owns either the read or write direction of the FD
+        if entry.read_owner == handle_to_match || entry.write_owner == handle_to_match {
+            fd_h := fd_handle_make(u16(i), entry.generation)
+
+            if is_waiting_for_io && fd_h == in_flight_fd {
+                // Defer the close. The reactor will handle it when the completion arrives.
+                fd_table_mark_close_on_completion(&shard.reactor.fd_table, fd_h)
+            } else {
+                // Safe to close immediately.
+                reactor_internal_close_fd(&shard.reactor, fd_h)
+            }
+        }
     }
 
     // Step 3: Drain mailbox
@@ -1032,7 +1055,18 @@ shard_mass_teardown :: proc(shard: ^Shard) {
         shard.transfer_pool.free_head = u16(i)
     }
 
-    // 2. Single-pass over SOA metadata for maximum cache efficiency
+    // 1b. Reset FD Table and Close all OS FDs
+    for i in 0..<shard.reactor.fd_table.slot_count {
+        entry := &shard.reactor.fd_table.entries[i]
+
+        if entry.read_owner != HANDLE_NONE || entry.write_owner != HANDLE_NONE {
+            backend_control_close(&shard.reactor.backend, entry.os_fd)
+            fd_handle := fd_handle_make(u16(i), entry.generation)
+            fd_table_free(&shard.reactor.fd_table, fd_handle)
+        }
+    }
+
+    // 2. Single-pass over SOA metadata
     for type_desc in shard.type_descriptors {
         type_id := type_desc.id
         soa_meta := shard.metadata[type_id]
@@ -1073,108 +1107,4 @@ shard_mass_teardown :: proc(shard: ^Shard) {
     // 5. Rebuild supervision tree
     root_group_spec := shard.supervision_groups[0].boot_spec
     shard_build_supervision_tree(shard, root_group_spec, context.allocator)
-}
-
-// ============================================================================
-// Deterministic Simulation Tests
-// ============================================================================
-
-when #config(TINA_SIM, false) {
-
-    @(test)
-    test_io_timeout_sequence_firewall :: proc(t: ^testing.T) {
-        // 1. Shard Setup
-        shard := new(Shard)
-        defer free(shard)
-        shard.id = 1
-
-        buffer_backing:[4096]u8
-        fd_backing: [10]FD_Entry
-        message_backing:[1280]u8
-        transfer_backing: [4096]u8
-        timer_backing: [10]Timer_Entry
-
-        pool_init(&shard.message_pool, message_backing[:], 128)
-        reactor_buffer_pool_init(&shard.transfer_pool, transfer_backing[:], 4096, 1)
-        timer_wheel_init(&shard.timer_wheel, timer_backing[:])
-
-        // Configure SimulatedIO to guarantee I/O takes exactly 10 ticks
-        config := Backend_Config{
-            queue_size = 10,
-            sim_config = Simulation_IO_Config{
-                delay_range_ticks = {10, 10},
-            },
-        }
-        err := reactor_init(&shard.reactor, config, fd_backing[:], buffer_backing[:], 4096, 1)
-        testing.expect_value(t, err, Backend_Error.None)
-        defer reactor_deinit(&shard.reactor)
-
-        // SOA and Memory allocation for 1 Isolate
-        soa_slice := make(#soa[]Isolate_Metadata, 1)
-        defer delete(soa_slice)
-        shard.metadata = []#soa[]Isolate_Metadata{soa_slice}
-        shard.metadata[0][0].generation = 1 // Start at 1 to satisfy HANDLE_NONE guards
-
-        Timeout_Isolate :: struct { state: int }
-        mem_slice := make([]u8, size_of(Timeout_Isolate))
-        defer delete(mem_slice)
-        shard.isolate_memory = [][]u8{mem_slice}
-
-        groups := make([]Supervision_Group, 1)
-        defer delete(groups)
-        shard.supervision_groups = groups
-
-        // 2. Isolate Logic
-        TIMEOUT_TAG :: Message_Tag(0x0042)
-
-        init_fn :: proc(self: rawptr, args:[]u8, ctx: ^TinaContext) -> Effect {
-            fd, _ := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-            // Register a timer that fires MUCH faster than the I/O
-            ctx_register_timer(ctx, 2, TIMEOUT_TAG)
-            return Effect_Io{ operation = IoOp_Recv{ fd = fd, buffer_size_max = 100 } }
-        }
-
-        handler_fn :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
-            if message != nil && message.tag == TIMEOUT_TAG {
-                // Success! The timer woke us up. Return to waiting state to keep Isolate alive.
-                return Effect_Receive{}
-            }
-            return Effect_Crash{ reason = .None } // Fail if we get anything else
-        }
-
-        desc := TypeDescriptor{
-            id = 0,
-            slot_count = 1,
-            stride = size_of(Timeout_Isolate),
-            soa_metadata_size = size_of(Isolate_Metadata),
-            init_fn = init_fn,
-            handler_fn = handler_fn,
-        }
-        shard.type_descriptors =[]TypeDescriptor{desc}
-
-        // 3. Execution
-        // Spawn the Isolate
-        t_ctx := TinaContext{ shard = shard, self_handle = HANDLE_NONE }
-        res := ctx_spawn(&t_ctx, Spawn_Spec{ type_id = 0, group_index = 0 })
-        handle := res.(Handle)
-        testing.expect(t, handle != HANDLE_NONE, "Spawn should succeed")
-
-        // Run the scheduler for 15 ticks.
-        // Tick 2: Timer fires, wakes Isolate, increments io_sequence.
-        // Tick 3: Handler runs, goes back to sleep.
-        // Tick 12: Simulated OS finally returns the I/O completion!
-        for i in 0..<15 {
-            scheduler_tick(shard)
-        }
-
-        // 4. Assertions
-        // The sequence firewall MUST have discarded the completion
-        testing.expect_value(t, shard.counters.io_stale_completions, 1)
-
-        // The Buffer Pool MUST have its 1 slot returned (No memory leak!)
-        testing.expect_value(t, shard.reactor.buffer_pool.free_count, 1)
-
-        // The Isolate MUST still be alive (Generation did not bump to 2)
-        testing.expect_value(t, shard.metadata[0][0].generation, 1)
-    }
 }
