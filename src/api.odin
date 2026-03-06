@@ -1,9 +1,7 @@
 package tina
 
 MAX_INIT_ARGS_SIZE :: 64 //Fixed-Size Payload/Args for init_fn
-MAX_ISOLATES_PER_TYPE :: int(max(u16)) // 65535, constrained by 16-bit slot index in Handle
-
-HANDLE_NONE :: Handle(0)
+MAX_ISOLATES_PER_TYPE :: 1_048_575 // 20-bit slot index
 
 Crash_Reason :: enum u8 {
     None = 0,

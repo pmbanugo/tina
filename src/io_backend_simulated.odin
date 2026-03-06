@@ -348,7 +348,7 @@ test_simulated_backend_determinism :: proc(t: ^testing.T) {
 		submissions: [4]Submission
 		for i in 0..<4 {
 			submissions[i] = Submission{
-				token = submission_token_pack(0, u16(i), 0, 0, BUFFER_INDEX_NONE, 7),
+				token = submission_token_pack(0, u32(i), 0, 0, BUFFER_INDEX_NONE, 7),
 				operation = Submission_Op_Recv{socket_fd = OS_FD(i32(i) + 10), size = 1024},
 			}
 		}

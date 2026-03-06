@@ -104,13 +104,39 @@ _advance_timers :: proc(shard: ^Shard) {
             next := entry.next
 
             if entry.deliver_at <= tick {
+                // --- Timerwheel WAITING_FOR_IO Integration (§6.6.3 §12) ---
+                target_type := extract_type_id(entry.target)
+                target_slot := extract_slot(entry.target)
+                target_gen := extract_generation(entry.target)
+
+                if int(target_type) < len(shard.metadata) {
+                    soa_meta := shard.metadata[target_type]
+                    if int(target_slot) < len(soa_meta) {
+                        if soa_meta[target_slot].generation == target_gen {
+                            if soa_meta[target_slot].state == .Waiting_For_Io {
+                                // 1. Issue best-effort cancel to the reactor
+                                reactor_cancel_active_io(&shard.reactor, shard, target_type, target_slot)
+
+                                // 2. Increment io_sequence to structurally invalidate the in-flight completion
+                                soa_meta[target_slot].io_sequence += 1
+
+                                // 3. Transition to Runnable so it receives the timeout message
+                                soa_meta[target_slot].state = .Runnable
+                            }
+                        }
+                    }
+                }
+
                 envelope: Message_Envelope
                 envelope.source = HANDLE_NONE
                 envelope.destination = entry.target
                 envelope.tag = entry.tag
                 envelope.correlation = entry.correlation
+
+                // Deliver the timeout message
                 _enqueue(shard, entry.target, &envelope)
 
+                // Unlink from spoke
                 if prev == POOL_NONE_INDEX {
                     shard.timer_wheel.spokes[spoke_index] = next
                 } else {
@@ -121,7 +147,8 @@ _advance_timers :: proc(shard: ^Shard) {
                 shard.timer_wheel.free_head = curr
                 curr = next
             } else {
-                prev = curr; curr = next
+                prev = curr
+                curr = next
             }
         }
     }

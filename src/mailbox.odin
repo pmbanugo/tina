@@ -7,6 +7,8 @@ MAX_PAYLOAD_SIZE :: 96
 Message_Tag :: distinct u16
 TAG_CALL_TIMEOUT : Message_Tag : 0x0001
 TAG_TIMER        : Message_Tag : 0x0002
+TAG_SHUTDOWN     : Message_Tag : 0x0003
+TAG_TRANSFER     : Message_Tag : 0x0004
 // Application message tags can start from here (0x0040 - 0xFFFF)
 USER_MESSAGE_TAG_BASE : Message_Tag : 0x0040
 

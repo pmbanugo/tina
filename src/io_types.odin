@@ -35,20 +35,20 @@ fd_handle_generation :: #force_inline proc(h: FD_Handle) -> u16 {
 	return u16(u32(h) >> 16)
 }
 
-// --- IO Completion Tags (§6.6.1 §5, §6.6.3 §7) ---
+// --- IO Completion Tags (§6.6.1 §5, §6.6.3 §7, PUBLIC_API_SURFACE §7.2) ---
 
 IO_Completion_Tag :: distinct u16
 
-IO_TAG_NONE             : IO_Completion_Tag : 0
-IO_TAG_READ_COMPLETE    : IO_Completion_Tag : 1
-IO_TAG_WRITE_COMPLETE   : IO_Completion_Tag : 2
-IO_TAG_ACCEPT_COMPLETE  : IO_Completion_Tag : 3
-IO_TAG_CONNECT_COMPLETE : IO_Completion_Tag : 4
-IO_TAG_CLOSE_COMPLETE   : IO_Completion_Tag : 5
-IO_TAG_SEND_COMPLETE    : IO_Completion_Tag : 6
-IO_TAG_RECV_COMPLETE    : IO_Completion_Tag : 7
-IO_TAG_SENDTO_COMPLETE  : IO_Completion_Tag : 8
-IO_TAG_RECVFROM_COMPLETE: IO_Completion_Tag : 9
+IO_TAG_NONE             : IO_Completion_Tag : 0x0000
+IO_TAG_READ_COMPLETE    : IO_Completion_Tag : 0x0010
+IO_TAG_WRITE_COMPLETE   : IO_Completion_Tag : 0x0011
+IO_TAG_ACCEPT_COMPLETE  : IO_Completion_Tag : 0x0012
+IO_TAG_CONNECT_COMPLETE : IO_Completion_Tag : 0x0013
+IO_TAG_SEND_COMPLETE    : IO_Completion_Tag : 0x0014
+IO_TAG_RECV_COMPLETE    : IO_Completion_Tag : 0x0015
+IO_TAG_SENDTO_COMPLETE  : IO_Completion_Tag : 0x0016
+IO_TAG_RECVFROM_COMPLETE: IO_Completion_Tag : 0x0017
+IO_TAG_CLOSE_COMPLETE   : IO_Completion_Tag : 0x0018
 
 // --- Socket Types (§6.6.3 §4, §9, §10) ---
 
@@ -233,57 +233,54 @@ Handoff_Mode :: enum u8 {
 	Write_Only = 2, // child gets write direction, parent retains read direction
 }
 
-// --- Submission Token (§6.6.2 §4) ---
-// 64-bit packed correlation identifier. No pointers — deterministic in simulation.
-//
+// --- Submission Token (§6.6.2 §4 / Repacked for 20-bit slots) ---
+// 64-bit packed correlation identifier.
 // Bit layout (LSB to MSB):
-//   [0..7]   isolate_type_index  u8    which typed arena
-//   [8..23]  isolate_slot_index  u16   slot within arena
-//   [24..31] isolate_generation  u8    crash-restart cycle
-//   [32..39] io_sequence         u8    per-incarnation I/O epoch
-//   [40..55] buffer_index        u16   reactor buffer pool slot
-//   [56..63] operation_tag       u8    which IoOp variant
+//   [0..7]   isolate_type_index  u8    (8 bits)
+//   [8..27]  isolate_slot_index  u32   (20 bits)
+//   [28..35] isolate_generation  u8    (8 bits)
+//   [36..43] io_sequence         u8    (8 bits)
+//   [44..55] buffer_index        u16   (12 bits)
+//   [56..63] operation_tag       u8    (8 bits)
 
 Submission_Token :: distinct u64
 
-BUFFER_INDEX_NONE :: u16(0xFFFF)
+BUFFER_INDEX_NONE :: u16(0x0FFF) // 12-bit max value (4095)
 
 submission_token_pack :: #force_inline proc(
 	type_index: u8,
-	slot_index: u16,
+	slot_index: u32,
 	generation: u8,
 	sequence:   u8,
 	buf_index:  u16,
 	op_tag:     u8,
 ) -> Submission_Token {
-	return Submission_Token(
-		u64(type_index)       |
-		(u64(slot_index) << 8)  |
-		(u64(generation) << 24) |
-		(u64(sequence)   << 32) |
-		(u64(buf_index)  << 40) |
-		(u64(op_tag)     << 56),
-	)
+	return Submission_Token(		u64(type_index & 0xFF) |
+		(u64(slot_index & 0xFFFFF) << 8) |
+		(u64(generation & 0xFF) << 28) |
+		(u64(sequence & 0xFF) << 36) |
+		(u64(buf_index & 0x0FFF) << 44) |
+		(u64(op_tag & 0xFF) << 56)	)
 }
 
 submission_token_type_index :: #force_inline proc(t: Submission_Token) -> u8 {
 	return u8(u64(t) & 0xFF)
 }
 
-submission_token_slot_index :: #force_inline proc(t: Submission_Token) -> u16 {
-	return u16((u64(t) >> 8) & 0xFFFF)
+submission_token_slot_index :: #force_inline proc(t: Submission_Token) -> u32 {
+	return u32((u64(t) >> 8) & 0xFFFFF)
 }
 
 submission_token_generation :: #force_inline proc(t: Submission_Token) -> u8 {
-	return u8((u64(t) >> 24) & 0xFF)
+	return u8((u64(t) >> 28) & 0xFF)
 }
 
 submission_token_io_sequence :: #force_inline proc(t: Submission_Token) -> u8 {
-	return u8((u64(t) >> 32) & 0xFF)
+	return u8((u64(t) >> 36) & 0xFF)
 }
 
 submission_token_buffer_index :: #force_inline proc(t: Submission_Token) -> u16 {
-	return u16((u64(t) >> 40) & 0xFFFF)
+	return u16((u64(t) >> 44) & 0x0FFF)
 }
 
 submission_token_operation_tag :: #force_inline proc(t: Submission_Token) -> u8 {
@@ -396,6 +393,71 @@ IO_ERR_AFFINITY_VIOLATION : IO_Error : -3
 IO_ERR_BOUNDS_VIOLATION   : IO_Error : -4
 IO_ERR_SUBMISSION_FULL    : IO_Error : -5
 
+// --- Transfer Buffer Handle (§6.9 §8.2) ---
+// Layout: lower 16 bits = pool index, upper 16 bits = generation
+Transfer_Handle :: distinct u32
+
+TRANSFER_HANDLE_NONE :: Transfer_Handle(0xFFFF_FFFF)
+
+transfer_handle_make :: #force_inline proc(index: u16, generation: u16) -> Transfer_Handle {
+	return Transfer_Handle(u32(index) | (u32(generation) << 16))
+}
+
+transfer_handle_index :: #force_inline proc(h: Transfer_Handle) -> u16 {
+	return u16(u32(h) & 0xFFFF)
+}
+
+transfer_handle_generation :: #force_inline proc(h: Transfer_Handle) -> u16 {
+	return u16(u32(h) >> 16)
+}
+
+// --- Helpers for SOA Address Storage ---
+
+socket_address_to_peer_address :: #force_inline proc(sa: Socket_Address) -> Peer_Address {
+    pa: Peer_Address
+    switch a in sa {
+    case Socket_Address_Inet4:
+        pa.family = .AF_INET
+        pa.port = a.port
+        // Explicit 4-byte assignment
+        pa.address_data[0] = a.address[0]
+        pa.address_data[1] = a.address[1]
+        pa.address_data[2] = a.address[2]
+        pa.address_data[3] = a.address[3]
+    case Socket_Address_Inet6:
+        pa.family = .AF_INET6
+        pa.port = a.port
+        pa.flow_info = a.flow
+        pa.scope_id = a.scope
+        // Both are [16]u8, direct array assignment works
+        pa.address_data = a.address
+    case Socket_Address_Unix:
+        pa.family = .AF_UNIX
+    }
+    return pa
+}
+
+peer_address_to_socket_address :: #force_inline proc(pa: Peer_Address) -> Socket_Address {
+    switch pa.family {
+    case .AF_INET:
+        a := Socket_Address_Inet4{ port = pa.port }
+        // Explicit 4-byte assignment from the unaddressable parameter
+        a.address[0] = pa.address_data[0]
+        a.address[1] = pa.address_data[1]
+        a.address[2] = pa.address_data[2]
+        a.address[3] = pa.address_data[3]
+        return a
+    case .AF_INET6:
+        a := Socket_Address_Inet6{ port = pa.port, flow = pa.flow_info, scope = pa.scope_id }
+        a.address = pa.address_data
+        return a
+    case .AF_UNIX:
+        return Socket_Address_Unix{}
+    case:
+        return nil
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -420,18 +482,18 @@ test_fd_handle_packing :: proc(t: ^testing.T) {
 test_submission_token_round_trip :: proc(t: ^testing.T) {
 	token := submission_token_pack(
 		type_index = 0x12,
-		slot_index = 0x3456,
+		slot_index = 0x93456,  // Testing a 20-bit value!
 		generation = 0x78,
 		sequence   = 0x9A,
-		buf_index  = 0xBCDE,
+		buf_index  = 0x0CDE,   // Fits in 12 bits!
 		op_tag     = 0xF0,
 	)
 
 	testing.expect_value(t, submission_token_type_index(token),  0x12)
-	testing.expect_value(t, submission_token_slot_index(token),  0x3456)
+	testing.expect_value(t, submission_token_slot_index(token),  0x93456)
 	testing.expect_value(t, submission_token_generation(token),  0x78)
 	testing.expect_value(t, submission_token_io_sequence(token), 0x9A)
-	testing.expect_value(t, submission_token_buffer_index(token), 0xBCDE)
+	testing.expect_value(t, submission_token_buffer_index(token), 0x0CDE)
 	testing.expect_value(t, submission_token_operation_tag(token), 0xF0)
 }
 
