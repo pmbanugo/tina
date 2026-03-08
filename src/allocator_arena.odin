@@ -76,18 +76,23 @@ carve_shard_memory :: proc(arena: ^Grand_Arena, spec: ^SystemSpec, shard: ^Shard
     arena.regions[0] = SubRegion{"Arena_Regions_Tracker", 0, tracker_size} // offset 0 (first alloc)
     arena.region_count = 1
 
-    // 2. Allocate everything else
+    // 2. Allocate everything else using uniquely formatted names
     for t in spec.types {
-        grand_arena_alloc_named(arena, "Typed_Arena", t.slot_count * t.stride) or_return
-        grand_arena_alloc_named(arena, "SOA_Metadata", t.slot_count * t.soa_metadata_size) or_return
+        grand_arena_alloc_named(arena, fmt.tprintf("Typed_Arena_%d", t.id), t.slot_count * t.stride) or_return
+
+        // Carve using the aligned physical capacity
+        aligned_count := _aligned_capacity(t.slot_count)
+        grand_arena_alloc_named(arena, fmt.tprintf("SOA_Metadata_%d", t.id), aligned_count * t.soa_metadata_size) or_return
+
         if t.working_memory_size > 0 {
-            grand_arena_alloc_named(arena, "Working_Memory", t.slot_count * t.working_memory_size) or_return
+            grand_arena_alloc_named(arena, fmt.tprintf("Working_Memory_%d", t.id), t.slot_count * t.working_memory_size) or_return
         }
     }
 
     grand_arena_alloc_named(arena, "Message_Pool", spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE) or_return
     grand_arena_alloc_named(arena, "Reactor_Buffer_Pool", spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size) or_return
     grand_arena_alloc_named(arena, "Transfer_Buffer_Pool", spec.transfer_slot_count * spec.transfer_slot_size) or_return
+    grand_arena_alloc_named(arena, "Transfer_Generations", spec.transfer_slot_count * size_of(u16)) or_return
     grand_arena_alloc_named(arena, "Timer_Wheel", spec.timer_wheel_memory) or_return
     grand_arena_alloc_named(arena, "FD_Table", spec.fd_table_slot_count * spec.fd_entry_size) or_return
     grand_arena_alloc_named(arena, "Log_Ring_Buffer", spec.log_ring_size) or_return

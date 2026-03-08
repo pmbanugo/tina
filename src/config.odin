@@ -26,6 +26,7 @@ ShardSpec :: struct {
 
 SystemSpec :: struct {
     types: []TypeDescriptor,
+    shard_specs:[]ShardSpec,
     pool_slot_count: int,
     reactor_buffer_slot_count: int,
     reactor_buffer_slot_size: int,
@@ -97,18 +98,27 @@ validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
 // Revisit CONFIGURATION_VALIDATION.md later, perhaps combined with the memory management ADR
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
     types_count := len(spec.types)
-    // 3 per type (Typed Arena, SOA Metadata, Working Memory) + 8 static framework regions + 1 for the SubRegion tracker array itself
-    return (types_count * 3) + 8 + 1
+    // 3 per type (Typed Arena, SOA Metadata, Working Memory) + 9 static framework regions + 1 for the SubRegion tracker array itself
+    return (types_count * 3) + 9 + 1
     // FYI: Fixed system regions:
     // 1. Regions Array (SubRegion tracker)
     // 2. Message Pool
     // 3. Reactor Buffer Pool
     // 4. Transfer Buffer Pool
-    // 5. Timer Wheel
-    // 6. FD Table
-    // 7. Log Ring Buffer
-    // 8. Supervision Group Table
-    // 9. Scratch Arena
+    // 5. Transfer Generations
+    // 6. Timer Wheel
+    // 7. FD Table
+    // 8. Log Ring Buffer
+    // 9. Supervision Group Table
+    // 10. Scratch Arena
+}
+
+// Computes an upper-bound capacity aligned to a multiple of 8.
+// This guarantees that Odin's #soa memory geometry, which aligns each field's
+// slice independently, will never exceed our physical byte budget.
+@(private="package")
+_aligned_capacity :: #force_inline proc(count: int) -> int {
+    return (count + 7) & ~int(7)
 }
 
 compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
@@ -121,13 +131,18 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 
     for t in spec.types {
         total += t.slot_count * t.stride
-        total += t.slot_count * t.soa_metadata_size
+
+        // Use aligned physical capacity for SOA metadata to guarantee it absorbs Odin's field alignment padding
+        aligned_count := _aligned_capacity(t.slot_count)
+        total += aligned_count * t.soa_metadata_size
+
         total += t.slot_count * t.working_memory_size
     }
 
     total += spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE
     total += spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size
     total += spec.transfer_slot_count * spec.transfer_slot_size
+    total += spec.transfer_slot_count * size_of(u16) // Transfer_Generations array
     total += spec.timer_wheel_memory
     total += spec.fd_table_slot_count * spec.fd_entry_size
     total += spec.log_ring_size
@@ -136,7 +151,6 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 
     // Account for the memory required to hold the sub-region tracking array itself
     total += max_regions * size_of(SubRegion)
-
 
     return total + padding_overhead
 }

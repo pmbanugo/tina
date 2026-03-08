@@ -1,5 +1,7 @@
 package tina
 
+import "core:mem"
+
 MAX_INIT_ARGS_SIZE :: 64 //Fixed-Size Payload/Args for init_fn
 MAX_ISOLATES_PER_TYPE :: 1_048_575 // 20-bit slot index
 
@@ -41,6 +43,13 @@ Spawn_Error :: enum u8 { arena_full, group_full, type_not_allocated, init_failed
 Spawn_Result :: union { Handle, Spawn_Error }
 Restart_Type :: enum u8 { permanent, transient, temporary }
 
+Transfer_Alloc_Error :: enum u8 { None, Pool_Exhausted }
+Transfer_Write_Error :: enum u8 { None, Stale_Handle, Bounds_Violation }
+Transfer_Read_Error  :: enum u8 { None, Stale_Handle }
+
+Transfer_Alloc_Result :: union { Transfer_Handle, Transfer_Alloc_Error }
+Transfer_Read_Result  :: union {[]u8, Transfer_Read_Error }
+
 Spawn_Spec :: struct {
     args_payload:[MAX_INIT_ARGS_SIZE]u8,
     group_index: u16,
@@ -56,6 +65,34 @@ TinaContext :: struct {
     shard: ^Shard,
     self_handle: Handle,
     current_message_source: Handle,
+    // Memory surfaces (initialized per handler invocation by the scheduler)
+    working_arena: mem.Arena,
+    scratch_arena: mem.Arena,
+
     current_correlation: u32,
     is_call: bool,
+}
+
+// ============================================================================
+// Ergonomic Helpers (§7.2 §8)
+// ============================================================================
+
+bytes_of :: #force_inline proc(ptr: ^$T) ->[]u8 {
+    return mem.byte_slice(ptr, size_of(T))
+}
+
+payload_as :: #force_inline proc($T: typeid, payload:[]u8) -> ^T {
+    assert(size_of(T) <= len(payload), "Payload slice too small for type")
+    return cast(^T)raw_data(payload)
+}
+
+ctx_send_typed :: #force_inline proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, message: ^$T) -> Send_Result {
+    assert(size_of(T) <= MAX_PAYLOAD_SIZE, "Payload exceeds max size")
+    return ctx_send(ctx, to, tag, mem.byte_slice(message, size_of(T)))
+}
+
+make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8, len: u8) {
+    assert(size_of(T) <= MAX_INIT_ARGS_SIZE, "Init args exceed MAX_INIT_ARGS_SIZE")
+    mem.copy(&buf[0], args, size_of(T))
+    return buf, u8(size_of(T))
 }
