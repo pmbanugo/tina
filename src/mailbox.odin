@@ -12,8 +12,12 @@ TAG_TRANSFER     : Message_Tag : 0x0004
 // Application message tags can start from here (0x0040 - 0xFFFF)
 USER_MESSAGE_TAG_BASE : Message_Tag : 0x0040
 
-ENVELOPE_FLAG_IS_CALL  : u16 : 1 << 0
-ENVELOPE_FLAG_IS_REPLY : u16 : 1 << 1
+Envelope_Flag :: enum {
+    Is_Call,   // bit 0
+    Is_Reply,  // bit 1
+}
+
+Envelope_Flags :: bit_set[Envelope_Flag; u16]
 
 // Structured to cleanly separate User payloads from I/O completions
 Message :: struct {
@@ -40,7 +44,7 @@ Message_Envelope :: struct #align(128) {
     correlation: u32,           // 4 bytes
     next_in_mailbox: u32,       // 4 bytes (The queue linkage, overwrites index)
     tag: Message_Tag,           // 2 bytes
-    flags: u16,                 // 2 bytes
+    flags: Envelope_Flags,      // 2 bytes
     payload_size: u16,          // 2 bytes
     _padding: u16,              // 2 bytes (Packs to exactly 32 bytes before payload)
     payload: [MAX_PAYLOAD_SIZE]u8, // 96 bytes

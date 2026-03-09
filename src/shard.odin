@@ -220,7 +220,7 @@ scheduler_tick :: proc(shard: ^Shard) {
                 message: Message
                 message_pointer: ^Message = nil
                 correlation: u32 = 0
-                flags: u16 = 0
+                flags: Envelope_Flags
 
                 is_io_completion := false
                 buffer_to_free: u16 = BUFFER_INDEX_NONE
@@ -254,7 +254,7 @@ scheduler_tick :: proc(shard: ^Shard) {
                     self_handle = make_handle(shard.id, u16(type_id), slot, soa_meta[slot].generation),
                     current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.body.user.source : HANDLE_NONE,
                     current_correlation = correlation,
-                    is_call = (flags & ENVELOPE_FLAG_IS_CALL) != 0,
+                    is_call = .Is_Call in flags,
                 }
 
                 // Initialize Context Arenas (§6.9)
@@ -678,7 +678,7 @@ _enqueue :: proc(shard: ^Shard, to: Handle, env: ^Message_Envelope) -> Send_Resu
 
     if soa_meta[slot].generation != extract_generation(to) { return .stale_handle }
 
-    is_reply := (env.flags & ENVELOPE_FLAG_IS_REPLY) != 0
+    is_reply := .Is_Reply in env.flags
     is_timeout := env.tag == TAG_CALL_TIMEOUT
 
     if is_reply || is_timeout {
@@ -713,7 +713,7 @@ _enqueue :: proc(shard: ^Shard, to: Handle, env: ^Message_Envelope) -> Send_Resu
 }
 
 @(private="package")
-_dequeue :: proc(shard: ^Shard, type_id: u16, slot: u32, out_message: ^Message, out_correlation: ^u32, out_flags: ^u16) -> u32 {
+_dequeue :: proc(shard: ^Shard, type_id: u16, slot: u32, out_message: ^Message, out_correlation: ^u32, out_flags: ^Envelope_Flags) -> u32 {
     soa_meta := shard.metadata[type_id]
     head_index := soa_meta[slot].inbox_head
     if head_index == POOL_NONE_INDEX { return POOL_NONE_INDEX }
@@ -764,7 +764,7 @@ _interpret_effect :: proc(shard: ^Shard, type_id: u16, slot: u32, effect: Effect
         envelope.source = ctx.self_handle
         envelope.destination = e.to
         envelope.correlation = corr
-        envelope.flags |= ENVELOPE_FLAG_IS_CALL
+        envelope.flags += {.Is_Call}
         envelope.tag = local_msg.tag
         envelope.payload_size = local_msg.body.user.payload_size
         copy(envelope.payload[:], local_msg.body.user.payload[:])
@@ -784,7 +784,7 @@ _interpret_effect :: proc(shard: ^Shard, type_id: u16, slot: u32, effect: Effect
         envelope.source = ctx.self_handle
         envelope.destination = ctx.current_message_source
         envelope.correlation = ctx.current_correlation
-        envelope.flags |= ENVELOPE_FLAG_IS_REPLY
+        envelope.flags += {.Is_Reply}
         envelope.tag = local_msg.tag
         envelope.payload_size = local_msg.body.user.payload_size
         copy(envelope.payload[:], local_msg.body.user.payload[:])

@@ -47,7 +47,7 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 		entry.generation = 0
 		entry.read_owner = HANDLE_NONE
 		entry.write_owner = HANDLE_NONE
-		entry.flags = FD_FLAG_NONE
+		entry.flags = {}
 		table.free_head = u16(i)
 	}
 }
@@ -70,7 +70,7 @@ fd_table_alloc :: proc(table: ^FD_Table, os_fd: OS_FD, owner: Handle) -> (FD_Han
 	entry.os_fd = os_fd
 	entry.read_owner = owner
 	entry.write_owner = owner
-	entry.flags = FD_FLAG_NONE
+	entry.flags = {}
 	// generation already set from previous free or init
 
 	return fd_handle_make(index, entry.generation), .None
@@ -163,7 +163,7 @@ fd_table_free :: proc(table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
 	entry.os_fd = _fd_table_encode_next(table.free_head)
 	entry.read_owner = HANDLE_NONE
 	entry.write_owner = HANDLE_NONE
-	entry.flags = FD_FLAG_NONE
+	entry.flags = {}
 
 	table.free_head = index
 	table.free_count += 1
@@ -178,13 +178,13 @@ fd_table_mark_close_on_completion :: proc(table: ^FD_Table, handle: FD_Handle) -
 	if err != .None {
 		return err
 	}
-	entry.flags = FD_Flags(u8(entry.flags) | u8(FD_FLAG_CLOSE_ON_COMPLETION))
+	entry.flags += {.Close_On_Completion}
 	return .None
 }
 
 // Check if an FD is marked for close-on-completion.
 fd_table_is_close_on_completion :: #force_inline proc(entry: ^FD_Entry) -> bool {
-	return (u8(entry.flags) & u8(FD_FLAG_CLOSE_ON_COMPLETION)) != 0
+	return .Close_On_Completion in entry.flags
 }
 
 // Find all FDs owned by a given Isolate (for teardown).

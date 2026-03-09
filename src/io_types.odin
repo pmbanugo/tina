@@ -212,9 +212,11 @@ IoOp :: union {
 // Direction-partitioned ownership: read_owner and write_owner tracked separately.
 // For single-owner FDs (common case), both point to the same Isolate.
 
-FD_Flags :: distinct u8
-FD_FLAG_NONE               : FD_Flags : 0
-FD_FLAG_CLOSE_ON_COMPLETION: FD_Flags : 1 << 0
+FD_Flag :: enum {
+	Close_On_Completion, // bit 0
+}
+
+FD_Flags :: bit_set[FD_Flag; u8]
 
 FD_Entry :: struct {
 	os_fd:       OS_FD,
