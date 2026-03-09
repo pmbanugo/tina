@@ -3,127 +3,119 @@ package tina
 import "core:mem"
 import "core:testing"
 
-// POOL_NONE_INDEX is a sentinel value representing the end of an index-based linked list.
-// Because index 0 is a valid array position,
-// we use max(u32) to explicitly mean "empty" or "no next item". It is shared across
-// the Message Pool free-list, the Isolate Mailbox queues, and the Timer Wheel spokes.
 POOL_NONE_INDEX :: 0xFFFF_FFFF
 
 Message_Pool :: struct {
-    buffer: []u8,
-    chunk_size: int,
-    head_index: u32,
-    total_slots: int,
-    free_slots: int,
+    buffer:[]u8,
+    slot_size:  u32,
+    slot_shift: u32, // Power-of-2 exponent for bit-shifting
+    slot_count: u32,
+    free_count: u32,
+    free_head:  u32,
 }
 
 Pool_Stats :: struct {
-    total: int,
-    used: int,
-    free: int,
+    slot_count: u32,
+    used_count: u32,
+    free_count: u32,
 }
 
 Pool_Error :: enum u8 {
     None,
     Empty,
-    Out_Of_Bounds,
-    Unaligned_Pointer,
 }
 
-pool_init :: proc(p: ^Message_Pool, backing: []u8, chunk_size: int) {
+pool_init :: proc(p: ^Message_Pool, backing:[]u8, slot_size: u32) {
+    assert(slot_size >= 4, "slot_size must be >= 4 bytes for intrusive free list")
+    assert((slot_size & (slot_size - 1)) == 0, "slot_size must be a power of 2")
+
     p.buffer = backing
-    p.chunk_size = chunk_size
-    p.total_slots = len(backing) / chunk_size
-    p.free_slots = 0
-    p.head_index = POOL_NONE_INDEX
+    p.slot_size = slot_size
 
-    // Intrusive push. We loop backwards so that slot 0 is at the head of the list,
-    // pointing to slot 1, which points to 2, etc. This should improve initial cache locality.
-    for i := p.total_slots - 1; i >= 0; i -= 1 {
-        ptr := &p.buffer[i * p.chunk_size]
+    // Calculate log2(slot_size) to get the shift amount
+    shift: u32 = 0
+    for temp := slot_size; temp > 1; temp >>= 1 {
+        shift += 1
+    }
+    p.slot_shift = shift
 
-        // Write the previous head_index directly into the first 4 bytes of the chunk
-        next_index_pointer := cast(^u32)ptr
-        next_index_pointer^ = p.head_index
+    // Total capacity via bit-shift division
+    p.slot_count = u32(len(backing)) >> shift
+    p.free_count = 0
+    p.free_head = POOL_NONE_INDEX
 
-        p.head_index = u32(i)
-        p.free_slots += 1
+    // Intrusive push. Slot 0 at the head for sequential cache warmth.
+    for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
+        // Bit-shift multiplication: index << shift
+        ptr := &p.buffer[u32(i) << p.slot_shift]
+
+        (cast(^u32)ptr)^ = p.free_head
+        p.free_head = u32(i)
+        p.free_count += 1
     }
 }
 
-pool_alloc :: proc(p: ^Message_Pool) -> (rawptr, Pool_Error) {
-    if p.head_index == POOL_NONE_INDEX {
-        return nil, .Empty
+// Allocates a slot and returns its index. O(1).
+pool_alloc :: proc(p: ^Message_Pool) -> (u32, Pool_Error) {
+    if p.free_head == POOL_NONE_INDEX {
+        return POOL_NONE_INDEX, .Empty
     }
 
-    // Get the slot index and calculate its pointer
-    slot_index := p.head_index
-    ptr := rawptr(&p.buffer[int(slot_index) * p.chunk_size])
+    slot_index := p.free_head
+    ptr := &p.buffer[slot_index << p.slot_shift]
 
-    // Read the next index from the first 4 bytes of the slot
-    p.head_index = (cast(^u32)ptr)^
-    p.free_slots -= 1
+    p.free_head = (cast(^u32)ptr)^
+    p.free_count -= 1
 
-    mem.zero(ptr, p.chunk_size)
-    return ptr, .None
+    mem.zero(ptr, int(p.slot_size))
+    return slot_index, .None
 }
 
-pool_free :: proc(p: ^Message_Pool, ptr: rawptr) -> Pool_Error {
-    if ptr == nil {
-        return .None
-    }
+// Frees a slot by its index. O(1).
+pool_free :: proc(p: ^Message_Pool, index: u32) {
+    assert(index < p.slot_count, "Message pool free index out of bounds")
 
-    // Bounds and mathematical alignment check!
-    buffer_base_address := uintptr(raw_data(p.buffer))
-    pointer_address := uintptr(ptr)
-
-    if pointer_address < buffer_base_address || pointer_address >= buffer_base_address + uintptr(len(p.buffer)) {
-        return .Out_Of_Bounds
-    }
-
-    offset := pointer_address - buffer_base_address
-    if offset % uintptr(p.chunk_size) != 0 {
-        return .Unaligned_Pointer // User tried to free an address in the middle of a chunk
-    }
-
-    slot_index := u32(offset / uintptr(p.chunk_size))
-
+    ptr := &p.buffer[index << p.slot_shift]
     // Intrusive push back onto the free list
-    next_index_pointer := cast(^u32)ptr
-    next_index_pointer^ = p.head_index
-    p.head_index = slot_index
-    p.free_slots += 1
+    (cast(^u32)ptr)^ = p.free_head
+    p.free_head = index
+    p.free_count += 1
+}
 
-    return .None
+// Resolves a pool index to its memory pointer.
+pool_get_ptr :: #force_inline proc(p: ^Message_Pool, index: u32) -> rawptr {
+    assert(index < p.slot_count, "Message pool ptr index out of bounds")
+    return rawptr(&p.buffer[index << p.slot_shift])
 }
 
 pool_stats :: proc(p: ^Message_Pool) -> Pool_Stats {
     return Pool_Stats{
-        total = p.total_slots,
-        free = p.free_slots,
-        used = p.total_slots - p.free_slots,
+        slot_count = p.slot_count,
+        free_count = p.free_count,
+        used_count = p.slot_count - p.free_count,
     }
 }
 
 // === TESTS ===
 @(test)
 test_message_pool :: proc(t: ^testing.T) {
-    // Stack allocate backing buffer for the test. 10 slots of 128 bytes.
     backing: [1280]u8
     pool: Message_Pool
     pool_init(&pool, backing[:], 128)
 
     stats := pool_stats(&pool)
-    testing.expect_value(t, stats.total, 10)
-    testing.expect_value(t, stats.free, 10)
-    testing.expect_value(t, stats.used, 0)
+    testing.expect_value(t, stats.slot_count, 10)
+    testing.expect_value(t, pool.slot_shift, 7) // log2(128) == 7
+
+        testing.expect_value(t, stats.free_count, 10)
+    testing.expect_value(t, stats.used_count, 0)
 
     // Allocate all slots
-    ptrs: [10]rawptr
+    indices:[10]u32
     for i in 0..<10 {
-        ptr, err := pool_alloc(&pool)
+        idx, err := pool_alloc(&pool)
         testing.expect_value(t, err, Pool_Error.None)
-        ptrs[i] = ptr
+        indices[i] = idx
     }
 
     // Pool should now be empty
@@ -131,25 +123,19 @@ test_message_pool :: proc(t: ^testing.T) {
     testing.expect_value(t, empty_err, Pool_Error.Empty)
 
     stats_full := pool_stats(&pool)
-    testing.expect_value(t, stats_full.used, 10)
-    testing.expect_value(t, stats_full.free, 0)
+    testing.expect_value(t, stats_full.used_count, 10)
 
-    // Test Bounds checking
-    dummy_val: u64
-    oob_err := pool_free(&pool, &dummy_val)
-    testing.expect_value(t, oob_err, Pool_Error.Out_Of_Bounds)
-
-    unaligned_ptr := rawptr(uintptr(ptrs[0]) + 1)
-    unalign_err := pool_free(&pool, unaligned_ptr)
-    testing.expect_value(t, unalign_err, Pool_Error.Unaligned_Pointer)
+    // Test pointer resolution
+    ptr := pool_get_ptr(&pool, indices[0])
+    testing.expect(t, ptr == raw_data(backing[:]), "Index 0 should map to backing buffer start")
 
     // Free them all back
     for i in 0..<10 {
-        err := pool_free(&pool, ptrs[i])
-        testing.expect_value(t, err, Pool_Error.None)
+        pool_free(&pool, indices[i])
     }
 
     stats_freed := pool_stats(&pool)
-    testing.expect_value(t, stats_freed.used, 0)
-    testing.expect_value(t, stats_freed.free, 10)
+    testing.expect_value(t, stats_freed.used_count, 0)
+    testing.expect_value(t, stats_freed.free_count, 10)
+
 }

@@ -198,8 +198,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 
         if sigsetjmp(&shard.trap_environment, 0) != 0 {
             if shard.current_msg_slot != POOL_NONE_INDEX {
-                env_ptr := rawptr(&shard.message_pool.buffer[shard.current_msg_slot * MESSAGE_ENVELOPE_SIZE])
-                pool_free(&shard.message_pool, env_ptr)
+                pool_free(&shard.message_pool, shard.current_msg_slot)
                 shard.current_msg_slot = POOL_NONE_INDEX
             }
             _teardown_isolate(shard, shard.current_type_id, shard.current_slot_index, .Crashed)
@@ -296,8 +295,7 @@ scheduler_tick :: proc(shard: ^Shard) {
                 }
 
                 if shard.current_msg_slot != POOL_NONE_INDEX {
-                    env_ptr := rawptr(&shard.message_pool.buffer[shard.current_msg_slot * MESSAGE_ENVELOPE_SIZE])
-                    pool_free(&shard.message_pool, env_ptr)
+                    pool_free(&shard.message_pool, shard.current_msg_slot)
                     shard.current_msg_slot = POOL_NONE_INDEX
                 }
 
@@ -646,8 +644,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
     // Step 3: Drain mailbox
     curr := soa_meta[slot_index].inbox_head
     for curr != POOL_NONE_INDEX {
-        env_ptr := rawptr(&shard.message_pool.buffer[curr * MESSAGE_ENVELOPE_SIZE])
-        envelope := cast(^Message_Envelope)env_ptr
+        envelope := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, curr)
         next := envelope.next_in_mailbox
 
         if envelope.tag == TAG_TRANSFER && envelope.payload_size >= size_of(Transfer_Handle) {
@@ -655,7 +652,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
             _transfer_pool_free(shard, transfer_handle_index(t_handle))
         }
 
-        pool_free(&shard.message_pool, env_ptr)
+        pool_free(&shard.message_pool, curr)
         curr = next
     }
     soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
@@ -694,19 +691,18 @@ _enqueue :: proc(shard: ^Shard, to: Handle, env: ^Message_Envelope) -> Send_Resu
 
     if soa_meta[slot].inbox_count >= 256 { return .mailbox_full }
 
-    ptr, err := pool_alloc(&shard.message_pool)
+    pool_index, err := pool_alloc(&shard.message_pool)
     if err != .None { return .pool_exhausted }
 
-    dest_env := cast(^Message_Envelope)ptr
+    dest_env := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, pool_index)
     dest_env^ = env^
     dest_env.next_in_mailbox = POOL_NONE_INDEX
 
-    pool_index := u32((uintptr(ptr) - uintptr(raw_data(shard.message_pool.buffer))) / MESSAGE_ENVELOPE_SIZE)
     if soa_meta[slot].inbox_head == POOL_NONE_INDEX {
         soa_meta[slot].inbox_head = pool_index
     } else {
-        tail_ptr := rawptr(&shard.message_pool.buffer[soa_meta[slot].inbox_tail * MESSAGE_ENVELOPE_SIZE])
-        (cast(^Message_Envelope)tail_ptr).next_in_mailbox = pool_index
+        tail_envelope := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, soa_meta[slot].inbox_tail)
+        tail_envelope.next_in_mailbox = pool_index
     }
 
     soa_meta[slot].inbox_tail = pool_index
@@ -722,8 +718,7 @@ _dequeue :: proc(shard: ^Shard, type_id: u16, slot: u32, out_message: ^Message, 
     head_index := soa_meta[slot].inbox_head
     if head_index == POOL_NONE_INDEX { return POOL_NONE_INDEX }
 
-    envelope_ptr := rawptr(&shard.message_pool.buffer[head_index * MESSAGE_ENVELOPE_SIZE])
-    envelope := cast(^Message_Envelope)envelope_ptr
+    envelope := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, head_index)
 
     out_message.tag = envelope.tag
     out_message.body.user.source = envelope.source
@@ -1085,18 +1080,18 @@ shard_mass_teardown :: proc(shard: ^Shard) {
     log_flush(shard)
 
     // 1. Reset Pools (Message & Transfer)
-    shard.message_pool.free_slots = shard.message_pool.total_slots
-    shard.message_pool.head_index = POOL_NONE_INDEX
-    for i := shard.message_pool.total_slots - 1; i >= 0; i -= 1 {
-        ptr := &shard.message_pool.buffer[i * shard.message_pool.chunk_size]
-        (cast(^u32)ptr)^ = shard.message_pool.head_index
-        shard.message_pool.head_index = u32(i)
+    shard.message_pool.free_count = shard.message_pool.slot_count
+    shard.message_pool.free_head = POOL_NONE_INDEX
+    for i := int(shard.message_pool.slot_count) - 1; i >= 0; i -= 1 {
+        ptr := pool_get_ptr(&shard.message_pool, u32(i))
+        (cast(^u32)ptr)^ = shard.message_pool.free_head
+        shard.message_pool.free_head = u32(i)
     }
 
     shard.transfer_pool.free_count = shard.transfer_pool.slot_count
     shard.transfer_pool.free_head = BUFFER_INDEX_NONE
     for i := int(shard.transfer_pool.slot_count) - 1; i >= 0; i -= 1 {
-        ptr := raw_data(shard.transfer_pool.buffer[i * int(shard.transfer_pool.slot_size):])
+        ptr := reactor_buffer_pool_slot_ptr(&shard.transfer_pool, u16(i))
         (cast(^u16)ptr)^ = shard.transfer_pool.free_head
         shard.transfer_pool.free_head = u16(i)
         shard.transfer_generations[i] += 1

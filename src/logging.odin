@@ -20,39 +20,41 @@ USER_LOG_TAG_BASE : Log_Tag : 0x40
 POSIX_PIPE_BUF_SIZE     :: 4096  // Guaranteed atomic write size on POSIX
 MAX_FORMATTED_LOG_LINE  :: 256   // Max size for the string builder output
 
-// 24 bytes exactly. Ordered largest to smallest.
 Log_Record_Header :: struct {
-    timestamp: u64,         // 8 bytes
-    isolate_handle: Handle, // 8 bytes
-    payload_size: u16,      // 2 bytes
-    _reserved_0: u16,       // 2 bytes
-    level: Log_Level,       // 1 byte
-    tag: Log_Tag,           // 1 byte
-    _reserved_1: u16,       // 2 bytes
+    timestamp: u64,
+    isolate_handle: Handle,
+    payload_size: u16,
+    _reserved_0: u16,
+    level: Log_Level,
+    tag: Log_Tag,
+    _reserved_1: u16,
 }
 
 Log_Record_Header_Size :: u64(size_of(Log_Record_Header))
 
 Log_Ring_Buffer :: struct {
     buffer:[]u8,
-    capacity: u64,
+    capacity_mask: u64, // Mask instead of capacity for fast bitwise wrapping
     read_cursor: u64,
     write_cursor: u64,
 }
 
 log_init :: proc(ring: ^Log_Ring_Buffer, backing:[]u8) {
+    capacity := u64(len(backing))
+    assert(capacity > 0 && (capacity & (capacity - 1)) == 0, "Log ring buffer capacity must be a power of 2")
+
     ring.buffer = backing
-    ring.capacity = u64(len(backing))
+    ring.capacity_mask = capacity - 1
     ring.read_cursor = 0
     ring.write_cursor = 0
 }
 
 ctx_log :: proc(ctx: ^TinaContext, level: Log_Level, tag: Log_Tag, payload:[]u8) {
     timestamp := ctx.shard.clock.current_tick
-    record_size := Log_Record_Header_Size + u64( ((len(payload) + 7) & ~int(7))) // 8-byte aligned chunks
+    record_size := Log_Record_Header_Size + u64( ((len(payload) + 7) & ~int(7)))
 
-    // Front-door drop if full
-    if ctx.shard.log_ring.write_cursor + record_size - ctx.shard.log_ring.read_cursor > ctx.shard.log_ring.capacity {
+    capacity := ctx.shard.log_ring.capacity_mask + 1
+    if ctx.shard.log_ring.write_cursor + record_size - ctx.shard.log_ring.read_cursor > capacity {
         return
     }
 
@@ -71,17 +73,47 @@ ctx_log :: proc(ctx: ^TinaContext, level: Log_Level, tag: Log_Tag, payload:[]u8)
     ctx.shard.log_ring.write_cursor += record_size
 }
 
+// SIMD-friendly 2-part ring buffer block copy
 @(private="package")
-_write_ring_data :: proc(ring: ^Log_Ring_Buffer, offset: u64, data:[]u8) {
-    for i in 0..<len(data) {
-        ring.buffer[(offset + u64(i)) % ring.capacity] = data[i]
+_write_ring_data :: #force_inline proc(ring: ^Log_Ring_Buffer, offset: u64, data: []u8) {
+    size := u64(len(data))
+    if size == 0 do return
+
+    start := offset & ring.capacity_mask
+    capacity := ring.capacity_mask + 1
+
+    if start + size <= capacity {
+        // Fits perfectly without wrapping
+        mem.copy(&ring.buffer[start], raw_data(data), int(size))
+    } else {
+        // Wraps the buffer edge: perform two distinct copies
+        first_chunk := capacity - start
+        mem.copy(&ring.buffer[start], raw_data(data), int(first_chunk))
+
+        src_offset := rawptr(uintptr(raw_data(data)) + uintptr(first_chunk))
+        mem.copy(&ring.buffer[0], src_offset, int(size - first_chunk))
     }
 }
 
+// SIMD-friendly 2-part ring buffer block read
 @(private="package")
-_read_ring_data :: proc(ring: ^Log_Ring_Buffer, offset: u64, data: []u8) {
-    for i in 0..<len(data) {
-        data[i] = ring.buffer[(offset + u64(i)) % ring.capacity]
+_read_ring_data :: #force_inline proc(ring: ^Log_Ring_Buffer, offset: u64, data: []u8) {
+    size := u64(len(data))
+    if size == 0 do return
+
+    start := offset & ring.capacity_mask
+    capacity := ring.capacity_mask + 1
+
+    if start + size <= capacity {
+        // Fits perfectly without wrapping
+        mem.copy(raw_data(data), &ring.buffer[start], int(size))
+    } else {
+        // Wraps the buffer edge: perform two distinct copies
+        first_chunk := capacity - start
+        mem.copy(raw_data(data), &ring.buffer[start], int(first_chunk))
+
+        dst_offset := rawptr(uintptr(raw_data(data)) + uintptr(first_chunk))
+        mem.copy(dst_offset, &ring.buffer[0], int(size - first_chunk))
     }
 }
 
@@ -109,7 +141,6 @@ log_flush :: proc(shard: ^Shard) {
             header.timestamp, header.level, header.tag, u64(header.isolate_handle),
             string(payload_buf[:header.payload_size]))
 
-        // Chunk to 4096 to prevent cross-thread interleaving (PIPE_BUF atomicity)
         if temp_len + len(b.buf) > POSIX_PIPE_BUF_SIZE {
             os.write(os.stderr, temp_buf[:temp_len])
             temp_len = 0
@@ -120,7 +151,6 @@ log_flush :: proc(shard: ^Shard) {
         ring.read_cursor += record_len
     }
 
-    // EAGAIN handling (capacitor behavior). We write what we have.
     if temp_len > 0 {
     	// TODO: check the os.write result for errors/EAGAIN? or do something different and assert earlier?
         os.write(os.stderr, temp_buf[:temp_len])

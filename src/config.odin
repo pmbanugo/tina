@@ -49,6 +49,7 @@ SystemSpecError :: enum u8 {
     None,
     ScratchArenaTooSmall,
     SlotCountExceedsHandleCapacity,
+    LogRingSizeNotPowerOfTwo,
 }
 
 Supervision_Strategy :: enum u8 {
@@ -90,6 +91,11 @@ validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
     if spec.scratch_arena_size < max_scratch {
         return .ScratchArenaTooSmall
     }
+
+    if spec.log_ring_size == 0 || (spec.log_ring_size & (spec.log_ring_size - 1)) != 0 {
+        return .LogRingSizeNotPowerOfTwo
+    }
+
     return .None
 }
 
@@ -166,6 +172,7 @@ test_system_spec_validation :: proc(t: ^testing.T) {
     spec := SystemSpec{
         types = types[:],
         scratch_arena_size = 2048, // Intentionally too small
+        log_ring_size = 65536,     // Provide a valid power-of-2 size!
     }
 
     err := validate_system_spec(&spec)
