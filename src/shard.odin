@@ -130,6 +130,8 @@ Shard :: struct {
     // --- Hot Pointers & Slices (8-byte aligned) ---
     sim_network:          ^SimulatedNetwork,
     fault_config:         ^FaultConfig,
+    outbound_rings:       []^SPSC_Ring,
+    inbound_rings:        []^SPSC_Ring,
     type_descriptors:[]TypeDescriptor,
     isolate_memory:       [][]u8,
     working_memory:       [][]u8,   // Base slices for working memory
@@ -177,6 +179,7 @@ scheduler_tick :: proc(shard: ^Shard) {
     shard.clock.current_tick += 1
     now := shard.clock.current_tick
 
+    // Step 1: Drain inbound cross-shard rings → deliver to local mailboxes ---
     when #config(TINA_SIM, false) {
         if shard.sim_network != nil {
             for src in u16(0)..<shard.sim_network.shard_count {
@@ -185,10 +188,34 @@ scheduler_tick :: proc(shard: ^Shard) {
                 }
             }
         }
+    } else {
+        if len(shard.inbound_rings) > 0 {
+            for ring in shard.inbound_rings {
+                if ring == nil do continue
+
+                available := spsc_ring_available_to_read(ring)
+                for i in 0..<available {
+                    envelope := spsc_ring_get_read_ptr(ring, i)
+                    res := _enqueue(shard, envelope.destination, envelope)
+
+                    if res == .mailbox_full {
+                        shard.counters.mailbox_full_drops += 1
+                    } else if res == .stale_handle {
+                        shard.counters.stale_delivery_drops += 1
+                    }
+                }
+
+                if available > 0 {
+                    spsc_ring_commit_read(ring, available)
+                }
+            }
+        }
     }
 
+    // Step 2: Collect I/O completions
 	reactor_collect_completions(&shard.reactor, shard, 0)
 
+	// Step 3: Isolate Dispatch
     for type_descriptor in shard.type_descriptors {
         type_id := type_descriptor.id
         soa_meta := shard.metadata[type_id]
@@ -304,8 +331,10 @@ scheduler_tick :: proc(shard: ^Shard) {
         }
     }
 
+    // Step 4: Flush I/O submissions
 	reactor_flush_submissions(&shard.reactor, shard)
 
+	// Step 5: Flush outbound cross-shard rings
     when #config(TINA_SIM, false) {
         if shard.sim_network != nil {
             for i in 0..<shard.outbound_count {
@@ -315,8 +344,17 @@ scheduler_tick :: proc(shard: ^Shard) {
             }
             shard.outbound_count = 0
         }
+    } else {
+        if len(shard.outbound_rings) > 0 {
+            for ring in shard.outbound_rings {
+                if ring != nil {
+                    spsc_ring_flush_producer(ring)
+                }
+            }
+        }
     }
 
+    // Step 6 & 7: Advance timers and Flush logs
     _advance_timers(shard)
     log_flush(shard)
 }
@@ -573,6 +611,12 @@ _route_envelope :: proc(shard: ^Shard, to: Handle, envelope: ^Message_Envelope) 
                 return .mailbox_full
             }
         } else {
+            ring := shard.outbound_rings[destination]
+            if ring == nil do return .stale_handle
+            if !spsc_ring_enqueue(ring, envelope) {
+                shard.counters.ring_full_drops += 1
+                return .mailbox_full
+            }
             return .ok
         }
     }
