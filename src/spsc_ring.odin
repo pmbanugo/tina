@@ -42,7 +42,7 @@ spsc_ring_init :: proc(ring: ^SPSC_Ring, capacity: u64, buffer: []Message_Envelo
 
 // Enqueues a message into the ring but DOES NOT publish it yet.
 // no atomic barrier unless cached capacity is exhausted.
-spsc_ring_enqueue :: #force_inline proc(ring: ^SPSC_Ring, envelope: ^Message_Envelope) -> bool {
+spsc_ring_enqueue :: #force_inline proc(ring: ^SPSC_Ring, envelope: ^Message_Envelope) -> Enqueue_Result {
     // Check if full using local cache
     if ring.local_write_sequence - ring.cached_read_sequence >= ring.capacity {
         // Cache says full, fetch the actual read_sequence via Acquire load
@@ -50,7 +50,7 @@ spsc_ring_enqueue :: #force_inline proc(ring: ^SPSC_Ring, envelope: ^Message_Env
 
         // Re-check
         if ring.local_write_sequence - ring.cached_read_sequence >= ring.capacity {
-            return false // Ring is completely full
+            return .Full
         }
     }
 
@@ -59,7 +59,7 @@ spsc_ring_enqueue :: #force_inline proc(ring: ^SPSC_Ring, envelope: ^Message_Env
     ring.buffer[idx] = envelope^
 
     ring.local_write_sequence += 1
-    return true
+    return .Success
 }
 
 // Publishes all enqueued messages to the consumer simultaneously.
@@ -107,36 +107,25 @@ test_spsc_ring_batching :: proc(t: ^testing.T) {
 
     env := Message_Envelope{ tag = TAG_TIMER }
 
-    // Enqueue 2 items (staged, not published)
-    testing.expect(t, spsc_ring_enqueue(&ring, &env))
-    testing.expect(t, spsc_ring_enqueue(&ring, &env))
+    testing.expect(t, spsc_ring_enqueue(&ring, &env) == .Success)
+    testing.expect(t, spsc_ring_enqueue(&ring, &env) == .Success)
 
-    // Consumer should see 0 because they are not flushed
     testing.expect_value(t, spsc_ring_available_to_read(&ring), 0)
-
-    // Publish
     spsc_ring_flush_producer(&ring)
 
-    // Consumer should now see 2
     avail := spsc_ring_available_to_read(&ring)
     testing.expect_value(t, avail, 2)
 
-    // Commit read. The ring is now 100% EMPTY (2 written, 2 read).
     spsc_ring_commit_read(&ring, avail)
 
-    // Since capacity is 4, and the ring is empty, we should be able to enqueue exactly 4 items.
-    testing.expect(t, spsc_ring_enqueue(&ring, &env)) // LWS = 3
-    testing.expect(t, spsc_ring_enqueue(&ring, &env)) // LWS = 4
-    testing.expect(t, spsc_ring_enqueue(&ring, &env)) // LWS = 5 (Forces atomic read of RS)
-    testing.expect(t, spsc_ring_enqueue(&ring, &env)) // LWS = 6
+    testing.expect(t, spsc_ring_enqueue(&ring, &env) == .Success)
+    testing.expect(t, spsc_ring_enqueue(&ring, &env) == .Success)
+    testing.expect(t, spsc_ring_enqueue(&ring, &env) == .Success)
+    testing.expect(t, spsc_ring_enqueue(&ring, &env) == .Success)
 
     // The 5th enqueue MUST fail.
-    // LWS (6) - CRS (2) == 4. 4 >= capacity (4).
-    testing.expect(t, !spsc_ring_enqueue(&ring, &env), "5th enqueue on a capacity 4 ring must fail")
+    testing.expect(t, spsc_ring_enqueue(&ring, &env) == .Full, "5th enqueue on a capacity 4 ring must fail")
 
-    // Publish the 4 successfully enqueued items
     spsc_ring_flush_producer(&ring)
-
-    // Consumer should see exactly 4 items available
     testing.expect_value(t, spsc_ring_available_to_read(&ring), 4)
 }

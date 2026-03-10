@@ -3,6 +3,7 @@ package tina
 import "core:testing"
 import "core:mem"
 import "core:c"
+import "core:sync"
 
 // --- Trap Boundary Platform Bindings ---
 
@@ -61,9 +62,21 @@ Shard_State :: enum u8 {
     Init = 0,
     Running = 1,
     Quarantined = 2,
+    Shutting_Down = 3,
 }
 
 Isolate_State :: enum u8 { Unallocated = 0, Runnable, Waiting, Waiting_For_Reply, Waiting_For_Io, Crashed }
+Isolate_Flag :: enum u8 {
+    Shutdown_Pending,
+}
+Isolate_Flags :: distinct bit_set[Isolate_Flag; u8]
+
+// Mutually Exclusive Control Signals from Watchdog
+Control_Signal :: enum u8 {
+    None     = 0,
+    Shutdown = 1,
+    Kill     = 2,
+}
 
 SUPERVISION_GROUP_NONE  :: 0xFFFF
 HANDLE_TYPE_ID_SUBGROUP :: 0xFFFF
@@ -85,9 +98,9 @@ Isolate_Metadata :: struct {
     io_completion_tag:     IO_Completion_Tag,   // 2 bytes
     io_buffer_index:       u16,                 // 2 bytes
     state:                 Isolate_State,       // 1 byte
-    shutdown_pending:      u8,                  // 1 byte
+    flags:                 Isolate_Flags,       // 1 byte (Replaces shutdown_pending: u8)
     io_sequence:           u8,                  // 1 byte
-    _padding:              [1]u8,               // (Packs exactly to 72 bytes)
+    _padding:              [1]u8,               // 1 byte (Packs exactly to 72 bytes)
 }
 
 Shard_Counters :: struct {
@@ -135,10 +148,10 @@ Shard :: struct {
     type_descriptors:[]TypeDescriptor,
     isolate_memory:       [][]u8,
     working_memory:       [][]u8,   // Base slices for working memory
-    scratch_memory:[]u8,     // Base slice for scratch arena
-    transfer_generations:[]u16,    // Generations for transfer buffer stale-reference detection
+    scratch_memory:		  []u8,     // Base slice for scratch arena
+    transfer_generations: []u16,
     metadata:             []#soa[]Isolate_Metadata,
-    supervision_groups:[]Supervision_Group,
+    supervision_groups:   []Supervision_Group,
 
     // --- Hot Embedded Structs (8-byte aligned) ---
     clock:         Simulated_Clock,
@@ -156,9 +169,8 @@ Shard :: struct {
     id:                  u16,
     current_type_id:     u16,
     watchdog_state:      Shard_State,
-    kill_requested:      bool,
-    shutdown_requested:  bool,
-    _padding:            [1]u8,
+    control_signal:      Control_Signal, //(Atomic, mutually exclusive signals)
+    _padding:            [2]u8,// 2 bytes padding to 4-byte boundary
 
     // --- Cold / Massive Storage ---
     timer_wheel:      Timer_Wheel,
@@ -170,16 +182,60 @@ Shard :: struct {
 // --- Scheduler Loop ---
 
 scheduler_tick :: proc(shard: ^Shard) {
-    if shard.kill_requested {
-        shard_mass_teardown(shard)
-        return
+    signal := cast(Control_Signal) sync.atomic_load_explicit(cast(^u8)&shard.control_signal, .Relaxed)
+    if signal != .None {
+        switch signal {
+        case .None: // Unreachable but satisfies switch exhaustion
+        case .Shutdown:
+            // Consume the signal, transition Shard state to Shutting_Down
+            sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(Control_Signal.None), .Relaxed)
+            shard.watchdog_state = .Shutting_Down
+
+            // Phase 1 Notification: wake all parked isolates
+            for type_desc in shard.type_descriptors {
+                type_id    := type_desc.id
+                slot_count := u32(type_desc.slot_count)
+
+                // Extract 1D slices to bypass 2D lookups
+                states        := shard.metadata[type_id].state[:]
+                flags         := shard.metadata[type_id].flags[:]
+                io_sequences       := shard.metadata[type_id].io_sequence[:]
+                pending_correlations := shard.metadata[type_id].pending_correlation[:]
+
+                for index in 0..<slot_count {
+                    if states[index] != .Unallocated {
+                        flags[index] += {.Shutdown_Pending}
+                    }
+                }
+
+                for index in 0..<slot_count {
+                    #partial switch states[index] {
+                    case .Waiting:
+                        states[index] = .Runnable
+                    case .Waiting_For_Io:
+                        // Invalidate pending completion
+                        io_sequences[index] += 1
+                        states[index] = .Runnable
+                    case .Waiting_For_Reply:
+                        // Discard stale replies
+                        pending_correlations[index] = 0
+                        states[index] = .Runnable
+                    }
+                }
+            }
+        case .Kill:
+            shard_mass_teardown(shard)
+            return
+        }
     }
 
     shard.heartbeat_tick += 1
     shard.clock.current_tick += 1
     now := shard.clock.current_tick
 
-    // Step 1: Drain inbound cross-shard rings → deliver to local mailboxes ---
+    // ========================================================================
+    // Step 1: Drain inbound cross-shard rings → deliver to local mailboxes
+    // ========================================================================
     when #config(TINA_SIM, false) {
         if shard.sim_network != nil {
             for src in u16(0)..<shard.sim_network.shard_count {
@@ -212,13 +268,30 @@ scheduler_tick :: proc(shard: ^Shard) {
         }
     }
 
+    // ========================================================================
     // Step 2: Collect I/O completions
-	reactor_collect_completions(&shard.reactor, shard, 0)
+    // ========================================================================
+    reactor_collect_completions(&shard.reactor, shard, 0)
 
-	// Step 3: Isolate Dispatch
+    // ========================================================================
+    // Step 3: Isolate Dispatch (Budget-limited by type)
+    // ========================================================================
     for type_descriptor in shard.type_descriptors {
-        type_id := type_descriptor.id
-        soa_meta := shard.metadata[type_id]
+        type_id    := type_descriptor.id
+        slot_count := u32(type_descriptor.slot_count)
+
+        // Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop
+        states                 := shard.metadata[type_id].state[:]
+        flags                  := shard.metadata[type_id].flags[:]
+        inbox_counts           := shard.metadata[type_id].inbox_count[:]
+        io_completions         := shard.metadata[type_id].io_completion_tag[:]
+        generations            := shard.metadata[type_id].generation[:]
+        io_results             := shard.metadata[type_id].io_result[:]
+        io_fds                 := shard.metadata[type_id].io_fd[:]
+        io_buffer_indices      := shard.metadata[type_id].io_buffer_index[:]
+        io_peer_addresses      := shard.metadata[type_id].io_peer_address[:]
+        working_arena_offsets  := shard.metadata[type_id].working_arena_offset[:]
+        pending_transfer_reads := shard.metadata[type_id].pending_transfer_read[:]
 
         shard.current_type_id = u16(type_id)
         start_slot: u32 = 0
@@ -232,13 +305,17 @@ scheduler_tick :: proc(shard: ^Shard) {
             start_slot = shard.current_slot_index + 1
         }
 
-        for slot : u32 = start_slot; slot < u32(type_descriptor.slot_count); slot += 1 {
-            state := soa_meta[slot].state
+        for slot in start_slot..<slot_count {
+            state := states[slot]
 
+            // FAST-PATH REJECT: If empty, skip immediately.
+            if state == .Unallocated do continue
+
+            // Use the extracted 1D slices
             has_work := (state == .Runnable) ||
-                        (state == .Waiting && soa_meta[slot].inbox_count > 0) ||
-                        (soa_meta[slot].io_completion_tag != IO_TAG_NONE) ||
-                        (soa_meta[slot].shutdown_pending != 0)
+                        (state == .Waiting && inbox_counts[slot] > 0) ||
+                        (io_completions[slot] != IO_TAG_NONE) ||
+                        (.Shutdown_Pending in flags[slot])
 
             if has_work {
                 shard.current_slot_index = slot
@@ -247,55 +324,57 @@ scheduler_tick :: proc(shard: ^Shard) {
                 message: Message
                 message_pointer: ^Message = nil
                 correlation: u32 = 0
-                flags: Envelope_Flags
+                envelope_flags: Envelope_Flags
 
                 is_io_completion := false
                 buffer_to_free: u16 = BUFFER_INDEX_NONE
 
-                if soa_meta[slot].io_completion_tag != IO_TAG_NONE {
-                    message.tag = Message_Tag(soa_meta[slot].io_completion_tag)
-                    message.body.io.result = soa_meta[slot].io_result
-                    message.body.io.fd = soa_meta[slot].io_fd
-                    message.body.io.buffer_index = soa_meta[slot].io_buffer_index
-                    message.body.io.peer_address = soa_meta[slot].io_peer_address
+                // Dispatch Priority: I/O > Shutdown > Inbox (ADR §6.13.4)
+                if io_completions[slot] != IO_TAG_NONE {
+                    message.tag = Message_Tag(io_completions[slot])
+                    message.body.io.result = io_results[slot]
+                    message.body.io.fd = io_fds[slot]
+                    message.body.io.buffer_index = io_buffer_indices[slot]
+                    message.body.io.peer_address = io_peer_addresses[slot]
 
                     message_pointer = &message
                     is_io_completion = true
-                    buffer_to_free = soa_meta[slot].io_buffer_index
-                } else if soa_meta[slot].shutdown_pending != 0 {
+                    buffer_to_free = io_buffer_indices[slot]
+                } else if .Shutdown_Pending in flags[slot] {
                     message.tag = TAG_SHUTDOWN
                     message.body.user.source = HANDLE_NONE
                     message.body.user.payload_size = 0
 
                     message_pointer = &message
-                    soa_meta[slot].shutdown_pending = 0
-                } else if soa_meta[slot].inbox_count > 0 {
-                    shard.current_msg_slot = _dequeue(shard, u16(type_id), slot, &message, &correlation, &flags)
+                    flags[slot] -= {.Shutdown_Pending}
+                } else if inbox_counts[slot] > 0 {
+                    shard.current_msg_slot = _dequeue(shard, u16(type_id), slot, &message, &correlation, &envelope_flags)
                     if shard.current_msg_slot != POOL_NONE_INDEX {
                         message_pointer = &message
                     }
                 }
 
+                ctx_flags: Context_Flags
+                if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
+
                 ctx := TinaContext{
                     shard = shard,
-                    self_handle = make_handle(shard.id, u16(type_id), slot, soa_meta[slot].generation),
+                    self_handle = make_handle(shard.id, u16(type_id), slot, generations[slot]),
                     current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.body.user.source : HANDLE_NONE,
                     current_correlation = correlation,
-                    is_call = .Is_Call in flags,
+                    flags = ctx_flags,
                 }
 
-                // Initialize Context Arenas (§6.9)
-                mem.arena_init(&ctx.scratch_arena, shard.scratch_memory) // Implicitly resets offset to 0
+                // Initialize Context Arenas
+                mem.arena_init(&ctx.scratch_arena, shard.scratch_memory)
 
                 working_stride := type_descriptor.working_memory_size
                 if working_stride > 0 {
                     start_idx := int(slot) * working_stride
                     working_slice := shard.working_memory[type_id][start_idx : start_idx + working_stride]
-                    // Working Arena: Do NOT use mem.arena_init
-                    // Constructing it manually preserves the ASAN unpoisoned state of previously allocated bytes.
                     ctx.working_arena = mem.Arena{
                         data = working_slice,
-                        offset = int(soa_meta[slot].working_arena_offset),
+                        offset = int(working_arena_offsets[slot]),
                     }
                 }
 
@@ -304,21 +383,21 @@ scheduler_tick :: proc(shard: ^Shard) {
 
                 // Write back working arena offset
                 if working_stride > 0 {
-                    soa_meta[slot].working_arena_offset = u32(ctx.working_arena.offset)
+                    working_arena_offsets[slot] = u32(ctx.working_arena.offset)
                 }
 
                 if is_io_completion {
-                    soa_meta[slot].io_completion_tag = IO_TAG_NONE
+                    io_completions[slot] = IO_TAG_NONE
                     if buffer_to_free != BUFFER_INDEX_NONE {
                         reactor_buffer_pool_free(&shard.reactor.buffer_pool, buffer_to_free)
                     }
                 }
 
                 // Transfer Buffer Auto-Free (§6.9 §8.3)
-                if soa_meta[slot].pending_transfer_read != TRANSFER_HANDLE_NONE {
-                    t_handle := soa_meta[slot].pending_transfer_read
+                if pending_transfer_reads[slot] != TRANSFER_HANDLE_NONE {
+                    t_handle := pending_transfer_reads[slot]
                     _transfer_pool_free(shard, transfer_handle_index(t_handle))
-                    soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
+                    pending_transfer_reads[slot] = TRANSFER_HANDLE_NONE
                 }
 
                 if shard.current_msg_slot != POOL_NONE_INDEX {
@@ -331,10 +410,14 @@ scheduler_tick :: proc(shard: ^Shard) {
         }
     }
 
+    // ========================================================================
     // Step 4: Flush I/O submissions
-	reactor_flush_submissions(&shard.reactor, shard)
+    // ========================================================================
+    reactor_flush_submissions(&shard.reactor, shard)
 
-	// Step 5: Flush outbound cross-shard rings
+    // ========================================================================
+    // Step 5: Flush outbound cross-shard rings
+    // ========================================================================
     when #config(TINA_SIM, false) {
         if shard.sim_network != nil {
             for i in 0..<shard.outbound_count {
@@ -354,7 +437,9 @@ scheduler_tick :: proc(shard: ^Shard) {
         }
     }
 
+    // ========================================================================
     // Step 6 & 7: Advance timers and Flush logs
+    // ========================================================================
     _advance_timers(shard)
     log_flush(shard)
 }
@@ -565,7 +650,9 @@ ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, leng
 }
 
 ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
-	return ctx.shard.shutdown_requested
+	// TODO: figure out why we have this function and if it could benefit from using the enum state vs boolean.
+	// But we leave it as is for now, boolean might still be a great option and doesn't affect processing speed
+	return ctx.shard.watchdog_state == .Shutting_Down
 }
 
 ctx_type_config :: #force_inline proc(ctx: ^TinaContext) -> ^TypeDescriptor {
@@ -613,7 +700,7 @@ _route_envelope :: proc(shard: ^Shard, to: Handle, envelope: ^Message_Envelope) 
         } else {
             ring := shard.outbound_rings[destination]
             if ring == nil do return .stale_handle
-            if !spsc_ring_enqueue(ring, envelope) {
+            if spsc_ring_enqueue(ring, envelope) == .Full {
                 shard.counters.ring_full_drops += 1
                 return .mailbox_full
             }
@@ -816,7 +903,8 @@ _interpret_effect :: proc(shard: ^Shard, type_id: u16, slot: u32, effect: Effect
         _route_envelope(shard, e.to, &envelope)
 
     case Effect_Reply:
-        if !ctx.is_call {
+        if .Is_Call not_in ctx.flags {
+        // if !(.Is_Call in ctx.flags) {
             ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Reply effect without call context"))
             _teardown_isolate(shard, type_id, slot, .Crashed)
             return
@@ -911,7 +999,13 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
     group.child_count = 0
 
     if group.parent_index == SUPERVISION_GROUP_NONE {
-        shard.kill_requested = true
+        // We use Relaxed because the scheduler loop's atomic_load_explicit
+        // is the synchronization point.
+        sync.atomic_store_explicit(
+            cast(^u8)&shard.control_signal,
+            u8(Control_Signal.Kill),
+            .Relaxed,
+        )
     } else {
         group_handle := make_handle(shard.id, HANDLE_TYPE_ID_SUBGROUP, u32(group.group_index), 0)
         _on_child_exit(shard, group.parent_index, group_handle, .Crashed)
@@ -1168,6 +1262,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
             soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
             soa_meta[slot].io_completion_tag = IO_TAG_NONE
             soa_meta[slot].working_arena_offset = 0
+            soa_meta[slot].flags = {}
         }
     }
 
@@ -1182,7 +1277,9 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
     shard.outbound_count = 0
     shard.next_correlation_id = 0
-    shard.kill_requested = false
+    // Control Signal reset
+    sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(Control_Signal.None), .Relaxed)
+    shard.watchdog_state = .Init
 
     root_group_spec := shard.supervision_groups[0].boot_spec
     shard_build_supervision_tree(shard, root_group_spec, context.allocator)

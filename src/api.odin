@@ -57,9 +57,15 @@ Spawn_Spec :: struct {
     restart_type: Restart_Type,
     args_size: u8,
     handoff_mode: Handoff_Mode,
-    _padding: [2]u8,                      // 2 bytes padding -> makes 72 to this point
-    handoff_fd: FD_Handle,                // FD to transfer (FD_HANDLE_NONE if no transfer)
+    _padding: [2]u8,      // 2 bytes padding -> makes 72 to this point
+    handoff_fd: FD_Handle,
 }
+
+Context_Flag :: enum u8 {
+    Is_Call,
+    // Future flags would come here.
+}
+Context_Flags :: distinct bit_set[Context_Flag; u8]
 
 TinaContext :: struct {
     shard: ^Shard,
@@ -70,7 +76,13 @@ TinaContext :: struct {
     scratch_arena: mem.Arena,
 
     current_correlation: u32,
-    is_call: bool,
+    flags: Context_Flags,
+    _padding: [3]u8,
+}
+
+Enqueue_Result :: enum u8 {
+    Success,
+    Full,
 }
 
 // ============================================================================

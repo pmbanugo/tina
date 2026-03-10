@@ -1,5 +1,6 @@
 Considerations to consider in the future
 - could some places doing boolean checks use enum(u8) or bit_set, and maybe we can combine/compose the behaviour/logic in a better way (better for human comprehension or machine code)
+    - (also) ifs up, fors down
 -  I need to mark my procedures as contextless because I don't need Odin's implicit "context"
 - some functions should be marked as private to the package (or file)
 - Other expressions to consider
