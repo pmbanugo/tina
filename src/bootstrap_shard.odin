@@ -103,9 +103,12 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 		// S16. Enter scheduler loop
 		for {
-			if cast(Shard_State)sync.atomic_load_explicit(config.watchdog_state, .Relaxed) ==
-			   .Shutting_Down {
-				break
+			state := cast(Shard_State)sync.atomic_load_explicit(config.watchdog_state, .Relaxed)
+			if state == .Shutting_Down {
+				// Phase 2 Drain: Only break when all Isolates have gracefully returned .done
+				if !shard_has_live_isolates(shard) {
+					break
+				}
 			}
 
 			// Execute the single tick
@@ -115,6 +118,8 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		// Break out of recovery loop if we gracefully shut down
 		break
 	}
+
+	// Clean exit after graceful drain
 	// Mark as Terminated so the Watchdog knows the drain is complete
 	sync.atomic_store_explicit(config.watchdog_state, u8(Shard_State.Terminated), .Release)
 }

@@ -524,7 +524,7 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 		}
 	}
 
-	// 2. O(1) Slot Allocation (Popping the LIFO free list)
+	// 2. Slot Allocation (Popping the LIFO free list)
 	slot := shard.isolate_free_heads[type_id]
 	if slot == POOL_NONE_INDEX {
 		return Spawn_Error.arena_full
@@ -1484,7 +1484,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
 	// SAFETY: We use a dummy allocator that panics on allocation to prove that
 	// Level 2 Recovery NEVER touches the OS or the Grand Arena. It relies purely on
-	// state resets and our O(1) free lists.
+	// state resets and the LIFO free lists.
 	panic_allocator_proc :: proc(
 		allocator_data: rawptr,
 		mode: mem.Allocator_Mode,
@@ -1506,4 +1506,18 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
 	root_group_spec := shard.supervision_groups[0].boot_spec
 	shard_build_supervision_tree(shard, root_group_spec, panic_alloc, nil)
+}
+
+// Checks if any Isolates are still alive across all types on this Shard.
+@(private)
+shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
+	for type_desc in shard.type_descriptors {
+		states := shard.metadata[type_desc.id].state[:]
+		for i in 0 ..< type_desc.slot_count {
+			if states[i] != .Unallocated {
+				return true
+			}
+		}
+	}
+	return false
 }
