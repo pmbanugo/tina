@@ -253,22 +253,16 @@ scheduler_tick :: proc(shard: ^Shard) {
 		}
 	}
 
-	shard.heartbeat_tick += 1
-	shard.clock.current_tick += 1
+	when !#config(TINA_SIM, false) {
+		shard.heartbeat_tick += 1
+		shard.clock.current_tick += 1
+	}
 	now := shard.clock.current_tick
 
 	// ========================================================================
 	// Step 1: Drain inbound cross-shard rings → deliver to local mailboxes
 	// ========================================================================
-	when #config(TINA_SIM, false) {
-		if shard.sim_network != nil {
-			for src in u16(0) ..< shard.sim_network.shard_count {
-				if src != shard.id {
-					sim_network_drain(shard.sim_network, shard, src, now)
-				}
-			}
-		}
-	} else {
+	when !#config(TINA_SIM, false) {
 		if len(shard.inbound_rings) > 0 {
 			for ring in shard.inbound_rings {
 				if ring == nil do continue
@@ -287,6 +281,14 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 				if available > 0 {
 					spsc_ring_commit_read(ring, available)
+				}
+			}
+		}
+	} else {
+		if shard.sim_network != nil {
+			for src in u16(0) ..< shard.sim_network.shard_count {
+				if src != shard.id {
+					sim_network_drain(shard.sim_network, shard, src, now)
 				}
 			}
 		}
@@ -349,7 +351,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				message: Message
 				message_pointer: ^Message = nil
 				correlation: u32 = 0
-				envelope_flags: Envelope_Flags
+				envelope_flags: Envelope_Flags = {}
 
 				is_io_completion := false
 				buffer_to_free: u16 = BUFFER_INDEX_NONE
@@ -456,7 +458,15 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	// Step 5: Flush outbound cross-shard rings
 	// ========================================================================
-	when #config(TINA_SIM, false) {
+	when !#config(TINA_SIM, false) {
+		if len(shard.outbound_rings) > 0 {
+			for ring in shard.outbound_rings {
+				if ring != nil {
+					spsc_ring_flush_producer(ring)
+				}
+			}
+		}
+	} else {
 		if shard.sim_network != nil {
 			for i in 0 ..< shard.outbound_count {
 				env := shard.outbound_staging[i]
@@ -471,14 +481,6 @@ scheduler_tick :: proc(shard: ^Shard) {
 				)
 			}
 			shard.outbound_count = 0
-		}
-	} else {
-		if len(shard.outbound_rings) > 0 {
-			for ring in shard.outbound_rings {
-				if ring != nil {
-					spsc_ring_flush_producer(ring)
-				}
-			}
 		}
 	}
 
@@ -508,24 +510,32 @@ ctx_send :: proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, payload: []u8)
 	return response
 }
 
-// Replace the old ctx_spawn entirely with this O(1) version:
 ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	shard := ctx.shard
 	type_id := u16(spec.type_id)
-	soa_meta := shard.metadata[type_id]
 
-	// 1. O(1) Slot Allocation (Popping the LIFO free list)
+	// 1. Group Capacity Check (Fail early!)
+	group: ^Supervision_Group = nil
+	if spec.group_index != SUPERVISION_GROUP_NONE {
+		group = &shard.supervision_groups[spec.group_index]
+		if group.child_count >= u16(len(group.children_handles)) {
+			return Spawn_Error.group_full
+		}
+	}
+
+	// 2. O(1) Slot Allocation (Popping the LIFO free list)
 	slot := shard.isolate_free_heads[type_id]
 	if slot == POOL_NONE_INDEX {
 		return Spawn_Error.arena_full
 	}
 
-	// Advance the free head
+	soa_meta := shard.metadata[type_id]
 	shard.isolate_free_heads[type_id] = soa_meta[slot].inbox_head
 
 	child_generation := soa_meta[slot].generation
 	child_handle := make_handle(shard.id, type_id, slot, child_generation)
 
+	// 3. Validate FD Handoff Affinity
 	if spec.handoff_fd != FD_HANDLE_NONE {
 		entry, fd_err := fd_table_lookup(&shard.reactor.fd_table, spec.handoff_fd)
 		if fd_err == .None {
@@ -551,19 +561,18 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 					LOG_TAG_ISOLATE_CRASHED,
 					transmute([]u8)string("FD handoff affinity violation"),
 				)
-				// Push back to free list on failure
 				soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
 				shard.isolate_free_heads[type_id] = slot
 				return Spawn_Error.init_failed
 			}
 		} else {
-			// Push back to free list on failure
 			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
 			shard.isolate_free_heads[type_id] = slot
 			return Spawn_Error.init_failed
 		}
 	}
 
+	// 4. Initialize Isolate Memory & Context
 	soa_meta[slot].state = .Runnable
 	soa_meta[slot].group_index = spec.group_index
 	soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
@@ -585,10 +594,10 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	if working_stride > 0 {
 		start_idx := int(slot) * working_stride
 		working_slice := shard.working_memory[type_id][start_idx:start_idx + working_stride]
-		// On spawn, it is brand new, so we DO want to wipe/poison it.
 		mem.arena_init(&child_ctx.working_arena, working_slice)
 	}
 
+	// 5. Execute init_fn
 	local_spec := spec
 	effect := shard.type_descriptors[type_id].init_fn(
 		ptr,
@@ -603,7 +612,6 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	if _, is_crash := effect.(Effect_Crash); is_crash {
 		soa_meta[slot].state = .Unallocated
 		soa_meta[slot].group_index = SUPERVISION_GROUP_NONE
-		// Return slot to free list
 		soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
 		shard.isolate_free_heads[type_id] = slot
 		return Spawn_Error.init_failed
@@ -611,10 +619,23 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	if _, is_done := effect.(Effect_Done); is_done {
 		soa_meta[slot].state = .Unallocated
 		soa_meta[slot].group_index = SUPERVISION_GROUP_NONE
-		// Return slot to free list
 		soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
 		shard.isolate_free_heads[type_id] = slot
 		return Spawn_Error.init_failed
+	}
+
+	// 6. Register with Supervision Group
+	if group != nil {
+		group.children_handles[group.child_count] = child_handle
+
+		if len(group.dynamic_specs) > 0 {
+			dyn := &group.dynamic_specs[group.child_count]
+			dyn.type_id = spec.type_id
+			dyn.restart_type = spec.restart_type
+			dyn.args_size = spec.args_size
+			dyn.args_payload = spec.args_payload
+		}
+		group.child_count += 1
 	}
 
 	_interpret_effect(shard, type_id, slot, effect, &child_ctx)
@@ -776,6 +797,7 @@ ctx_getsockopt :: #force_inline proc(
 _transfer_pool_free :: #force_inline proc(shard: ^Shard, idx: u16) {
 	reactor_buffer_pool_free(&shard.transfer_pool, idx)
 	shard.transfer_generations[idx] += 1
+	if shard.transfer_generations[idx] == 0 do shard.transfer_generations[idx] = 1
 }
 
 @(private = "package")
@@ -785,7 +807,15 @@ _route_envelope :: proc(shard: ^Shard, to: Handle, envelope: ^Message_Envelope) 
 	if destination == shard.id {
 		return _enqueue(shard, to, envelope)
 	} else {
-		when #config(TINA_SIM, false) {
+		when !#config(TINA_SIM, false) {
+			ring := shard.outbound_rings[destination]
+			if ring == nil do return .stale_handle
+			if spsc_ring_enqueue(ring, envelope) == .Full {
+				shard.counters.ring_full_drops += 1
+				return .mailbox_full
+			}
+			return .ok
+		} else {
 			if shard.outbound_count < len(shard.outbound_staging) {
 				shard.outbound_staging[shard.outbound_count] = envelope^
 				shard.outbound_count += 1
@@ -794,14 +824,6 @@ _route_envelope :: proc(shard: ^Shard, to: Handle, envelope: ^Message_Envelope) 
 				shard.counters.ring_full_drops += 1
 				return .mailbox_full
 			}
-		} else {
-			ring := shard.outbound_rings[destination]
-			if ring == nil do return .stale_handle
-			if spsc_ring_enqueue(ring, envelope) == .Full {
-				shard.counters.ring_full_drops += 1
-				return .mailbox_full
-			}
-			return .ok
 		}
 	}
 }
@@ -1354,10 +1376,10 @@ _build_group :: proc(
 			spawn_loop: for {
 				res := ctx_spawn(&ctx, spec)
 				if handle, ok := res.(Handle); ok {
-					group.children_handles[group.child_count] = handle
-					group.child_count += 1
+					// ctx_spawn already safely registered the child!
 					break spawn_loop
 				} else {
+					// Init failed!
 					if _check_and_record_restart(shard, group) {
 						fmt.eprintfln(
 							"[FATAL] Supervision intensity exceeded during boot/recovery for group %d",
@@ -1410,6 +1432,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		(cast(^u16)ptr)^ = shard.transfer_pool.free_head
 		shard.transfer_pool.free_head = u16(i)
 		shard.transfer_generations[i] += 1
+		if shard.transfer_generations[i] == 0 do shard.transfer_generations[i] = 1
 	}
 
 	for i in 0 ..< shard.reactor.fd_table.slot_count {

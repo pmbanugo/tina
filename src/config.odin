@@ -71,7 +71,7 @@ SystemSpec :: struct {
 	fd_table_slot_count:       int,
 	fd_entry_size:             int,
 	log_ring_size:             int,
-	max_supervision_groups:    int,
+	supervision_groups_max:    int,
 	scratch_arena_size:        int,
 	shard_count:               u16,
 	default_ring_size:         u32,
@@ -164,6 +164,29 @@ _aligned_capacity :: #force_inline proc(count: int) -> int {
 	return (count + 7) & ~int(7)
 }
 
+// Walks a Group_Spec tree to calculate the exact bytes needed for its dynamic arrays
+@(private = "package")
+_compute_group_capacity :: proc(group: ^Group_Spec) -> int {
+	mem_size := 0
+	cap := int(group.dynamic_child_count_max)
+	if cap == 0 do cap = len(group.children)
+
+	mem_size += cap * size_of(Handle) // children_handles array
+	if group.dynamic_child_count_max > 0 {
+		mem_size += cap * size_of(Dynamic_Child_Spec) // dynamic_specs array
+	}
+
+	// Recurse for sub-groups
+	for i in 0 ..< len(group.children) {
+		child_ptr := &group.children[i]
+		#partial switch &s in child_ptr {
+		case Group_Spec:
+			mem_size += _compute_group_capacity(&s)
+		}
+	}
+	return mem_size
+}
+
 compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total := 0
 	max_regions := compute_max_sub_regions(spec)
@@ -174,32 +197,37 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 
 	for t in spec.types {
 		total += t.slot_count * t.stride
-
-		// Use aligned physical capacity for SOA metadata to guarantee it absorbs Odin's field alignment padding
 		aligned_count := _aligned_capacity(t.slot_count)
 		total += aligned_count * t.soa_metadata_size
-
 		total += t.slot_count * t.working_memory_size
 	}
 
 	total += spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE
 	total += spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size
 	total += spec.transfer_slot_count * spec.transfer_slot_size
-	total += spec.transfer_slot_count * size_of(u16) // Transfer_Generations array
+	total += spec.transfer_slot_count * size_of(u16)
 	total += spec.timer_wheel_slots * size_of(Timer_Entry)
 	total += spec.fd_table_slot_count * spec.fd_entry_size
 	total += spec.log_ring_size
-	total += spec.max_supervision_groups * size_of(Supervision_Group)
+	total += spec.supervision_groups_max * size_of(Supervision_Group)
 	total += spec.scratch_arena_size
-	// Account for the memory required to hold the sub-region tracking array itself
 	total += max_regions * size_of(SubRegion)
 
-	// Account for the Odin slice headers
 	types_count := len(spec.types)
 	slice_headers_overhead :=
 		types_count *
 		(size_of(TypeDescriptor) + size_of([]u8) * 2 + size_of(#soa[]Isolate_Metadata))
 	total += slice_headers_overhead
+	total += types_count * size_of(u32)
+
+	// Find the largest supervision tree across all shards and budget for its arrays
+	max_tree_mem := 0
+	for &s in spec.shard_specs {
+		tree_mem := _compute_group_capacity(&s.root_group)
+		if tree_mem > max_tree_mem do max_tree_mem = tree_mem
+	}
+	// We add an extra padding allowance per group to ensure the alignments don't overflow
+	total += max_tree_mem + (spec.supervision_groups_max * CACHE_LINE_SIZE)
 
 	return total + padding_overhead
 }

@@ -194,6 +194,9 @@ hydrate_shard :: proc(
 
 	alloc_data.current_name = "Transfer_Generations"
 	shard.transfer_generations = make([]u16, spec.transfer_slot_count, alloc)
+	for i in 0 ..< spec.transfer_slot_count {
+		shard.transfer_generations[i] = 1
+	}
 
 	alloc_data.current_name = "Timer_Wheel"
 	timer_buf := make([]Timer_Entry, spec.timer_wheel_slots, alloc)
@@ -204,7 +207,7 @@ hydrate_shard :: proc(
 	log_init(&shard.log_ring, log_buf)
 
 	alloc_data.current_name = "Supervision_Group_Table"
-	shard.supervision_groups = make([]Supervision_Group, spec.max_supervision_groups, alloc)
+	shard.supervision_groups = make([]Supervision_Group, spec.supervision_groups_max, alloc)
 
 	alloc_data.current_name = "Scratch_Arena"
 	shard.scratch_memory = make([]u8, spec.scratch_arena_size, alloc)
@@ -272,7 +275,6 @@ arena_print_layout :: proc(arena: ^Grand_Arena) {
 }
 
 // === TESTS ===
-// === TESTS ===
 @(test)
 test_grand_arena :: proc(t: ^testing.T) {
 	types := [1]TypeDescriptor {
@@ -280,11 +282,15 @@ test_grand_arena :: proc(t: ^testing.T) {
 			id = 1,
 			slot_count = 10,
 			stride = 64,
-			soa_metadata_size = 8,
+			soa_metadata_size = size_of(Isolate_Metadata),
 			working_memory_size = 0,
 			max_scratch_requirement = 0,
 		},
 	}
+	REACTOR_SLOTS :: 4
+	REACTOR_SIZE :: 4096
+	TRANSFER_SLOTS :: 4
+	TRANSFER_SIZE :: 4096
 
 	spec := SystemSpec {
 		types                     = types[:],
@@ -292,12 +298,12 @@ test_grand_arena :: proc(t: ^testing.T) {
 		scratch_arena_size        = 1024,
 
 		// Provide valid sizes to satisfy the subsystem initializers
-		reactor_buffer_slot_count = 4,
-		reactor_buffer_slot_size  = 4096, // Power of 2, >= 2
-		transfer_slot_count       = 4,
-		transfer_slot_size        = 4096, // Power of 2, >= 2
+		reactor_buffer_slot_count = REACTOR_SLOTS,
+		reactor_buffer_slot_size  = REACTOR_SIZE,
+		transfer_slot_count       = TRANSFER_SLOTS,
+		transfer_slot_size        = TRANSFER_SIZE,
 		timer_wheel_slots         = 64, // Power of 2
-		max_supervision_groups    = 4,
+		supervision_groups_max    = 4,
 		fd_table_slot_count       = 16,
 		fd_entry_size             = size_of(FD_Entry),
 		log_ring_size             = 1024, // Power of 2

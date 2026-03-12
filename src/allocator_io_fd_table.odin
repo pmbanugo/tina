@@ -44,7 +44,7 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 		entry := &table.entries[i]
 		entry^ = FD_Entry{}
 		entry.os_fd = _fd_table_encode_next(table.free_head)
-		entry.generation = 0
+		entry.generation = 1
 		entry.read_owner = HANDLE_NONE
 		entry.write_owner = HANDLE_NONE
 		entry.flags = {}
@@ -54,7 +54,14 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 
 // Allocate an FD table slot for a new OS file descriptor.
 // Returns the FD_Handle with generation for stale-reference detection.
-fd_table_alloc :: proc(table: ^FD_Table, os_fd: OS_FD, owner: Handle) -> (FD_Handle, FD_Table_Error) {
+fd_table_alloc :: proc(
+	table: ^FD_Table,
+	os_fd: OS_FD,
+	owner: Handle,
+) -> (
+	FD_Handle,
+	FD_Table_Error,
+) {
 	if table.free_head == FD_TABLE_NONE_INDEX {
 		return FD_HANDLE_NONE, .Table_Full
 	}
@@ -97,7 +104,13 @@ fd_table_lookup :: proc(table: ^FD_Table, handle: FD_Handle) -> (^FD_Entry, FD_T
 }
 
 // Resolve an FD_Handle to the underlying OS_FD with generation check.
-fd_table_resolve :: #force_inline proc(table: ^FD_Table, handle: FD_Handle) -> (OS_FD, FD_Table_Error) {
+fd_table_resolve :: #force_inline proc(
+	table: ^FD_Table,
+	handle: FD_Handle,
+) -> (
+	OS_FD,
+	FD_Table_Error,
+) {
 	entry, err := fd_table_lookup(table, handle)
 	if err != .None {
 		return OS_FD_INVALID, err
@@ -107,14 +120,20 @@ fd_table_resolve :: #force_inline proc(table: ^FD_Table, handle: FD_Handle) -> (
 
 // Validate that `owner` has the correct direction affinity for the given operation.
 // recv/recvfrom/read/accept check read_owner; send/sendto/write/connect/close check write_owner.
-fd_table_validate_read_affinity :: #force_inline proc(entry: ^FD_Entry, owner: Handle) -> FD_Table_Error {
+fd_table_validate_read_affinity :: #force_inline proc(
+	entry: ^FD_Entry,
+	owner: Handle,
+) -> FD_Table_Error {
 	if entry.read_owner != owner {
 		return .Affinity_Violation
 	}
 	return .None
 }
 
-fd_table_validate_write_affinity :: #force_inline proc(entry: ^FD_Entry, owner: Handle) -> FD_Table_Error {
+fd_table_validate_write_affinity :: #force_inline proc(
+	entry: ^FD_Entry,
+	owner: Handle,
+) -> FD_Table_Error {
 	if entry.write_owner != owner {
 		return .Affinity_Violation
 	}
@@ -122,7 +141,12 @@ fd_table_validate_write_affinity :: #force_inline proc(entry: ^FD_Entry, owner: 
 }
 
 // Transfer FD ownership according to handoff mode (§6.6.3 §5.4).
-fd_table_handoff :: proc(table: ^FD_Table, handle: FD_Handle, new_owner: Handle, mode: Handoff_Mode) -> FD_Table_Error {
+fd_table_handoff :: proc(
+	table: ^FD_Table,
+	handle: FD_Handle,
+	new_owner: Handle,
+	mode: Handoff_Mode,
+) -> FD_Table_Error {
 	entry, err := fd_table_lookup(table, handle)
 	if err != .None {
 		return err
@@ -189,8 +213,12 @@ fd_table_is_close_on_completion :: #force_inline proc(entry: ^FD_Entry) -> bool 
 
 // Find all FDs owned by a given Isolate (for teardown).
 // Calls visitor for each matching FD. Visitor returns true to continue, false to stop.
-fd_table_for_each_owned :: proc(table: ^FD_Table, owner: Handle, visitor: proc(handle: FD_Handle, entry: ^FD_Entry) -> bool) {
-	for i in 0..<table.slot_count {
+fd_table_for_each_owned :: proc(
+	table: ^FD_Table,
+	owner: Handle,
+	visitor: proc(handle: FD_Handle, entry: ^FD_Entry) -> bool,
+) {
+	for i in 0 ..< table.slot_count {
 		entry := &table.entries[i]
 		if entry.read_owner == owner || entry.write_owner == owner {
 			h := fd_handle_make(i, entry.generation)
@@ -285,7 +313,7 @@ test_fd_table_direction_affinity :: proc(t: ^testing.T) {
 
 	reader := make_handle(0, 1, 0, 0)
 	writer := make_handle(0, 1, 1, 0)
-	other  := make_handle(0, 1, 2, 0)
+	other := make_handle(0, 1, 2, 0)
 
 	// Allocate with full ownership to reader, then split
 	handle, _ := fd_table_alloc(&table, OS_FD(99), reader)
@@ -296,11 +324,19 @@ test_fd_table_direction_affinity :: proc(t: ^testing.T) {
 
 	// Reader owns read direction
 	testing.expect_value(t, fd_table_validate_read_affinity(entry, reader), FD_Table_Error.None)
-	testing.expect_value(t, fd_table_validate_read_affinity(entry, other), FD_Table_Error.Affinity_Violation)
+	testing.expect_value(
+		t,
+		fd_table_validate_read_affinity(entry, other),
+		FD_Table_Error.Affinity_Violation,
+	)
 
 	// Writer owns write direction
 	testing.expect_value(t, fd_table_validate_write_affinity(entry, writer), FD_Table_Error.None)
-	testing.expect_value(t, fd_table_validate_write_affinity(entry, other), FD_Table_Error.Affinity_Violation)
+	testing.expect_value(
+		t,
+		fd_table_validate_write_affinity(entry, other),
+		FD_Table_Error.Affinity_Violation,
+	)
 }
 
 @(test)
@@ -340,5 +376,9 @@ test_fd_table_reuse_after_free :: proc(t: ^testing.T) {
 	h3, err := fd_table_alloc(&table, OS_FD(30), owner)
 	testing.expect_value(t, err, FD_Table_Error.None)
 	testing.expect_value(t, fd_handle_index(h3), fd_handle_index(h1))
-	testing.expect(t, fd_handle_generation(h3) > fd_handle_generation(h1), "generation should have bumped")
+	testing.expect(
+		t,
+		fd_handle_generation(h3) > fd_handle_generation(h1),
+		"generation should have bumped",
+	)
 }
