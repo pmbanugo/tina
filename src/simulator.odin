@@ -144,7 +144,7 @@ simulator_run :: proc(sim: ^Simulator) {
 		}
 
 		// 5. Run structural checkers at interval
-		if round % u64(sim.spec.simulation.checker_interval_ticks) == 0 {
+		if sim.spec.simulation.checker_interval_ticks > 0 && round % u64(sim.spec.simulation.checker_interval_ticks) == 0 {
 			// TODO: Run checkers (pool_integrity, etc.)
 		}
 

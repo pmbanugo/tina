@@ -21,6 +21,9 @@ assert_spawn_success :: proc(res: Spawn_Result, name: string, loc := #caller_loc
 COORDINATOR_TYPE_ID: u8 : 0
 PING_TYPE_ID: u8 : 1
 PONG_TYPE_ID: u8 : 2
+SUPERVISOR_TYPE_ID: u8 : 3
+EXITER_TYPE_ID: u8 : 4
+BYSTANDER_TYPE_ID: u8 : 5
 
 APP_TAG_PING: Message_Tag : USER_MESSAGE_TAG_BASE + 1
 APP_TAG_PONG: Message_Tag : USER_MESSAGE_TAG_BASE + 2
@@ -229,4 +232,167 @@ test_ping_pong_simulation :: proc(t: ^testing.T) {
 		"\n[TEST SUCCESS] Ping completed exactly %d round trips before terminating.",
 		ping_memory.count,
 	)
+}
+
+// ============================================================================
+// Supervision: Temporary child exit does not restart or escalate
+// ============================================================================
+Supervisor :: struct {}
+Exiter :: struct {}
+Bystander :: struct {}
+
+supervisor_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	bystander_spec := Spawn_Spec {
+		type_id      = BYSTANDER_TYPE_ID,
+		group_index  = 0,
+		restart_type = .temporary,
+	}
+	_ = assert_spawn_success(ctx_spawn(ctx, bystander_spec), "Bystander")
+
+	exiter_spec := Spawn_Spec {
+		type_id      = EXITER_TYPE_ID,
+		group_index  = 0,
+		restart_type = .temporary,
+	}
+	_ = assert_spawn_success(ctx_spawn(ctx, exiter_spec), "Exiter")
+
+	return Effect_Receive{}
+}
+
+supervisor_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	return Effect_Receive{}
+}
+
+exiter_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	return Effect_Receive{}
+}
+
+exiter_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	return Effect_Done{}
+}
+
+bystander_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	return Effect_Receive{}
+}
+
+bystander_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	return Effect_Receive{}
+}
+
+@(test)
+test_temporary_child_exit_no_escalation :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	types := [6]TypeDescriptor {
+		{
+			id = COORDINATOR_TYPE_ID,
+			slot_count = 1,
+			stride = size_of(Coordinator),
+			soa_metadata_size = size_of(Isolate_Metadata),
+			init_fn = coordinator_init,
+			handler_fn = coordinator_handler,
+		},
+		{
+			id = PING_TYPE_ID,
+			slot_count = 1,
+			stride = size_of(PingIsolate),
+			soa_metadata_size = size_of(Isolate_Metadata),
+			init_fn = ping_init,
+			handler_fn = ping_handler,
+		},
+		{
+			id = PONG_TYPE_ID,
+			slot_count = 1,
+			stride = size_of(PongIsolate),
+			soa_metadata_size = size_of(Isolate_Metadata),
+			init_fn = pong_init,
+			handler_fn = pong_handler,
+		},
+		{
+			id = SUPERVISOR_TYPE_ID,
+			slot_count = 1,
+			stride = size_of(Supervisor),
+			soa_metadata_size = size_of(Isolate_Metadata),
+			init_fn = supervisor_init,
+			handler_fn = supervisor_handler,
+		},
+		{
+			id = EXITER_TYPE_ID,
+			slot_count = 1,
+			stride = size_of(Exiter),
+			soa_metadata_size = size_of(Isolate_Metadata),
+			init_fn = exiter_init,
+			handler_fn = exiter_handler,
+		},
+		{
+			id = BYSTANDER_TYPE_ID,
+			slot_count = 1,
+			stride = size_of(Bystander),
+			soa_metadata_size = size_of(Isolate_Metadata),
+			init_fn = bystander_init,
+			handler_fn = bystander_handler,
+		},
+	}
+
+	children := [1]Child_Spec {
+		Static_Child_Spec{type_id = SUPERVISOR_TYPE_ID, restart_type = .permanent},
+	}
+
+	root_group := Group_Spec {
+		strategy                = .One_For_One,
+		restart_count_max       = 3,
+		window_duration_ticks   = 1000,
+		children                = children[:],
+		dynamic_child_count_max = 10,
+	}
+
+	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+	sim_config := SimulationConfig {
+		seed                   = 0xDEADBEEF,
+		max_ticks              = 100,
+		terminate_on_quiescent = true,
+	}
+
+	spec := SystemSpec {
+		shard_count               = 1,
+		types                     = types[:],
+		shard_specs               = shard_specs[:],
+		simulation                = &sim_config,
+		pool_slot_count           = 256,
+		reactor_buffer_slot_count = 4,
+		reactor_buffer_slot_size  = 4096,
+		transfer_slot_count       = 4,
+		transfer_slot_size        = 4096,
+		timer_wheel_slots         = 256,
+		fd_table_slot_count       = 16,
+		fd_entry_size             = size_of(FD_Entry),
+		log_ring_size             = 4096,
+		supervision_groups_max    = 16,
+		scratch_arena_size        = 65536,
+	}
+
+	sim: Simulator
+	err := simulator_init(&sim, &spec, context.temp_allocator)
+	testing.expect_value(t, err, mem.Allocator_Error.None)
+
+	shard := &sim.shards[0]
+
+	// Send a message to Exiter to trigger its handler (which returns Effect_Done)
+	exiter_handle := make_handle(0, u16(EXITER_TYPE_ID), 0, shard.metadata[EXITER_TYPE_ID].generation[0])
+	ctx := TinaContext {
+		shard       = shard,
+		self_handle = HANDLE_NONE,
+	}
+	ctx_send_typed(&ctx, exiter_handle, APP_TAG_PING, &PingMsg{seq = 0})
+
+	simulator_run(&sim)
+
+	// Exiter should be torn down (temporary + normal exit = no restart)
+	exiter_state := shard.metadata[EXITER_TYPE_ID].state[0]
+	testing.expect_value(t, exiter_state, Isolate_State.Unallocated)
+
+	// Bystander must still be alive — no escalation should have occurred
+	bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[0]
+	testing.expect_value(t, bystander_state, Isolate_State.Waiting)
 }
