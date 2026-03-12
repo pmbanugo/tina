@@ -72,6 +72,7 @@ Shard_State :: enum u8 {
 	Running       = 1,
 	Quarantined   = 2,
 	Shutting_Down = 3,
+	Terminated    = 4,
 }
 
 Isolate_State :: enum u8 {

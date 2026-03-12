@@ -36,3 +36,19 @@ os_set_current_thread_name :: proc(name: string) {
 	win.SetThreadDescription(win.GetCurrentThread(), w_name)
 	free_all(context.temp_allocator)
 }
+import "core:c"
+
+os_get_current_thread_handle :: proc "contextless" () -> rawptr {
+	// A pseudo-handle or ID is enough since we no-op the signaling
+	return rawptr(uintptr(win.GetCurrentThreadId()))
+}
+
+os_signal_thread :: proc "contextless" (thread_handle: rawptr, sig: c.int) {
+	// No-op on Windows. Windows uses IOCP/SEH instead of POSIX signals.
+	// Forced recovery via cross-thread interruption requires QueueUserAPC
+	// or SuspendThread. I should tackle this later since it's (Tier 4).
+}
+
+os_force_exit :: proc "contextless" (status: c.int) -> ! {
+	win.ExitProcess(u32(status))
+}

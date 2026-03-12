@@ -14,10 +14,16 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	name_string := fmt.bprintf(name_bufffer[:], "tina-shard-%d", config.shard_id)
 	os_set_current_thread_name(name_string)
 
+	// PUBLISH THREAD HANDLE FOR WATCHDOG
+	config.os_thread_handle = os_get_current_thread_handle()
+
 	// Allocate the Shard struct on the heap.
 	// It must survive Trap Boundaries and Level 2 recoveries.
 	shard := new(Shard)
 	defer free(shard)
+
+	// PUBLISH SHARD POINTER BACK TO WATCHDOG
+	config.shard_ptr = shard
 
 	g_current_shard_ptr = shard
 	shard.id = config.shard_id
@@ -109,4 +115,6 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		// Break out of recovery loop if we gracefully shut down
 		break
 	}
+	// Mark as Terminated so the Watchdog knows the drain is complete
+	sync.atomic_store_explicit(config.watchdog_state, u8(Shard_State.Terminated), .Release)
 }

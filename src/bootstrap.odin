@@ -23,11 +23,12 @@ Shard_Config :: struct {
 	system_spec:       ^SystemSpec,
 	shard_spec:        ^ShardSpec,
 	barrier:           ^sync.Barrier,
+	shard_ptr:         ^Shard,
 	watchdog_state:    ^u8,
+	os_thread_handle:  rawptr,
 	total_memory_size: int,
 	shard_id:          u16,
 	target_core:       u8,
-	// _padding:		   [5]u8,// Explicit padding to maintain 8-byte struct alignment
 }
 
 // #assert(size_of(Shard_Config) == 4160, "Shard_Config alignment/size drifted.")
