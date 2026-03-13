@@ -1,6 +1,5 @@
 package tina
 
-import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:sync"
@@ -252,7 +251,38 @@ _bootstrap_signals :: proc() {
 when ODIN_OS ==
 	.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
 
-	// The Tier 3 Fault Trap
+	// --- Async-Signal-Safe Helpers (write(2) only, no fmt/allocator/runtime) ---
+
+	@(private = "file")
+	_sig_append_str :: proc "contextless" (dst: []u8, pos: int, src: string) -> int {
+		n := min(len(dst) - pos, len(src))
+		for i in 0 ..< n do dst[pos + i] = src[i]
+		return pos + n
+	}
+
+	@(private = "file")
+	_sig_append_u64 :: proc "contextless" (dst: []u8, pos: int, value: u64) -> int {
+		if pos >= len(dst) do return pos
+		if value == 0 {
+			dst[pos] = '0'
+			return pos + 1
+		}
+		tmp: [20]u8
+		n := 0
+		v := value
+		for v > 0 {
+			tmp[n] = u8('0') + u8(v % 10)
+			v /= 10
+			n += 1
+		}
+		written := min(n, len(dst) - pos)
+		for i in 0 ..< written {
+			dst[pos + i] = tmp[n - 1 - i]
+		}
+		return pos + written
+	}
+
+	// The Tier 3 Fault Trap — async-signal-safe
 	@(private = "file")
 	fatal_signal_handler :: proc "c" (
 		sig: posix.Signal,
@@ -261,40 +291,45 @@ when ODIN_OS ==
 	) {
 		shard := g_current_shard_ptr
 		if shard == nil {
-			// Not a Shard thread (likely the main thread). Restore default handler and abort.
+			// Not a Shard thread. Re-raise with default handler → abort + core dump.
+			buf: [64]u8
+			n := _sig_append_str(buf[:], 0, "[FATAL] non-shard sig=")
+			n = _sig_append_u64(buf[:], n, u64(sig))
+			n = _sig_append_str(buf[:], n, "\n")
+			_write_stderr(buf[:n])
 			posix.signal(sig, auto_cast posix.SIG_DFL)
 			posix.raise(sig)
 			return
 		}
 
-		// Establish Odin context for fmt / log_flush
-		context = runtime.default_context()
-		fmt.eprintfln(
-			"\n[FATAL] Shard %d caught hardware fault: %v! Initiating Level 2 Recovery.",
-			shard.id,
-			sig,
-		)
+		buf: [96]u8
+		n := _sig_append_str(buf[:], 0, "[FATAL] Shard ")
+		n = _sig_append_u64(buf[:], n, u64(shard.id))
+		n = _sig_append_str(buf[:], n, " caught sig=")
+		n = _sig_append_u64(buf[:], n, u64(sig))
+		n = _sig_append_str(buf[:], n, ". Level 2 Recovery.\n")
+		_write_stderr(buf[:n])
 
-		// Emergency log flush — the "Black Box"
-		log_flush(shard)
+		// Emergency log flush — the "Black Box" (async-signal-safe)
+		emergency_log_flush_signal(shard)
 
-		// Warp execution back to the init loop
+		// Warp execution back to the recovery point
 		siglongjmp(&shard.trap_environment, RECOVERY_TIER_3)
 	}
 
-	// The Watchdog Cooperative Kill Trap
+	// The Watchdog Cooperative Kill Trap — async-signal-safe
 	@(private = "file")
 	sigusr1_handler :: proc "c" (sig: posix.Signal, info: ^posix.siginfo_t, ucontext: rawptr) {
 		shard := g_current_shard_ptr
 		if shard == nil do return
 
-		context = runtime.default_context()
-		fmt.eprintfln(
-			"\n[WATCHDOG] Shard %d received SIGUSR1 force-kill. Initiating Level 2 Recovery.",
-			shard.id,
-		)
+		buf: [96]u8
+		n := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
+		n = _sig_append_u64(buf[:], n, u64(shard.id))
+		n = _sig_append_str(buf[:], n, " SIGUSR1 force-kill. Level 2 Recovery.\n")
+		_write_stderr(buf[:n])
 
-		// Warp execution back to the init loop
+		// Warp execution back to the recovery point
 		siglongjmp(&shard.trap_environment, RECOVERY_WATCHDOG)
 	}
 }

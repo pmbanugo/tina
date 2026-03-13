@@ -27,6 +27,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 	g_current_shard_ptr = shard
 	shard.id = config.shard_id
+	shard.shared_state = config.watchdog_state
 
 	// S1. Pin to target core
 	os_pin_thread_to_core(i32(config.target_core))
@@ -120,6 +121,9 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	}
 
 	// Clean exit after graceful drain
+	// §13: Final synchronous log flush — last operation before shard thread exits
+	log_flush(shard)
+
 	// Mark as Terminated so the Watchdog knows the drain is complete
 	sync.atomic_store_explicit(config.watchdog_state, u8(Shard_State.Terminated), .Release)
 }

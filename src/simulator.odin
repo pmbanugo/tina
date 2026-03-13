@@ -6,6 +6,7 @@ import "core:mem"
 Simulator :: struct {
 	spec:               ^SystemSpec,
 	shards:             []Shard, // Allocated as a flat array
+	shard_states:       []u8, // Backing for Shard.shared_state (bypasses watchdog)
 	network:            SimulatedNetwork,
 	prng_tree:          Prng_Tree,
 	fault_engine:       FaultEngine,
@@ -24,6 +25,7 @@ simulator_init :: proc(
 ) -> mem.Allocator_Error {
 	sim.spec = spec
 	sim.shards = make([]Shard, spec.shard_count, allocator)
+	sim.shard_states = make([]u8, spec.shard_count, allocator)
 
 	// Validate uniform timer resolution (ADR constraint)
 	sim.tick_resolution_ns = 1_000_000 // Default 1ms
@@ -80,6 +82,10 @@ simulator_init :: proc(
 			return err
 		}
 
+		// Wire up shared_state before tree building (ctx_spawn reads it)
+		sim.shard_states[i] = u8(Shard_State.Running)
+		shard.shared_state = &sim.shard_states[i]
+
 		// Initialize Supervision Tree
 		alloc_data := Grand_Arena_Allocator_Data {
 			arena = &arena,
@@ -94,9 +100,6 @@ simulator_init :: proc(
 				&alloc_data,
 			)
 		}
-
-		// Mark as running (bypassing the watchdog/barrier)
-		shard.watchdog_state = .Running
 	}
 
 	// Clean up temporary ring sizing array

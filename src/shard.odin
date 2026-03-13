@@ -186,9 +186,9 @@ Shard :: struct {
 	current_slot_index:   u32,
 	id:                   u16,
 	current_type_id:      u16,
-	watchdog_state:       Shard_State,
-	control_signal:       Control_Signal, //(Atomic, mutually exclusive signals)
-	_padding:             [2]u8, // 2 bytes padding to 4-byte boundary
+	control_signal:       Control_Signal, // Atomic, mutually exclusive signals from watchdog
+	_padding:             [5]u8,
+	shared_state:         ^u8, // Points to external shared state (config or simulator backing)
 
 	// --- Cold / Massive Storage ---
 	timer_wheel:          Timer_Wheel,
@@ -214,7 +214,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				u8(Control_Signal.None),
 				.Relaxed,
 			)
-			shard.watchdog_state = .Shutting_Down
+			sync.atomic_store_explicit(shard.shared_state, u8(Shard_State.Shutting_Down), .Release)
 
 			// Phase 1 Notification: wake all parked isolates
 			for type_desc in shard.type_descriptors {
@@ -240,6 +240,8 @@ scheduler_tick :: proc(shard: ^Shard) {
 					case .Waiting_For_Io:
 						// Invalidate pending completion
 						io_sequences[index] += 1
+						// Best-effort cancel (§3.4 — structural safety does not depend on it)
+						reactor_cancel_active_io(&shard.reactor, shard, u16(type_id), index)
 						states[index] = .Runnable
 					case .Waiting_For_Reply:
 						// Discard stale replies
@@ -255,7 +257,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	}
 
 	when !#config(TINA_SIM, false) {
-		shard.heartbeat_tick += 1
+		sync.atomic_store_explicit(&shard.heartbeat_tick, sync.atomic_load_explicit(&shard.heartbeat_tick, .Relaxed) + 1, .Relaxed)
 		shard.clock.current_tick += 1
 	}
 	now := shard.clock.current_tick
@@ -639,6 +641,11 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 		group.child_count += 1
 	}
 
+	// §11: Spawns during shutdown — child immediately receives TAG_SHUTDOWN
+	if ctx_is_shutting_down(&child_ctx) {
+		soa_meta[slot].flags += {.Shutdown_Pending}
+	}
+
 	_interpret_effect(shard, type_id, slot, effect, &child_ctx)
 	return child_handle
 }
@@ -766,9 +773,7 @@ ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, leng
 }
 
 ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
-	// TODO: figure out why we have this function and if it could benefit from using the enum state vs boolean.
-	// But we leave it as is for now, boolean might still be a great option and doesn't affect processing speed
-	return ctx.shard.watchdog_state == .Shutting_Down
+	return cast(Shard_State)sync.atomic_load_explicit(ctx.shard.shared_state, .Relaxed) == .Shutting_Down
 }
 
 ctx_type_config :: #force_inline proc(ctx: ^TinaContext) -> ^TypeDescriptor {
@@ -1445,6 +1450,9 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			fd_table_free(&shard.reactor.fd_table, fd_handle)
 		}
 	}
+	// Explicitly destroy the OS-level I/O backend (io_uring/kqueue).
+	// Because siglongjmp bypasses defer, we must do this manually before re-hydrating!
+	reactor_deinit(&shard.reactor)
 
 	for type_desc in shard.type_descriptors {
 		type_id := type_desc.id
@@ -1480,7 +1488,6 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	shard.next_correlation_id = 0
 	// Control Signal reset
 	sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(Control_Signal.None), .Relaxed)
-	shard.watchdog_state = .Init
 
 	// SAFETY: We use a dummy allocator that panics on allocation to prove that
 	// Level 2 Recovery NEVER touches the OS or the Grand Arena. It relies purely on
