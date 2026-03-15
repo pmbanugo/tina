@@ -3,7 +3,8 @@ package tina
 import "core:mem"
 import "core:testing"
 
-CACHE_LINE_SIZE :: 128 // CPU Cache Line size for alignment.
+CACHE_LINE_SIZE :: 128
+TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
 
 Init_Fn :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
@@ -67,7 +68,8 @@ SystemSpec :: struct {
 	reactor_buffer_slot_size:  int,
 	transfer_slot_count:       int,
 	transfer_slot_size:        int,
-	timer_wheel_slots:         int,
+	timer_spoke_count:         int,
+	timer_entry_count:         int,
 	fd_table_slot_count:       int,
 	fd_entry_size:             int,
 	log_ring_size:             int,
@@ -84,6 +86,7 @@ SystemSpecError :: enum u8 {
 	ScratchArenaTooSmall,
 	SlotCountExceedsHandleCapacity,
 	LogRingSizeNotPowerOfTwo,
+	TimerSpokeCountNotPowerOfTwo,
 }
 
 Supervision_Strategy :: enum u8 {
@@ -130,6 +133,11 @@ validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
 		return .LogRingSizeNotPowerOfTwo
 	}
 
+	if spec.timer_spoke_count == 0 ||
+	   (spec.timer_spoke_count & (spec.timer_spoke_count - 1)) != 0 {
+		return .TimerSpokeCountNotPowerOfTwo
+	}
+
 	return .None
 }
 
@@ -139,21 +147,22 @@ validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
 	// 3 per type (Typed Arena, SOA Metadata, Working Memory)
-	// + 9 static framework regions
+	// + 10 static framework regions
 	// + 1 for the SubRegion tracker array itself
 	// + 1 for the Slice Headers
-	return (types_count * 3) + 9 + 1 + 1
+	return (types_count * 3) + 10 + 1 + 1
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
 	// 2. Message Pool
 	// 3. Reactor Buffer Pool
 	// 4. Transfer Buffer Pool
 	// 5. Transfer Generations
-	// 6. Timer Wheel
-	// 7. FD Table
-	// 8. Log Ring Buffer
-	// 9. Supervision Group Table
-	// 10. Scratch Arena
+	// 6. Timer Wheel Spokes
+	// 7. Timer Wheel Entries
+	// 8. FD Table
+	// 9. Log Ring Buffer
+	// 10. Supervision Group Table
+	// 11. Scratch Arena
 }
 
 // Computes an upper-bound capacity aligned to a multiple of 8.
@@ -206,7 +215,8 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size
 	total += spec.transfer_slot_count * spec.transfer_slot_size
 	total += spec.transfer_slot_count * size_of(u16)
-	total += spec.timer_wheel_slots * size_of(Timer_Entry)
+	total += spec.timer_spoke_count * size_of(u32) // Spoke head array
+	total += spec.timer_entry_count * size_of(Timer_Entry) // Timer entry pool
 	total += spec.fd_table_slot_count * spec.fd_entry_size
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)
@@ -244,6 +254,8 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 		types              = types[:],
 		scratch_arena_size = 2048, // Intentionally too small
 		log_ring_size      = 65536, // Provide a valid power-of-2 size!
+		timer_spoke_count  = 4096,
+		timer_entry_count  = 64,
 	}
 
 	err := validate_system_spec(&spec)
@@ -252,6 +264,13 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	spec.scratch_arena_size = 4096 // Exactly enough
 	err = validate_system_spec(&spec)
 	testing.expect_value(t, err, SystemSpecError.None)
+
+	// Test timer_spoke_count power-of-2 validation
+	spec.timer_spoke_count = 100 // Not power of 2
+	err = validate_system_spec(&spec)
+	testing.expect_value(t, err, SystemSpecError.TimerSpokeCountNotPowerOfTwo)
+
+	spec.timer_spoke_count = 4096 // Restore valid value
 }
 
 // --- Simulation Configuration ---
@@ -261,15 +280,20 @@ Ratio :: struct {
 	denominator: u32,
 }
 
-FaultConfig :: struct {
-	io_error_rate:               Ratio,
-	io_delay_range_ticks:        [2]u32,
-	network_drop_rate:           Ratio,
-	network_delay_range_ticks:   [2]u32,
-	network_partition_rate:      Ratio,
-	network_partition_heal_rate: Ratio,
-	isolate_crash_rate:          Ratio,
-	init_failure_rate:           Ratio,
+when TINA_SIMULATION_MODE {
+
+	FaultConfig :: struct {
+		io_error_rate:               Ratio,
+		io_delay_range_ticks:        [2]u32,
+		network_drop_rate:           Ratio,
+		network_delay_range_ticks:   [2]u32,
+		network_partition_rate:      Ratio,
+		network_partition_heal_rate: Ratio,
+		isolate_crash_rate:          Ratio,
+		init_failure_rate:           Ratio,
+	}
+} else {
+	FaultConfig :: struct {}
 }
 
 SimulationConfig :: struct {

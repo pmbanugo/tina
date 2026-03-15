@@ -1,214 +1,240 @@
 package tina
-
 import "core:mem"
 
-// 256-bit mask split into two 128-bit halves (Odin bit_set max is 128 bits).
-// lo covers shard IDs 0–127, hi covers 128–255 (stored as id - 128).
-Shard_Mask :: struct {
-    lo: bit_set[0..=127],
-    hi: bit_set[0..=127],
-}
+when TINA_SIMULATION_MODE {
 
-shard_mask_contains :: proc(m: Shard_Mask, id: u16) -> bool {
-    if id < 128 { return int(id) in m.lo }
-    return int(id - 128) in m.hi
-}
+	// 256-bit mask split into two 128-bit halves (Odin bit_set max is 128 bits).
+	// lo covers shard IDs 0–127, hi covers 128–255 (stored as id - 128).
+	Shard_Mask :: struct {
+		lo: bit_set[0 ..= 127],
+		hi: bit_set[0 ..= 127],
+	}
 
-shard_mask_include :: proc(m: ^Shard_Mask, id: u16) {
-    if id < 128 { m.lo += {int(id)} } else { m.hi += {int(id - 128)} }
-}
+	shard_mask_contains :: proc(m: Shard_Mask, id: u16) -> bool {
+		if id < 128 {return int(id) in m.lo}
+		return int(id - 128) in m.hi
+	}
 
-shard_mask_exclude :: proc(m: ^Shard_Mask, id: u16) {
-    if id < 128 { m.lo -= {int(id)} } else { m.hi -= {int(id - 128)} }
-}
+	shard_mask_include :: proc(m: ^Shard_Mask, id: u16) {
+		if id < 128 {m.lo += {int(id)}} else {m.hi += {int(id - 128)}}
+	}
 
-// --- Delay Queue (Bounded FIFO) ---
+	shard_mask_exclude :: proc(m: ^Shard_Mask, id: u16) {
+		if id < 128 {m.lo -= {int(id)}} else {m.hi -= {int(id - 128)}}
+	}
 
-DelayedEnvelope :: struct {
-    envelope:   Message_Envelope,
-    deliver_at: u64,
-}
+	// --- Delay Queue (Bounded FIFO) ---
 
-DelayQueue :: struct {
-    buffer:	  []DelayedEnvelope,
-    head:     u32,
-    tail:     u32,
-    count:    u32,
-    capacity: u32,
-}
+	DelayedEnvelope :: struct {
+		envelope:   Message_Envelope,
+		deliver_at: u64,
+	}
 
-delay_queue_init :: proc(q: ^DelayQueue, capacity: u32, allocator: mem.Allocator) {
-    assert((capacity != 0) && ((capacity & (capacity - 1)) == 0), "DelayQueue capacity must be a power of 2")
-    q.buffer = make([]DelayedEnvelope, capacity, allocator)
-    q.capacity = capacity
-    q.head = 0
-    q.tail = 0
-    q.count = 0
-}
+	DelayQueue :: struct {
+		buffer:   []DelayedEnvelope,
+		head:     u32,
+		tail:     u32,
+		count:    u32,
+		capacity: u32,
+	}
 
-delay_queue_push :: proc(q: ^DelayQueue, item: DelayedEnvelope) -> Enqueue_Result {
-    if q.count >= q.capacity do return .Full
-    q.buffer[q.tail] = item
-    q.tail = (q.tail + 1) & (q.capacity - 1)
-    q.count += 1
-    return .Success
-}
+	delay_queue_init :: proc(q: ^DelayQueue, capacity: u32, allocator: mem.Allocator) {
+		assert(
+			(capacity != 0) && ((capacity & (capacity - 1)) == 0),
+			"DelayQueue capacity must be a power of 2",
+		)
+		q.buffer = make([]DelayedEnvelope, capacity, allocator)
+		q.capacity = capacity
+		q.head = 0
+		q.tail = 0
+		q.count = 0
+	}
 
-delay_queue_pop :: proc(q: ^DelayQueue) -> (DelayedEnvelope, bool) {
-    if q.count == 0 do return DelayedEnvelope{}, false
-    item := q.buffer[q.head]
-    q.head = (q.head + 1) & (q.capacity - 1)
-    q.count -= 1
-    return item, true
-}
+	delay_queue_push :: proc(q: ^DelayQueue, item: DelayedEnvelope) -> Enqueue_Result {
+		if q.count >= q.capacity do return .Full
+		q.buffer[q.tail] = item
+		q.tail = (q.tail + 1) & (q.capacity - 1)
+		q.count += 1
+		return .Success
+	}
 
-delay_queue_peek :: proc(q: ^DelayQueue) -> (^DelayedEnvelope, bool) {
-    if q.count == 0 do return nil, false
-    return &q.buffer[q.head], true
-}
+	delay_queue_pop :: proc(q: ^DelayQueue) -> (DelayedEnvelope, bool) {
+		if q.count == 0 do return DelayedEnvelope{}, false
+		item := q.buffer[q.head]
+		q.head = (q.head + 1) & (q.capacity - 1)
+		q.count -= 1
+		return item, true
+	}
 
-// --- Simulated Network ---
+	delay_queue_peek :: proc(q: ^DelayQueue) -> (^DelayedEnvelope, bool) {
+		if q.count == 0 do return nil, false
+		return &q.buffer[q.head], true
+	}
 
-Channel :: struct {
-    delay_queue: DelayQueue,
-    delay_ticks: u32,
-}
+	// --- Simulated Network ---
 
-SimulatedNetwork :: struct {
-    channels:         [][]Channel,
-    partition_matrix: []Shard_Mask,
-    drop_prng:        ^Prng,
-    shard_count:      u16,
-}
+	Channel :: struct {
+		delay_queue: DelayQueue,
+		delay_ticks: u32,
+	}
 
-sim_network_init :: proc(net: ^SimulatedNetwork, shard_count: u16, ring_sizes: [][]u32, drop_prng: ^Prng, allocator: mem.Allocator) {
-    net.shard_count = shard_count
-    net.drop_prng = drop_prng
+	SimulatedNetwork :: struct {
+		channels:         [][]Channel,
+		partition_matrix: []Shard_Mask,
+		drop_prng:        ^Prng,
+		shard_count:      u16,
+	}
 
-    net.channels = make([][]Channel, shard_count, allocator)
-    net.partition_matrix = make([]Shard_Mask, shard_count, allocator)
+	sim_network_init :: proc(
+		net: ^SimulatedNetwork,
+		shard_count: u16,
+		ring_sizes: [][]u32,
+		drop_prng: ^Prng,
+		allocator: mem.Allocator,
+	) {
+		net.shard_count = shard_count
+		net.drop_prng = drop_prng
 
-    for i in 0..<shard_count {
-        net.channels[i] = make([]Channel, shard_count, allocator)
-        for j in 0..<shard_count {
-            if i != j {
-                delay_queue_init(&net.channels[i][j].delay_queue, ring_sizes[i][j], allocator)
-            }
-        }
-    }
-}
+		net.channels = make([][]Channel, shard_count, allocator)
+		net.partition_matrix = make([]Shard_Mask, shard_count, allocator)
 
-// Enqueue: Called by Source Shard
-sim_network_enqueue :: proc(net: ^SimulatedNetwork, src_shard: ^Shard, dst: u16, envelope: Message_Envelope, current_tick: u64, fault_config: ^FaultConfig) {
-    src := src_shard.id
+		for i in 0 ..< shard_count {
+			net.channels[i] = make([]Channel, shard_count, allocator)
+			for j in 0 ..< shard_count {
+				if i != j {
+					delay_queue_init(&net.channels[i][j].delay_queue, ring_sizes[i][j], allocator)
+				}
+			}
+		}
+	}
 
-    // 1. Partition Check
-    if shard_mask_contains(net.partition_matrix[src], dst) {
-        src_shard.counters.quarantine_drops += 1
-        return
-    }
+	// Enqueue: Called by Source Shard
+	sim_network_enqueue :: proc(
+		net: ^SimulatedNetwork,
+		src_shard: ^Shard,
+		dst: u16,
+		envelope: Message_Envelope,
+		current_tick: u64,
+		fault_config: ^FaultConfig,
+	) {
+		src := src_shard.id
 
-    // 2. Probabilistic Drop Check
-    if ratio_chance(fault_config.network_drop_rate, net.drop_prng) {
-        src_shard.counters.ring_full_drops += 1 // Logically identical to physical drop
-        return
-    }
+		// 1. Partition Check
+		if shard_mask_contains(net.partition_matrix[src], dst) {
+			src_shard.counters.quarantine_drops += 1
+			return
+		}
 
-    // 3. Capacity Check (Simulates SPSC ring full)
-    channel := &net.channels[src][dst]
-    delayed_env := DelayedEnvelope{
-        envelope = envelope,
-        deliver_at = current_tick + u64(channel.delay_ticks),
-    }
+		// 2. Probabilistic Drop Check
+		if ratio_chance(fault_config.network_drop_rate, net.drop_prng) {
+			src_shard.counters.ring_full_drops += 1 // Logically identical to physical drop
+			return
+		}
 
-    if delay_queue_push(&channel.delay_queue, delayed_env) == .Full {
-        src_shard.counters.ring_full_drops += 1
-    }
-}
+		// 3. Capacity Check (Simulates SPSC ring full)
+		channel := &net.channels[src][dst]
+		delayed_env := DelayedEnvelope {
+			envelope   = envelope,
+			deliver_at = current_tick + u64(channel.delay_ticks),
+		}
 
-// Drain: Called by Destination Shard (Step 1 drain)
-sim_network_drain :: proc(net: ^SimulatedNetwork, dst_shard: ^Shard, src: u16, current_tick: u64) {
-    dst := dst_shard.id
-    channel := &net.channels[src][dst]
+		if delay_queue_push(&channel.delay_queue, delayed_env) == .Full {
+			src_shard.counters.ring_full_drops += 1
+		}
+	}
 
-    for {
-        peeked, ok := delay_queue_peek(&channel.delay_queue)
-        if !ok do break
+	// Drain: Called by Destination Shard (Step 1 drain)
+	sim_network_drain :: proc(
+		net: ^SimulatedNetwork,
+		dst_shard: ^Shard,
+		src: u16,
+		current_tick: u64,
+	) {
+		dst := dst_shard.id
+		channel := &net.channels[src][dst]
 
-        if peeked.deliver_at > current_tick do break
+		for {
+			peeked, ok := delay_queue_peek(&channel.delay_queue)
+			if !ok do break
 
-        item, _ := delay_queue_pop(&channel.delay_queue)
+			if peeked.deliver_at > current_tick do break
 
-        res := _enqueue(dst_shard, item.envelope.destination, &item.envelope)
-        if res == .mailbox_full {
-            dst_shard.counters.mailbox_full_drops += 1
-        }
-    }
-}
+			item, _ := delay_queue_pop(&channel.delay_queue)
 
-// --- Fault Engine ---
+			res := _enqueue_user_msg(dst_shard, item.envelope.destination, &item.envelope)
+			if res == .mailbox_full {
+				dst_shard.counters.mailbox_full_drops += 1
+			}
+		}
+	}
 
-FaultEngine :: struct {
-    partition_prng: ^Prng,
-    fault_config:   ^FaultConfig,
-    network:        ^SimulatedNetwork,
-    shard_count:    u16,
-}
+	// --- Fault Engine ---
 
-fault_engine_tick :: proc(engine: ^FaultEngine, round: u64) {
-	// 1. Heal existing partitions probabilistically
-    heal_rate := engine.fault_config.network_partition_heal_rate
-    if heal_rate.numerator > 0 {
-        for src in 0..<engine.shard_count {
-            mask := engine.network.partition_matrix[src]
-            for id in mask.lo {
-                if ratio_chance(heal_rate, engine.partition_prng) {
-                    shard_mask_exclude(&engine.network.partition_matrix[src], u16(id))
-                }
-            }
-            for id in mask.hi {
-                if ratio_chance(heal_rate, engine.partition_prng) {
-                    shard_mask_exclude(&engine.network.partition_matrix[src], u16(id) + 128)
-                }
-            }
-        }
-    }
+	FaultEngine :: struct {
+		partition_prng: ^Prng,
+		fault_config:   ^FaultConfig,
+		network:        ^SimulatedNetwork,
+		shard_count:    u16,
+	}
 
-    // 2. Create new partitions probabilistically
-    part_rate := engine.fault_config.network_partition_rate
-    if part_rate.numerator > 0 {
-        if ratio_chance(part_rate, engine.partition_prng) {
-            victim := u16(prng_uint_less_than(engine.partition_prng, u32(engine.shard_count)))
-            for other in 0..<engine.shard_count {
-                if other != victim {
-                    shard_mask_include(&engine.network.partition_matrix[victim], other)
-                    shard_mask_include(&engine.network.partition_matrix[other],  victim)
-                }
-            }
-        }
-    }
+	fault_engine_tick :: proc(engine: ^FaultEngine, round: u64) {
+		// 1. Heal existing partitions probabilistically
+		heal_rate := engine.fault_config.network_partition_heal_rate
+		if heal_rate.numerator > 0 {
+			for src in 0 ..< engine.shard_count {
+				mask := engine.network.partition_matrix[src]
+				for id in mask.lo {
+					if ratio_chance(heal_rate, engine.partition_prng) {
+						shard_mask_exclude(&engine.network.partition_matrix[src], u16(id))
+					}
+				}
+				for id in mask.hi {
+					if ratio_chance(heal_rate, engine.partition_prng) {
+						shard_mask_exclude(&engine.network.partition_matrix[src], u16(id) + 128)
+					}
+				}
+			}
+		}
 
-    // 3. Update per-channel delays (jitter)
-    range := engine.fault_config.network_delay_range_ticks
-    if range[1] > 0 {
-        diff := range[1] - range[0]
-        for src in 0..<engine.shard_count {
-            src_channels := engine.network.channels[src]
-            for dst in 0..<engine.shard_count {
-                if src != dst {
-                    src_channels[dst].delay_ticks = range[0] + prng_uint_less_than(engine.partition_prng, diff + 1)
-                }
-            }
-        }
-    } else {
-        // Fast path for 0-delay simulation
-        for src in 0..<engine.shard_count {
-            src_channels := engine.network.channels[src]
-            for dst in 0..<engine.shard_count {
-                if src != dst {
-                    src_channels[dst].delay_ticks = 0
-                }
-            }
-        }
-    }
+		// 2. Create new partitions probabilistically
+		part_rate := engine.fault_config.network_partition_rate
+		if part_rate.numerator > 0 {
+			if ratio_chance(part_rate, engine.partition_prng) {
+				victim := u16(prng_uint_less_than(engine.partition_prng, u32(engine.shard_count)))
+				for other in 0 ..< engine.shard_count {
+					if other != victim {
+						shard_mask_include(&engine.network.partition_matrix[victim], other)
+						shard_mask_include(&engine.network.partition_matrix[other], victim)
+					}
+				}
+			}
+		}
+
+		// 3. Update per-channel delays (jitter)
+		range := engine.fault_config.network_delay_range_ticks
+		if range[1] > 0 {
+			diff := range[1] - range[0]
+			for src in 0 ..< engine.shard_count {
+				src_channels := engine.network.channels[src]
+				for dst in 0 ..< engine.shard_count {
+					if src != dst {
+						src_channels[dst].delay_ticks =
+							range[0] + prng_uint_less_than(engine.partition_prng, diff + 1)
+					}
+				}
+			}
+		} else {
+			// Fast path for 0-delay simulation
+			for src in 0 ..< engine.shard_count {
+				src_channels := engine.network.channels[src]
+				for dst in 0 ..< engine.shard_count {
+					if src != dst {
+						src_channels[dst].delay_ticks = 0
+					}
+				}
+			}
+		}
+	}
+} else {
+	SimulatedNetwork :: struct {}
 }

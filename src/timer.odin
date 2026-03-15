@@ -1,176 +1,232 @@
 package tina
 
-TIMER_WHEEL_SPOKE_COUNT :: 4096
+TIMER_DEFAULT_SPOKE_COUNT :: 4096
 TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256
 
-Simulated_Clock :: struct {
-    current_tick: u64,
-}
-
 Timer_Entry :: struct {
-    deliver_at: u64,
-    next: u32,
-    correlation: u32,
-    target: Handle,
-    tag: Message_Tag,
+	deliver_at:  u64,
+	next:        u32,
+	correlation: u32,
+	target:      Handle,
+	tag:         Message_Tag,
 }
 
 Timer_Wheel :: struct {
-    spokes:[TIMER_WHEEL_SPOKE_COUNT]u32,
-    entries:[]Timer_Entry,
-    last_tick: u64,
-    free_head: u32,
+	spokes:         []u32,
+	entries:        []Timer_Entry,
+	spoke_mask:     u64,
+	last_tick:      u64,
+	free_head:      u32,
+	resident_count: u32,
 }
 
-timer_wheel_init :: proc(wheel: ^Timer_Wheel, backing:[]Timer_Entry) {
-    for i in 0..<TIMER_WHEEL_SPOKE_COUNT {
-        wheel.spokes[i] = POOL_NONE_INDEX
-    }
-    wheel.entries = backing
-    wheel.free_head = POOL_NONE_INDEX
+timer_wheel_init :: proc(
+	wheel: ^Timer_Wheel,
+	spoke_backing: []u32,
+	entry_backing: []Timer_Entry,
+	initial_tick: u64 = 0,
+) {
+	wheel.spokes = spoke_backing
+	wheel.spoke_mask = u64(len(spoke_backing) - 1)
+	wheel.entries = entry_backing
+	wheel.last_tick = initial_tick
+	wheel.free_head = POOL_NONE_INDEX
+	wheel.resident_count = 0
 
-    // Intrusive LIFO pool setup
-    for i := len(backing)-1; i >= 0; i -= 1 {
-        wheel.entries[i].next = wheel.free_head
-        wheel.free_head = u32(i)
-    }
+	for i in 0 ..< len(spoke_backing) {
+		wheel.spokes[i] = POOL_NONE_INDEX
+	}
+
+	// Intrusive LIFO pool setup
+	for i := len(entry_backing) - 1; i >= 0; i -= 1 {
+		wheel.entries[i].next = wheel.free_head
+		wheel.free_head = u32(i)
+	}
 }
 
-ctx_register_timer :: proc(ctx: ^TinaContext, delay_ticks: u64, tag: Message_Tag) {
-    wheel := &ctx.shard.timer_wheel
-    if wheel.free_head == POOL_NONE_INDEX {
-        ctx_log(ctx, .ERROR, USER_LOG_TAG_BASE, transmute([]u8)string("Timer pool exhausted"))
-        return
-    }
+@(private = "package")
+timer_wheel_reset :: proc(wheel: ^Timer_Wheel, current_tick: u64) {
+	for i in 0 ..< len(wheel.spokes) {
+		wheel.spokes[i] = POOL_NONE_INDEX
+	}
+	wheel.last_tick = current_tick
+	wheel.free_head = POOL_NONE_INDEX
+	wheel.resident_count = 0
 
-    index := wheel.free_head
-    wheel.free_head = wheel.entries[index].next
-
-    deliver_at := ctx.shard.clock.current_tick + delay_ticks
-    wheel.entries[index] = Timer_Entry{
-        deliver_at = deliver_at,
-        target = ctx.self_handle,
-        tag = tag,
-        next = POOL_NONE_INDEX,
-    }
-
-    // Fast power-of-two modulo
-    spoke_index := deliver_at & (TIMER_WHEEL_SPOKE_COUNT - 1)
-    wheel.entries[index].next = wheel.spokes[spoke_index]
-    wheel.spokes[spoke_index] = index
+	for i := len(wheel.entries) - 1; i >= 0; i -= 1 {
+		wheel.entries[i].next = wheel.free_head
+		wheel.free_head = u32(i)
+	}
 }
 
-@(private="package")
-_register_system_timer :: proc(shard: ^Shard, target: Handle, delay_ticks: u64, tag: Message_Tag, correlation: u32) {
-    wheel := &shard.timer_wheel
-    // SAFETY CHECK: If timer pool is exhausted, we MUST not fail silently.
-    // In production, we might drop, but for this test, we expect capacity.
-    if wheel.free_head == POOL_NONE_INDEX {
-        // Force a panic or error log to make debugging obvious
-        // fmt.eprintln("[PANIC] Timer pool exhausted! Isolate will deadlock.")
-        // return
-        panic("[PANIC] Timer pool exhausted! Isolate will deadlock.")
-    }
-
-    index := wheel.free_head
-    wheel.free_head = wheel.entries[index].next
-
-    deliver_at := shard.clock.current_tick + delay_ticks
-    wheel.entries[index] = Timer_Entry{
-        deliver_at = deliver_at,
-        target = target,
-        tag = tag,
-        correlation = correlation,
-        next = POOL_NONE_INDEX,
-    }
-
-    spoke_index := deliver_at & (TIMER_WHEEL_SPOKE_COUNT - 1)
-    wheel.entries[index].next = wheel.spokes[spoke_index]
-    wheel.spokes[spoke_index] = index
+ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag) {
+	wheel := &ctx.shard.timer_wheel
+	if wheel.free_head == POOL_NONE_INDEX {
+		ctx_log(ctx, .ERROR, USER_LOG_TAG_BASE, transmute([]u8)string("Timer pool exhausted"))
+		return
+	}
+	// Convert nanoseconds to ticks
+	delay_ticks :=
+		(duration_ns + ctx.shard.timer_resolution_ns - 1) / ctx.shard.timer_resolution_ns
+	_timer_wheel_insert(wheel, ctx.shard.current_tick + delay_ticks, ctx.self_handle, tag, 0)
 }
 
-@(private="package")
-_advance_timers :: proc(shard: ^Shard, max_expirations: u32 = TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT) {
-    now := shard.clock.current_tick
-    expirations: u32 = 0
+@(private = "package")
+_register_system_timer :: proc(
+	shard: ^Shard,
+	target: Handle,
+	delay_ticks: u64,
+	tag: Message_Tag,
+	correlation: u32,
+) {
+	wheel := &shard.timer_wheel
+	if wheel.free_head == POOL_NONE_INDEX {
+		panic("[PANIC] Timer pool exhausted! Isolate will deadlock.")
+	}
+	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, target, tag, correlation)
+}
 
-    tick_loop: for shard.timer_wheel.last_tick < now {
-        if expirations >= max_expirations do break
+@(private = "package")
+_timer_wheel_insert :: #force_inline proc(
+	wheel: ^Timer_Wheel,
+	deliver_at: u64,
+	target: Handle,
+	tag: Message_Tag,
+	correlation: u32,
+) {
+	index := wheel.free_head
+	wheel.free_head = wheel.entries[index].next
 
-        tick := shard.timer_wheel.last_tick + 1
-        spoke_index := tick & (TIMER_WHEEL_SPOKE_COUNT - 1)
-        curr := shard.timer_wheel.spokes[spoke_index]
-        prev: u32 = POOL_NONE_INDEX
+	wheel.entries[index] = Timer_Entry {
+		deliver_at  = deliver_at,
+		target      = target,
+		tag         = tag,
+		correlation = correlation,
+		next        = POOL_NONE_INDEX,
+	}
 
-        spoke_finished := true
+	spoke_index := deliver_at & wheel.spoke_mask
+	wheel.entries[index].next = wheel.spokes[spoke_index]
+	wheel.spokes[spoke_index] = index
+	wheel.resident_count += 1
+}
 
-        for curr != POOL_NONE_INDEX {
-            entry := &shard.timer_wheel.entries[curr]
-            next := entry.next
+// FUTURE OPT: The envelope construction (128 bytes on stack) + _enqueue copy could be
+// eliminated by allocating the pool slot first and writing directly into it. This avoids
+// a 128-byte stack write + 128-byte memcpy per expiration. Requires changing _enqueue's
+// interface to return a writable slot pointer, which has wider implications across the
+// messaging subsystem. Measure timer expiration throughput before pursuing.
+@(private = "package")
+_advance_timers :: proc(
+	shard: ^Shard,
+	max_expirations: u32 = TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT,
+) {
+	wheel := &shard.timer_wheel
+	now := shard.current_tick
 
-            if entry.deliver_at > tick {
-                prev = curr
-                curr = next
-                continue
-            }
+	if wheel.resident_count == 0 {
+		wheel.last_tick = now
+		return
+	}
 
-            if expirations >= max_expirations {
-                spoke_finished = false
-                break
-            }
+	expirations: u32 = 0
 
-            // --- Timerwheel WAITING_FOR_IO Integration (§6.6.3 §12) ---
-            target_type := extract_type_id(entry.target)
-            target_slot := extract_slot(entry.target)
-            target_gen  := extract_generation(entry.target)
+	tick_loop: for wheel.last_tick < now {
+		if expirations >= max_expirations do break
 
-            is_valid_target := int(target_type) < len(shard.metadata) &&
-                               int(target_slot) < len(shard.metadata[target_type]) &&
-                               shard.metadata[target_type][target_slot].generation == target_gen
+		tick := wheel.last_tick + 1
+		spoke_index := tick & wheel.spoke_mask
+		curr := wheel.spokes[spoke_index]
+		prev: u32 = POOL_NONE_INDEX
 
-            if is_valid_target {
-                soa_meta := shard.metadata[target_type]
-                if soa_meta[target_slot].state == .Waiting_For_Io {
-                    // 1. Issue best-effort cancel to the reactor
-                    reactor_cancel_active_io(&shard.reactor, shard, target_type, target_slot)
+		spoke_finished := true
 
-                    // 2. Increment io_sequence to structurally invalidate the in-flight completion
-                    soa_meta[target_slot].io_sequence += 1
+		for curr != POOL_NONE_INDEX {
+			entry := &wheel.entries[curr]
+			next := entry.next
 
-                    // 3. Transition to Runnable so it receives the timeout message
-                    soa_meta[target_slot].state = .Runnable
-                }
-            }
+			if entry.deliver_at > tick {
+				prev = curr
+				curr = next
+				continue
+			}
 
-            envelope: Message_Envelope
-            envelope.source = HANDLE_NONE
-            envelope.destination = entry.target
-            envelope.tag = entry.tag
-            envelope.correlation = entry.correlation
+			if expirations >= max_expirations {
+				spoke_finished = false
+				break
+			}
 
-            // Deliver the timeout message
-            _enqueue(shard, entry.target, &envelope)
-            expirations += 1
+			// --- WAITING_FOR_IO Integration ---
+			// Gated on TAG_CALL_TIMEOUT: only system call-timeout timers may cancel
+			// in-flight I/O. User timers skip this entire block (single comparison).
+			if entry.tag == TAG_CALL_TIMEOUT {
+				target_type := extract_type_id(entry.target)
+				target_slot := extract_slot(entry.target)
+				target_gen := extract_generation(entry.target)
 
-            // Unlink from spoke
-            if prev == POOL_NONE_INDEX {
-                shard.timer_wheel.spokes[spoke_index] = next
-            } else {
-                shard.timer_wheel.entries[prev].next = next
-            }
+				if int(target_type) < len(shard.metadata) &&
+				   int(target_slot) < len(shard.metadata[target_type]) &&
+				   shard.metadata[target_type][target_slot].generation == target_gen {
+					soa_meta := shard.metadata[target_type]
+					if soa_meta[target_slot].state == .Waiting_For_Io {
+						reactor_cancel_active_io(&shard.reactor, shard, target_type, target_slot)
+						soa_meta[target_slot].io_sequence += 1
+						soa_meta[target_slot].state = .Runnable
+					}
+				}
+			}
 
-            // Push back onto the free list
-            entry.next = shard.timer_wheel.free_head
-            shard.timer_wheel.free_head = curr
-            curr = next
-        }
+			envelope: Message_Envelope
+			envelope.source = HANDLE_NONE
+			envelope.destination = entry.target
+			envelope.tag = entry.tag
+			envelope.correlation = entry.correlation
 
-        if spoke_finished {
-            shard.timer_wheel.last_tick = tick
-        } else {
-	        // Budget exhausted before we could finish evaluating this spoke.
-	        // Do not advance last_tick so we resume this spoke on the next scheduler loop.
-            break tick_loop
-        }
-    }
+			_enqueue_system_msg(shard, entry.target, &envelope)
+			expirations += 1
+
+			// Unlink from spoke
+			if prev == POOL_NONE_INDEX {
+				wheel.spokes[spoke_index] = next
+			} else {
+				wheel.entries[prev].next = next
+			}
+
+			// Push back onto the free list
+			entry.next = wheel.free_head
+			wheel.free_head = curr
+			wheel.resident_count -= 1
+			curr = next
+		}
+
+		if spoke_finished {
+			wheel.last_tick = tick
+		} else {
+			// Budget exhausted before we could finish evaluating this spoke.
+			// Do not advance last_tick so we resume this spoke on the next scheduler loop.
+			break tick_loop
+		}
+	}
+}
+
+// O(N) scan to find the earliest deadline across the hashed wheel.
+// This is safe and ok ATM because it is ONLY called by the
+// Simulator, and ONLY when the entire system is 100% quiescent (idle).
+// We can consider improving or finding a different solution in future
+@(private = "package")
+timer_wheel_earliest_deadline :: proc(wheel: ^Timer_Wheel) -> u64 {
+	if wheel.resident_count == 0 do return max(u64)
+
+	earliest: u64 = max(u64)
+	for spoke in wheel.spokes {
+		current := spoke
+		for current != POOL_NONE_INDEX {
+			entry := &wheel.entries[current]
+			if entry.deliver_at < earliest {
+				earliest = entry.deliver_at
+			}
+			current = entry.next
+		}
+	}
+	return earliest
 }

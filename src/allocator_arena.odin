@@ -198,9 +198,13 @@ hydrate_shard :: proc(
 		shard.transfer_generations[i] = 1
 	}
 
-	alloc_data.current_name = "Timer_Wheel"
-	timer_buf := make([]Timer_Entry, spec.timer_wheel_slots, alloc)
-	timer_wheel_init(&shard.timer_wheel, timer_buf)
+	alloc_data.current_name = "Timer_Wheel_Spokes"
+	spoke_buf := make([]u32, spec.timer_spoke_count, alloc)
+
+	alloc_data.current_name = "Timer_Wheel_Entries"
+	entry_buf := make([]Timer_Entry, spec.timer_entry_count, alloc)
+
+	timer_wheel_init(&shard.timer_wheel, spoke_buf, entry_buf)
 
 	alloc_data.current_name = "Log_Ring_Buffer"
 	log_buf := make([]u8, spec.log_ring_size, alloc)
@@ -222,13 +226,14 @@ hydrate_shard :: proc(
 	backend_config := Backend_Config {
 		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
 	}
-	if spec.simulation != nil {
-		backend_config.sim_config = Simulation_IO_Config {
-			fault_rate        = spec.simulation.faults.io_error_rate,
-			delay_range_ticks = spec.simulation.faults.io_delay_range_ticks,
-			reorder           = true,
-		}
-	}
+	when TINA_SIMULATION_MODE {
+		if spec.simulation != nil {
+			backend_config.sim_config = Simulation_IO_Config {
+				fault_rate        = spec.simulation.faults.io_error_rate,
+				delay_range_ticks = spec.simulation.faults.io_delay_range_ticks,
+				reorder           = true,
+			}
+		}}
 
 	reactor_err := reactor_init(
 		&shard.reactor,
@@ -302,7 +307,8 @@ test_grand_arena :: proc(t: ^testing.T) {
 		reactor_buffer_slot_size  = REACTOR_SIZE,
 		transfer_slot_count       = TRANSFER_SLOTS,
 		transfer_slot_size        = TRANSFER_SIZE,
-		timer_wheel_slots         = 64, // Power of 2
+		timer_spoke_count         = 64, // Power of 2 spoke count
+		timer_entry_count         = 64, // Timer entry pool capacity
 		supervision_groups_max    = 4,
 		fd_table_slot_count       = 16,
 		fd_entry_size             = size_of(FD_Entry),

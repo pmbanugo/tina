@@ -100,6 +100,7 @@ HANDLE_TYPE_ID_SUBGROUP :: 0xFFFF
 
 // --- Core Data Structures ---
 
+// SOA metadata
 Isolate_Metadata :: struct {
 	io_peer_address:       Peer_Address, // 28 bytes
 	inbox_head:            u32, // 4 bytes
@@ -156,10 +157,21 @@ Supervision_Group :: struct {
 	_padding:              [3]u8,
 }
 
+when TINA_SIMULATION_MODE {
+	Simulation_State :: struct {
+		network:          ^SimulatedNetwork,
+		fault_config:     ^FaultConfig,
+		outbound_count:   u32,
+		_padding:         [4]u8, // Keep 8-byte alignment
+		outbound_staging: [1024]Message_Envelope,
+	}
+} else {
+	// Zero bytes in production!
+	Simulation_State :: struct {}
+}
+
 Shard :: struct {
 	// --- Hot Pointers & Slices (8-byte aligned) ---
-	sim_network:          ^SimulatedNetwork,
-	fault_config:         ^FaultConfig,
 	outbound_rings:       []^SPSC_Ring,
 	inbound_rings:        []^SPSC_Ring,
 	type_descriptors:     []TypeDescriptor,
@@ -172,16 +184,16 @@ Shard :: struct {
 	supervision_groups:   []Supervision_Group,
 
 	// --- Hot Embedded Structs (8-byte aligned) ---
-	clock:                Simulated_Clock,
 	log_ring:             Log_Ring_Buffer,
 	message_pool:         Message_Pool,
 	transfer_pool:        Reactor_Buffer_Pool,
 	counters:             Shard_Counters,
 
 	// --- Hot Scalars (Ordered largest to smallest) ---
+	current_tick:         u64, // The current time quantized to the resolution
+	timer_resolution_ns:  u64, // E.g., 1_000_000 for 1ms ticks
 	heartbeat_tick:       u64,
 	next_correlation_id:  u32,
-	outbound_count:       u32,
 	current_msg_slot:     u32,
 	current_slot_index:   u32,
 	id:                   u16,
@@ -192,9 +204,12 @@ Shard :: struct {
 
 	// --- Cold / Massive Storage ---
 	timer_wheel:          Timer_Wheel,
-	outbound_staging:     [1024]Message_Envelope,
 	trap_environment:     sigjmp_buf,
 	reactor:              Reactor,
+
+	// Used/Set only during simulation.
+	// Placed at the end to prevent possible cache-line shifting of hot fields.
+	sim_state:            Simulation_State,
 }
 
 // --- Scheduler Loop ---
@@ -256,16 +271,24 @@ scheduler_tick :: proc(shard: ^Shard) {
 		}
 	}
 
-	when !#config(TINA_SIM, false) {
-		sync.atomic_store_explicit(&shard.heartbeat_tick, sync.atomic_load_explicit(&shard.heartbeat_tick, .Relaxed) + 1, .Relaxed)
-		shard.clock.current_tick += 1
+	when !TINA_SIMULATION_MODE {
+		now_ns := os_monotonic_time_ns()
+		// TODO: If there's a high API/abstraction that initiates the Shard, make sure it uses the default below and
+		// we could eliminate the if statement (with a test that always verifies that, otherwise leave it)
+		if shard.timer_resolution_ns == 0 do shard.timer_resolution_ns = 1_048_576 // Default to ~1ms. Later I can experiement with 524,288 (~500ns)
+		// Quantize to timer wheel ticks.
+		// If timer_resolution_ns is a power of 2, the compiler should be able to
+		// turn this into a bit-shift.
+		shard.current_tick = now_ns / shard.timer_resolution_ns
+		// Watchdog heartbeat
+		sync.atomic_store_explicit(&shard.heartbeat_tick, shard.current_tick, .Relaxed)
 	}
-	now := shard.clock.current_tick
+	now := shard.current_tick
 
 	// ========================================================================
 	// Step 1: Drain inbound cross-shard rings → deliver to local mailboxes
 	// ========================================================================
-	when !#config(TINA_SIM, false) {
+	when !TINA_SIMULATION_MODE {
 		if len(shard.inbound_rings) > 0 {
 			for ring in shard.inbound_rings {
 				if ring == nil do continue
@@ -273,7 +296,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				available := spsc_ring_available_to_read(ring)
 				for i in 0 ..< available {
 					envelope := spsc_ring_get_read_ptr(ring, i)
-					res := _enqueue(shard, envelope.destination, envelope)
+					res := _enqueue_user_msg(shard, envelope.destination, envelope)
 
 					if res == .mailbox_full {
 						shard.counters.mailbox_full_drops += 1
@@ -288,10 +311,10 @@ scheduler_tick :: proc(shard: ^Shard) {
 			}
 		}
 	} else {
-		if shard.sim_network != nil {
-			for src in u16(0) ..< shard.sim_network.shard_count {
+		if shard.sim_state.network != nil {
+			for src in u16(0) ..< shard.sim_state.network.shard_count {
 				if src != shard.id {
-					sim_network_drain(shard.sim_network, shard, src, now)
+					sim_network_drain(shard.sim_state.network, shard, src, now)
 				}
 			}
 		}
@@ -461,7 +484,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	// Step 5: Flush outbound cross-shard rings
 	// ========================================================================
-	when !#config(TINA_SIM, false) {
+	when !TINA_SIMULATION_MODE {
 		if len(shard.outbound_rings) > 0 {
 			for ring in shard.outbound_rings {
 				if ring != nil {
@@ -470,20 +493,20 @@ scheduler_tick :: proc(shard: ^Shard) {
 			}
 		}
 	} else {
-		if shard.sim_network != nil {
-			for i in 0 ..< shard.outbound_count {
-				env := shard.outbound_staging[i]
+		if shard.sim_state.network != nil {
+			for i in 0 ..< shard.sim_state.outbound_count {
+				env := shard.sim_state.outbound_staging[i]
 				dest_shard := extract_shard_id(env.destination)
 				sim_network_enqueue(
-					shard.sim_network,
+					shard.sim_state.network,
 					shard,
 					dest_shard,
 					env,
 					now,
-					shard.fault_config,
+					shard.sim_state.fault_config,
 				)
 			}
-			shard.outbound_count = 0
+			shard.sim_state.outbound_count = 0
 		}
 	}
 
@@ -506,7 +529,7 @@ ctx_send :: proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, payload: []u8)
 	envelope.payload_size = u16(len(payload))
 	copy(envelope.payload[:], payload)
 
-	response := _route_envelope(ctx.shard, to, &envelope)
+	response := _route_envelope_user(ctx.shard, to, &envelope)
 	if response == .mailbox_full {
 		ctx_log(ctx, .WARN, LOG_TAG_IO_EXHAUSTION, transmute([]u8)string("Mailbox full"))
 	}
@@ -773,7 +796,10 @@ ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, leng
 }
 
 ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
-	return cast(Shard_State)sync.atomic_load_explicit(ctx.shard.shared_state, .Relaxed) == .Shutting_Down
+	return(
+		cast(Shard_State)sync.atomic_load_explicit(ctx.shard.shared_state, .Relaxed) ==
+		.Shutting_Down \
+	)
 }
 
 ctx_type_config :: #force_inline proc(ctx: ^TinaContext) -> ^TypeDescriptor {
@@ -804,34 +830,6 @@ _transfer_pool_free :: #force_inline proc(shard: ^Shard, idx: u16) {
 	reactor_buffer_pool_free(&shard.transfer_pool, idx)
 	shard.transfer_generations[idx] += 1
 	if shard.transfer_generations[idx] == 0 do shard.transfer_generations[idx] = 1
-}
-
-@(private = "package")
-_route_envelope :: proc(shard: ^Shard, to: Handle, envelope: ^Message_Envelope) -> Send_Result {
-	destination := extract_shard_id(to)
-
-	if destination == shard.id {
-		return _enqueue(shard, to, envelope)
-	} else {
-		when !#config(TINA_SIM, false) {
-			ring := shard.outbound_rings[destination]
-			if ring == nil do return .stale_handle
-			if spsc_ring_enqueue(ring, envelope) == .Full {
-				shard.counters.ring_full_drops += 1
-				return .mailbox_full
-			}
-			return .ok
-		} else {
-			if shard.outbound_count < len(shard.outbound_staging) {
-				shard.outbound_staging[shard.outbound_count] = envelope^
-				shard.outbound_count += 1
-				return .ok
-			} else {
-				shard.counters.ring_full_drops += 1
-				return .mailbox_full
-			}
-		}
-	}
 }
 
 @(private = "package")
@@ -934,19 +932,94 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 }
 
 @(private = "package")
-_enqueue :: proc(shard: ^Shard, to: Handle, env: ^Message_Envelope) -> Send_Result {
+_route_envelope_user :: #force_inline proc(
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _route_envelope_internal(shard, to, envelope, true)
+}
+
+@(private = "package")
+_route_envelope_system :: #force_inline proc(
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _route_envelope_internal(shard, to, envelope, false)
+}
+
+@(private = "file")
+_route_envelope_internal :: #force_inline proc(
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+	is_user: bool,
+) -> Send_Result {
+	destination := extract_shard_id(to)
+
+	if destination == shard.id {
+		return _enqueue_internal(shard, to, envelope, is_user)
+	} else {
+		when !TINA_SIMULATION_MODE {
+			ring := shard.outbound_rings[destination]
+			if ring == nil do return .stale_handle
+			if spsc_ring_enqueue(ring, envelope) == .Full {
+				shard.counters.ring_full_drops += 1
+				return .mailbox_full
+			}
+			return .ok
+		} else {
+
+			if shard.sim_state.outbound_count < len(shard.sim_state.outbound_staging) {
+				shard.sim_state.outbound_staging[shard.sim_state.outbound_count] = envelope^
+				shard.sim_state.outbound_count += 1
+				return .ok
+			} else {
+				shard.counters.ring_full_drops += 1
+				return .mailbox_full
+			}
+		}
+	}
+}
+
+@(private = "package")
+_enqueue_user_msg :: #force_inline proc(
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _enqueue_internal(shard, to, envelope, true)
+}
+
+@(private = "package")
+_enqueue_system_msg :: #force_inline proc(
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _enqueue_internal(shard, to, envelope, false)
+}
+
+@(private = "file")
+_enqueue_internal :: #force_inline proc(
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+	is_user: bool,
+) -> Send_Result {
 	type_id := extract_type_id(to)
 	slot := extract_slot(to)
 	soa_meta := shard.metadata[type_id]
 
 	if soa_meta[slot].generation != extract_generation(to) {return .stale_handle}
 
-	is_reply := .Is_Reply in env.flags
-	is_timeout := env.tag == TAG_CALL_TIMEOUT
+	is_reply := .Is_Reply in envelope.flags
+	is_timeout := envelope.tag == TAG_CALL_TIMEOUT
 
 	if is_reply || is_timeout {
 		if soa_meta[slot].state != .Waiting_For_Reply {return .stale_handle}
-		if soa_meta[slot].pending_correlation != env.correlation {return .stale_handle}
+		if soa_meta[slot].pending_correlation != envelope.correlation {return .stale_handle}
 
 		soa_meta[slot].pending_correlation = 0
 		soa_meta[slot].state = .Runnable
@@ -954,12 +1027,22 @@ _enqueue :: proc(shard: ^Shard, to: Handle, env: ^Message_Envelope) -> Send_Resu
 
 	if soa_meta[slot].inbox_count >= 256 {return .mailbox_full}
 
-	pool_index, err := pool_alloc(&shard.message_pool)
+	pool_index: u32
+	err: Pool_Error
+
+	// Because `is_user` is passed as a constant from the wrapper,
+	// I expect the compiler will dead-code-eliminate this IF statement.
+	if is_user {
+		pool_index, err = pool_alloc_user(&shard.message_pool)
+	} else {
+		pool_index, err = pool_alloc_system(&shard.message_pool)
+	}
+
 	if err != .None {return .pool_exhausted}
 
-	dest_env := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, pool_index)
-	dest_env^ = env^
-	dest_env.next_in_mailbox = POOL_NONE_INDEX
+	envelope_destination := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, pool_index)
+	envelope_destination^ = envelope^
+	envelope_destination.next_in_mailbox = POOL_NONE_INDEX
 
 	if soa_meta[slot].inbox_head == POOL_NONE_INDEX {
 		soa_meta[slot].inbox_head = pool_index
@@ -1036,7 +1119,8 @@ _interpret_effect :: proc(
 		soa_meta[slot].pending_correlation = corr
 		soa_meta[slot].state = .Waiting_For_Reply
 
-		_register_system_timer(shard, ctx.self_handle, e.timeout, TAG_CALL_TIMEOUT, corr)
+		timeout_ticks := (e.timeout + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
+		_register_system_timer(shard, ctx.self_handle, timeout_ticks, TAG_CALL_TIMEOUT, corr)
 
 		local_msg := e.message // Make "e.message" it addressable
 		envelope: Message_Envelope
@@ -1048,7 +1132,7 @@ _interpret_effect :: proc(
 		envelope.payload_size = local_msg.body.user.payload_size
 		copy(envelope.payload[:], local_msg.body.user.payload[:])
 
-		_route_envelope(shard, e.to, &envelope)
+		_route_envelope_user(shard, e.to, &envelope)
 
 	case Effect_Reply:
 		if .Is_Call not_in ctx.flags {
@@ -1074,7 +1158,7 @@ _interpret_effect :: proc(
 		envelope.payload_size = local_msg.body.user.payload_size
 		copy(envelope.payload[:], local_msg.body.user.payload[:])
 
-		_route_envelope(shard, ctx.current_message_source, &envelope)
+		_route_envelope_user(shard, ctx.current_message_source, &envelope)
 
 	case Effect_Io:
 		err := reactor_submit_io(&shard.reactor, shard, ctx.self_handle, e.operation)
@@ -1129,7 +1213,7 @@ _get_child_restart_type :: proc(group: ^Supervision_Group, index: u16) -> Restar
 
 @(private = "package")
 _check_and_record_restart :: proc(shard: ^Shard, group: ^Supervision_Group) -> bool {
-	now := shard.clock.current_tick
+	now := shard.current_tick
 	if now - group.window_start_tick >= u64(group.window_duration_ticks) {
 		group.window_start_tick = now
 		group.restart_count = 1
@@ -1180,7 +1264,7 @@ _teardown_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
 		}
 	}
 	group.restart_count = 0
-	group.window_start_tick = shard.clock.current_tick
+	group.window_start_tick = shard.current_tick
 }
 
 @(private = "package")
@@ -1341,7 +1425,7 @@ _build_group :: proc(
 	group.window_duration_ticks = group_spec.window_duration_ticks
 	group.restart_count_max = group_spec.restart_count_max
 	group.restart_count = 0
-	group.window_start_tick = shard.clock.current_tick
+	group.window_start_tick = shard.current_tick
 
 	capacity: int = int(group_spec.dynamic_child_count_max)
 	if capacity == 0 {
@@ -1415,7 +1499,7 @@ _rebuild_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
 		group.child_count += 1
 	}
 	group.restart_count = 0
-	group.window_start_tick = shard.clock.current_tick
+	group.window_start_tick = shard.current_tick
 }
 
 @(private = "package")
@@ -1475,16 +1559,11 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		}
 	}
 
-	for i in 0 ..< TIMER_WHEEL_SPOKE_COUNT {
-		shard.timer_wheel.spokes[i] = POOL_NONE_INDEX
-	}
-	shard.timer_wheel.free_head = POOL_NONE_INDEX
-	for i := len(shard.timer_wheel.entries) - 1; i >= 0; i -= 1 {
-		shard.timer_wheel.entries[i].next = shard.timer_wheel.free_head
-		shard.timer_wheel.free_head = u32(i)
-	}
+	timer_wheel_reset(&shard.timer_wheel, shard.current_tick)
 
-	shard.outbound_count = 0
+	when TINA_SIMULATION_MODE {
+		shard.sim_state.outbound_count = 0
+	}
 	shard.next_correlation_id = 0
 	// Control Signal reset
 	sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(Control_Signal.None), .Relaxed)
