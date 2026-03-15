@@ -273,9 +273,6 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 	when !TINA_SIMULATION_MODE {
 		now_ns := os_monotonic_time_ns()
-		// TODO: If there's a high API/abstraction that initiates the Shard, make sure it uses the default below and
-		// we could eliminate the if statement (with a test that always verifies that, otherwise leave it)
-		if shard.timer_resolution_ns == 0 do shard.timer_resolution_ns = 1_048_576 // Default to ~1ms. Later I can experiement with 524,288 (~500ns)
 		// Quantize to timer wheel ticks.
 		// If timer_resolution_ns is a power of 2, the compiler should be able to
 		// turn this into a bit-shift.

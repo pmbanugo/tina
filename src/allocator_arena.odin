@@ -140,6 +140,10 @@ hydrate_shard :: proc(
 
 	types_count := len(spec.types)
 
+	if spec.timer_resolution_ns == 0 {
+		shard.timer_resolution_ns = 1_048_576 // Default to ~1ms (power-of-2). Later I can experiement with 524,288 (~500ns)
+	} else {shard.timer_resolution_ns = spec.timer_resolution_ns}
+
 	// 2. Allocate the Slice Headers
 	alloc_data.current_name = "Slice_Headers"
 	shard.type_descriptors = make([]TypeDescriptor, types_count, alloc)
@@ -233,7 +237,8 @@ hydrate_shard :: proc(
 				delay_range_ticks = spec.simulation.faults.io_delay_range_ticks,
 				reorder           = true,
 			}
-		}}
+		}
+	}
 
 	reactor_err := reactor_init(
 		&shard.reactor,

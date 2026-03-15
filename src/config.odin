@@ -37,7 +37,7 @@ Watchdog_Config :: struct {
 }
 
 Dio_Config :: struct {
-	target_core:          i32, // -1 means no specific core
+	target_core:          i32,
 	submission_ring_size: u32,
 	completion_ring_size: u32,
 }
@@ -63,6 +63,7 @@ SystemSpec :: struct {
 	// Subsystem parameters
 	types:                     []TypeDescriptor,
 	shard_specs:               []ShardSpec,
+	timer_resolution_ns:       u64,
 	pool_slot_count:           int,
 	reactor_buffer_slot_count: int,
 	reactor_buffer_slot_size:  int,

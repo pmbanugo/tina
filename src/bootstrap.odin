@@ -47,6 +47,23 @@ tina_start :: proc(spec: ^SystemSpec) {
 		os.exit(1)
 	}
 
+	when TINA_SIMULATION_MODE {
+		if spec.simulation != nil {
+			simulator := new(Simulator)
+			defer free(simulator)
+
+			if init_err := simulator_init(simulator, spec, context.allocator); init_err != .None {
+				fmt.eprintfln("[FATAL] Simulator init failed: %v", init_err)
+				os.exit(1)
+			}
+
+			set_process_phase(.Running)
+			simulator_run(simulator)
+			set_process_phase(.Terminated)
+			return // End process cleanly, bypassing production setup
+		}
+	}
+
 	// Evaluate SPSC ring matrix via painter's algorithm. Returns counts (items), not sizes (bytes).
 	ring_counts := compute_ring_sizes(
 		spec.shard_count,
