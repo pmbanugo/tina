@@ -1,7 +1,6 @@
 package tina
 
 import "core:fmt"
-import "core:mem"
 import "core:sync"
 import "core:sys/posix"
 import "core:thread"

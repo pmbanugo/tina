@@ -320,9 +320,6 @@ test_grand_arena :: proc(t: ^testing.T) {
 		log_ring_size             = 1024, // Power of 2
 	}
 
-	shard_spec := ShardSpec {
-		shard_id = 1,
-	}
 	total_mem := compute_shard_memory_total(&spec)
 
 	arena := Grand_Arena{}

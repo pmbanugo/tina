@@ -365,7 +365,7 @@ test_fd_table_reuse_after_free :: proc(t: ^testing.T) {
 
 	// Allocate both slots
 	h1, _ := fd_table_alloc(&table, OS_FD(10), owner)
-	h2, _ := fd_table_alloc(&table, OS_FD(20), owner)
+	_, _ = fd_table_alloc(&table, OS_FD(20), owner)
 	testing.expect_value(t, table.free_count, 0)
 
 	// Free h1

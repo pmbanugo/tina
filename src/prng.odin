@@ -108,7 +108,7 @@ test_prng_determinism :: proc(t: ^testing.T) {
     prng_init(&prng1, seed1)
     prng_init(&prng2, seed1) // Init with the exact same seed
 
-    for i in 0..<100 {
+    for _ in 0..<100 {
         v1 := prng_step(&prng1)
         v2 := prng_step(&prng2)
         testing.expect_value(t, v1, v2)

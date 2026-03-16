@@ -1,6 +1,5 @@
 package tina
 
-import "core:mem"
 import "core:testing"
 
 MAX_REACTOR_BATCH :: DEFAULT_BACKEND_QUEUE_SIZE

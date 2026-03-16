@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:sync"
-import "core:testing"
 
 // --- Trap Boundary Platform Bindings ---
 
@@ -704,7 +703,8 @@ ctx_transfer_write :: proc(
 	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
-	if index >= ctx.shard.transfer_pool.slot_count || ctx.shard.transfer_generations[index] != gen {
+	if index >= ctx.shard.transfer_pool.slot_count ||
+	   ctx.shard.transfer_generations[index] != gen {
 		return .Stale_Handle
 	}
 
@@ -721,7 +721,8 @@ ctx_transfer_read :: proc(ctx: ^TinaContext, handle: Transfer_Handle) -> Transfe
 	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
-	if index >= ctx.shard.transfer_pool.slot_count || ctx.shard.transfer_generations[index] != gen {
+	if index >= ctx.shard.transfer_pool.slot_count ||
+	   ctx.shard.transfer_generations[index] != gen {
 		ctx.shard.counters.transfer_stale_reads += 1
 		return Transfer_Read_Error.Stale_Handle
 	}
@@ -1462,8 +1463,7 @@ _build_group :: proc(
 
 			spawn_loop: for {
 				res := ctx_spawn(&ctx, spec)
-				if handle, ok := res.(Handle); ok {
-					// ctx_spawn already safely registered the child!
+				if _, ok := res.(Handle); ok {
 					break spawn_loop
 				} else {
 					// Init failed!
