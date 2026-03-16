@@ -132,7 +132,7 @@ _read_ring_data :: #force_inline proc(ring: ^Log_Ring_Buffer, offset: u64, data:
 // Step 7: Flush logs to OS stream via PIPE_BUF chunks
 log_flush :: proc(shard: ^Shard) {
 	temp_buf: [POSIX_PIPE_BUF_SIZE]u8
-	temp_len := 0
+	temp_size := 0
 	ring := &shard.log_ring
 
 	for ring.read_cursor < ring.write_cursor {
@@ -144,9 +144,9 @@ log_flush :: proc(shard: ^Shard) {
 			ring.read_cursor,
 			mem.byte_slice(cast(^u8)&header, Log_Record_Header_Size),
 		)
-		record_len := Log_Record_Header_Size + u64((header.payload_size + 7) & ~u16(7))
+		record_size := Log_Record_Header_Size + u64((header.payload_size + 7) & ~u16(7))
 
-		if ring.write_cursor - ring.read_cursor < record_len {break}
+		if ring.write_cursor - ring.read_cursor < record_size {break}
 
 		payload_buf: [MAX_PAYLOAD_SIZE]u8
 		_read_ring_data(
@@ -167,18 +167,18 @@ log_flush :: proc(shard: ^Shard) {
 			string(payload_buf[:header.payload_size]),
 		)
 
-		if temp_len + len(b.buf) > POSIX_PIPE_BUF_SIZE {
-			os.write(os.stderr, temp_buf[:temp_len])
-			temp_len = 0
+		if temp_size + len(b.buf) > POSIX_PIPE_BUF_SIZE {
+			os.write(os.stderr, temp_buf[:temp_size])
+			temp_size = 0
 		}
-		copy(temp_buf[temp_len:], b.buf[:])
-		temp_len += len(b.buf)
+		copy(temp_buf[temp_size:], b.buf[:])
+		temp_size += len(b.buf)
 
-		ring.read_cursor += record_len
+		ring.read_cursor += record_size
 	}
 
-	if temp_len > 0 {
+	if temp_size > 0 {
 		// TODO: check the os.write result for errors/EAGAIN? or do something different and assert earlier?
-		os.write(os.stderr, temp_buf[:temp_len])
+		os.write(os.stderr, temp_buf[:temp_size])
 	}
 }

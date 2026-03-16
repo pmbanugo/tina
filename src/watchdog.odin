@@ -116,8 +116,8 @@ _handle_forced_recovery :: proc(
 		time.Millisecond
 	if window_duration == 0 do window_duration = 30 * time.Second
 
-	max_restarts := spec.shard_specs[shard_id].root_group.restart_count_max
-	if max_restarts == 0 do max_restarts = 3
+	restart_count_max := spec.shard_specs[shard_id].root_group.restart_count_max
+	if restart_count_max == 0 do restart_count_max = 3
 
 	if time.tick_diff(tracker.window_start[shard_id], now) >= window_duration {
 		// Outside window, reset tracking
@@ -127,7 +127,7 @@ _handle_forced_recovery :: proc(
 		tracker.restart_count[shard_id] += 1
 	}
 
-	if tracker.restart_count[shard_id] > max_restarts {
+	if tracker.restart_count[shard_id] > restart_count_max {
 		if spec.quarantine_policy == .Abort {
 			fmt.eprintfln(
 				"[FATAL] Shard %d exceeded restart limits. Policy: Abort. Force Killing Process.",

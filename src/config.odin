@@ -15,7 +15,7 @@ TypeDescriptor :: struct {
 	stride:                  int,
 	soa_metadata_size:       int,
 	working_memory_size:     int,
-	max_scratch_requirement: int,
+	scratch_requirement_max: int,
 	init_fn:                 Init_Fn,
 	handler_fn:              Handler_Fn,
 }
@@ -117,16 +117,16 @@ Child_Spec :: union {
 }
 
 validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
-	max_scratch := 0
+	scratch_max := 0
 	for t in spec.types {
 		if t.slot_count > MAX_ISOLATES_PER_TYPE {
 			return .SlotCountExceedsHandleCapacity
 		}
-		if t.max_scratch_requirement > max_scratch {
-			max_scratch = t.max_scratch_requirement
+		if t.scratch_requirement_max > scratch_max {
+			scratch_max = t.scratch_requirement_max
 		}
 	}
-	if spec.scratch_arena_size < max_scratch {
+	if spec.scratch_arena_size < scratch_max {
 		return .ScratchArenaTooSmall
 	}
 
@@ -199,11 +199,11 @@ _compute_group_capacity :: proc(group: ^Group_Spec) -> int {
 
 compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total := 0
-	max_regions := compute_max_sub_regions(spec)
+	regions_max := compute_max_sub_regions(spec)
 
 	// In the worst case, every single sub-region allocation requires
 	// CACHE_LINE_SIZE - 1 bytes of padding to align.
-	padding_overhead := max_regions * CACHE_LINE_SIZE
+	padding_overhead := regions_max * CACHE_LINE_SIZE
 
 	for t in spec.types {
 		total += t.slot_count * t.stride
@@ -222,7 +222,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)
 	total += spec.scratch_arena_size
-	total += max_regions * size_of(SubRegion)
+	total += regions_max * size_of(SubRegion)
 
 	types_count := len(spec.types)
 	slice_headers_overhead :=
@@ -232,13 +232,13 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += types_count * size_of(u32)
 
 	// Find the largest supervision tree across all shards and budget for its arrays
-	max_tree_mem := 0
+	tree_memory_max := 0
 	for &s in spec.shard_specs {
-		tree_mem := _compute_group_capacity(&s.root_group)
-		if tree_mem > max_tree_mem do max_tree_mem = tree_mem
+		tree_memory := _compute_group_capacity(&s.root_group)
+		if tree_memory > tree_memory_max do tree_memory_max = tree_memory
 	}
 	// We add an extra padding allowance per group to ensure the alignments don't overflow
-	total += max_tree_mem + (spec.supervision_groups_max * CACHE_LINE_SIZE)
+	total += tree_memory_max + (spec.supervision_groups_max * CACHE_LINE_SIZE)
 
 	return total + padding_overhead
 }
@@ -247,8 +247,8 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 @(test)
 test_system_spec_validation :: proc(t: ^testing.T) {
 	types := [2]TypeDescriptor {
-		{id = 1, max_scratch_requirement = 1024},
-		{id = 2, max_scratch_requirement = 4096},
+		{id = 1, scratch_requirement_max = 1024},
+		{id = 2, scratch_requirement_max = 4096},
 	}
 
 	spec := SystemSpec {
@@ -299,7 +299,7 @@ when TINA_SIMULATION_MODE {
 
 SimulationConfig :: struct {
 	seed:                   u64,
-	max_ticks:              u64,
+	ticks_max:              u64,
 	shuffle_shard_order:    bool,
 	faults:                 FaultConfig,
 	checker_interval_ticks: u32,
@@ -322,7 +322,7 @@ Ring_Override :: struct {
 }
 
 // Painter's Algorithm: Computes a 2D matrix of ring capacities.
-// Returns a slice of slices: sizes[src_shard][dst_shard]
+// Returns a slice of slices: sizes[source_shard][target_shard]
 compute_ring_sizes :: proc(
 	shard_count: u16,
 	default_size: u32,

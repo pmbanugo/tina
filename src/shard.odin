@@ -309,9 +309,9 @@ scheduler_tick :: proc(shard: ^Shard) {
 		}
 	} else {
 		if shard.sim_state.network != nil {
-			for src in u16(0) ..< shard.sim_state.network.shard_count {
-				if src != shard.id {
-					sim_network_drain(shard.sim_state.network, shard, src, now)
+			for source in u16(0) ..< shard.sim_state.network.shard_count {
+				if source != shard.id {
+					sim_network_drain(shard.sim_state.network, shard, source, now)
 				}
 			}
 		}
@@ -687,13 +687,13 @@ ctx_scratch_arena :: #force_inline proc(ctx: ^TinaContext) -> mem.Allocator {
 }
 
 ctx_transfer_alloc :: proc(ctx: ^TinaContext) -> Transfer_Alloc_Result {
-	idx, err := reactor_buffer_pool_alloc(&ctx.shard.transfer_pool)
+	index, err := reactor_buffer_pool_alloc(&ctx.shard.transfer_pool)
 	if err != .None {
 		ctx.shard.counters.transfer_exhaustions += 1
 		return Transfer_Alloc_Error.Pool_Exhausted
 	}
-	gen := ctx.shard.transfer_generations[idx]
-	return transfer_handle_make(idx, gen)
+	gen := ctx.shard.transfer_generations[index]
+	return transfer_handle_make(index, gen)
 }
 
 ctx_transfer_write :: proc(
@@ -701,10 +701,10 @@ ctx_transfer_write :: proc(
 	handle: Transfer_Handle,
 	data: []u8,
 ) -> Transfer_Write_Error {
-	idx := transfer_handle_index(handle)
+	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
-	if idx >= ctx.shard.transfer_pool.slot_count || ctx.shard.transfer_generations[idx] != gen {
+	if index >= ctx.shard.transfer_pool.slot_count || ctx.shard.transfer_generations[index] != gen {
 		return .Stale_Handle
 	}
 
@@ -712,16 +712,16 @@ ctx_transfer_write :: proc(
 		return .Bounds_Violation
 	}
 
-	dst := reactor_buffer_pool_slot_ptr(&ctx.shard.transfer_pool, idx)
-	mem.copy(dst, raw_data(data), len(data))
+	target := reactor_buffer_pool_slot_ptr(&ctx.shard.transfer_pool, index)
+	mem.copy(target, raw_data(data), len(data))
 	return .None
 }
 
 ctx_transfer_read :: proc(ctx: ^TinaContext, handle: Transfer_Handle) -> Transfer_Read_Result {
-	idx := transfer_handle_index(handle)
+	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
-	if idx >= ctx.shard.transfer_pool.slot_count || ctx.shard.transfer_generations[idx] != gen {
+	if index >= ctx.shard.transfer_pool.slot_count || ctx.shard.transfer_generations[index] != gen {
 		ctx.shard.counters.transfer_stale_reads += 1
 		return Transfer_Read_Error.Stale_Handle
 	}
@@ -731,7 +731,7 @@ ctx_transfer_read :: proc(ctx: ^TinaContext, handle: Transfer_Handle) -> Transfe
 	slot := extract_slot(ctx.self_handle)
 	ctx.shard.metadata[type_id][slot].pending_transfer_read = handle
 
-	ptr := reactor_buffer_pool_slot_ptr(&ctx.shard.transfer_pool, idx)
+	ptr := reactor_buffer_pool_slot_ptr(&ctx.shard.transfer_pool, index)
 	return ptr[:ctx.shard.transfer_pool.slot_size]
 }
 
@@ -787,9 +787,9 @@ ctx_shutdown :: #force_inline proc(
 	return reactor_control_shutdown(&ctx.shard.reactor, fd, ctx.self_handle, how)
 }
 
-ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, length: u32) -> []u8 {
-	if length <= 0 do return nil
-	return reactor_buffer_pool_read_slice(&ctx.shard.reactor.buffer_pool, buffer_index, length)
+ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, size: u32) -> []u8 {
+	if size <= 0 do return nil
+	return reactor_buffer_pool_read_slice(&ctx.shard.reactor.buffer_pool, buffer_index, size)
 }
 
 ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
@@ -823,10 +823,10 @@ ctx_getsockopt :: #force_inline proc(
 // --- Internal Utilities ---
 
 @(private = "package")
-_transfer_pool_free :: #force_inline proc(shard: ^Shard, idx: u16) {
-	reactor_buffer_pool_free(&shard.transfer_pool, idx)
-	shard.transfer_generations[idx] += 1
-	if shard.transfer_generations[idx] == 0 do shard.transfer_generations[idx] = 1
+_transfer_pool_free :: #force_inline proc(shard: ^Shard, index: u16) {
+	reactor_buffer_pool_free(&shard.transfer_pool, index)
+	shard.transfer_generations[index] += 1
+	if shard.transfer_generations[index] == 0 do shard.transfer_generations[index] = 1
 }
 
 @(private = "package")

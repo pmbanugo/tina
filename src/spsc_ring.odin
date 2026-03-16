@@ -55,8 +55,8 @@ spsc_ring_enqueue :: #force_inline proc(ring: ^SPSC_Ring, envelope: ^Message_Env
     }
 
     // Write data directly to the ring buffer
-    idx := ring.local_write_sequence & ring.capacity_mask
-    ring.buffer[idx] = envelope^
+    index := ring.local_write_sequence & ring.capacity_mask
+    ring.buffer[index] = envelope^
 
     ring.local_write_sequence += 1
     return .Success
@@ -83,8 +83,8 @@ spsc_ring_available_to_read :: #force_inline proc(ring: ^SPSC_Ring) -> u64 {
 
 // Gets a pointer to the message at the given offset from the current read cursor.
 spsc_ring_get_read_ptr :: #force_inline proc(ring: ^SPSC_Ring, offset: u64) -> ^Message_Envelope {
-    idx := (ring.local_read_sequence + offset) & ring.capacity_mask
-    return &ring.buffer[idx]
+    index := (ring.local_read_sequence + offset) & ring.capacity_mask
+    return &ring.buffer[index]
 }
 
 // Advances the read sequence, freeing the slots for the producer.

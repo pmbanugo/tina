@@ -150,7 +150,7 @@ ctx_send_typed :: #force_inline proc(
 	return ctx_send(ctx, to, tag, mem.byte_slice(message, size_of(T)))
 }
 
-make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8, len: u8) {
+make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8, size: u8) {
 	assert(size_of(T) <= MAX_INIT_ARGS_SIZE, "Init args exceed MAX_INIT_ARGS_SIZE")
 	mem.copy(&buf[0], args, size_of(T))
 	return buf, u8(size_of(T))

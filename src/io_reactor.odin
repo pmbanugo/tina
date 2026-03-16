@@ -584,8 +584,8 @@ _alloc_and_copy_in :: #force_inline proc(
 	if b_err != .None do return BUFFER_INDEX_NONE, IO_ERR_RESOURCE_EXHAUSTED
 
 	isolate_ptr := _get_isolate_ptr(shard, type_idx, slot_idx)
-	src_ptr := rawptr(uintptr(isolate_ptr) + uintptr(offset))
-	reactor_buffer_pool_copy_in(&reactor.buffer_pool, b_idx, src_ptr, size)
+	source_pointer := rawptr(uintptr(isolate_ptr) + uintptr(offset))
+	reactor_buffer_pool_copy_in(&reactor.buffer_pool, b_idx, source_pointer, size)
 
 	return b_idx, IO_ERR_NONE
 }

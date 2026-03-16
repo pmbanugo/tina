@@ -119,7 +119,7 @@ _timer_wheel_insert :: #force_inline proc(
 @(private = "package")
 _advance_timers :: proc(
 	shard: ^Shard,
-	max_expirations: u32 = TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT,
+	expirations_max: u32 = TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT,
 ) {
 	wheel := &shard.timer_wheel
 	now := shard.current_tick
@@ -132,7 +132,7 @@ _advance_timers :: proc(
 	expirations: u32 = 0
 
 	tick_loop: for wheel.last_tick < now {
-		if expirations >= max_expirations do break
+		if expirations >= expirations_max do break
 
 		tick := wheel.last_tick + 1
 		spoke_index := tick & wheel.spoke_mask
@@ -151,7 +151,7 @@ _advance_timers :: proc(
 				continue
 			}
 
-			if expirations >= max_expirations {
+			if expirations >= expirations_max {
 				spoke_finished = false
 				break
 			}

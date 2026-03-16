@@ -125,9 +125,9 @@ test_message_pool :: proc(t: ^testing.T) {
 	// Allocate all slots
 	indices: [10]u32
 	for i in 0 ..< 10 {
-		idx, err := pool_alloc_user(&pool)
+		index, err := pool_alloc_user(&pool)
 		testing.expect_value(t, err, Pool_Error.None)
-		indices[i] = idx
+		indices[i] = index
 	}
 
 	// Pool should now be empty

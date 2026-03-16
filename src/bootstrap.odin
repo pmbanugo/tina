@@ -110,21 +110,21 @@ tina_start :: proc(spec: ^SystemSpec) {
 	// 2. Allocate SPSC ring buffers (outside Grand Arena)
 	spsc_memory_size: int = 0
 
-	for src in 0 ..< spec.shard_count {
-		for dst in 0 ..< spec.shard_count {
+	for source in 0 ..< spec.shard_count {
+		for target in 0 ..< spec.shard_count {
 			// Shards don't talk to themselves via SPSC rings
-			if src == dst do continue
+			if source == target do continue
 
-			ring_count := ring_counts[src][dst]
+			ring_count := ring_counts[source][target]
 			if ring_count == 0 do continue
 
 			ring_memory_size := size_of(SPSC_Ring) + int(ring_count) * size_of(Message_Envelope)
 			spsc_memory_size += ring_memory_size
 
-			// TODO (Production): mbind to the writer's (src) NUMA node here.
+			// TODO (Production): mbind to the writer's (source) NUMA node here.
 			raw_mem, alloc_err := os_reserve_arena_with_guard(uint(ring_memory_size))
 			if alloc_err != .None {
-				fmt.eprintfln("[FATAL] Failed to allocate SPSC ring %v->%v", src, dst)
+				fmt.eprintfln("[FATAL] Failed to allocate SPSC ring %v->%v", source, target)
 				os.exit(1)
 			}
 
@@ -134,10 +134,10 @@ tina_start :: proc(spec: ^SystemSpec) {
 				size_of(SPSC_Ring))
 			spsc_ring_init(ring, u64(ring_count), buffer_ptr[:ring_count])
 
-			os_apply_memory_policy(raw_mem, i32(src), spec.memory_init_mode)
+			os_apply_memory_policy(raw_mem, i32(source), spec.memory_init_mode)
 			// Wire directly into the pre-allocated configs
-			shard_configs[src].outbound_rings[dst] = ring
-			shard_configs[dst].inbound_rings[src] = ring
+			shard_configs[source].outbound_rings[target] = ring
+			shard_configs[target].inbound_rings[source] = ring
 		}
 	}
 
@@ -271,17 +271,17 @@ when ODIN_OS ==
 	// --- Async-Signal-Safe Helpers (write(2) only, no fmt/allocator/runtime) ---
 
 	@(private = "file")
-	_sig_append_str :: proc "contextless" (dst: []u8, pos: int, src: string) -> int {
-		n := min(len(dst) - pos, len(src))
-		for i in 0 ..< n do dst[pos + i] = src[i]
+	_sig_append_str :: proc "contextless" (target: []u8, pos: int, source: string) -> int {
+		n := min(len(target) - pos, len(source))
+		for i in 0 ..< n do target[pos + i] = source[i]
 		return pos + n
 	}
 
 	@(private = "file")
-	_sig_append_u64 :: proc "contextless" (dst: []u8, pos: int, value: u64) -> int {
-		if pos >= len(dst) do return pos
+	_sig_append_u64 :: proc "contextless" (target: []u8, pos: int, value: u64) -> int {
+		if pos >= len(target) do return pos
 		if value == 0 {
-			dst[pos] = '0'
+			target[pos] = '0'
 			return pos + 1
 		}
 		tmp: [20]u8
@@ -292,9 +292,9 @@ when ODIN_OS ==
 			v /= 10
 			n += 1
 		}
-		written := min(n, len(dst) - pos)
+		written := min(n, len(target) - pos)
 		for i in 0 ..< written {
-			dst[pos + i] = tmp[n - 1 - i]
+			target[pos + i] = tmp[n - 1 - i]
 		}
 		return pos + written
 	}

@@ -111,47 +111,47 @@ when TINA_SIMULATION_MODE {
 	// Enqueue: Called by Source Shard
 	sim_network_enqueue :: proc(
 		net: ^SimulatedNetwork,
-		src_shard: ^Shard,
-		dst: u16,
+		source_shard: ^Shard,
+		target: u16,
 		envelope: Message_Envelope,
 		current_tick: u64,
 		fault_config: ^FaultConfig,
 	) {
-		src := src_shard.id
+		source := source_shard.id
 
 		// 1. Partition Check
-		if shard_mask_contains(net.partition_matrix[src], dst) {
-			src_shard.counters.quarantine_drops += 1
+		if shard_mask_contains(net.partition_matrix[source], target) {
+			source_shard.counters.quarantine_drops += 1
 			return
 		}
 
 		// 2. Probabilistic Drop Check
 		if ratio_chance(fault_config.network_drop_rate, net.drop_prng) {
-			src_shard.counters.ring_full_drops += 1 // Logically identical to physical drop
+			source_shard.counters.ring_full_drops += 1 // Logically identical to physical drop
 			return
 		}
 
 		// 3. Capacity Check (Simulates SPSC ring full)
-		channel := &net.channels[src][dst]
+		channel := &net.channels[source][target]
 		delayed_env := DelayedEnvelope {
 			envelope   = envelope,
 			deliver_at = current_tick + u64(channel.delay_ticks),
 		}
 
 		if delay_queue_push(&channel.delay_queue, delayed_env) == .Full {
-			src_shard.counters.ring_full_drops += 1
+			source_shard.counters.ring_full_drops += 1
 		}
 	}
 
 	// Drain: Called by Destination Shard (Step 1 drain)
 	sim_network_drain :: proc(
 		net: ^SimulatedNetwork,
-		dst_shard: ^Shard,
-		src: u16,
+		target_shard: ^Shard,
+		source: u16,
 		current_tick: u64,
 	) {
-		dst := dst_shard.id
-		channel := &net.channels[src][dst]
+		target := target_shard.id
+		channel := &net.channels[source][target]
 
 		for {
 			peeked, ok := delay_queue_peek(&channel.delay_queue)
@@ -161,9 +161,9 @@ when TINA_SIMULATION_MODE {
 
 			item, _ := delay_queue_pop(&channel.delay_queue)
 
-			res := _enqueue_user_msg(dst_shard, item.envelope.destination, &item.envelope)
+			res := _enqueue_user_msg(target_shard, item.envelope.destination, &item.envelope)
 			if res == .mailbox_full {
-				dst_shard.counters.mailbox_full_drops += 1
+				target_shard.counters.mailbox_full_drops += 1
 			}
 		}
 	}
@@ -181,16 +181,16 @@ when TINA_SIMULATION_MODE {
 		// 1. Heal existing partitions probabilistically
 		heal_rate := engine.fault_config.network_partition_heal_rate
 		if heal_rate.numerator > 0 {
-			for src in 0 ..< engine.shard_count {
-				mask := engine.network.partition_matrix[src]
+			for source in 0 ..< engine.shard_count {
+				mask := engine.network.partition_matrix[source]
 				for id in mask.lo {
 					if ratio_chance(heal_rate, engine.partition_prng) {
-						shard_mask_exclude(&engine.network.partition_matrix[src], u16(id))
+						shard_mask_exclude(&engine.network.partition_matrix[source], u16(id))
 					}
 				}
 				for id in mask.hi {
 					if ratio_chance(heal_rate, engine.partition_prng) {
-						shard_mask_exclude(&engine.network.partition_matrix[src], u16(id) + 128)
+						shard_mask_exclude(&engine.network.partition_matrix[source], u16(id) + 128)
 					}
 				}
 			}
@@ -214,22 +214,22 @@ when TINA_SIMULATION_MODE {
 		range := engine.fault_config.network_delay_range_ticks
 		if range[1] > 0 {
 			diff := range[1] - range[0]
-			for src in 0 ..< engine.shard_count {
-				src_channels := engine.network.channels[src]
-				for dst in 0 ..< engine.shard_count {
-					if src != dst {
-						src_channels[dst].delay_ticks =
+			for source in 0 ..< engine.shard_count {
+				source_channels := engine.network.channels[source]
+				for target in 0 ..< engine.shard_count {
+					if source != target {
+						source_channels[target].delay_ticks =
 							range[0] + prng_uint_less_than(engine.partition_prng, diff + 1)
 					}
 				}
 			}
 		} else {
 			// Fast path for 0-delay simulation
-			for src in 0 ..< engine.shard_count {
-				src_channels := engine.network.channels[src]
-				for dst in 0 ..< engine.shard_count {
-					if src != dst {
-						src_channels[dst].delay_ticks = 0
+			for source in 0 ..< engine.shard_count {
+				source_channels := engine.network.channels[source]
+				for target in 0 ..< engine.shard_count {
+					if source != target {
+						source_channels[target].delay_ticks = 0
 					}
 				}
 			}

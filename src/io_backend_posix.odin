@@ -121,10 +121,10 @@ when !TINA_SIMULATION_MODE {
 		Backend_Error,
 	) {
 		out: u32 = 0
-		max_out := u32(len(completions))
+		output_max := u32(len(completions))
 
 		// Drain immediate completions first.
-		for backend.completed_read < backend.completed_count && out < max_out {
+		for backend.completed_read < backend.completed_count && out < output_max {
 			completions[out] = backend.completed[backend.completed_read]
 			backend.completed_read += 1
 			out += 1
@@ -136,7 +136,7 @@ when !TINA_SIMULATION_MODE {
 			backend.completed_read = 0
 		}
 
-		if out >= max_out {
+		if out >= output_max {
 			return out, .None
 		}
 
@@ -154,10 +154,10 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		events_buf: [128]kq.KEvent
-		remaining := int(max_out - out)
-		buf_len := min(remaining, len(events_buf))
+		remaining := int(output_max - out)
+		buffer_size := min(remaining, len(events_buf))
 
-		n, kerr := kq.kevent(kq.KQ(backend.kq_fd), nil, events_buf[:buf_len], ts_ptr)
+		n, kerr := kq.kevent(kq.KQ(backend.kq_fd), nil, events_buf[:buffer_size], ts_ptr)
 		if kerr != nil {
 			if kerr == .EINTR {
 				return out, .None
@@ -173,7 +173,7 @@ when !TINA_SIMULATION_MODE {
 				continue
 			}
 
-			if out >= max_out {
+			if out >= output_max {
 				break
 			}
 
@@ -621,10 +621,10 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_remove_pending :: proc(backend: ^Platform_Backend, idx: u16) {
+	_remove_pending :: proc(backend: ^Platform_Backend, index: u16) {
 		backend.pending_count -= 1
-		if idx < backend.pending_count {
-			backend.pending[idx] = backend.pending[backend.pending_count]
+		if index < backend.pending_count {
+			backend.pending[index] = backend.pending[backend.pending_count]
 		}
 	}
 

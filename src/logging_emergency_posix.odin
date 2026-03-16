@@ -19,10 +19,10 @@ _write_stderr :: proc "contextless" (data: []u8) {
 }
 
 @(private = "package")
-_ring_copy_raw :: proc "contextless" (ring: ^Log_Ring_Buffer, offset: u64, dst: []u8) {
-	for i in 0 ..< len(dst) {
-		idx := (offset + u64(i)) & ring.capacity_mask
-		dst[i] = ring.buffer[idx]
+_ring_copy_raw :: proc "contextless" (ring: ^Log_Ring_Buffer, offset: u64, target: []u8) {
+	for i in 0 ..< len(target) {
+		index := (offset + u64(i)) & ring.capacity_mask
+		target[i] = ring.buffer[index]
 	}
 }
 
@@ -49,9 +49,9 @@ emergency_log_flush_signal :: proc "contextless" (shard: ^Shard) {
 		payload_size := _u16_from_le_bytes(header_bytes[16], header_bytes[17])
 		if payload_size > u16(MAX_PAYLOAD_SIZE) do break
 
-		record_len := header_size + u64((payload_size + 7) & ~u16(7))
-		if record_len > (ring.capacity_mask + 1) do break
-		if limit - cursor < record_len do break
+		record_size := header_size + u64((payload_size + 7) & ~u16(7))
+		if record_size > (ring.capacity_mask + 1) do break
+		if limit - cursor < record_size do break
 
 		// Write payload bytes to stderr in chunks
 		payload_remaining := int(payload_size)
@@ -66,7 +66,7 @@ emergency_log_flush_signal :: proc "contextless" (shard: ^Shard) {
 		}
 		_write_stderr({'\n'})
 
-		cursor += record_len
+		cursor += record_size
 	}
 
 	ring.read_cursor = cursor
@@ -87,9 +87,9 @@ emergency_log_flush_snapshot :: proc "contextless" (shard: ^Shard) {
 		payload_size := _u16_from_le_bytes(header_bytes[16], header_bytes[17])
 		if payload_size > MAX_PAYLOAD_SIZE do break
 
-		record_len := header_size + u64((payload_size + 7) & ~u16(7))
-		if record_len > (ring.capacity_mask + 1) do break
-		if limit - cursor < record_len do break
+		record_size := header_size + u64((payload_size + 7) & ~u16(7))
+		if record_size > (ring.capacity_mask + 1) do break
+		if limit - cursor < record_size do break
 
 		payload_remaining := int(payload_size)
 		payload_offset := cursor + header_size
@@ -103,7 +103,7 @@ emergency_log_flush_snapshot :: proc "contextless" (shard: ^Shard) {
 		}
 		_write_stderr({'\n'})
 
-		cursor += record_len
+		cursor += record_size
 	}
 	// NOTE: Does NOT update ring.read_cursor — non-destructive snapshot.
 }

@@ -144,12 +144,12 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		// Harvest CQEs
-		max_cqes := u32(len(completions))
-		if max_cqes > 256 {
-			max_cqes = 256
+		cqes_max := u32(len(completions))
+		if cqes_max > 256 {
+			cqes_max = 256
 		}
 		cqes: [256]linux.IO_Uring_CQE = ---
-		completed, cqe_err := uring.copy_cqes(&backend.ring, cqes[:max_cqes], 0)
+		completed, cqe_err := uring.copy_cqes(&backend.ring, cqes[:cqes_max], 0)
 		if cqe_err != nil && cqe_err != .NONE && cqe_err != .EINTR {
 			return 0, .System_Error
 		}

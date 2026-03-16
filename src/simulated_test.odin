@@ -190,7 +190,7 @@ when TINA_SIMULATION_MODE {
 
 		sim_config := SimulationConfig {
 			seed                   = 0x1234567890ABCDEF,
-			max_ticks              = 10_000,
+			ticks_max              = 10_000,
 			terminate_on_quiescent = true,
 			checker_interval_ticks = 100,
 		}
@@ -357,7 +357,7 @@ when TINA_SIMULATION_MODE {
 
 		sim_config := SimulationConfig {
 			seed                   = 0xDEADBEEF,
-			max_ticks              = 100,
+			ticks_max              = 100,
 			terminate_on_quiescent = true,
 		}
 

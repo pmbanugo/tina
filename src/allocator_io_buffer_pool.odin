@@ -76,11 +76,11 @@ reactor_buffer_pool_slot_ptr :: #force_inline proc(pool: ^Reactor_Buffer_Pool, i
 }
 
 // Get a read-only slice of the buffer data for a completed read.
-reactor_buffer_pool_read_slice :: proc(pool: ^Reactor_Buffer_Pool, index: u16, length: u32) ->[]u8 {
+reactor_buffer_pool_read_slice :: proc(pool: ^Reactor_Buffer_Pool, index: u16, size: u32) ->[]u8 {
     assert(index < pool.slot_count, "buffer index out of bounds")
     ptr := _buffer_pool_slot_ptr(pool, index)
-    actual_length := min(length, pool.slot_size)
-    return ptr[:actual_length]
+    actual_size := min(size, pool.slot_size)
+    return ptr[:actual_size]
 }
 
 // Copy payload from an Isolate's struct into a buffer slot (copy-on-submit for writes).
@@ -88,9 +88,9 @@ reactor_buffer_pool_copy_in :: proc(pool: ^Reactor_Buffer_Pool, index: u16, sour
     assert(index < pool.slot_count, "buffer index out of bounds")
     assert(payload_size <= pool.slot_size, "payload exceeds slot size")
 
-    dst := _buffer_pool_slot_ptr(pool, index)
-    mem.copy(dst, source, int(payload_size))
-    return dst
+    target := _buffer_pool_slot_ptr(pool, index)
+    mem.copy(target, source, int(payload_size))
+    return target
 }
 
 @(private = "file")
@@ -122,10 +122,10 @@ test_reactor_buffer_pool_alloc_free :: proc(t: ^testing.T) {
 
 	indices: [8]u16
 	for i in 0..<8 {
-		idx, err := reactor_buffer_pool_alloc(&pool)
+		index, err := reactor_buffer_pool_alloc(&pool)
 		testing.expect_value(t, err, Buffer_Pool_Error.None)
-		testing.expect(t, idx != BUFFER_INDEX_NONE, "should get valid index")
-		indices[i] = idx
+		testing.expect(t, index != BUFFER_INDEX_NONE, "should get valid index")
+		indices[i] = index
 	}
 	testing.expect_value(t, pool.free_count, 0)
 

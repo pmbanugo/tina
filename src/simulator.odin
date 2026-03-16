@@ -121,13 +121,13 @@ when TINA_SIMULATION_MODE {
 		)
 
 		round: u64 = 0
-		max_ticks := sim.spec.simulation.max_ticks
+		ticks_max := sim.spec.simulation.ticks_max
 
 		// Pre-allocate array for shuffled shard execution order
 		order := make([]u16, sim.spec.shard_count, context.temp_allocator)
 		for i in 0 ..< sim.spec.shard_count do order[i] = u16(i)
 
-		for round < max_ticks {
+		for round < ticks_max {
 			// 1. Advance simulated time globally & Fast-Forward Logic
 			if sim.spec.simulation.terminate_on_quiescent && simulator_is_globally_idle(sim) {
 				earliest_deadline: u64 = max(u64)

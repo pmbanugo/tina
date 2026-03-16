@@ -124,11 +124,11 @@ hydrate_shard :: proc(
 	shard: ^Shard,
 ) -> mem.Allocator_Error {
 	// 1. Allocate the tracking array FOR the arena, FROM the arena!
-	max_regions := compute_max_sub_regions(spec)
-	tracker_size := max_regions * size_of(SubRegion)
+	regions_max := compute_max_sub_regions(spec)
+	tracker_size := regions_max * size_of(SubRegion)
 	tracker_ptr := grand_arena_alloc_named(arena, "Arena_Regions_Tracker", tracker_size) or_return
 
-	arena.regions = (cast([^]SubRegion)tracker_ptr)[:max_regions]
+	arena.regions = (cast([^]SubRegion)tracker_ptr)[:regions_max]
 	arena.regions[0] = SubRegion{"Arena_Regions_Tracker", 0, tracker_size}
 	arena.region_count = 1
 
@@ -294,7 +294,7 @@ test_grand_arena :: proc(t: ^testing.T) {
 			stride = 64,
 			soa_metadata_size = size_of(Isolate_Metadata),
 			working_memory_size = 0,
-			max_scratch_requirement = 0,
+			scratch_requirement_max = 0,
 		},
 	}
 	REACTOR_SLOTS :: 4
