@@ -189,7 +189,7 @@ when TINA_SIMULATION_MODE {
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		sim_config := SimulationConfig {
-			seed                   = 0x1234567890ABCDEF,
+			seed                   = t.seed,
 			ticks_max              = 10_000,
 			terminate_on_quiescent = true,
 			checker_interval_ticks = 100,
@@ -356,7 +356,7 @@ when TINA_SIMULATION_MODE {
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		sim_config := SimulationConfig {
-			seed                   = 0xDEADBEEF,
+			seed                   = t.seed,
 			ticks_max              = 100,
 			terminate_on_quiescent = true,
 		}
