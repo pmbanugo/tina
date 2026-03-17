@@ -16,6 +16,8 @@ TypeDescriptor :: struct {
 	soa_metadata_size:       int,
 	working_memory_size:     int,
 	scratch_requirement_max: int,
+	mailbox_capacity:        u16, // Mailbox capacity (default: 256). TODO: rename to mailbox_capacity?
+	budget_weight:           u16, // (default: 1)
 	init_fn:                 Init_Fn,
 	handler_fn:              Handler_Fn,
 }

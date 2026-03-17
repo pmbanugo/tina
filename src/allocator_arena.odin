@@ -96,7 +96,7 @@ grand_arena_allocator_proc :: proc(
 	data := cast(^Grand_Arena_Allocator_Data)allocator_data
 	switch mode {
 	case .Alloc:
-		// Enforce cache-line alignment to prevent false sharing between sub-regions (ADR §6.9 §5)
+		// Enforce cache-line alignment to prevent false sharing between sub-regions
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
 		ptr, err := grand_arena_alloc_named(data.arena, data.current_name, size, actual_alignment)
 		if err != .None do return nil, err
@@ -144,6 +144,8 @@ hydrate_shard :: proc(
 		shard.timer_resolution_ns = 1_048_576 // Default to ~1ms (power-of-2). Later I can experiement with 524,288 (~500ns)
 	} else {shard.timer_resolution_ns = spec.timer_resolution_ns}
 
+	shard.peer_alive_mask = {~u64(0), ~u64(0), ~u64(0), ~u64(0)} // All peers alive by default
+
 	// 2. Allocate the Slice Headers
 	alloc_data.current_name = "Slice_Headers"
 	shard.type_descriptors = make([]TypeDescriptor, types_count, alloc)
@@ -154,31 +156,36 @@ hydrate_shard :: proc(
 
 	// 3. Allocate Type-Specific Data (Inner slices)
 	for t, i in spec.types {
-		shard.type_descriptors[i] = t
+		// Apply defaults at startup
+		desc := t
+		if desc.budget_weight == 0 do desc.budget_weight = 1
+		if desc.mailbox_capacity == 0 do desc.mailbox_capacity = 256
+
+		shard.type_descriptors[i] = desc
 		shard.isolate_free_heads[i] = POOL_NONE_INDEX // Initialize
 
-		if t.slot_count > 0 && t.stride > 0 {
-			alloc_data.current_name = fmt.tprintf("Typed_Arena_%d", t.id)
-			shard.isolate_memory[i] = make([]u8, t.slot_count * t.stride, alloc)
+		if desc.slot_count > 0 && desc.stride > 0 {
+			alloc_data.current_name = fmt.tprintf("Typed_Arena_%d", desc.id)
+			shard.isolate_memory[i] = make([]u8, desc.slot_count * desc.stride, alloc)
 		}
 
-		aligned_count := _aligned_capacity(t.slot_count)
+		aligned_count := _aligned_capacity(desc.slot_count)
 		if aligned_count > 0 {
-			alloc_data.current_name = fmt.tprintf("SOA_Metadata_%d", t.id)
+			alloc_data.current_name = fmt.tprintf("SOA_Metadata_%d", desc.id)
 			shard.metadata[i] = make(#soa[]Isolate_Metadata, aligned_count, alloc)
 
 			// Build the intrusive free list for this Type Arena
 			// We iterate backwards so slot 0 is at the head of the free list
-			for slot := int(t.slot_count) - 1; slot >= 0; slot -= 1 {
+			for slot := int(desc.slot_count) - 1; slot >= 0; slot -= 1 {
 				shard.metadata[i][slot].inbox_head = shard.isolate_free_heads[i]
 				shard.metadata[i][slot].state = .Unallocated
 				shard.metadata[i][slot].generation = 1 // Enforce ADR rule: generations start at 1
 				shard.isolate_free_heads[i] = u32(slot)
 			}
 		}
-		if t.working_memory_size > 0 {
-			alloc_data.current_name = fmt.tprintf("Working_Memory_%d", t.id)
-			shard.working_memory[i] = make([]u8, t.slot_count * t.working_memory_size, alloc)
+		if desc.working_memory_size > 0 {
+			alloc_data.current_name = fmt.tprintf("Working_Memory_%d", desc.id)
+			shard.working_memory[i] = make([]u8, desc.slot_count * desc.working_memory_size, alloc)
 		}
 	}
 

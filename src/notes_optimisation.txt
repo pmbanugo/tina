@@ -5,3 +5,4 @@ Considerations to consider in the future
 - some functions should be marked as private to the package (or file)
 - Other expressions to consider
     - #bounds_check and #no_bounds_check
+- are there places I can use intrinsics to make the compiler do certain things?

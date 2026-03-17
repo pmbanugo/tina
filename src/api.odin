@@ -155,3 +155,11 @@ make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8
 	mem.copy(&buf[0], args, size_of(T))
 	return buf, u8(size_of(T))
 }
+
+// Consistent key-based partitioning utility
+// NOTE: `shard_count` is u16 because the maximum number of shards is 256,
+// which overflows a u8. The result of (key % 256) is guaranteed to be in the
+// range [0, 255], so it safely truncates back to a u8 without data loss.
+key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u16) -> u8 {
+	return u8(key % u64(shard_count))
+}

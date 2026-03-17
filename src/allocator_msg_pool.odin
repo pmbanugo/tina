@@ -50,10 +50,8 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 
 	// Intrusive push. Slot 0 at the head for sequential cache warmth.
 	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
-		// Bit-shift multiplication: index << shift
-		ptr := &p.buffer[u32(i) << p.slot_shift]
-
-		(cast(^u32)ptr)^ = p.free_head
+		ptr := cast(^Message_Envelope)&p.buffer[u32(i) << p.slot_shift]
+		ptr.next_in_mailbox = p.free_head
 		p.free_head = u32(i)
 		p.free_count += 1
 	}
@@ -62,11 +60,9 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 @(private = "file")
 _pool_alloc_unchecked :: #force_inline proc(p: ^Message_Pool) -> u32 {
 	slot_index := p.free_head
-	ptr := &p.buffer[slot_index << p.slot_shift]
-
-	p.free_head = (cast(^u32)ptr)^
+	ptr := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
+	p.free_head = ptr.next_in_mailbox
 	p.free_count -= 1
-
 	mem.zero(ptr, int(p.slot_size))
 	return slot_index
 }
@@ -86,10 +82,9 @@ pool_alloc_system :: #force_inline proc(p: ^Message_Pool) -> (u32, Pool_Error) {
 // Frees a slot by its index. O(1).
 pool_free :: proc(p: ^Message_Pool, index: u32) {
 	assert(index < p.slot_count, "Message pool free index out of bounds")
-
-	ptr := &p.buffer[index << p.slot_shift]
-	// Intrusive push back onto the free list
-	(cast(^u32)ptr)^ = p.free_head
+	ptr := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+	// Type-aware intrusive push back onto the free list
+	ptr.next_in_mailbox = p.free_head
 	p.free_head = index
 	p.free_count += 1
 }

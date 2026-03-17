@@ -5,6 +5,9 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:sync"
+import "core:testing"
+
+DISPATCH_QUOTA_PER_WEIGHT :: 256 // Baseline message processing limit per tick, per priority weight
 
 // --- Trap Boundary Platform Bindings ---
 
@@ -197,6 +200,7 @@ Shard :: struct {
 	current_slot_index:   u32,
 	id:                   u16,
 	current_type_id:      u16,
+	peer_alive_mask:      Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
 	control_signal:       Control_Signal, // Atomic, mutually exclusive signals from watchdog
 	_padding:             [5]u8,
 	shared_state:         ^u8, // Points to external shared state (config or simulator backing)
@@ -286,19 +290,29 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	when !TINA_SIMULATION_MODE {
 		if len(shard.inbound_rings) > 0 {
-			for ring in shard.inbound_rings {
+			for ring, source_shard in shard.inbound_rings {
 				if ring == nil do continue
 
 				available := spsc_ring_available_to_read(ring)
 				for i in 0 ..< available {
 					envelope := spsc_ring_get_read_ptr(ring, i)
-					res := _enqueue_user_msg(shard, envelope.destination, envelope)
-
-					if res == .mailbox_full {
-						shard.counters.mailbox_full_drops += 1
-					} else if res == .stale_handle {
-						shard.counters.stale_delivery_drops += 1
+					// System Broadcast Intercept
+					if envelope.destination == HANDLE_NONE {
+						if envelope.tag == TAG_SHARD_RESTARTED {
+							// Peer recovered, un-quarantine it
+							shard_mask_include(&shard.peer_alive_mask, u16(source_shard))
+							// NOTE (§7.5.4): We could optionally perform an O(N) scan of
+							// all local Isolates here to "fast-fail" any pending .call requests to this
+							// restarted shard (since we know they are now stale). For now, we rely on
+							// the Timer Wheel timeouts to naturally wake and fail the callers.
+						} else if envelope.tag == TAG_SHARD_QUARANTINED {
+							// Peer died, quarantine it
+							shard_mask_exclude(&shard.peer_alive_mask, u16(source_shard))
+							// NOTE: Same concern as above if-block. Pending calls will naturally time out.
+						}
+						continue
 					}
+					_ = _enqueue_user_msg(shard, envelope.destination, envelope)
 				}
 
 				if available > 0 {
@@ -341,6 +355,10 @@ scheduler_tick :: proc(shard: ^Shard) {
 		working_arena_offsets := shard.metadata[type_id].working_arena_offset[:]
 		pending_transfer_reads := shard.metadata[type_id].pending_transfer_read[:]
 
+		// Determine dynamic budget for this type batch
+		dispatch_budget := u32(type_descriptor.budget_weight) * DISPATCH_QUOTA_PER_WEIGHT
+		dispatched_count: u32 = 0
+
 		shard.current_type_id = u16(type_id)
 		start_slot: u32 = 0
 
@@ -353,7 +371,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 			start_slot = shard.current_slot_index + 1
 		}
 
-		for slot in start_slot ..< slot_count {
+		slot_loop: for slot in start_slot ..< slot_count {
 			state := states[slot]
 
 			// FAST-PATH REJECT: If empty, skip immediately.
@@ -367,6 +385,9 @@ scheduler_tick :: proc(shard: ^Shard) {
 				(.Shutdown_Pending in flags[slot])
 
 			if has_work {
+				if dispatched_count >= dispatch_budget do break slot_loop // Type budget exhausted, yield
+				dispatched_count += 1
+
 				shard.current_slot_index = slot
 				shard.current_msg_slot = POOL_NONE_INDEX
 
@@ -516,7 +537,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 // --- Active Operations ---
 
 ctx_send :: proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, payload: []u8) -> Send_Result {
-	if len(payload) > MAX_PAYLOAD_SIZE {return .pool_exhausted}
+	assert(len(payload) <= MAX_PAYLOAD_SIZE, "Payload exceeds MAX_PAYLOAD_SIZE")
 
 	envelope: Message_Envelope
 	envelope.source = ctx.self_handle
@@ -526,9 +547,6 @@ ctx_send :: proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, payload: []u8)
 	copy(envelope.payload[:], payload)
 
 	response := _route_envelope_user(ctx.shard, to, &envelope)
-	if response == .mailbox_full {
-		ctx_log(ctx, .WARN, LOG_TAG_IO_EXHAUSTION, transmute([]u8)string("Mailbox full"))
-	}
 	return response
 }
 
@@ -960,15 +978,26 @@ _route_envelope_internal :: #force_inline proc(
 		return _enqueue_internal(shard, to, envelope, is_user)
 	} else {
 		when !TINA_SIMULATION_MODE {
+			if !shard_mask_contains(&shard.peer_alive_mask, destination) {
+				shard.counters.quarantine_drops += 1
+				return .stale_handle
+			}
+
 			ring := shard.outbound_rings[destination]
-			if ring == nil do return .stale_handle
+			if ring == nil {
+				shard.counters.stale_delivery_drops += 1
+				return .stale_handle
+			}
 			if spsc_ring_enqueue(ring, envelope) == .Full {
 				shard.counters.ring_full_drops += 1
 				return .mailbox_full
 			}
 			return .ok
 		} else {
-
+			if !shard_mask_contains(&shard.peer_alive_mask, destination) {
+				shard.counters.quarantine_drops += 1
+				return .stale_handle
+			}
 			if shard.sim_state.outbound_count < len(shard.sim_state.outbound_staging) {
 				shard.sim_state.outbound_staging[shard.sim_state.outbound_count] = envelope^
 				shard.sim_state.outbound_count += 1
@@ -1010,20 +1039,29 @@ _enqueue_internal :: #force_inline proc(
 	slot := extract_slot(to)
 	soa_meta := shard.metadata[type_id]
 
-	if soa_meta[slot].generation != extract_generation(to) {return .stale_handle}
+	if soa_meta[slot].generation != extract_generation(to) {
+		shard.counters.stale_delivery_drops += 1
+		return .stale_handle
+	}
 
 	is_reply := .Is_Reply in envelope.flags
 	is_timeout := envelope.tag == TAG_CALL_TIMEOUT
 
 	if is_reply || is_timeout {
-		if soa_meta[slot].state != .Waiting_For_Reply {return .stale_handle}
-		if soa_meta[slot].pending_correlation != envelope.correlation {return .stale_handle}
+		if soa_meta[slot].state != .Waiting_For_Reply ||
+		   soa_meta[slot].pending_correlation != envelope.correlation {
+			shard.counters.stale_delivery_drops += 1
+			return .stale_handle
+		}
 
 		soa_meta[slot].pending_correlation = 0
 		soa_meta[slot].state = .Runnable
 	}
 
-	if soa_meta[slot].inbox_count >= 256 {return .mailbox_full}
+	if soa_meta[slot].inbox_count >= shard.type_descriptors[type_id].mailbox_capacity {
+		shard.counters.mailbox_full_drops += 1
+		return .mailbox_full
+	}
 
 	pool_index: u32
 	err: Pool_Error
@@ -1036,7 +1074,10 @@ _enqueue_internal :: #force_inline proc(
 		pool_index, err = pool_alloc_system(&shard.message_pool)
 	}
 
-	if err != .None {return .pool_exhausted}
+	if err != .None {
+		shard.counters.pool_exhaustion_drops += 1
+		return .pool_exhausted
+	}
 
 	envelope_destination := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, pool_index)
 	envelope_destination^ = envelope^
@@ -1112,19 +1153,42 @@ _interpret_effect :: proc(
 	case Effect_Call:
 		shard.next_correlation_id += 1
 		if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
-		corr := shard.next_correlation_id
+		correlation_id := shard.next_correlation_id
 
-		soa_meta[slot].pending_correlation = corr
+		// Quarantine Fast-Fail Check (§6.4.5.4 Step 4b)
+		destination_shard := extract_shard_id(e.to)
+		if destination_shard != shard.id &&
+		   !shard_mask_contains(&shard.peer_alive_mask, destination_shard) {
+			// Target is dead. Abort .call setup and fast-fail with an immediate timeout.
+			timeout_env: Message_Envelope
+			timeout_env.source = HANDLE_NONE
+			timeout_env.destination = ctx.self_handle
+			timeout_env.tag = TAG_CALL_TIMEOUT
+			timeout_env.correlation = correlation_id
+
+			_enqueue_system_msg(shard, ctx.self_handle, &timeout_env)
+			soa_meta[slot].state = .Runnable
+			shard.counters.quarantine_drops += 1
+			return
+		}
+
+		soa_meta[slot].pending_correlation = correlation_id
 		soa_meta[slot].state = .Waiting_For_Reply
 
 		timeout_ticks := (e.timeout + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
-		_register_system_timer(shard, ctx.self_handle, timeout_ticks, TAG_CALL_TIMEOUT, corr)
+		_register_system_timer(
+			shard,
+			ctx.self_handle,
+			timeout_ticks,
+			TAG_CALL_TIMEOUT,
+			correlation_id,
+		)
 
 		local_msg := e.message // Make "e.message" it addressable
 		envelope: Message_Envelope
 		envelope.source = ctx.self_handle
 		envelope.destination = e.to
-		envelope.correlation = corr
+		envelope.correlation = correlation_id
 		envelope.flags += {.Is_Call}
 		envelope.tag = local_msg.tag
 		envelope.payload_size = local_msg.body.user.payload_size
@@ -1564,6 +1628,21 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	shard.next_correlation_id = 0
 	// Control Signal reset
 	sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(Control_Signal.None), .Relaxed)
+
+	// Step 6: Notify peers via SHARD_RESTARTED
+	for outbound_ring, destination_shard in shard.outbound_rings {
+		if outbound_ring != nil {
+			env: Message_Envelope
+			env.source = HANDLE_NONE // System message
+			// We don't have a specific destination isolate, the receiving Shard's
+			// scheduler will intercept this before mailbox delivery.
+			env.destination = HANDLE_NONE
+			env.tag = TAG_SHARD_RESTARTED
+
+			spsc_ring_enqueue(outbound_ring, &env)
+		}
+	}
+
 
 	// SAFETY: We use a dummy allocator that panics on allocation to prove that
 	// Level 2 Recovery NEVER touches the OS or the Grand Arena. It relies purely on

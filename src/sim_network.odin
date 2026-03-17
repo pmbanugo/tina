@@ -2,27 +2,6 @@ package tina
 import "core:mem"
 
 when TINA_SIMULATION_MODE {
-
-	// 256-bit mask split into two 128-bit halves (Odin bit_set max is 128 bits).
-	// lo covers shard IDs 0–127, hi covers 128–255 (stored as id - 128).
-	Shard_Mask :: struct {
-		lo: bit_set[0 ..= 127],
-		hi: bit_set[0 ..= 127],
-	}
-
-	shard_mask_contains :: proc(m: Shard_Mask, id: u16) -> bool {
-		if id < 128 {return int(id) in m.lo}
-		return int(id - 128) in m.hi
-	}
-
-	shard_mask_include :: proc(m: ^Shard_Mask, id: u16) {
-		if id < 128 {m.lo += {int(id)}} else {m.hi += {int(id - 128)}}
-	}
-
-	shard_mask_exclude :: proc(m: ^Shard_Mask, id: u16) {
-		if id < 128 {m.lo -= {int(id)}} else {m.hi -= {int(id - 128)}}
-	}
-
 	// --- Delay Queue (Bounded FIFO) ---
 
 	DelayedEnvelope :: struct {
@@ -120,7 +99,7 @@ when TINA_SIMULATION_MODE {
 		source := source_shard.id
 
 		// 1. Partition Check
-		if shard_mask_contains(net.partition_matrix[source], target) {
+		if shard_mask_contains(&net.partition_matrix[source], target) {
 			source_shard.counters.quarantine_drops += 1
 			return
 		}
@@ -162,9 +141,6 @@ when TINA_SIMULATION_MODE {
 			item, _ := delay_queue_pop(&channel.delay_queue)
 
 			res := _enqueue_user_msg(target_shard, item.envelope.destination, &item.envelope)
-			if res == .mailbox_full {
-				target_shard.counters.mailbox_full_drops += 1
-			}
 		}
 	}
 
@@ -182,15 +158,11 @@ when TINA_SIMULATION_MODE {
 		heal_rate := engine.fault_config.network_partition_heal_rate
 		if heal_rate.numerator > 0 {
 			for source in 0 ..< engine.shard_count {
-				mask := engine.network.partition_matrix[source]
-				for id in mask.lo {
-					if ratio_chance(heal_rate, engine.partition_prng) {
-						shard_mask_exclude(&engine.network.partition_matrix[source], u16(id))
-					}
-				}
-				for id in mask.hi {
-					if ratio_chance(heal_rate, engine.partition_prng) {
-						shard_mask_exclude(&engine.network.partition_matrix[source], u16(id) + 128)
+				for id in 0 ..< engine.shard_count {
+					if shard_mask_contains(&engine.network.partition_matrix[source], id) {
+						if ratio_chance(heal_rate, engine.partition_prng) {
+							shard_mask_exclude(&engine.network.partition_matrix[source], id)
+						}
 					}
 				}
 			}

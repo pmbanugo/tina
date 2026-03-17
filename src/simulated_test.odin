@@ -409,5 +409,4 @@ when TINA_SIMULATION_MODE {
 		bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[0]
 		testing.expect_value(t, bystander_state, Isolate_State.Waiting)
 	}
-
 }
