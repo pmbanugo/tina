@@ -58,7 +58,7 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 }
 
 @(private = "file")
-_pool_alloc_unchecked :: #force_inline proc(p: ^Message_Pool) -> u32 {
+_pool_alloc_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool) -> u32 {
 	slot_index := p.free_head
 	ptr := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
 	p.free_head = ptr.next_in_mailbox
@@ -68,13 +68,13 @@ _pool_alloc_unchecked :: #force_inline proc(p: ^Message_Pool) -> u32 {
 }
 
 // User traffic Path (Respects High-Water Mark)
-pool_alloc_user :: #force_inline proc(p: ^Message_Pool) -> (u32, Pool_Error) {
+pool_alloc_user :: #force_inline proc "contextless" (p: ^Message_Pool) -> (u32, Pool_Error) {
 	if p.free_count <= p.reserved_count do return POOL_NONE_INDEX, .Empty
 	return _pool_alloc_unchecked(p), .None
 }
 
 // System traffic Path (Drains to zero)
-pool_alloc_system :: #force_inline proc(p: ^Message_Pool) -> (u32, Pool_Error) {
+pool_alloc_system :: #force_inline proc "contextless" (p: ^Message_Pool) -> (u32, Pool_Error) {
 	if p.free_count == 0 do return POOL_NONE_INDEX, .Empty
 	return _pool_alloc_unchecked(p), .None
 }

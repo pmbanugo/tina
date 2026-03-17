@@ -95,19 +95,19 @@ when TINA_SIMULATION_MODE {
 		envelope: Message_Envelope,
 		current_tick: u64,
 		fault_config: ^FaultConfig,
-	) {
+	) -> Send_Result {
 		source := source_shard.id
 
 		// 1. Partition Check
 		if shard_mask_contains(&net.partition_matrix[source], target) {
 			source_shard.counters.quarantine_drops += 1
-			return
+			return .stale_handle
 		}
 
 		// 2. Probabilistic Drop Check
 		if ratio_chance(fault_config.network_drop_rate, net.drop_prng) {
 			source_shard.counters.ring_full_drops += 1 // Logically identical to physical drop
-			return
+			return .mailbox_full
 		}
 
 		// 3. Capacity Check (Simulates SPSC ring full)
@@ -119,7 +119,9 @@ when TINA_SIMULATION_MODE {
 
 		if delay_queue_push(&channel.delay_queue, delayed_env) == .Full {
 			source_shard.counters.ring_full_drops += 1
+			return .mailbox_full
 		}
+		return .ok
 	}
 
 	// Drain: Called by Destination Shard (Step 1 drain)
@@ -140,7 +142,7 @@ when TINA_SIMULATION_MODE {
 
 			item, _ := delay_queue_pop(&channel.delay_queue)
 
-			res := _enqueue_user_msg(target_shard, item.envelope.destination, &item.envelope)
+			_process_inbound_envelope(target_shard, source, &item.envelope)
 		}
 	}
 

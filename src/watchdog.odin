@@ -137,6 +137,25 @@ _handle_forced_recovery :: proc(
 		} else {
 			fmt.eprintfln("[QUARANTINE] Shard %d exceeded restart limits. Quarantining.", shard_id)
 			sync.atomic_store_explicit(state, u8(Shard_State.Quarantined), .Release)
+
+			// Broadcast TAG_SHARD_QUARANTINED so peers can fast-fail.
+			// The watchdog thread does this on behalf of the frozen Shard.
+			when !TINA_SIMULATION_MODE {
+				env: Message_Envelope
+				env.source = HANDLE_NONE
+				env.destination = HANDLE_NONE
+				env.tag = TAG_SHARD_QUARANTINED
+
+				if len(config.outbound_rings) > 0 {
+					for outbound_ring in config.outbound_rings {
+						if outbound_ring != nil {
+							spsc_ring_enqueue(outbound_ring, &env)
+							// Watchdog is the only writer now; must flush manually
+							spsc_ring_flush_producer(outbound_ring)
+						}
+					}
+				}
+			}
 			return
 		}
 	}
@@ -264,7 +283,8 @@ _execute_phase3_force_kill :: proc(configs: []Shard_Config, states: []u8, spec: 
 	for i in 0 ..< spec.shard_count {
 		shard := configs[i].shard_ptr
 		if shard != nil {
-			when ODIN_OS == .Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
+			when ODIN_OS ==
+				.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
 				emergency_log_flush_snapshot(shard)
 			}
 		}
@@ -273,5 +293,3 @@ _execute_phase3_force_kill :: proc(configs: []Shard_Config, states: []u8, spec: 
 	// Step 3: Terminate (kernel reclaims all resources in O(1))
 	os_force_exit(0)
 }
-
-

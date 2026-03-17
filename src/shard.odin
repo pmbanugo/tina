@@ -161,11 +161,8 @@ Supervision_Group :: struct {
 
 when TINA_SIMULATION_MODE {
 	Simulation_State :: struct {
-		network:          ^SimulatedNetwork,
-		fault_config:     ^FaultConfig,
-		outbound_count:   u32,
-		_padding:         [4]u8, // Keep 8-byte alignment
-		outbound_staging: [1024]Message_Envelope,
+		network:      ^SimulatedNetwork,
+		fault_config: ^FaultConfig,
 	}
 } else {
 	// Zero bytes in production!
@@ -296,23 +293,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				available := spsc_ring_available_to_read(ring)
 				for i in 0 ..< available {
 					envelope := spsc_ring_get_read_ptr(ring, i)
-					// System Broadcast Intercept
-					if envelope.destination == HANDLE_NONE {
-						if envelope.tag == TAG_SHARD_RESTARTED {
-							// Peer recovered, un-quarantine it
-							shard_mask_include(&shard.peer_alive_mask, u16(source_shard))
-							// NOTE (§7.5.4): We could optionally perform an O(N) scan of
-							// all local Isolates here to "fast-fail" any pending .call requests to this
-							// restarted shard (since we know they are now stale). For now, we rely on
-							// the Timer Wheel timeouts to naturally wake and fail the callers.
-						} else if envelope.tag == TAG_SHARD_QUARANTINED {
-							// Peer died, quarantine it
-							shard_mask_exclude(&shard.peer_alive_mask, u16(source_shard))
-							// NOTE: Same concern as above if-block. Pending calls will naturally time out.
-						}
-						continue
-					}
-					_ = _enqueue_user_msg(shard, envelope.destination, envelope)
+					_process_inbound_envelope(shard, u16(source_shard), envelope)
 				}
 
 				if available > 0 {
@@ -508,22 +489,6 @@ scheduler_tick :: proc(shard: ^Shard) {
 					spsc_ring_flush_producer(ring)
 				}
 			}
-		}
-	} else {
-		if shard.sim_state.network != nil {
-			for i in 0 ..< shard.sim_state.outbound_count {
-				env := shard.sim_state.outbound_staging[i]
-				dest_shard := extract_shard_id(env.destination)
-				sim_network_enqueue(
-					shard.sim_state.network,
-					shard,
-					dest_shard,
-					env,
-					now,
-					shard.sim_state.fault_config,
-				)
-			}
-			shard.sim_state.outbound_count = 0
 		}
 	}
 
@@ -998,14 +963,14 @@ _route_envelope_internal :: #force_inline proc(
 				shard.counters.quarantine_drops += 1
 				return .stale_handle
 			}
-			if shard.sim_state.outbound_count < len(shard.sim_state.outbound_staging) {
-				shard.sim_state.outbound_staging[shard.sim_state.outbound_count] = envelope^
-				shard.sim_state.outbound_count += 1
-				return .ok
-			} else {
-				shard.counters.ring_full_drops += 1
-				return .mailbox_full
-			}
+			return sim_network_enqueue(
+				shard.sim_state.network,
+				shard,
+				destination,
+				envelope^,
+				shard.current_tick,
+				shard.sim_state.fault_config,
+			)
 		}
 	}
 }
@@ -1622,24 +1587,37 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
 	timer_wheel_reset(&shard.timer_wheel, shard.current_tick)
 
-	when TINA_SIMULATION_MODE {
-		shard.sim_state.outbound_count = 0
-	}
 	shard.next_correlation_id = 0
 	// Control Signal reset
 	sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(Control_Signal.None), .Relaxed)
 
 	// Step 6: Notify peers via SHARD_RESTARTED
-	for outbound_ring, destination_shard in shard.outbound_rings {
-		if outbound_ring != nil {
-			env: Message_Envelope
-			env.source = HANDLE_NONE // System message
-			// We don't have a specific destination isolate, the receiving Shard's
-			// scheduler will intercept this before mailbox delivery.
-			env.destination = HANDLE_NONE
-			env.tag = TAG_SHARD_RESTARTED
-
-			spsc_ring_enqueue(outbound_ring, &env)
+	env: Message_Envelope
+	env.source = HANDLE_NONE
+	env.destination = HANDLE_NONE
+	env.tag = TAG_SHARD_RESTARTED
+	when TINA_SIMULATION_MODE {
+		if shard.sim_state.network != nil {
+			for target_shard in u16(0) ..< shard.sim_state.network.shard_count {
+				if target_shard != shard.id {
+					_ = sim_network_enqueue(
+						shard.sim_state.network,
+						shard,
+						target_shard,
+						env,
+						shard.current_tick,
+						shard.sim_state.fault_config,
+					)
+				}
+			}
+		}
+	} else {
+		if len(shard.outbound_rings) > 0 {
+			for outbound_ring in shard.outbound_rings {
+				if outbound_ring != nil {
+					spsc_ring_enqueue(outbound_ring, &env)
+				}
+			}
 		}
 	}
 
@@ -1682,4 +1660,27 @@ shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
 		}
 	}
 	return false
+}
+
+@(private = "package")
+_process_inbound_envelope :: #force_inline proc(
+	shard: ^Shard,
+	source_shard: u16,
+	envelope: ^Message_Envelope,
+) {
+	// System Broadcast Intercept
+	if envelope.destination == HANDLE_NONE {
+		if envelope.tag == TAG_SHARD_RESTARTED {
+			// Peer recovered, un-quarantine it
+			shard_mask_include(&shard.peer_alive_mask, source_shard)
+			// NOTE (§7.5.4): We could optionally perform an O(N) scan of
+			// all local Isolates here to "fast-fail" any pending .call requests to this
+			// restarted shard (since we know they are now stale). For now, we rely on
+			// the Timer Wheel timeouts to naturally wake and fail the callers.
+		} else if envelope.tag == TAG_SHARD_QUARANTINED {
+			// Peer died, quarantine it
+			shard_mask_exclude(&shard.peer_alive_mask, source_shard)
+			// NOTE: Same concern as above if-block. Pending calls will naturally time out.
+		}
+	} else do _ = _enqueue_user_msg(shard, envelope.destination, envelope)
 }
