@@ -17,15 +17,14 @@ Direction_Affinity :: enum u8 {
 }
 
 // ============================================================================
-// The Reactor (Layer 2) — Shard-Owned I/O Manager
+// The Reactor
 // ============================================================================
 //
 // Bridges the Platform_Backend with the Shard's Isolate handles and memory.
 // It manages the FD table, the buffer pool, and accumulates I/O submissions
-// for a single tick-wide flush (smart batching).
+// for a single tick-wide flush.
 
 Reactor :: struct {
-	// Big/Opaque Fields
 	backend:             Platform_Backend,
 	pending_submissions: [MAX_REACTOR_BATCH]Submission,
 
@@ -35,10 +34,10 @@ Reactor :: struct {
 
 	// Hot Scalars
 	pending_count:       u16,
-	_padding:            [6]u8, // Explicit padding to maintain 8-byte alignment
+	_padding:            [6]u8,
 }
 
-// Initialize the Reactor with memory pre-carved from the Grand Arena.
+// Initialize the Reactor with memory carved from the Grand Arena.
 reactor_init :: proc(
 	reactor: ^Reactor,
 	config: Backend_Config,
@@ -49,9 +48,7 @@ reactor_init :: proc(
 ) -> Backend_Error {
 	reactor.pending_count = 0
 
-	err := backend_init(&reactor.backend, config)
-	if err != .None do return err
-
+	// Init buffer pool first — backend needs pool metadata for registered buffers.
 	fd_table_init(&reactor.fd_table, fd_backing)
 	reactor_buffer_pool_init(
 		&reactor.buffer_pool,
@@ -59,6 +56,15 @@ reactor_init :: proc(
 		buffer_slot_size,
 		buffer_slot_count,
 	)
+
+	// Pass buffer pool metadata to backend for io_uring registered buffers.
+	backend_config := config
+	backend_config.buffer_base = raw_data(buffer_backing)
+	backend_config.buffer_slot_size = buffer_slot_size
+	backend_config.buffer_slot_count = buffer_slot_count
+
+	err := backend_init(&reactor.backend, backend_config)
+	if err != .None do return err
 
 	return .None
 }

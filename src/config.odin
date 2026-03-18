@@ -89,6 +89,7 @@ SystemSpecError :: enum u8 {
 	ScratchArenaTooSmall,
 	SlotCountExceedsHandleCapacity,
 	LogRingSizeNotPowerOfTwo,
+	ReactorBufferSlotCountExceedTokenCapacity,
 	TimerSpokeCountNotPowerOfTwo,
 }
 
@@ -134,6 +135,11 @@ validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
 
 	if spec.log_ring_size == 0 || (spec.log_ring_size & (spec.log_ring_size - 1)) != 0 {
 		return .LogRingSizeNotPowerOfTwo
+	}
+
+	// 12-bit buffer_index field in Submission_Token; 0x0FFF (4095) is the NONE sentinel
+	if spec.reactor_buffer_slot_count > 4094 {
+		return .ReactorBufferSlotCountExceedTokenCapacity
 	}
 
 	if spec.timer_spoke_count == 0 ||
@@ -274,6 +280,17 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, SystemSpecError.TimerSpokeCountNotPowerOfTwo)
 
 	spec.timer_spoke_count = 4096 // Restore valid value
+
+	// Test reactor_buffer_slot_count exceeds 12-bit token capacity
+	spec.reactor_buffer_slot_count = 4095
+	err = validate_system_spec(&spec)
+	testing.expect_value(t, err, SystemSpecError.ReactorBufferSlotCountExceedTokenCapacity)
+
+	spec.reactor_buffer_slot_count = 4094 // Exactly at limit
+	err = validate_system_spec(&spec)
+	testing.expect_value(t, err, SystemSpecError.None)
+
+	spec.reactor_buffer_slot_count = 0 // Restore
 }
 
 // --- Simulation Configuration ---

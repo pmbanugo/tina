@@ -239,10 +239,15 @@ hydrate_shard :: proc(
 	}
 	when TINA_SIMULATION_MODE {
 		if spec.simulation != nil {
+			// Derive a per-shard I/O seed from the simulation master seed and shard ID.
+			// This is a bootstrap seed — the full Prng_Tree wiring replaces it during
+			// simulator setup when the tree is available.
+			io_seed := spec.simulation.seed ~ (u64(shard.id) *~ u64(0x9E3779B97F4A7C15))
 			backend_config.sim_config = Simulation_IO_Config {
 				fault_rate        = spec.simulation.faults.io_error_rate,
 				delay_range_ticks = spec.simulation.faults.io_delay_range_ticks,
 				reorder           = true,
+				seed              = io_seed,
 			}
 		}
 	}

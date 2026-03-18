@@ -25,7 +25,8 @@ when TINA_SIMULATION_MODE {
 	_Platform_State :: struct {
 		pending:       [MAX_SIMULATED_PENDING]Simulated_Operation,
 		pending_count: u16,
-		prng:          Prng,
+		prng:          Prng, // used only for reordering (order-dependent is OK)
+		seed:          u64, // original seed for per-op deterministic derivation
 		tick_count:    u64,
 		config:        Simulation_IO_Config,
 		next_sim_fd:   i32, // incrementing simulated FD counter
@@ -38,9 +39,10 @@ when TINA_SIMULATION_MODE {
 		backend.next_sim_fd = 100 // start above stdin/stdout/stderr range
 		backend.config = config.sim_config
 
-		// Seed PRNG deterministically. In a real simulation, the seed comes from the PRNG tree.
-		// Default seed for testing.
-		prng_init(&backend.prng, 0xDEADBEEF_CAFEBABE)
+		// Seed from config — populated from Prng_Tree at shard hydration,
+		// or from t.seed in tests.
+		backend.seed = config.sim_config.seed
+		prng_init(&backend.prng, backend.seed)
 		return .None
 	}
 
@@ -59,14 +61,15 @@ when TINA_SIMULATION_MODE {
 				return .Queue_Full
 			}
 
-			// Compute delay from PRNG seeded by (tick_count, token) for determinism
-			// invariant to batch size
+			// Compute delay from hash seeded by (seed, tick_count, token) for determinism
+			// invariant to batch size and iteration order
 			delay: u64
 			min_delay := u64(backend.config.delay_range_ticks[0])
 			max_delay := u64(backend.config.delay_range_ticks[1])
 			if max_delay > min_delay {
-				range := u32(max_delay - min_delay)
-				delay = min_delay + u64(prng_uint_less_than(&backend.prng, range))
+				range := max_delay - min_delay
+				h := _sim_op_hash(backend.seed, backend.tick_count, sub.token)
+				delay = min_delay + (h % range)
 			} else {
 				delay = min_delay
 			}
@@ -109,10 +112,21 @@ when TINA_SIMULATION_MODE {
 				completion.token = op.token
 				completion.extra = nil
 
-				// Fault injection
+				// Fault injection — hash-based derivation with a different phase
+				// to avoid correlation with delay (§6.6.2 §5.4)
 				if backend.config.fault_rate.denominator > 0 &&
-				   ratio_chance(backend.config.fault_rate, &backend.prng) {
-					completion.result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+				   backend.config.fault_rate.numerator > 0 {
+					fault_hash := _sim_op_hash(backend.seed ~ 0x1, backend.tick_count, op.token)
+					fault_val := u32(fault_hash >> 32)
+					threshold := u32(
+						(u64(backend.config.fault_rate.numerator) * u64(max(u32))) /
+						u64(backend.config.fault_rate.denominator),
+					)
+					if fault_val < threshold {
+						completion.result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+					} else {
+						_sim_generate_success(op, completion)
+					}
 				} else {
 					_sim_generate_success(op, completion)
 				}
@@ -223,6 +237,21 @@ when TINA_SIMULATION_MODE {
 
 	// --- Internal Helpers ---
 
+	// Derive a deterministic per-operation value from (seed, tick, token).
+	// Uses the existing PRNG engine: mixes inputs into a seed, inits a
+	// throwaway Prng, and draws one step. Invariant to batch size/order (§6.6.2 §5.4).
+	@(private = "file")
+	_sim_op_hash :: #force_inline proc "contextless" (
+		seed: u64,
+		tick: u64,
+		token: Submission_Token,
+	) -> u64 {
+		mixed := seed ~ (tick * ~u64(0x9E3779B97F4A7C15)) ~ (u64(token) * ~u64(0x517CC1B727220A95))
+		p: Prng
+		prng_init(&p, mixed)
+		return prng_step(&p)
+	}
+
 	@(private = "file")
 	_sim_generate_success :: proc(op: ^Simulated_Operation, completion: ^Raw_Completion) {
 		switch _ in op.operation {
@@ -266,7 +295,7 @@ when TINA_SIMULATION_MODE {
 		backend: Platform_Backend
 		config := Backend_Config {
 			queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
-			sim_config = Simulation_IO_Config{delay_range_ticks = {1, 3}},
+			sim_config = Simulation_IO_Config{delay_range_ticks = {1, 3}, seed = t.seed},
 		}
 
 		err := backend_init(&backend, config)
@@ -283,6 +312,7 @@ when TINA_SIMULATION_MODE {
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
 				delay_range_ticks = {0, 1}, // complete within 1 tick
+				seed              = t.seed,
 			},
 		}
 		backend_init(&backend, config)
@@ -317,6 +347,7 @@ when TINA_SIMULATION_MODE {
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
 				delay_range_ticks = {100, 200}, // won't complete soon
+				seed              = t.seed,
 			},
 		}
 		backend_init(&backend, config)
@@ -342,7 +373,9 @@ when TINA_SIMULATION_MODE {
 	@(test)
 	test_simulated_backend_control_socket :: proc(t: ^testing.T) {
 		backend: Platform_Backend
-		config := Backend_Config{}
+		config := Backend_Config {
+			sim_config = Simulation_IO_Config{seed = t.seed},
+		}
 		backend_init(&backend, config)
 
 		fd1, err1 := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
@@ -359,10 +392,12 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_determinism :: proc(t: ^testing.T) {
-		run_sim :: proc() -> [4]Raw_Completion {
+		seed := t.seed
+
+		run_sim :: proc(seed: u64) -> [4]Raw_Completion {
 			backend: Platform_Backend
 			config := Backend_Config {
-				sim_config = Simulation_IO_Config{delay_range_ticks = {1, 5}},
+				sim_config = Simulation_IO_Config{delay_range_ticks = {1, 5}, seed = seed},
 			}
 			backend_init(&backend, config)
 
@@ -392,8 +427,8 @@ when TINA_SIMULATION_MODE {
 			return result
 		}
 
-		result1 := run_sim()
-		result2 := run_sim()
+		result1 := run_sim(seed)
+		result2 := run_sim(seed)
 
 		// Same seed → same sequence of completions
 		for i in 0 ..< 4 {

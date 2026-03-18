@@ -26,6 +26,7 @@ when !TINA_SIMULATION_MODE {
 		overlapped: win.OVERLAPPED,
 		token:      Submission_Token,
 		operation:  Submission_Operation,
+		client_fd:  OS_FD,
 		accept_buf: [(size_of(win.sockaddr_in6) + 16) * 2]u8,
 		active:     bool,
 	}
@@ -95,6 +96,17 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		submissions: []Submission,
 	) -> Backend_Error {
+		// All-or-error: pre-check overlapped entry capacity.
+		available: i32 = 0
+		for i in 0 ..< MAX_WIN_OVERLAPPED {
+			if !backend.entries[i].active {
+				available += 1
+			}
+		}
+		if available < i32(len(submissions)) {
+			return .Queue_Full
+		}
+
 		for &sub in submissions {
 			entry_idx := _win_alloc_entry(backend)
 			if entry_idx < 0 {
@@ -105,6 +117,7 @@ when !TINA_SIMULATION_MODE {
 			entry.token = sub.token
 			entry.operation = sub.operation
 			entry.overlapped = {}
+			entry.client_fd = OS_FD_INVALID
 
 			switch op in sub.operation {
 			case Submission_Op_Read:
@@ -168,6 +181,7 @@ when !TINA_SIMULATION_MODE {
 					entry.active = false
 					continue
 				}
+				entry.client_fd = OS_FD(client_sock)
 
 				received: win.DWORD
 				ok := true
@@ -185,6 +199,7 @@ when !TINA_SIMULATION_MODE {
 				} else {
 					_win_push_error_completion(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED))
 					win.closesocket(client_sock)
+					entry.client_fd = OS_FD_INVALID
 					entry.active = false
 					continue
 				}
@@ -195,6 +210,7 @@ when !TINA_SIMULATION_MODE {
 						continue
 					}
 					win.closesocket(client_sock)
+					entry.client_fd = OS_FD_INVALID
 					_win_push_error_completion(backend, sub.token, i32(err))
 					entry.active = false
 					continue
@@ -472,11 +488,9 @@ when !TINA_SIMULATION_MODE {
 						client_addr := _win_sockaddr_to_socket_address(
 							(^win.SOCKADDR_STORAGE_LH)(remote_addr),
 						)
-						// Client FD: We don't directly have it here.
-						// AcceptEx created the socket in submit. We store it as result=0 (success).
 						completion.result = 0
 						completion.extra = Completion_Extra_Accept {
-							client_fd      = OS_FD_INVALID, // placeholder
+							client_fd      = entry.client_fd,
 							client_address = client_addr,
 						}
 					}
@@ -749,7 +763,7 @@ when !TINA_SIMULATION_MODE {
 		token: Submission_Token,
 		err: i32,
 	) {
-		_win_push_completion(backend, token, i32(IO_ERR_RESOURCE_EXHAUSTED), nil)
+		_win_push_completion(backend, token, -err, nil)
 	}
 
 	@(private = "file")

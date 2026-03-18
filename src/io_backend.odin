@@ -28,8 +28,13 @@ Backend_Error :: enum u8 {
 // --- Backend Configuration ---
 
 Backend_Config :: struct {
-	queue_size:  u32,            // submission/completion queue depth (default 256)
-	sim_config:  Simulation_IO_Config, // only used when TINA_SIM=true
+	queue_size:        u32,            // submission/completion queue depth (default 256)
+	sim_config:        Simulation_IO_Config, // only used when TINA_SIM=true
+	// Buffer pool metadata for io_uring registered buffers (§6.6.2 §8).
+	// Set to nil/zero on non-Linux or when registered buffers are not desired.
+	buffer_base:       [^]u8,          // buffer pool backing memory base address
+	buffer_slot_size:  u32,            // bytes per slot
+	buffer_slot_count: u16,            // number of slots
 }
 
 DEFAULT_BACKEND_QUEUE_SIZE :: 256
@@ -40,6 +45,7 @@ Simulation_IO_Config :: struct {
 	fault_rate:          Ratio,   // probability of fault per operation (0/N = never)
 	delay_range_ticks:   [2]u32,  // [min, max] simulated delay in ticks
 	reorder:             bool,    // whether completions can be reordered
+	seed:                u64,     // deterministic seed (from Prng_Tree.shard_io)
 }
 
 // --- Platform Backend Struct ---

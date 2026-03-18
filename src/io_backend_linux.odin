@@ -15,6 +15,7 @@ package tina
 //   Cancel: IORING_OP_ASYNC_CANCEL.
 //   Wake: write to eventfd.
 
+import "core:fmt"
 import "core:sys/linux"
 import "core:sys/linux/uring"
 
@@ -35,12 +36,17 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	_Platform_State :: struct {
-		ring:           uring.Ring,
-		wake_fd:        OS_FD,
-		unqueued:       [MAX_LINUX_UNQUEUED]Submission,
-		unqueued_count: u16,
-		addr_entries:   [MAX_LINUX_PENDING_ADDRS]Pending_Addr_Entry,
+		ring:               uring.Ring,
+		wake_fd:            OS_FD,
+		wake_buffer:        u64,
+		unqueued:           [MAX_LINUX_UNQUEUED]Submission,
+		unqueued_count:     u16,
+		buffers_registered: bool,
+		addr_entries:       [MAX_LINUX_PENDING_ADDRS]Pending_Addr_Entry,
 	}
+
+	// Internal user_data for wake eventfd reads. High bit marks it as internal (filtered from user completions).
+	LINUX_WAKE_UD :: u64(0x8000_0000_0000_0001)
 
 	// ============================================================================
 	// Backend Procedures
@@ -68,16 +74,45 @@ when !TINA_SIMULATION_MODE {
 		}
 		backend.wake_fd = OS_FD(wakefd)
 		backend.unqueued_count = 0
+		backend.buffers_registered = false
 
 		for i in 0 ..< MAX_LINUX_PENDING_ADDRS {
 			backend.addr_entries[i].active = false
 		}
+
+		_linux_arm_wake(backend)
+
+		// Registered buffers (§6.6.2 §8): register buffer pool memory with io_uring.
+		// This eliminates get_user_pages per-operation cost for pre-allocated pool buffers.
+		// The reactor's buffer pool is pre-allocated at Shard init and stable for the
+		// Shard's lifetime, making it an ideal fit for kernel page-pinning.
+		if config.buffer_base != nil && config.buffer_slot_count > 0 {
+			backend.buffers_registered = _linux_register_buffers(
+				backend,
+				config.buffer_base,
+				config.buffer_slot_size,
+				config.buffer_slot_count,
+			)
+			if !backend.buffers_registered {
+				fmt.eprintfln(
+					"[WARN] io_uring buffer registration failed for %d slots. Falling back to standard READ/WRITE ops.",
+					config.buffer_slot_count,
+				)
+			}
+		}
+
+		// Fixed files (§6.6.2 §8): deferred until FD table mutation hooks are implemented.
+		// Requires synchronizing kernel's fixed-file table with FD_Table alloc/free.
 
 		return .None
 	}
 
 	@(private = "package")
 	_backend_deinit :: proc(backend: ^Platform_Backend) {
+		if backend.buffers_registered {
+			linux.io_uring_register(backend.ring.fd, .UNREGISTER_BUFFERS, nil, 0)
+			backend.buffers_registered = false
+		}
 		linux.close(linux.Fd(backend.wake_fd))
 		uring.destroy(&backend.ring)
 		backend.unqueued_count = 0
@@ -88,12 +123,15 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		submissions: []Submission,
 	) -> Backend_Error {
-		for &sub in submissions {
-			if !_linux_submit_one(backend, &sub) {
-				if backend.unqueued_count >= MAX_LINUX_UNQUEUED {
-					return .Queue_Full
-				}
-				backend.unqueued[backend.unqueued_count] = sub
+		// All-or-error: pre-check worst-case capacity.
+		// In the worst case, every submission overflows to unqueued.
+		if int(backend.unqueued_count) + len(submissions) > MAX_LINUX_UNQUEUED {
+			return .Queue_Full
+		}
+
+		for &submission in submissions {
+			if !_linux_submit_one(backend, &submission) {
+				backend.unqueued[backend.unqueued_count] = submission
 				backend.unqueued_count += 1
 			}
 		}
@@ -120,22 +158,22 @@ when !TINA_SIMULATION_MODE {
 		_linux_flush_unqueued(backend)
 
 		// Submit and optionally wait
-		wait_nr: u32 = 0
-		ts: linux.Time_Spec
-		ts_ptr: ^linux.Time_Spec = nil
+		wait_number: u32 = 0
+		time_spec: linux.Time_Spec
+		time_spec_pointer: ^linux.Time_Spec = nil
 
 		if timeout_ns > 0 {
-			wait_nr = 1
+			wait_number = 1
 			NANOSECONDS_PER_SECOND :: 1_000_000_000
-			ts.time_sec = uint(timeout_ns / NANOSECONDS_PER_SECOND)
-			ts.time_nsec = uint(timeout_ns % NANOSECONDS_PER_SECOND)
-			ts_ptr = &ts
+			time_spec.time_sec = uint(timeout_ns / NANOSECONDS_PER_SECOND)
+			time_spec.time_nsec = uint(timeout_ns % NANOSECONDS_PER_SECOND)
+			time_spec_pointer = &time_spec
 		} else if timeout_ns < 0 {
 			// Negative = block indefinitely until at least one CQE
-			wait_nr = 1
+			wait_number = 1
 		}
 
-		_, submit_err := uring.submit(&backend.ring, wait_nr, ts_ptr)
+		_, submit_err := uring.submit(&backend.ring, wait_number, time_spec_pointer)
 		if submit_err != nil &&
 		   submit_err != .NONE &&
 		   submit_err != .ETIME &&
@@ -157,31 +195,41 @@ when !TINA_SIMULATION_MODE {
 		count: u32 = 0
 		for i in 0 ..< completed {
 			cqe := &cqes[i]
+
+			// Filter internal CQEs: cancel results (high bit set) and wake reads
+			if cqe.user_data & (1 << 63) != 0 {
+				if cqe.user_data == LINUX_WAKE_UD {
+					// Re-arm the wake read
+					_linux_arm_wake(backend)
+				}
+				continue
+			}
+
 			token := Submission_Token(cqe.user_data)
-			comp := &completions[count]
-			comp.token = token
-			comp.result = cqe.res
-			comp.extra = nil
+			completion := &completions[count]
+			completion.token = token
+			completion.result = cqe.res
+			completion.extra = nil
 
 			// Check for accept completion (res >= 0 means new FD)
 			op_tag := submission_token_operation_tag(token)
 			if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) && cqe.res >= 0 {
 				entry := _linux_find_addr_entry(backend, token)
 				if entry != nil {
-					comp.extra = Completion_Extra_Accept {
+					completion.extra = Completion_Extra_Accept {
 						client_fd      = OS_FD(cqe.res),
 						client_address = _linux_sockaddr_to_socket_address(&entry.sockaddr),
 					}
 					entry.active = false
 				} else {
-					comp.extra = Completion_Extra_Accept {
+					completion.extra = Completion_Extra_Accept {
 						client_fd = OS_FD(cqe.res),
 					}
 				}
 			} else if op_tag == u8(IO_TAG_RECVFROM_COMPLETE) && cqe.res >= 0 {
 				entry := _linux_find_addr_entry(backend, token)
 				if entry != nil {
-					comp.extra = Completion_Extra_Recvfrom {
+					completion.extra = Completion_Extra_Recvfrom {
 						peer_address = _linux_sockaddr_to_socket_address(&entry.sockaddr),
 					}
 					entry.active = false
@@ -407,11 +455,18 @@ when !TINA_SIMULATION_MODE {
 
 	// Submit a single operation to the uring. Returns true if enqueued, false if ring full.
 	@(private = "file")
-	_linux_submit_one :: proc(backend: ^Platform_Backend, sub: ^Submission) -> bool {
-		ud := u64(sub.token)
+	_linux_submit_one :: proc(backend: ^Platform_Backend, submission: ^Submission) -> bool {
+		ud := u64(submission.token)
 
-		switch op in sub.operation {
+		switch op in submission.operation {
 		case Submission_Op_Read:
+			buffer_index := submission_token_buffer_index(submission.token)
+
+			// When the buffer belongs to the registered pool, use READ_FIXED to
+			// bypass the kernel's per-operation get_user_pages cost (§6.6.2 §8).
+			if backend.buffers_registered && buffer_index != BUFFER_INDEX_NONE {
+				return _linux_submit_read_fixed(backend, ud, op, buffer_index)
+			}
 			_, ok := uring.read(
 				&backend.ring,
 				ud,
@@ -422,6 +477,11 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Write:
+			buffer_index := submission_token_buffer_index(submission.token)
+
+			if backend.buffers_registered && buffer_index != BUFFER_INDEX_NONE {
+				return _linux_submit_write_fixed(backend, ud, op, buffer_index)
+			}
 			_, ok := uring.write(
 				&backend.ring,
 				ud,
@@ -432,7 +492,7 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Accept:
-			entry := _linux_alloc_addr_entry(backend, sub.token)
+			entry := _linux_alloc_addr_entry(backend, submission.token)
 			if entry != nil {
 				entry.sockaddr_len = size_of(entry.sockaddr)
 				_, ok := uring.accept(
@@ -453,7 +513,7 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Connect:
-			entry := _linux_alloc_addr_entry(backend, sub.token)
+			entry := _linux_alloc_addr_entry(backend, submission.token)
 			if entry != nil {
 				entry.sockaddr = _linux_socket_address_to_sockaddr(op.address)
 				_, ok := uring.connect(&backend.ring, ud, linux.Fd(op.socket_fd), &entry.sockaddr)
@@ -489,7 +549,7 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Sendto:
-			entry := _linux_alloc_addr_entry(backend, sub.token)
+			entry := _linux_alloc_addr_entry(backend, submission.token)
 			if entry == nil {
 				return false
 			}
@@ -516,7 +576,7 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Recvfrom:
-			entry := _linux_alloc_addr_entry(backend, sub.token)
+			entry := _linux_alloc_addr_entry(backend, submission.token)
 			if entry == nil {
 				return false
 			}
@@ -544,6 +604,89 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		return false
+	}
+
+	// Register the reactor's pre-allocated buffer pool with io_uring.
+	// Builds a temporary iovec array on the stack, one entry per slot, and passes it
+	// to the io_uring_register syscall. Returns true if registration succeeded.
+	// On failure the backend falls back to standard READ/WRITE ops.
+	@(private = "file")
+	_linux_register_buffers :: proc(
+		backend: ^Platform_Backend,
+		buffer_base: [^]u8,
+		buffer_slot_size: u32,
+		buffer_slot_count: u16,
+	) -> bool {
+		// The iovec array is only needed for the duration of the register syscall.
+		// Stack-allocate up to the maximum supported slot count (4094, from the
+		// 12-bit buffer_index field in Submission_Token with 0x0FFF as NONE sentinel).
+		iovecs: [4094]linux.IO_Vec = ---
+		slot_size := int(buffer_slot_size)
+		for i in 0 ..< int(buffer_slot_count) {
+			iovecs[i] = linux.IO_Vec {
+				base = buffer_base[i * slot_size:],
+				len  = uint(buffer_slot_size),
+			}
+		}
+		err := linux.io_uring_register(
+			backend.ring.fd,
+			.REGISTER_BUFFERS,
+			&iovecs[0],
+			u32(buffer_slot_count),
+		)
+		return err == .NONE
+	}
+
+	// Submit a READ_FIXED SQE. The kernel uses pre-pinned pages for the buffer
+	@(private = "file")
+	_linux_submit_read_fixed :: proc(
+		backend: ^Platform_Backend,
+		user_data: u64,
+		op: Submission_Op_Read,
+		buffer_index: u16,
+	) -> bool {
+		sqe := uring.get_sqe(&backend.ring) or_return
+		sqe.opcode = .READ_FIXED
+		sqe.fd = linux.Fd(op.fd)
+		sqe.addr = u64(uintptr(op.buffer))
+		sqe.len = op.size
+		sqe.off = op.offset
+		sqe.user_data = user_data
+		sqe.buf_index = buffer_index
+		return true
+	}
+
+	// Submit a WRITE_FIXED SQE. Same kernel page-pinning benefit as READ_FIXED.
+	@(private = "file")
+	_linux_submit_write_fixed :: proc(
+		backend: ^Platform_Backend,
+		user_data: u64,
+		op: Submission_Op_Write,
+		buffer_index: u16,
+	) -> bool {
+		sqe := uring.get_sqe(&backend.ring) or_return
+		sqe.opcode = .WRITE_FIXED
+		sqe.fd = linux.Fd(op.fd)
+		sqe.addr = u64(uintptr(op.buffer))
+		sqe.len = op.size
+		sqe.off = op.offset
+		sqe.user_data = user_data
+		sqe.buf_index = buffer_index
+		return true
+	}
+
+	@(private = "file")
+	_linux_arm_wake :: proc(backend: ^Platform_Backend) {
+		_, ok := uring.read(
+			&backend.ring,
+			LINUX_WAKE_UD,
+			linux.Fd(backend.wake_fd),
+			([^]u8)(&backend.wake_buffer)[:size_of(u64)],
+			0,
+		)
+		if ok {
+			uring.submit(&backend.ring, 0, nil)
+		}
 	}
 
 	// Flush buffered unqueued submissions into the ring.
@@ -659,4 +802,4 @@ when !TINA_SIMULATION_MODE {
 		return size_of(linux.Sock_Addr_Any)
 	}
 
-} // when !TINA_SIM
+}

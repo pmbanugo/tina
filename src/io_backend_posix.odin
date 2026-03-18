@@ -23,9 +23,15 @@ when !TINA_SIMULATION_MODE {
 	MAX_POSIX_COMPLETED :: 256
 	POSIX_WAKE_IDENT :: 69
 
+	Pending_Posix_Op_Flag :: enum u8 {
+		Connect_In_Progress,
+	}
+	Pending_Posix_Op_Flags :: bit_set[Pending_Posix_Op_Flag;u8]
+
 	Pending_Posix_Op :: struct {
 		token:     Submission_Token,
 		operation: Submission_Operation,
+		flags:     Pending_Posix_Op_Flags,
 	}
 
 	_Platform_State :: struct {
@@ -56,8 +62,8 @@ when !TINA_SIMULATION_MODE {
 		wake_ev := [1]kq.KEvent {
 			{ident = POSIX_WAKE_IDENT, filter = .User, flags = {.Add, .Enable, .Clear}},
 		}
-		ts: posix.timespec
-		_, kerr := kq.kevent(kq_fd, wake_ev[:], nil, &ts)
+		time_spec: posix.timespec
+		_, kerr := kq.kevent(kq_fd, wake_ev[:], nil, &time_spec)
 		if kerr != nil {
 			posix.close(kq_fd)
 			return .System_Error
@@ -82,22 +88,30 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		submissions: []Submission,
 	) -> Backend_Error {
+		// All-or-error: pre-check worst-case capacity.
+		// Each submission may go to either completed or pending.
+		submission_count := u16(len(submissions))
+		completed_available := MAX_POSIX_COMPLETED - backend.completed_count
+		pending_available := MAX_POSIX_PENDING - backend.pending_count
+		if submission_count > completed_available || submission_count > pending_available {
+			return .Queue_Full
+		}
+
 		for &sub in submissions {
 			result, immediate := _try_syscall(&sub)
 
 			if immediate {
-				if backend.completed_count >= MAX_POSIX_COMPLETED {
-					return .Queue_Full
-				}
 				backend.completed[backend.completed_count] = result
 				backend.completed_count += 1
 			} else {
-				if backend.pending_count >= MAX_POSIX_PENDING {
-					return .Queue_Full
+				pending_flags: Pending_Posix_Op_Flags
+				if _is_connect_op(&sub.operation) {
+					pending_flags = {.Connect_In_Progress}
 				}
 				backend.pending[backend.pending_count] = Pending_Posix_Op {
 					token     = sub.token,
 					operation = sub.operation,
+					flags     = pending_flags,
 				}
 				backend.pending_count += 1
 
@@ -141,23 +155,33 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		// Call kevent for readiness events.
-		ts: posix.timespec
-		ts_ptr: ^posix.timespec
-		if timeout_ns <= 0 {
-			ts_ptr = &ts
+		time_spec: posix.timespec
+		time_spec_pointer: ^posix.timespec
+		if timeout_ns < 0 {
+			// Negative: block indefinitely (nil timespec = wait forever)
+			time_spec_pointer = nil
+		} else if timeout_ns == 0 {
+			// Zero: non-blocking poll
+			time_spec_pointer = &time_spec
 		} else {
-			ts = posix.timespec {
+			// Positive: bounded wait
+			time_spec = posix.timespec {
 				tv_sec  = posix.time_t(timeout_ns / 1_000_000_000),
 				tv_nsec = c.long(timeout_ns % 1_000_000_000),
 			}
-			ts_ptr = &ts
+			time_spec_pointer = &time_spec
 		}
 
 		events_buf: [128]kq.KEvent
 		remaining := int(output_max - out)
 		buffer_size := min(remaining, len(events_buf))
 
-		n, kerr := kq.kevent(kq.KQ(backend.kq_fd), nil, events_buf[:buffer_size], ts_ptr)
+		n, kerr := kq.kevent(
+			kq.KQ(backend.kq_fd),
+			nil,
+			events_buf[:buffer_size],
+			time_spec_pointer,
+		)
 		if kerr != nil {
 			if kerr == .EINTR {
 				return out, .None
@@ -177,6 +201,22 @@ when !TINA_SIMULATION_MODE {
 				break
 			}
 
+			// Handle error events.
+			if .Error in event.flags {
+				token := Submission_Token(u64(uintptr(event.udata)))
+				pending_idx := _find_pending(backend, token)
+				if pending_idx >= 0 && out < output_max {
+					completions[out] = Raw_Completion {
+						token  = token,
+						result = -i32(posix.Errno(event.data)),
+						extra  = nil,
+					}
+					out += 1
+					_remove_pending(backend, u16(pending_idx))
+				}
+				continue
+			}
+
 			token := Submission_Token(u64(uintptr(event.udata)))
 			pending_idx := _find_pending(backend, token)
 			if pending_idx < 0 {
@@ -184,6 +224,29 @@ when !TINA_SIMULATION_MODE {
 			}
 
 			pop := &backend.pending[pending_idx]
+
+			// Connect completion: use getsockopt(SO_ERROR) instead of re-calling connect().
+			if .Connect_In_Progress in pop.flags {
+				conn_result := Raw_Completion {
+					token = pop.token,
+					extra = nil,
+				}
+				err: posix.Errno
+				err_size := posix.socklen_t(size_of(err))
+				connect_fd := pop.operation.(Submission_Op_Connect).socket_fd
+				posix.getsockopt(posix.FD(connect_fd), posix.SOL_SOCKET, .ERROR, &err, &err_size)
+				if err != nil {
+					conn_result.result = -i32(err)
+				} else {
+					conn_result.result = 0
+				}
+				completions[out] = conn_result
+				out += 1
+				_remove_pending(backend, u16(pending_idx))
+				continue
+			}
+
+			// Non-connect: retry the syscall.
 			sub := Submission {
 				token     = pop.token,
 				operation = pop.operation,
@@ -219,8 +282,8 @@ when !TINA_SIMULATION_MODE {
 		ev := [1]kq.KEvent {
 			{ident = POSIX_WAKE_IDENT, filter = .User, fflags = {user = {.Trigger}}},
 		}
-		ts: posix.timespec
-		kq.kevent(kq.KQ(backend.kq_fd), ev[:], nil, &ts)
+		time_spec: posix.timespec
+		kq.kevent(kq.KQ(backend.kq_fd), ev[:], nil, &time_spec)
 	}
 
 	// ============================================================================
@@ -279,6 +342,23 @@ when !TINA_SIMULATION_MODE {
 		if posix.fcntl(fd, .SETFL, transmute(posix.O_Flags)(flags) + {.NONBLOCK}) < 0 {
 			posix.close(fd)
 			return OS_FD_INVALID, .System_Error
+		}
+
+		// Set close-on-exec.
+		posix.fcntl(fd, .SETFD, posix.FD_CLOEXEC)
+
+		// Set SO_NOSIGPIPE to suppress SIGPIPE on BSD/macOS.
+		when ODIN_OS ==
+			.Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .NetBSD || ODIN_OS == .OpenBSD {
+			nosigpipe: c.int = 1
+			SO_NOSIGPIPE :: 0x1022
+			posix.setsockopt(
+				fd,
+				posix.SOL_SOCKET,
+				transmute(posix.Sock_Option)c.int(SO_NOSIGPIPE),
+				&nosigpipe,
+				size_of(nosigpipe),
+			)
 		}
 
 		return OS_FD(fd), .None
@@ -452,6 +532,8 @@ when !TINA_SIMULATION_MODE {
 			if flags >= 0 {
 				posix.fcntl(client_fd, .SETFL, transmute(posix.O_Flags)(flags) + {.NONBLOCK})
 			}
+			// Set close-on-exec on accepted client socket.
+			posix.fcntl(client_fd, .SETFD, posix.FD_CLOEXEC)
 			result.result = 0
 			result.extra = Completion_Extra_Accept {
 				client_fd      = OS_FD(client_fd),
@@ -602,8 +684,8 @@ when !TINA_SIMULATION_MODE {
 				udata = rawptr(uintptr(u64(sub.token))),
 			},
 		}
-		ts: posix.timespec
-		_, kerr := kq.kevent(kq.KQ(backend.kq_fd), ev[:], nil, &ts)
+		time_spec: posix.timespec
+		_, kerr := kq.kevent(kq.KQ(backend.kq_fd), ev[:], nil, &time_spec)
 		if kerr != nil {
 			return .System_Error
 		}
@@ -687,6 +769,12 @@ when !TINA_SIMULATION_MODE {
 		case:
 			return nil
 		}
+	}
+
+	@(private = "file")
+	_is_connect_op :: #force_inline proc(op: ^Submission_Operation) -> bool {
+		_, ok := op.(Submission_Op_Connect)
+		return ok
 	}
 
 	@(private = "file")
