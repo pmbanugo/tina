@@ -1,3 +1,4 @@
+#+private
 package tina
 
 // ============================================================================
@@ -28,14 +29,14 @@ Backend_Error :: enum u8 {
 // --- Backend Configuration ---
 
 Backend_Config :: struct {
-	queue_size:        u32,            // submission/completion queue depth (default 256)
+	queue_size:        u32, // submission/completion queue depth (default 256)
 	sim_config:        Simulation_IO_Config, // only used when TINA_SIM=true
 	// Buffer pool metadata for io_uring registered buffers (§6.6.2 §8).
 	// Set to nil/zero on non-Linux or when registered buffers are not desired.
-	buffer_base:       [^]u8,          // buffer pool backing memory base address
-	buffer_slot_size:  u32,            // bytes per slot
-	buffer_slot_count: u16,            // number of slots
-	fd_slot_count:     u16,            // number of fixed-file slots
+	buffer_base:       [^]u8, // buffer pool backing memory base address
+	buffer_slot_size:  u32, // bytes per slot
+	buffer_slot_count: u16, // number of slots
+	fd_slot_count:     u16, // number of fixed-file slots
 }
 
 DEFAULT_BACKEND_QUEUE_SIZE :: 256
@@ -43,10 +44,10 @@ DEFAULT_BACKEND_QUEUE_SIZE :: 256
 // --- SimulatedIO Configuration (§6.6.2 §5.4) ---
 
 Simulation_IO_Config :: struct {
-	fault_rate:          Ratio,   // probability of fault per operation (0/N = never)
-	delay_range_ticks:   [2]u32,  // [min, max] simulated delay in ticks
-	reorder:             bool,    // whether completions can be reordered
-	seed:                u64,     // deterministic seed (from Prng_Tree.shard_io)
+	fault_rate:        Ratio, // probability of fault per operation (0/N = never)
+	delay_range_ticks: [2]u32, // [min, max] simulated delay in ticks
+	reorder:           bool, // whether completions can be reordered
+	seed:              u64, // deterministic seed (from Prng_Tree.shard_io)
 }
 
 // --- Platform Backend Struct ---
@@ -92,7 +93,14 @@ backend_submit :: proc(backend: ^Platform_Backend, submissions: []Submission) ->
 }
 
 // Collect completed operations into the output slice. Non-blocking when timeout_ns == 0.
-backend_collect :: proc(backend: ^Platform_Backend, completions: []Raw_Completion, timeout_ns: i64) -> (u32, Backend_Error) {
+backend_collect :: proc(
+	backend: ^Platform_Backend,
+	completions: []Raw_Completion,
+	timeout_ns: i64,
+) -> (
+	u32,
+	Backend_Error,
+) {
 	if len(completions) == 0 {
 		return 0, .None
 	}
@@ -118,15 +126,26 @@ backend_control_socket :: proc(
 	domain: Socket_Domain,
 	socket_type: Socket_Type,
 	protocol: Socket_Protocol,
-) -> (OS_FD, Backend_Error) {
+) -> (
+	OS_FD,
+	Backend_Error,
+) {
 	return _backend_control_socket(backend, domain, socket_type, protocol)
 }
 
-backend_control_bind :: proc(backend: ^Platform_Backend, fd: OS_FD, address: Socket_Address) -> Backend_Error {
+backend_control_bind :: proc(
+	backend: ^Platform_Backend,
+	fd: OS_FD,
+	address: Socket_Address,
+) -> Backend_Error {
 	return _backend_control_bind(backend, fd, address)
 }
 
-backend_control_listen :: proc(backend: ^Platform_Backend, fd: OS_FD, backlog: u32) -> Backend_Error {
+backend_control_listen :: proc(
+	backend: ^Platform_Backend,
+	fd: OS_FD,
+	backlog: u32,
+) -> Backend_Error {
 	return _backend_control_listen(backend, fd, backlog)
 }
 
@@ -140,7 +159,11 @@ backend_control_setsockopt :: proc(
 	return _backend_control_setsockopt(backend, fd, level, option, value)
 }
 
-backend_control_shutdown :: proc(backend: ^Platform_Backend, fd: OS_FD, how: Shutdown_How) -> Backend_Error {
+backend_control_shutdown :: proc(
+	backend: ^Platform_Backend,
+	fd: OS_FD,
+	how: Shutdown_How,
+) -> Backend_Error {
 	return _backend_control_shutdown(backend, fd, how)
 }
 

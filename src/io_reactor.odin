@@ -1,3 +1,4 @@
+#+private
 package tina
 
 import "core:testing"
