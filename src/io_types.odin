@@ -248,6 +248,7 @@ Handoff_Mode :: enum u8 {
 Submission_Token :: distinct u64
 
 BUFFER_INDEX_NONE :: u16(0x0FFF) // 12-bit max value (4095)
+FIXED_FILE_INDEX_NONE :: u16(0xFFFF)
 
 submission_token_pack :: #force_inline proc(
 	type_index: u8,
@@ -359,8 +360,9 @@ Submission_Operation :: union {
 }
 
 Submission :: struct {
-	token:     Submission_Token,
-	operation: Submission_Operation,
+	token:            Submission_Token,
+	fixed_file_index: u16, // Index into io_uring fixed-file table (Linux only). FIXED_FILE_INDEX_NONE if unused.
+	operation:        Submission_Operation,
 }
 
 // --- Raw Completion (§6.6.2 §4) ---

@@ -463,6 +463,16 @@ when !TINA_SIMULATION_MODE {
 		return .None
 	}
 
+	@(private = "package")
+	_backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+		// No-op: kqueue has no fixed-file table.
+	}
+
+	@(private = "package")
+	_backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+		// No-op: kqueue has no fixed-file table.
+	}
+
 	// ============================================================================
 	// Internal Helpers
 	// ============================================================================

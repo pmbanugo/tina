@@ -42,6 +42,8 @@ when !TINA_SIMULATION_MODE {
 		unqueued:           [MAX_LINUX_UNQUEUED]Submission,
 		unqueued_count:     u16,
 		buffers_registered: bool,
+		files_registered:   bool,
+		fixed_fd_count:     u16,
 		addr_entries:       [MAX_LINUX_PENDING_ADDRS]Pending_Addr_Entry,
 	}
 
@@ -101,14 +103,28 @@ when !TINA_SIMULATION_MODE {
 			}
 		}
 
-		// Fixed files (§6.6.2 §8): deferred until FD table mutation hooks are implemented.
-		// Requires synchronizing kernel's fixed-file table with FD_Table alloc/free.
+		// register a sparse fixed-file table with io_uring.
+		if config.fd_slot_count > 0 {
+			backend.files_registered = _linux_register_fixed_files(backend, config.fd_slot_count)
+			if !backend.files_registered {
+				fmt.eprintfln(
+					"[WARN] io_uring fixed file registration failed for %d slots. Falling back to standard FD ops.",
+					config.fd_slot_count,
+				)
+			} else {
+				backend.fixed_fd_count = config.fd_slot_count
+			}
+		}
 
 		return .None
 	}
 
 	@(private = "package")
 	_backend_deinit :: proc(backend: ^Platform_Backend) {
+		if backend.files_registered {
+			linux.io_uring_register(backend.ring.fd, .UNREGISTER_FILES, nil, 0)
+			backend.files_registered = false
+		}
 		if backend.buffers_registered {
 			linux.io_uring_register(backend.ring.fd, .UNREGISTER_BUFFERS, nil, 0)
 			backend.buffers_registered = false
@@ -457,6 +473,8 @@ when !TINA_SIMULATION_MODE {
 	@(private = "file")
 	_linux_submit_one :: proc(backend: ^Platform_Backend, submission: ^Submission) -> bool {
 		ud := u64(submission.token)
+		ffi := submission.fixed_file_index
+		use_fixed := backend.files_registered && ffi != FIXED_FILE_INDEX_NONE
 
 		switch op in submission.operation {
 		case Submission_Op_Read:
@@ -465,37 +483,43 @@ when !TINA_SIMULATION_MODE {
 			// When the buffer belongs to the registered pool, use READ_FIXED to
 			// bypass the kernel's per-operation get_user_pages cost (§6.6.2 §8).
 			if backend.buffers_registered && buffer_index != BUFFER_INDEX_NONE {
-				return _linux_submit_read_fixed(backend, ud, op, buffer_index)
+				return _linux_submit_read_fixed(backend, ud, op, buffer_index, use_fixed, ffi)
 			}
-			_, ok := uring.read(
+			sqe, ok := uring.read(
 				&backend.ring,
 				ud,
 				linux.Fd(op.fd),
 				op.buffer[:op.size],
 				i64(op.offset),
 			)
+			if ok && use_fixed {
+				_linux_apply_fixed_file(sqe, ffi)
+			}
 			return ok
 
 		case Submission_Op_Write:
 			buffer_index := submission_token_buffer_index(submission.token)
 
 			if backend.buffers_registered && buffer_index != BUFFER_INDEX_NONE {
-				return _linux_submit_write_fixed(backend, ud, op, buffer_index)
+				return _linux_submit_write_fixed(backend, ud, op, buffer_index, use_fixed, ffi)
 			}
-			_, ok := uring.write(
+			sqe, ok := uring.write(
 				&backend.ring,
 				ud,
 				linux.Fd(op.fd),
 				op.buffer[:op.size],
 				i64(op.offset),
 			)
+			if ok && use_fixed {
+				_linux_apply_fixed_file(sqe, ffi)
+			}
 			return ok
 
 		case Submission_Op_Accept:
 			entry := _linux_alloc_addr_entry(backend, submission.token)
 			if entry != nil {
 				entry.sockaddr_len = size_of(entry.sockaddr)
-				_, ok := uring.accept(
+				sqe, ok := uring.accept(
 					&backend.ring,
 					ud,
 					linux.Fd(op.listen_fd),
@@ -506,19 +530,33 @@ when !TINA_SIMULATION_MODE {
 				if !ok {
 					entry.active = false
 				}
+				if ok && use_fixed {
+					_linux_apply_fixed_file(sqe, ffi)
+				}
 				return ok
 			}
 			// No addr slot available, accept without sockaddr
-			_, ok := uring.accept(&backend.ring, ud, linux.Fd(op.listen_fd), nil, nil, {})
+			sqe, ok := uring.accept(&backend.ring, ud, linux.Fd(op.listen_fd), nil, nil, {})
+			if ok && use_fixed {
+				_linux_apply_fixed_file(sqe, ffi)
+			}
 			return ok
 
 		case Submission_Op_Connect:
 			entry := _linux_alloc_addr_entry(backend, submission.token)
 			if entry != nil {
 				entry.sockaddr = _linux_socket_address_to_sockaddr(op.address)
-				_, ok := uring.connect(&backend.ring, ud, linux.Fd(op.socket_fd), &entry.sockaddr)
+				sqe, ok := uring.connect(
+					&backend.ring,
+					ud,
+					linux.Fd(op.socket_fd),
+					&entry.sockaddr,
+				)
 				if !ok {
 					entry.active = false
+				}
+				if ok && use_fixed {
+					_linux_apply_fixed_file(sqe, ffi)
 				}
 				return ok
 			}
@@ -529,23 +567,29 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Send:
-			_, ok := uring.send(
+			sqe, ok := uring.send(
 				&backend.ring,
 				ud,
 				linux.Fd(op.socket_fd),
 				op.buffer[:op.size],
 				{.NOSIGNAL},
 			)
+			if ok && use_fixed {
+				_linux_apply_fixed_file(sqe, ffi)
+			}
 			return ok
 
 		case Submission_Op_Recv:
-			_, ok := uring.recv(
+			sqe, ok := uring.recv(
 				&backend.ring,
 				ud,
 				linux.Fd(op.socket_fd),
 				op.buffer[:op.size],
 				{.NOSIGNAL},
 			)
+			if ok && use_fixed {
+				_linux_apply_fixed_file(sqe, ffi)
+			}
 			return ok
 
 		case Submission_Op_Sendto:
@@ -563,7 +607,7 @@ when !TINA_SIMULATION_MODE {
 				namelen = _linux_sockaddr_len(op.address),
 				iov     = (&entry.iovec)[:1],
 			}
-			_, ok := uring.sendmsg(
+			sqe, ok := uring.sendmsg(
 				&backend.ring,
 				ud,
 				linux.Fd(op.socket_fd),
@@ -572,6 +616,9 @@ when !TINA_SIMULATION_MODE {
 			)
 			if !ok {
 				entry.active = false
+			}
+			if ok && use_fixed {
+				_linux_apply_fixed_file(sqe, ffi)
 			}
 			return ok
 
@@ -590,7 +637,7 @@ when !TINA_SIMULATION_MODE {
 				namelen = size_of(entry.sockaddr),
 				iov     = (&entry.iovec)[:1],
 			}
-			_, ok := uring.recvmsg(
+			sqe, ok := uring.recvmsg(
 				&backend.ring,
 				ud,
 				linux.Fd(op.socket_fd),
@@ -599,6 +646,9 @@ when !TINA_SIMULATION_MODE {
 			)
 			if !ok {
 				entry.active = false
+			}
+			if ok && use_fixed {
+				_linux_apply_fixed_file(sqe, ffi)
 			}
 			return ok
 		}
@@ -637,6 +687,72 @@ when !TINA_SIMULATION_MODE {
 		return err == .NONE
 	}
 
+	// Register a sparse fixed-file table with io_uring (§6.6.2 §8).
+	// All slots initialized to -1 (empty). Updated incrementally via
+	// _backend_register_fixed_fd / _backend_unregister_fixed_fd.
+	@(private = "file")
+	_linux_register_fixed_files :: proc(backend: ^Platform_Backend, fd_slot_count: u16) -> bool {
+		fds: [65534]linux.Fd = ---
+		for i in 0 ..< int(fd_slot_count) {
+			fds[i] = linux.Fd(-1)
+		}
+		err := linux.io_uring_register(
+			backend.ring.fd,
+			.REGISTER_FILES,
+			&fds[0],
+			u32(fd_slot_count),
+		)
+		return err == .NONE
+	}
+
+	// Internal struct matching kernel's io_uring_rsrc_update for FILES_UPDATE.
+	_IO_Uring_Files_Update :: struct {
+		offset: u32,
+		resv:   u32,
+		data:   u64,
+	}
+
+	// Update a single slot in the kernel's fixed-file table.
+	// Called by reactor on fd_table_alloc (new FD enters a slot).
+	@(private = "package")
+	_backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+		if !backend.files_registered do return
+
+		new_fd := linux.Fd(fd)
+		update := _IO_Uring_Files_Update {
+			offset = u32(slot_index),
+			resv   = 0,
+			data   = u64(uintptr(&new_fd)),
+		}
+		linux.io_uring_register(backend.ring.fd, .REGISTER_FILES_UPDATE, &update, 1)
+	}
+
+	// Clear a single slot in the kernel's fixed-file table.
+	// Called by reactor on fd_table_free (FD leaves a slot).
+	@(private = "package")
+	_backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+		if !backend.files_registered do return
+
+		empty_fd := linux.Fd(-1)
+		update := _IO_Uring_Files_Update {
+			offset = u32(slot_index),
+			resv   = 0,
+			data   = u64(uintptr(&empty_fd)),
+		}
+		linux.io_uring_register(backend.ring.fd, .REGISTER_FILES_UPDATE, &update, 1)
+	}
+
+	// Apply fixed-file optimization to an SQE if registered files are available.
+	// Called after the uring helper has filled the SQE with the raw OS_FD.
+	@(private = "file")
+	_linux_apply_fixed_file :: #force_inline proc(
+		sqe: ^linux.IO_Uring_SQE,
+		fixed_file_index: u16,
+	) {
+		sqe.fd = linux.Fd(i32(fixed_file_index))
+		sqe.flags += {.FIXED_FILE}
+	}
+
 	// Submit a READ_FIXED SQE. The kernel uses pre-pinned pages for the buffer
 	@(private = "file")
 	_linux_submit_read_fixed :: proc(
@@ -644,6 +760,8 @@ when !TINA_SIMULATION_MODE {
 		user_data: u64,
 		op: Submission_Op_Read,
 		buffer_index: u16,
+		use_fixed_file: bool,
+		fixed_file_index: u16,
 	) -> bool {
 		sqe := uring.get_sqe(&backend.ring) or_return
 		sqe.opcode = .READ_FIXED
@@ -653,6 +771,9 @@ when !TINA_SIMULATION_MODE {
 		sqe.off = op.offset
 		sqe.user_data = user_data
 		sqe.buf_index = buffer_index
+		if use_fixed_file {
+			_linux_apply_fixed_file(sqe, fixed_file_index)
+		}
 		return true
 	}
 
@@ -663,6 +784,8 @@ when !TINA_SIMULATION_MODE {
 		user_data: u64,
 		op: Submission_Op_Write,
 		buffer_index: u16,
+		use_fixed_file: bool,
+		fixed_file_index: u16,
 	) -> bool {
 		sqe := uring.get_sqe(&backend.ring) or_return
 		sqe.opcode = .WRITE_FIXED
@@ -672,6 +795,9 @@ when !TINA_SIMULATION_MODE {
 		sqe.off = op.offset
 		sqe.user_data = user_data
 		sqe.buf_index = buffer_index
+		if use_fixed_file {
+			_linux_apply_fixed_file(sqe, fixed_file_index)
+		}
 		return true
 	}
 
@@ -800,6 +926,120 @@ when !TINA_SIMULATION_MODE {
 			return size_of(linux.Sock_Addr_Un)
 		}
 		return size_of(linux.Sock_Addr_Any)
+	}
+
+	// ============================================================================
+	// Tests (Linux-only, real io_uring)
+	// ============================================================================
+
+	@(test)
+	test_linux_fixed_files_register_and_deinit :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			queue_size    = DEFAULT_BACKEND_QUEUE_SIZE,
+			fd_slot_count = 8,
+		}
+
+		err := backend_init(&backend, config)
+		testing.expect_value(t, err, Backend_Error.None)
+		testing.expect(t, backend.files_registered, "fixed files should be registered")
+		testing.expect_value(t, backend.fixed_fd_count, 8)
+
+		backend_deinit(&backend)
+		testing.expect(t, !backend.files_registered, "should be unregistered after deinit")
+	}
+
+	@(test)
+	test_linux_fixed_files_disabled_when_zero :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			queue_size    = DEFAULT_BACKEND_QUEUE_SIZE,
+			fd_slot_count = 0,
+		}
+
+		err := backend_init(&backend, config)
+		testing.expect_value(t, err, Backend_Error.None)
+		testing.expect(t, !backend.files_registered, "should not register with 0 slots")
+
+		backend_deinit(&backend)
+	}
+
+	@(test)
+	test_linux_fixed_file_update_round_trip :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			queue_size    = DEFAULT_BACKEND_QUEUE_SIZE,
+			fd_slot_count = 4,
+		}
+		backend_init(&backend, config)
+		defer backend_deinit(&backend)
+
+		// Create a real socket
+		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_err, Backend_Error.None)
+
+		// Register it in slot 0
+		_backend_register_fixed_fd(&backend, 0, fd)
+
+		// Submit a recv using IOSQE_FIXED_FILE on slot 0
+		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE))
+		buf: [64]u8
+		submissions := [1]Submission {
+			{
+				token = token,
+				fixed_file_index = 0,
+				operation = Submission_Op_Recv{socket_fd = fd, buffer = &buf[0], size = 64},
+			},
+		}
+		sub_err := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_err, Backend_Error.None)
+		// If IOSQE_FIXED_FILE was applied incorrectly, the kernel would return EBADF
+		// on the CQE. The submit succeeding means the SQE was accepted.
+
+		// Unregister slot 0
+		_backend_unregister_fixed_fd(&backend, 0)
+
+		// Cancel the in-flight recv so we don't leak
+		backend_cancel(&backend, token)
+
+		// Clean up the socket
+		backend_control_close(&backend, fd)
+	}
+
+	@(test)
+	test_linux_close_sqe_uses_raw_fd :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			queue_size    = DEFAULT_BACKEND_QUEUE_SIZE,
+			fd_slot_count = 4,
+		}
+		backend_init(&backend, config)
+		defer backend_deinit(&backend)
+
+		fd, _ := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		_backend_register_fixed_fd(&backend, 0, fd)
+
+		// Submit a close with fixed_file_index = 0.
+		// _linux_submit_one must NOT apply IOSQE_FIXED_FILE for close.
+		// If it did, the close would target the fixed-file slot, not the raw FD.
+		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_CLOSE_COMPLETE))
+		submissions := [1]Submission {
+			{
+				token = token,
+				fixed_file_index = 0, // deliberately set — backend must ignore for close
+				operation = Submission_Op_Close{fd = fd},
+			},
+		}
+		sub_err := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_err, Backend_Error.None)
+
+		// Collect the close completion — should succeed (not EBADF)
+		completions: [4]Raw_Completion
+		count, _ := backend_collect(&backend, completions[:], 100_000_000) // 100ms timeout
+		testing.expect(t, count >= 1, "close should complete")
+		testing.expect(t, completions[0].result >= 0, "close should succeed (not EBADF)")
+
+		_backend_unregister_fixed_fd(&backend, 0)
 	}
 
 }

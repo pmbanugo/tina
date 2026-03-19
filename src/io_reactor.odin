@@ -62,6 +62,7 @@ reactor_init :: proc(
 	backend_config.buffer_base = raw_data(buffer_backing)
 	backend_config.buffer_slot_size = buffer_slot_size
 	backend_config.buffer_slot_count = buffer_slot_count
+	backend_config.fd_slot_count = u16(len(fd_backing))
 
 	err := backend_init(&reactor.backend, backend_config)
 	if err != .None do return err
@@ -99,6 +100,7 @@ reactor_control_socket :: proc(
 		return FD_HANDLE_NONE, .FD_Table_Full
 	}
 
+	backend_register_fixed_fd(&reactor.backend, fd_handle_index(fd_handle), os_fd)
 	return fd_handle, .None
 }
 
@@ -156,6 +158,7 @@ reactor_control_shutdown :: proc(
 reactor_internal_close_fd :: proc(reactor: ^Reactor, fd: FD_Handle) {
 	os_fd, t_err := fd_table_resolve(&reactor.fd_table, fd)
 	if t_err == .None {
+		backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(fd))
 		backend_control_close(&reactor.backend, os_fd)
 		fd_table_free(&reactor.fd_table, fd)
 	}
@@ -261,6 +264,11 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 					fd_handle, fd_err := fd_table_alloc(&reactor.fd_table, e.client_fd, owner)
 
 					if fd_err == .None {
+						backend_register_fixed_fd(
+							&reactor.backend,
+							fd_handle_index(fd_handle),
+							e.client_fd,
+						)
 						soa_meta[slot_idx].io_fd = fd_handle
 					} else {
 						backend_control_close(&reactor.backend, e.client_fd)
@@ -349,34 +357,37 @@ reactor_submit_io :: proc(
 	seq := soa_meta[slot_idx].io_sequence
 	gen := soa_meta[slot_idx].generation
 
-	sub: Submission
-	sub_op_tag: u8
-	buf_idx: u16 = BUFFER_INDEX_NONE
+	submission: Submission
+	submission.fixed_file_index = FIXED_FILE_INDEX_NONE
+	submission_op_tag: u8
+	buffer_index: u16 = BUFFER_INDEX_NONE
 	target_fd: FD_Handle = FD_HANDLE_NONE
 
 	switch op in io_op {
 	case IoOp_Read:
 		target_fd = op.fd
-		sub_op_tag = u8(IO_TAG_READ_COMPLETE)
+		submission_op_tag = u8(IO_TAG_READ_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
+		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		b_idx, b_err := reactor_buffer_pool_alloc(&reactor.buffer_pool)
 		if b_err != .None do return IO_ERR_RESOURCE_EXHAUSTED
-		buf_idx = b_idx
+		buffer_index = b_idx
 
-		sub.operation = Submission_Op_Read {
+		submission.operation = Submission_Op_Read {
 			fd     = entry.os_fd,
-			buffer = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buf_idx),
+			buffer = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size   = op.buffer_size_max,
 			offset = op.offset,
 		}
 
 	case IoOp_Write:
 		target_fd = op.fd
-		sub_op_tag = u8(IO_TAG_WRITE_COMPLETE)
+		submission_op_tag = u8(IO_TAG_WRITE_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
+		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		b_idx, b_err := _alloc_and_copy_in(
 			reactor,
@@ -387,39 +398,42 @@ reactor_submit_io :: proc(
 			op.payload_size,
 		)
 		if b_err != IO_ERR_NONE do return b_err
-		buf_idx = b_idx
+		buffer_index = b_idx
 
-		sub.operation = Submission_Op_Write {
+		submission.operation = Submission_Op_Write {
 			fd     = entry.os_fd,
-			buffer = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buf_idx),
+			buffer = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size   = op.payload_size,
 			offset = op.offset,
 		}
 
 	case IoOp_Accept:
 		target_fd = op.listen_fd
-		sub_op_tag = u8(IO_TAG_ACCEPT_COMPLETE)
+		submission_op_tag = u8(IO_TAG_ACCEPT_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.listen_fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
-		sub.operation = Submission_Op_Accept {
+		submission.fixed_file_index = fd_handle_index(op.listen_fd)
+		submission.operation = Submission_Op_Accept {
 			listen_fd = entry.os_fd,
 		}
 
 	case IoOp_Connect:
 		target_fd = op.fd
-		sub_op_tag = u8(IO_TAG_CONNECT_COMPLETE)
+		submission_op_tag = u8(IO_TAG_CONNECT_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
-		sub.operation = Submission_Op_Connect {
+		submission.fixed_file_index = fd_handle_index(op.fd)
+		submission.operation = Submission_Op_Connect {
 			socket_fd = entry.os_fd,
 			address   = op.address,
 		}
 
 	case IoOp_Send:
 		target_fd = op.fd
-		sub_op_tag = u8(IO_TAG_SEND_COMPLETE)
+		submission_op_tag = u8(IO_TAG_SEND_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
+		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		b_idx, b_err := _alloc_and_copy_in(
 			reactor,
@@ -430,35 +444,37 @@ reactor_submit_io :: proc(
 			op.payload_size,
 		)
 		if b_err != IO_ERR_NONE do return b_err
-		buf_idx = b_idx
+		buffer_index = b_idx
 
-		sub.operation = Submission_Op_Send {
+		submission.operation = Submission_Op_Send {
 			socket_fd = entry.os_fd,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buf_idx),
+			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.payload_size,
 		}
 
 	case IoOp_Recv:
 		target_fd = op.fd
-		sub_op_tag = u8(IO_TAG_RECV_COMPLETE)
+		submission_op_tag = u8(IO_TAG_RECV_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
+		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		b_idx, b_err := reactor_buffer_pool_alloc(&reactor.buffer_pool)
 		if b_err != .None do return IO_ERR_RESOURCE_EXHAUSTED
-		buf_idx = b_idx
+		buffer_index = b_idx
 
-		sub.operation = Submission_Op_Recv {
+		submission.operation = Submission_Op_Recv {
 			socket_fd = entry.os_fd,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buf_idx),
+			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.buffer_size_max,
 		}
 
 	case IoOp_Sendto:
 		target_fd = op.fd
-		sub_op_tag = u8(IO_TAG_SENDTO_COMPLETE)
+		submission_op_tag = u8(IO_TAG_SENDTO_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
+		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		b_idx, b_err := _alloc_and_copy_in(
 			reactor,
@@ -469,45 +485,54 @@ reactor_submit_io :: proc(
 			op.payload_size,
 		)
 		if b_err != IO_ERR_NONE do return b_err
-		buf_idx = b_idx
+		buffer_index = b_idx
 
-		sub.operation = Submission_Op_Sendto {
+		submission.operation = Submission_Op_Sendto {
 			socket_fd = entry.os_fd,
 			address   = op.address,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buf_idx),
+			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.payload_size,
 		}
 
 	case IoOp_Recvfrom:
 		target_fd = op.fd
-		sub_op_tag = u8(IO_TAG_RECVFROM_COMPLETE)
+		submission_op_tag = u8(IO_TAG_RECVFROM_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
+		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		b_idx, b_err := reactor_buffer_pool_alloc(&reactor.buffer_pool)
 		if b_err != .None do return IO_ERR_RESOURCE_EXHAUSTED
-		buf_idx = b_idx
+		buffer_index = b_idx
 
-		sub.operation = Submission_Op_Recvfrom {
+		submission.operation = Submission_Op_Recvfrom {
 			socket_fd = entry.os_fd,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buf_idx),
+			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.buffer_size_max,
 		}
 
 	case IoOp_Close:
 		target_fd = FD_HANDLE_NONE
-		sub_op_tag = u8(IO_TAG_CLOSE_COMPLETE)
+		submission_op_tag = u8(IO_TAG_CLOSE_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Any)
 		if err != IO_ERR_NONE do return err
 
-		sub.operation = Submission_Op_Close {
+		submission.operation = Submission_Op_Close {
 			fd = entry.os_fd,
 		}
+		backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(op.fd))
 		fd_table_free(&reactor.fd_table, op.fd)
 	}
 
-	sub.token = submission_token_pack(u8(type_idx), slot_idx, u8(gen), seq, buf_idx, sub_op_tag)
-	reactor.pending_submissions[reactor.pending_count] = sub
+	submission.token = submission_token_pack(
+		u8(type_idx),
+		slot_idx,
+		u8(gen),
+		seq,
+		buffer_index,
+		submission_op_tag,
+	)
+	reactor.pending_submissions[reactor.pending_count] = submission
 	reactor.pending_count += 1
 	soa_meta[slot_idx].io_fd = target_fd
 
@@ -664,4 +689,143 @@ test_reactor_control_socket_and_shutdown :: proc(t: ^testing.T) {
 
 	_, exhaust_err := reactor_control_socket(&reactor, owner_handle, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, exhaust_err, Reactor_Socket_Error.FD_Table_Full)
+}
+
+@(test)
+test_fixed_file_sentinel_consistency :: proc(t: ^testing.T) {
+	testing.expect_value(t, FIXED_FILE_INDEX_NONE, u16(FD_TABLE_NONE_INDEX))
+}
+
+@(test)
+test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
+	config := Backend_Config {
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+	}
+	fd_backing: [8]FD_Entry
+	buffer_backing: [4096]u8
+
+	reactor: Reactor
+	reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	defer reactor_deinit(&reactor)
+
+	owner := make_handle(0, 1, 0, 1)
+
+	// Create a socket owned by this handle
+	fd_handle, sock_err := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
+	testing.expect(t, fd_handle != FD_HANDLE_NONE, "Valid FD handle expected")
+
+	// Build a minimal Shard stub with metadata for type_id=1
+	shard: Shard
+	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
+	defer delete(shard.metadata)
+	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata[1])
+	shard.metadata[1][0].generation = 1
+	shard.metadata[1][0].state = .Runnable
+
+	// Submit an IoOp_Recv
+	io_err := reactor_submit_io(
+		&reactor,
+		&shard,
+		owner,
+		IoOp_Recv{fd = fd_handle, buffer_size_max = 512},
+	)
+	testing.expect_value(t, io_err, IO_ERR_NONE)
+	testing.expect_value(t, reactor.pending_count, 1)
+	testing.expect_value(
+		t,
+		reactor.pending_submissions[0].fixed_file_index,
+		fd_handle_index(fd_handle),
+	)
+}
+
+@(test)
+test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
+	config := Backend_Config {
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+	}
+	fd_backing: [8]FD_Entry
+	buffer_backing: [4096]u8
+
+	reactor: Reactor
+	reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	defer reactor_deinit(&reactor)
+
+	owner := make_handle(0, 1, 0, 1)
+
+	fd_handle, sock_err := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
+
+	shard: Shard
+	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
+	defer delete(shard.metadata)
+	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata[1])
+	shard.metadata[1][0].generation = 1
+	shard.metadata[1][0].state = .Runnable
+
+	// Submit a close — fixed_file_index must be NONE (safety invariant)
+	io_err := reactor_submit_io(&reactor, &shard, owner, IoOp_Close{fd = fd_handle})
+	testing.expect_value(t, io_err, IO_ERR_NONE)
+	testing.expect_value(t, reactor.pending_count, 1)
+	testing.expect_value(t, reactor.pending_submissions[0].fixed_file_index, FIXED_FILE_INDEX_NONE)
+}
+
+@(test)
+test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
+	config := Backend_Config {
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+	}
+	fd_backing: [8]FD_Entry
+	buffer_backing: [4096]u8
+
+	reactor: Reactor
+	reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	defer reactor_deinit(&reactor)
+
+	owner := make_handle(0, 1, 0, 1)
+
+	// Create a socket — gets slot N via LIFO
+	fd_handle_a, _ := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	slot_a := fd_handle_index(fd_handle_a)
+
+	shard: Shard
+	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
+	defer delete(shard.metadata)
+	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata[1])
+	shard.metadata[1][0].generation = 1
+	shard.metadata[1][0].state = .Runnable
+
+	// 1. Close fd_handle_a — frees slot back to free list
+	io_err1 := reactor_submit_io(&reactor, &shard, owner, IoOp_Close{fd = fd_handle_a})
+	testing.expect_value(t, io_err1, IO_ERR_NONE)
+	testing.expect_value(t, reactor.pending_count, 1)
+
+	// Close submission must NOT use fixed file
+	testing.expect_value(t, reactor.pending_submissions[0].fixed_file_index, FIXED_FILE_INDEX_NONE)
+
+	// 2. Create a new socket — LIFO reuses slot_a
+	fd_handle_b, _ := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	slot_b := fd_handle_index(fd_handle_b)
+	testing.expect_value(t, slot_b, slot_a) // LIFO reuse: same slot index
+
+	// 3. Submit recv on the new socket — should use the reused slot index
+	shard.metadata[1][0].io_sequence += 1
+	shard.metadata[1][0].generation += 1 // bump to match new handle
+	owner_b := make_handle(0, 1, 0, u32(shard.metadata[1][0].generation))
+	fd_table_handoff(&reactor.fd_table, fd_handle_b, owner_b, .Full)
+
+	io_err2 := reactor_submit_io(
+		&reactor,
+		&shard,
+		owner_b,
+		IoOp_Recv{fd = fd_handle_b, buffer_size_max = 512},
+	)
+	testing.expect_value(t, io_err2, IO_ERR_NONE)
+	testing.expect_value(t, reactor.pending_count, 2)
+
+	// Recv submission must use the slot index (same as slot_a, now pointing to new FD)
+	testing.expect_value(t, reactor.pending_submissions[1].fixed_file_index, slot_b)
 }

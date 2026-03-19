@@ -35,6 +35,7 @@ Backend_Config :: struct {
 	buffer_base:       [^]u8,          // buffer pool backing memory base address
 	buffer_slot_size:  u32,            // bytes per slot
 	buffer_slot_count: u16,            // number of slots
+	fd_slot_count:     u16,            // number of fixed-file slots
 }
 
 DEFAULT_BACKEND_QUEUE_SIZE :: 256
@@ -145,4 +146,16 @@ backend_control_shutdown :: proc(backend: ^Platform_Backend, fd: OS_FD, how: Shu
 
 backend_control_close :: proc(backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
 	return _backend_control_close(backend, fd)
+}
+
+// --- Fixed File Hooks (§6.6.2 §8) ---
+// Called by reactor on FD table alloc/free to synchronize kernel fixed-file table (Linux only).
+// No-op on non-Linux backends.
+
+backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+	_backend_register_fixed_fd(backend, slot_index, fd)
+}
+
+backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+	_backend_unregister_fixed_fd(backend, slot_index)
 }

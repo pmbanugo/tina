@@ -235,6 +235,16 @@ when TINA_SIMULATION_MODE {
 		return .None
 	}
 
+	@(private = "package")
+	_backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+		// No-op: SimulatedIO has no kernel fixed-file table.
+	}
+
+	@(private = "package")
+	_backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+		// No-op: SimulatedIO has no kernel fixed-file table.
+	}
+
 	// --- Internal Helpers ---
 
 	// Derive a deterministic per-operation value from (seed, tick, token).
