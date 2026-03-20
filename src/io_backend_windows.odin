@@ -717,9 +717,73 @@ when !TINA_SIMULATION_MODE {
 			   win.SOCKET_ERROR {
 				return .System_Error
 			}
+		case Socket_Linger:
+			lin := v
+			if win.setsockopt(
+				   win.SOCKET(uintptr(fd)),
+				   sol,
+				   opt,
+				   (^win.CHAR)(&lin),
+				   size_of(lin),
+			   ) ==
+			   win.SOCKET_ERROR {
+				return .System_Error
+			}
 		}
 
 		return .None
+	}
+
+	@(private = "package")
+	_backend_control_getsockopt :: proc(
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+		level: Socket_Level,
+		option: Socket_Option,
+	) -> (
+		Socket_Option_Value,
+		Backend_Error,
+	) {
+		sol := _win_map_socket_level(level)
+		opt := _win_map_socket_option(option)
+
+		// SO_LINGER requires an 8-byte struct; route separately to avoid buffer overflow
+		if option == .SO_LINGER {
+			lin: Socket_Linger
+			lin_len := win.c_int(size_of(lin))
+			if win.getsockopt(
+				   win.SOCKET(uintptr(fd)),
+				   sol,
+				   opt,
+				   (^win.CHAR)(&lin),
+				   &lin_len,
+			   ) ==
+			   win.SOCKET_ERROR {
+				return nil, .System_Error
+			}
+			return lin, .None
+		}
+
+		val: win.DWORD
+		val_len := win.c_int(size_of(val))
+		if win.getsockopt(
+			   win.SOCKET(uintptr(fd)),
+			   sol,
+			   opt,
+			   (^win.CHAR)(&val),
+			   &val_len,
+		   ) ==
+		   win.SOCKET_ERROR {
+			return nil, .System_Error
+		}
+
+		// Boolean options return bool, others return i32
+		#partial switch option {
+		case .SO_REUSEADDR, .SO_REUSEPORT, .SO_KEEPALIVE, .TCP_NODELAY, .IPV6_V6ONLY:
+			return bool(val != 0), .None
+		case:
+			return i32(val), .None
+		}
 	}
 
 	@(private = "package")

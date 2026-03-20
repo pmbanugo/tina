@@ -171,7 +171,11 @@ when TINA_SIMULATION_MODE {
 			// 5. Run structural checkers at interval
 			if sim.spec.simulation.checker_interval_ticks > 0 &&
 			   round % u64(sim.spec.simulation.checker_interval_ticks) == 0 {
-				// TODO: Run checkers (pool_integrity, etc.)
+				violation := simulator_run_checkers(sim, round)
+				if violation {
+					fmt.eprintfln("[SIM] Checker violation at round %d. Aborting.", round)
+					break
+				}
 			}
 
 			// 6. Quiescence Check
@@ -189,6 +193,65 @@ when TINA_SIMULATION_MODE {
 		}
 
 		fmt.printfln("[SIM] Simulation complete at round %d.", round)
+	}
+
+	// ============================================================================
+	// Structural Checkers (§7 in SIMULATION_MODE_DST.md)
+	// ============================================================================
+
+	// Returns true if any checker detected a violation.
+	simulator_run_checkers :: proc(sim: ^Simulator, round: u64) -> bool {
+		for i in 0 ..< sim.spec.shard_count {
+			shard := &sim.shards[i]
+
+			// Pool integrity: reactor buffer pool
+			// The free_count + buffers held in completions + buffers in-flight in
+			// the backend must equal the total slot_count. Since we can't easily
+			// count in-flight buffers, we verify a weaker invariant:
+			// free_count must not exceed slot_count (underflow/corruption).
+			pool := &shard.reactor.buffer_pool
+			if pool.free_count > pool.slot_count {
+				fmt.eprintfln(
+					"[CHECKER] Shard %d: reactor buffer pool corruption — free_count (%d) > slot_count (%d)",
+					i,
+					pool.free_count,
+					pool.slot_count,
+				)
+				return true
+			}
+
+			// Pool integrity: message pool
+			msg_pool := &shard.message_pool
+			if msg_pool.free_count > msg_pool.slot_count {
+				fmt.eprintfln(
+					"[CHECKER] Shard %d: message pool corruption — free_count (%d) > slot_count (%d)",
+					i,
+					msg_pool.free_count,
+					msg_pool.slot_count,
+				)
+				return true
+			}
+
+			// Generation monotonicity: generations must never be zero
+			// (zero is reserved for HANDLE_NONE / stale sentinel)
+			for type_desc in shard.type_descriptors {
+				type_id := type_desc.id
+				for slot in 0 ..< type_desc.slot_count {
+					gen := shard.metadata[type_id].generation[slot]
+					if gen == 0 {
+						fmt.eprintfln(
+							"[CHECKER] Shard %d: generation zero at type=%d slot=%d (round %d)",
+							i,
+							type_id,
+							slot,
+							round,
+						)
+						return true
+					}
+				}
+			}
+		}
+		return false
 	}
 
 	simulator_is_globally_idle :: proc(sim: ^Simulator) -> bool {

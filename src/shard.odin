@@ -132,7 +132,11 @@ Shard_Counters :: struct {
 	mailbox_full_drops:        u64,
 	io_buffer_exhaustions:     u64,
 	io_submission_exhaustions: u64,
-	io_stale_completions:      u64,
+	io_stale_completions:      u64, // TODO: In simulation, consider verifying that this counter
+	                               // equals the number of timer-wakes + shutdown-wakes that
+	                               // interrupted WAITING_FOR_IO Isolates. A mismatch would indicate
+	                               // a stale completion was lost (buffer leak) or double-counted.
+	                               // Might require tracking a separate "io_wakes" counter to compare against.
 	transfer_exhaustions:      u64,
 	transfer_stale_reads:      u64,
 }
@@ -254,10 +258,12 @@ scheduler_tick :: proc(shard: ^Shard) {
 					case .Waiting:
 						states[index] = .Runnable
 					case .Waiting_For_Io:
-						// Invalidate pending completion
+						// Invalidate pending completion via io_sequence bump.
+						// No explicit backend_cancel — the stale completion will
+						// arrive naturally, fail the io_sequence check in
+						// reactor_collect_completions, and have its buffer freed
+						// by the stale-path reclamation. See §6.6.3 §12 design note.
 						io_sequences[index] += 1
-						// Best-effort cancel (§3.4 — structural safety does not depend on it)
-						reactor_cancel_active_io(&shard.reactor, shard, u16(type_id), index)
 						states[index] = .Runnable
 					case .Waiting_For_Reply:
 						// Discard stale replies
@@ -453,6 +459,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 				if is_io_completion {
 					io_completions[slot] = IO_TAG_NONE
+					io_peer_addresses[slot] = {}
 					if buffer_to_free != BUFFER_INDEX_NONE {
 						reactor_buffer_pool_free(&shard.reactor.buffer_pool, buffer_to_free)
 					}
@@ -545,6 +552,20 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	if spec.handoff_fd != FD_HANDLE_NONE {
 		entry, fd_err := fd_table_lookup(&shard.reactor.fd_table, spec.handoff_fd)
 		if fd_err == .None {
+			// §6.6.3 §6: Split-FD handoff requires one_for_all supervision group
+			if spec.handoff_mode == .Read_Only || spec.handoff_mode == .Write_Only {
+				if group == nil || group.strategy != .One_For_All {
+					ctx_log(
+						ctx,
+						.ERROR,
+						LOG_TAG_ISOLATE_CRASHED,
+						transmute([]u8)string("Split-FD handoff requires one_for_all group"),
+					)
+					soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
+					shard.isolate_free_heads[type_id] = slot
+					return Spawn_Error.init_failed
+				}
+			}
 			can_transfer := true
 			if spec.handoff_mode == .Full || spec.handoff_mode == .Read_Only {
 				if entry.read_owner != ctx.self_handle do can_transfer = false
@@ -616,6 +637,9 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	}
 
 	if _, is_crash := effect.(Effect_Crash); is_crash {
+		if spec.handoff_fd != FD_HANDLE_NONE {
+			fd_table_handoff(&shard.reactor.fd_table, spec.handoff_fd, ctx.self_handle, spec.handoff_mode)
+		}
 		soa_meta[slot].state = .Unallocated
 		soa_meta[slot].group_index = SUPERVISION_GROUP_NONE
 		soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
@@ -623,6 +647,9 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 		return Spawn_Error.init_failed
 	}
 	if _, is_done := effect.(Effect_Done); is_done {
+		if spec.handoff_fd != FD_HANDLE_NONE {
+			fd_table_handoff(&shard.reactor.fd_table, spec.handoff_fd, ctx.self_handle, spec.handoff_mode)
+		}
 		soa_meta[slot].state = .Unallocated
 		soa_meta[slot].group_index = SUPERVISION_GROUP_NONE
 		soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
@@ -747,11 +774,11 @@ ctx_bind :: #force_inline proc(
 	fd: FD_Handle,
 	address: Socket_Address,
 ) -> Backend_Error {
-	return reactor_control_bind(&ctx.shard.reactor, fd, address)
+	return reactor_control_bind(&ctx.shard.reactor, fd, ctx.self_handle, address)
 }
 
 ctx_listen :: #force_inline proc(ctx: ^TinaContext, fd: FD_Handle, backlog: u32) -> Backend_Error {
-	return reactor_control_listen(&ctx.shard.reactor, fd, backlog)
+	return reactor_control_listen(&ctx.shard.reactor, fd, ctx.self_handle, backlog)
 }
 
 ctx_setsockopt :: #force_inline proc(
@@ -761,7 +788,7 @@ ctx_setsockopt :: #force_inline proc(
 	option: Socket_Option,
 	value: Socket_Option_Value,
 ) -> Backend_Error {
-	return reactor_control_setsockopt(&ctx.shard.reactor, fd, level, option, value)
+	return reactor_control_setsockopt(&ctx.shard.reactor, fd, ctx.self_handle, level, option, value)
 }
 
 ctx_shutdown :: #force_inline proc(
@@ -802,7 +829,7 @@ ctx_getsockopt :: #force_inline proc(
 	Socket_Option_Value,
 	Backend_Error,
 ) {
-	return false, .Unsupported
+	return reactor_control_getsockopt(&ctx.shard.reactor, fd, level, option)
 }
 
 // --- Internal Utilities ---
@@ -841,16 +868,11 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 
 	// Step 2b: Reclaim pending I/O and Transfer buffers
 	if soa_meta[slot_index].io_completion_tag != IO_TAG_NONE {
-		tag := soa_meta[slot_index].io_completion_tag
-		if tag == IO_TAG_READ_COMPLETE ||
-		   tag == IO_TAG_RECV_COMPLETE ||
-		   tag == IO_TAG_RECVFROM_COMPLETE {
-			if soa_meta[slot_index].io_buffer_index != BUFFER_INDEX_NONE {
-				reactor_buffer_pool_free(
-					&shard.reactor.buffer_pool,
-					soa_meta[slot_index].io_buffer_index,
-				)
-			}
+		if soa_meta[slot_index].io_buffer_index != BUFFER_INDEX_NONE {
+			reactor_buffer_pool_free(
+				&shard.reactor.buffer_pool,
+				soa_meta[slot_index].io_buffer_index,
+			)
 		}
 		soa_meta[slot_index].io_completion_tag = IO_TAG_NONE
 		soa_meta[slot_index].io_buffer_index = BUFFER_INDEX_NONE
@@ -1193,7 +1215,7 @@ _interpret_effect :: proc(
 		if err != IO_ERR_NONE {
 			if err == IO_ERR_RESOURCE_EXHAUSTED do shard.counters.io_buffer_exhaustions += 1
 			soa_meta[slot].io_completion_tag = _io_op_to_completion_tag(e.operation)
-			soa_meta[slot].io_result = -i32(err)
+			soa_meta[slot].io_result = i32(err)
 			soa_meta[slot].io_buffer_index = BUFFER_INDEX_NONE
 			soa_meta[slot].state = .Runnable
 		} else {

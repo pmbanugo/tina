@@ -489,10 +489,65 @@ when !TINA_SIMULATION_MODE {
 			if posix.setsockopt(posix.FD(fd), plevel, popt, &val, size_of(val)) != .OK {
 				return .System_Error
 			}
+		case Socket_Linger:
+			lin := v
+			if posix.setsockopt(posix.FD(fd), plevel, popt, &lin, size_of(lin)) != .OK {
+				return .System_Error
+			}
 		case:
 			return .Unsupported
 		}
 		return .None
+	}
+
+	@(private = "package")
+	_backend_control_getsockopt :: proc(
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+		level: Socket_Level,
+		option: Socket_Option,
+	) -> (
+		Socket_Option_Value,
+		Backend_Error,
+	) {
+		plevel: c.int
+		switch level {
+		case .SOL_SOCKET:
+			plevel = c.int(posix.SOL_SOCKET)
+		case .IPPROTO_TCP:
+			plevel = 6
+		case .IPPROTO_UDP:
+			plevel = 17
+		case .IPPROTO_IPV6:
+			plevel = 41
+		}
+
+		popt, opt_ok := _map_socket_option(option)
+		if !opt_ok {
+			return nil, .Unsupported
+		}
+
+		if option == .SO_LINGER {
+			lin: Socket_Linger
+			lin_len := posix.socklen_t(size_of(lin))
+			if posix.getsockopt(posix.FD(fd), plevel, popt, &lin, &lin_len) != .OK {
+				return nil, .System_Error
+			}
+			return lin, .None
+		}
+
+		val: c.int
+		val_len := posix.socklen_t(size_of(val))
+		if posix.getsockopt(posix.FD(fd), plevel, popt, &val, &val_len) != .OK {
+			return nil, .System_Error
+		}
+
+		#partial switch option {
+		case .SO_REUSEADDR, .SO_REUSEPORT, .SO_KEEPALIVE, .TCP_NODELAY, .IPV6_V6ONLY:
+			return bool(val != 0), .None
+		case:
+			return i32(val), .None
+		}
 	}
 
 	@(private = "package")
@@ -518,6 +573,13 @@ when !TINA_SIMULATION_MODE {
 
 	@(private = "package")
 	_backend_control_close :: proc(backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
+		// Sweep pending operations for this FD BEFORE closing it.
+		// On BSD/macOS, close() silently removes kevents. Without this sweep,
+		// pending operations on this FD would never produce a completion,
+		// permanently leaking their reactor buffers. We synthesize -ECANCELED
+		// completions so the reactor's stale-path reclamation frees the buffers.
+		_sweep_pending_for_fd(backend, fd)
+
 		if posix.close(posix.FD(fd)) != .OK {
 			return .System_Error
 		}
@@ -817,6 +879,50 @@ when !TINA_SIMULATION_MODE {
 		if index < backend.pending_count {
 			backend.pending[index] = backend.pending[backend.pending_count]
 		}
+	}
+
+	// Sweep pending operations matching a given OS_FD.
+	// Synthesizes -ECANCELED completions for each match so the reactor's
+	// stale-path reclamation can free their buffers. Called before close()
+	// because on kqueue, close() silently removes kevents without firing events.
+	@(private = "file")
+	_sweep_pending_for_fd :: proc(backend: ^Platform_Backend, fd: OS_FD) {
+		i: u16 = 0
+		for i < backend.pending_count {
+			op_fd := _submission_op_fd(backend.pending[i].operation)
+			if op_fd == fd {
+				// Synthesize cancellation completion
+				if backend.completed_count < MAX_POSIX_COMPLETED {
+					backend.completed[backend.completed_count] = Raw_Completion{
+						token  = backend.pending[i].token,
+						result = -i32(posix.Errno.ECANCELED),
+						extra  = nil,
+					}
+					backend.completed_count += 1
+				}
+				_remove_pending(backend, i)
+				// Don't increment — swapped-in element needs checking
+			} else {
+				i += 1
+			}
+		}
+	}
+
+	// Extract the OS_FD from a Submission_Operation for FD-based sweep matching.
+	@(private = "file")
+	_submission_op_fd :: proc(op: Submission_Operation) -> OS_FD {
+		switch o in op {
+		case Submission_Op_Read:     return o.fd
+		case Submission_Op_Write:    return o.fd
+		case Submission_Op_Accept:   return o.listen_fd
+		case Submission_Op_Connect:  return o.socket_fd
+		case Submission_Op_Close:    return o.fd
+		case Submission_Op_Send:     return o.socket_fd
+		case Submission_Op_Recv:     return o.socket_fd
+		case Submission_Op_Sendto:   return o.socket_fd
+		case Submission_Op_Recvfrom: return o.socket_fd
+		}
+		return OS_FD_INVALID
 	}
 
 	@(private = "file")

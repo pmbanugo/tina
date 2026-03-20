@@ -102,9 +102,15 @@ Socket_Option :: enum u16 {
 	IPV6_V6ONLY     = 0x0201,
 }
 
+Socket_Linger :: struct {
+	onoff:  i32,
+	linger: i32,
+}
+
 Socket_Option_Value :: union {
 	bool,
 	i32,
+	Socket_Linger,
 }
 
 // --- Socket Address (§6.6.3 §9) ---

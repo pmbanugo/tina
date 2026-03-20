@@ -108,29 +108,45 @@ reactor_control_socket :: proc(
 reactor_control_bind :: proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
+	owner: Handle,
 	address: Socket_Address,
 ) -> Backend_Error {
-	os_fd, t_err := fd_table_resolve(&reactor.fd_table, fd)
-	if t_err != .None do return .Not_Found
-	return backend_control_bind(&reactor.backend, os_fd, address)
+	entry, err := _resolve_fd(reactor, fd, owner, .Any)
+	if err != IO_ERR_NONE do return .Not_Found
+	return backend_control_bind(&reactor.backend, entry.os_fd, address)
 }
 
-reactor_control_listen :: proc(reactor: ^Reactor, fd: FD_Handle, backlog: u32) -> Backend_Error {
-	os_fd, t_err := fd_table_resolve(&reactor.fd_table, fd)
-	if t_err != .None do return .Not_Found
-	return backend_control_listen(&reactor.backend, os_fd, backlog)
+reactor_control_listen :: proc(reactor: ^Reactor, fd: FD_Handle, owner: Handle, backlog: u32) -> Backend_Error {
+	entry, err := _resolve_fd(reactor, fd, owner, .Any)
+	if err != IO_ERR_NONE do return .Not_Found
+	return backend_control_listen(&reactor.backend, entry.os_fd, backlog)
 }
 
 reactor_control_setsockopt :: proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
+	owner: Handle,
 	level: Socket_Level,
 	option: Socket_Option,
 	value: Socket_Option_Value,
 ) -> Backend_Error {
+	entry, err := _resolve_fd(reactor, fd, owner, .Any)
+	if err != IO_ERR_NONE do return .Not_Found
+	return backend_control_setsockopt(&reactor.backend, entry.os_fd, level, option, value)
+}
+
+reactor_control_getsockopt :: proc(
+	reactor: ^Reactor,
+	fd: FD_Handle,
+	level: Socket_Level,
+	option: Socket_Option,
+) -> (
+	Socket_Option_Value,
+	Backend_Error,
+) {
 	os_fd, t_err := fd_table_resolve(&reactor.fd_table, fd)
-	if t_err != .None do return .Not_Found
-	return backend_control_setsockopt(&reactor.backend, os_fd, level, option, value)
+	if t_err != .None do return nil, .Not_Found
+	return backend_control_getsockopt(&reactor.backend, os_fd, level, option)
 }
 
 // Half-close a socket. Validates direction-scoped ownership (§6.6.3 §11).
@@ -163,34 +179,6 @@ reactor_internal_close_fd :: proc(reactor: ^Reactor, fd: FD_Handle) {
 		backend_control_close(&reactor.backend, os_fd)
 		fd_table_free(&reactor.fd_table, fd)
 	}
-}
-
-// ====================
-// Cancellation API
-// ====================
-
-reactor_cancel_active_io :: proc(
-	reactor: ^Reactor,
-	shard: ^Shard,
-	type_id: u16,
-	slot_idx: u32,
-) -> Backend_Error {
-	soa_meta := shard.metadata[type_id]
-
-	if soa_meta[slot_idx].io_completion_tag == IO_TAG_NONE {
-		return .Not_Found
-	}
-
-	token := submission_token_pack(
-		u8(type_id),
-		slot_idx,
-		u8(soa_meta[slot_idx].generation),
-		soa_meta[slot_idx].io_sequence,
-		soa_meta[slot_idx].io_buffer_index,
-		u8(soa_meta[slot_idx].io_completion_tag),
-	)
-
-	return backend_cancel(&reactor.backend, token)
 }
 
 // =====================================================
@@ -239,6 +227,17 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 				}
 			}
 
+			// Reclaim leaked OS resources from accept completions.
+			// The kernel allocated a client_fd that has no Isolate handler.
+			if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) {
+				#partial switch e in completion.extra {
+				case Completion_Extra_Accept:
+					if completion.result >= 0 && e.client_fd != OS_FD_INVALID {
+						backend_control_close(&reactor.backend, e.client_fd)
+					}
+				}
+			}
+
 			shard.counters.io_stale_completions += 1
 			continue
 		}
@@ -273,7 +272,7 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 						soa_meta[slot_idx].io_fd = fd_handle
 					} else {
 						backend_control_close(&reactor.backend, e.client_fd)
-						soa_meta[slot_idx].io_result = -i32(IO_ERR_RESOURCE_EXHAUSTED)
+						soa_meta[slot_idx].io_result = i32(IO_ERR_RESOURCE_EXHAUSTED)
 						soa_meta[slot_idx].io_fd = FD_HANDLE_NONE
 					}
 				} else {
@@ -323,7 +322,7 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) {
 			soa_meta[slot_idx].io_completion_tag = IO_Completion_Tag(
 				submission_token_operation_tag(sub.token),
 			)
-			soa_meta[slot_idx].io_result = -i32(IO_ERR_SUBMISSION_FULL)
+			soa_meta[slot_idx].io_result = i32(IO_ERR_SUBMISSION_FULL)
 			soa_meta[slot_idx].io_buffer_index = BUFFER_INDEX_NONE
 
 			if soa_meta[slot_idx].state == .Waiting_For_Io {
@@ -353,6 +352,17 @@ reactor_submit_io :: proc(
 	type_idx := extract_type_id(owner)
 	slot_idx := extract_slot(owner)
 	soa_meta := shard.metadata[type_idx]
+
+	// One-in-flight I/O invariant: an Isolate must not submit new I/O while
+	// already in WAITING_FOR_IO. The io_sequence mechanism assumes at most one
+	// in-flight operation per Isolate — if two were in flight, bumping the
+	// sequence would only invalidate one, leaving the other to corrupt state.
+	when TINA_DEBUG_ASSERTS {
+		assert(
+			soa_meta[slot_idx].state != .Waiting_For_Io,
+			"One-in-flight I/O invariant violated: Isolate submitted while WAITING_FOR_IO",
+		)
+	}
 
 	soa_meta[slot_idx].io_sequence += 1
 	seq := soa_meta[slot_idx].io_sequence
@@ -833,4 +843,84 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 
 	// Recv submission must use the slot index (same as slot_a, now pointing to new FD)
 	testing.expect_value(t, reactor.pending_submissions[1].fixed_file_index, slot_b)
+}
+
+when TINA_SIMULATION_MODE {
+    // The equivalent is named test_io_sequence_stale_completion_reclamation
+    // which is in the simulation test file, and runs only in simulation mode
+    // Once I make the Simulation IO emulate the kqueue/IOCP/uring semantics,
+    // I should remove one of them or merge the concepts.
+    @(test)
+    test_reactor_real_os_stale_completion_reclamation :: proc(t: ^testing.T) {
+    	// 1. Setup Backing Memory and Reactor
+    	config := Backend_Config{queue_size = 32}
+    	//when TINA_SIMULATION_MODE {
+    	//	config.sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, seed = t.seed}
+    	//}
+
+    	fd_backing: [8]FD_Entry
+    	buffer_backing: [4096]u8
+
+    	reactor := new(Reactor)
+    	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+    	defer { reactor_deinit(reactor); free(reactor) }
+
+    	// 2. Setup Mock Shard Metadata
+    	shard := new(Shard)
+    	defer free(shard)
+    	shard.metadata = make([]#soa[]Isolate_Metadata, 1)
+    	defer delete(shard.metadata)
+    	shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
+    	defer delete(shard.metadata[0])
+
+    	meta := &shard.metadata[0][0]
+    	meta.generation = 1
+    	meta.io_sequence = 1
+    	meta.state = .Runnable
+
+    	owner := make_handle(0, 0, 0, 1)
+
+    	// 3. Anchor the I/O: Create a UDP socket. It will block forever on Recv.
+    	fd, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .DGRAM, .UDP)
+    	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
+
+    	bind_addr := Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 0}
+    	reactor_control_bind(reactor, fd, owner, bind_addr)
+
+    	// 4. Submit Recv
+    	io_err := reactor_submit_io(reactor, shard, owner, IoOp_Recv{fd = fd, buffer_size_max = 512})
+    	testing.expect_value(t, io_err, IO_ERR_NONE)
+
+    	// Buffer should be allocated
+    	testing.expect_value(t, reactor.buffer_pool.free_count, 3)
+
+    	// Push to the OS kernel / Simulator
+    	reactor_flush_submissions(reactor, shard)
+
+    	// 5. Simulate the Timer Wake (The ADR Structural Guarantee)
+    	meta.io_sequence += 1
+    	meta.state = .Runnable
+
+    	// 6. Simulate Isolate closing the socket as a timeout response.
+    	// This triggers the kqueue sweep, the io_uring cancel, or the IOCP abort.
+    	reactor_internal_close_fd(reactor, fd)
+
+    	// 7. Collect Completions
+    	// Because kernel cancellation is asynchronous (especially on io_uring/IOCP),
+    	// we must poll a few times. The kqueue sweep is synchronous, but this loop
+    	// should safely handles all platforms.
+    	recovered := false
+    	for i in 0 ..< 50 {
+    		reactor_collect_completions(reactor, shard, 10_000_000) // 10ms wait
+    		if reactor.buffer_pool.free_count == 4 {
+    			recovered = true
+    			break
+    		}
+    	}
+
+    	// 8. The Critical Assertions
+    	testing.expect(t, recovered, "Reactor buffer leaked! The OS completion was lost or never generated.")
+    	testing.expect_value(t, reactor.buffer_pool.free_count, 4)
+    	testing.expect_value(t, shard.counters.io_stale_completions, 1)
+    }
 }

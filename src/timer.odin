@@ -156,10 +156,31 @@ _advance_timers :: proc(
 				break
 			}
 
-			// --- WAITING_FOR_IO Integration ---
-			// Gated on TAG_CALL_TIMEOUT: only system call-timeout timers may cancel
-			// in-flight I/O. User timers skip this entire block (single comparison).
-			if entry.tag == TAG_CALL_TIMEOUT {
+			// --- WAITING_FOR_IO Integration (§6.6.3 §12) ---
+			// Any timer expiration targeting an Isolate in Waiting_For_Io
+			// wakes it via io_sequence bump. Not gated on tag —
+			// user timers (e.g., CONNECT_TIMEOUT) must also wake I/O waiters.
+			//
+			// DESIGN NOTE — Why no backend_cancel:
+			// The io_sequence field is the structural safety guarantee for stale
+			// I/O completions. When we bump io_sequence here, the abandoned
+			// operation's completion will eventually arrive at
+			// reactor_collect_completions, fail the sequence check, and have
+			// its buffer freed by the stale-path reclamation. This is
+			// structurally safe regardless of platform cancel semantics:
+			//   - io_uring: kernel delivers CQE (success or -ECANCELED) → stale path frees buffer
+			//   - kqueue:   close() silently removes kevents, so _backend_control_close sweeps pending
+			//               operations and synthesizes -ECANCELED completions → stale path frees buffers
+			//   - SimulatedIO: operation completes on next tick_count advancement → stale path
+			//
+			// Explicit cancel was removed because it adds per-slot state
+			// (stored token) to the hot SOA metadata for a control-plane
+			// operation that the existing structural guarantee already handles.
+			// The only cost: the buffer stays allocated until the backend
+			// naturally completes the stale operation (bounded, typically
+			// sub-millisecond). This is consistent with the ADR's statement:
+			// "structural safety does not depend on [backend_cancel]" (§6.6.3 §12, GRACEFUL_SHUTDOWN §3.4).
+			{
 				target_type := extract_type_id(entry.target)
 				target_slot := extract_slot(entry.target)
 				target_gen := extract_generation(entry.target)
@@ -169,7 +190,6 @@ _advance_timers :: proc(
 				   shard.metadata[target_type][target_slot].generation == target_gen {
 					soa_meta := shard.metadata[target_type]
 					if soa_meta[target_slot].state == .Waiting_For_Io {
-						reactor_cancel_active_io(&shard.reactor, shard, target_type, target_slot)
 						soa_meta[target_slot].io_sequence += 1
 						soa_meta[target_slot].state = .Runnable
 					}

@@ -123,7 +123,7 @@ when TINA_SIMULATION_MODE {
 						u64(backend.config.fault_rate.denominator),
 					)
 					if fault_val < threshold {
-						completion.result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+						completion.result = _sim_sample_error(backend, op.token)
 					} else {
 						_sim_generate_success(op, completion)
 					}
@@ -222,6 +222,20 @@ when TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
+	_backend_control_getsockopt :: proc(
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+		level: Socket_Level,
+		option: Socket_Option,
+	) -> (
+		Socket_Option_Value,
+		Backend_Error,
+	) {
+		// Simulation returns a default value
+		return i32(0), .None
+	}
+
+	@(private = "package")
 	_backend_control_shutdown :: proc(
 		backend: ^Platform_Backend,
 		fd: OS_FD,
@@ -294,6 +308,40 @@ when TINA_SIMULATION_MODE {
 		case:
 			completion.result = 0
 		}
+	}
+
+	@(private = "file")
+	_sim_sample_error :: proc(backend: ^Platform_Backend, token: Submission_Token) -> i32 {
+		dist := backend.config.error_distribution
+		if len(dist) == 0 {
+			return i32(IO_ERR_RESOURCE_EXHAUSTED) // fallback
+		}
+
+		// Compute total weight
+		total_weight: u64 = 0
+		for entry in dist {
+			total_weight += u64(entry.weight)
+		}
+		if total_weight == 0 {
+			return i32(IO_ERR_RESOURCE_EXHAUSTED) // fallback
+		}
+
+		// Deterministic sample using a different hash phase (0x2) to avoid
+		// correlation with fault occurrence decision (which uses 0x1)
+		h := _sim_op_hash(backend.seed ~ 0x2, backend.tick_count, token)
+		sample := h % total_weight
+
+		// Cumulative weight selection
+		cumulative: u64 = 0
+		for entry in dist {
+			cumulative += u64(entry.weight)
+			if sample < cumulative {
+				return entry.error_code
+			}
+		}
+
+		// Should be unreachable, but return last entry as safety
+		return dist[len(dist) - 1].error_code
 	}
 
 	// ============================================================================
@@ -445,6 +493,46 @@ when TINA_SIMULATION_MODE {
 			testing.expect_value(t, result1[i].token, result2[i].token)
 			testing.expect_value(t, result1[i].result, result2[i].result)
 		}
+	}
+
+	@(test)
+	test_simulated_backend_error_distribution :: proc(t: ^testing.T) {
+		// Define a distribution: 50% ECONNRESET (-104), 50% EPIPE (-32)
+		dist := [2]Error_Weight {
+			{error_code = -104, weight = 1},
+			{error_code = -32, weight = 1},
+		}
+
+		backend: Platform_Backend
+		config := Backend_Config {
+			sim_config = Simulation_IO_Config {
+				delay_range_ticks  = {0, 1},
+				fault_rate         = Ratio{numerator = 1, denominator = 1}, // 100% fault rate
+				seed               = t.seed,
+				error_distribution = dist[:],
+			},
+		}
+		backend_init(&backend, config)
+
+		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE))
+		submissions := [1]Submission {
+			{token = token, operation = Submission_Op_Recv{socket_fd = OS_FD(10), size = 1024}},
+		}
+		backend_submit(&backend, submissions[:])
+
+		completions: [4]Raw_Completion
+		count, _ := backend_collect(&backend, completions[:], 0)
+		testing.expect(t, count >= 1, "should have at least 1 completion")
+
+		// With 100% fault rate, the result should be one of our distribution errors
+		result := completions[0].result
+		testing.expect(
+			t,
+			result == -104 || result == -32,
+			"fault result should be from the error distribution",
+		)
+
+		backend_deinit(&backend)
 	}
 
 } // when TINA_SIM

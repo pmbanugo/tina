@@ -119,7 +119,18 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		break
 	}
 
-	// Clean exit after graceful drain
+	// Clean exit after graceful drain.
+	// After all Isolates returned .done and the last scheduler_tick drained
+	// any remaining stale I/O completions, every reactor buffer should be back
+	// in the free pool. A mismatch means a buffer leaked — either the
+	// io_sequence stale-path failed to free it, or teardown step 2b missed one.
+	when TINA_DEBUG_ASSERTS {
+		assert(
+			shard.reactor.buffer_pool.free_count == shard.reactor.buffer_pool.slot_count,
+			"Reactor buffer pool leak: not all buffers reclaimed after shutdown drain",
+		)
+	}
+
 	// §13: Final synchronous log flush — last operation before shard thread exits
 	log_flush(shard)
 

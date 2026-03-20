@@ -420,19 +420,99 @@ when !TINA_SIMULATION_MODE {
 			opt = 26 // IPV6_V6ONLY
 		}
 
-		int_val: i32
 		switch v in value {
 		case bool:
-			int_val = 1 if v else 0
+			int_val: i32 = 1 if v else 0
+			err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
+			if err != nil do return .System_Error
 		case i32:
-			int_val = v
-		}
-
-		err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
-		if err != nil {
-			return .System_Error
+			int_val := v
+			err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
+			if err != nil do return .System_Error
+		case Socket_Linger:
+			lin := v
+			err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &lin)
+			if err != nil do return .System_Error
+		case:
+			return .Unsupported
 		}
 		return .None
+	}
+
+	@(private = "package")
+	_backend_control_getsockopt :: proc(
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+		level: Socket_Level,
+		option: Socket_Option,
+	) -> (
+		Socket_Option_Value,
+		Backend_Error,
+	) {
+		sol: i32
+		switch level {
+		case .SOL_SOCKET:
+			sol = 1 // SOL_SOCKET
+		case .IPPROTO_TCP:
+			sol = 6 // IPPROTO_TCP
+		case .IPPROTO_UDP:
+			sol = 17 // IPPROTO_UDP
+		case .IPPROTO_IPV6:
+			sol = 41 // IPPROTO_IPV6
+		}
+
+		opt: i32
+		switch option {
+		case .SO_REUSEADDR:
+			opt = 2 // SO_REUSEADDR
+		case .SO_REUSEPORT:
+			opt = 15 // SO_REUSEPORT
+		case .SO_KEEPALIVE:
+			opt = 9 // SO_KEEPALIVE
+		case .SO_RCVBUF:
+			opt = 8 // SO_RCVBUF
+		case .SO_SNDBUF:
+			opt = 7 // SO_SNDBUF
+		case .SO_LINGER:
+			opt = 13 // SO_LINGER
+		case .SO_BINDTODEVICE:
+			opt = 25 // SO_BINDTODEVICE
+		case .TCP_NODELAY:
+			opt = 1 // TCP_NODELAY
+		case .TCP_CORK:
+			opt = 3 // TCP_CORK
+		case .TCP_NOPUSH:
+			opt = 3 // TCP_NOPUSH (alias for CORK on Linux)
+		case .TCP_KEEPIDLE:
+			opt = 4 // TCP_KEEPIDLE
+		case .TCP_KEEPINTVL:
+			opt = 5 // TCP_KEEPINTVL
+		case .TCP_KEEPCNT:
+			opt = 6 // TCP_KEEPCNT
+		case .IPV6_V6ONLY:
+			opt = 26 // IPV6_V6ONLY
+		}
+
+		// SO_LINGER requires an 8-byte struct; route it separately to avoid stack overflow
+		if option == .SO_LINGER {
+			lin: Socket_Linger
+			_, err := linux.getsockopt_base(linux.Fd(fd), int(sol), linux.Socket_Option(opt), &lin)
+			if err != nil do return nil, .System_Error
+			return lin, .None
+		}
+
+		val: i32
+		_, err := linux.getsockopt_base(linux.Fd(fd), int(sol), linux.Socket_Option(opt), &val)
+		if err != nil {
+			return nil, .System_Error
+		}
+
+		#partial switch option {
+		case .SO_REUSEADDR, .SO_REUSEPORT, .SO_KEEPALIVE, .TCP_NODELAY, .IPV6_V6ONLY:
+			return bool(val != 0), .None
+		case:
+			return i32(val), .None
+		}
 	}
 
 	@(private = "package")

@@ -43,11 +43,17 @@ DEFAULT_BACKEND_QUEUE_SIZE :: 256
 
 // --- SimulatedIO Configuration (§6.6.2 §5.4) ---
 
+Error_Weight :: struct {
+	error_code: i32, // OS-level error result (e.g., -104 for ECONNRESET)
+	weight:     u32, // relative probability weight
+}
+
 Simulation_IO_Config :: struct {
-	fault_rate:        Ratio, // probability of fault per operation (0/N = never)
-	delay_range_ticks: [2]u32, // [min, max] simulated delay in ticks
-	reorder:           bool, // whether completions can be reordered
-	seed:              u64, // deterministic seed (from Prng_Tree.shard_io)
+	fault_rate:         Ratio, // probability of fault per operation (0/N = never)
+	delay_range_ticks:  [2]u32, // [min, max] simulated delay in ticks
+	reorder:            bool, // whether completions can be reordered
+	seed:               u64, // deterministic seed (from Prng_Tree.shard_io)
+	error_distribution: []Error_Weight, // varied error codes for fault injection
 }
 
 // --- Platform Backend Struct ---
@@ -74,6 +80,7 @@ Platform_Backend :: struct {
 //   _backend_control_bind        proc
 //   _backend_control_listen      proc
 //   _backend_control_setsockopt  proc
+//   _backend_control_getsockopt  proc
 //   _backend_control_shutdown    proc
 
 backend_init :: proc(backend: ^Platform_Backend, config: Backend_Config) -> Backend_Error {
@@ -157,6 +164,18 @@ backend_control_setsockopt :: proc(
 	value: Socket_Option_Value,
 ) -> Backend_Error {
 	return _backend_control_setsockopt(backend, fd, level, option, value)
+}
+
+backend_control_getsockopt :: proc(
+	backend: ^Platform_Backend,
+	fd: OS_FD,
+	level: Socket_Level,
+	option: Socket_Option,
+) -> (
+	Socket_Option_Value,
+	Backend_Error,
+) {
+	return _backend_control_getsockopt(backend, fd, level, option)
 }
 
 backend_control_shutdown :: proc(
