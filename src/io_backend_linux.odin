@@ -19,6 +19,7 @@ package tina
 import "core:fmt"
 import "core:sys/linux"
 import "core:sys/linux/uring"
+import "core:testing"
 
 when !TINA_SIMULATION_MODE {
 
@@ -319,9 +320,9 @@ when !TINA_SIMULATION_MODE {
 		case .DGRAM:
 			st = .DGRAM
 		}
-		st += {.NONBLOCK, .CLOEXEC}
+		sf: linux.Socket_FD_Flags = {.NONBLOCK, .CLOEXEC}
 
-		proto: linux.Socket_Protocol
+		proto: linux.Protocol
 		switch protocol {
 		case .DEFAULT:
 			proto = {}
@@ -331,7 +332,7 @@ when !TINA_SIMULATION_MODE {
 			proto = .UDP
 		}
 
-		fd, err := linux.socket(af, st, proto)
+		fd, err := linux.socket(af, st, sf, proto)
 		if err != nil {
 			return OS_FD_INVALID, .System_Error
 		}
@@ -347,7 +348,7 @@ when !TINA_SIMULATION_MODE {
 		sockaddr := _linux_socket_address_to_sockaddr(address)
 		addr_len := _linux_sockaddr_len(address)
 
-		err := linux.bind(linux.Fd(fd), &sockaddr, addr_len)
+		err := linux.bind(linux.Fd(fd), &sockaddr)
 		if err != nil {
 			return .System_Error
 		}
@@ -427,7 +428,7 @@ when !TINA_SIMULATION_MODE {
 			int_val = v
 		}
 
-		err := linux.setsockopt(linux.Fd(fd), sol, opt, &int_val, size_of(int_val))
+		err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
 		if err != nil {
 			return .System_Error
 		}
@@ -440,17 +441,17 @@ when !TINA_SIMULATION_MODE {
 		fd: OS_FD,
 		how: Shutdown_How,
 	) -> Backend_Error {
-		sh: linux.Shut_How
+		shutdown_how: linux.Shutdown_How
 		switch how {
 		case .SHUT_READER:
-			sh = .RD
+			shutdown_how = .RD
 		case .SHUT_WRITER:
-			sh = .WR
+			shutdown_how = .WR
 		case .SHUT_BOTH:
-			sh = .RDWR
+			shutdown_how = .RDWR
 		}
 
-		err := linux.shutdown(linux.Fd(fd), sh)
+		err := linux.shutdown(linux.Fd(fd), shutdown_how)
 		if err != nil {
 			return .System_Error
 		}
@@ -491,7 +492,7 @@ when !TINA_SIMULATION_MODE {
 				ud,
 				linux.Fd(op.fd),
 				op.buffer[:op.size],
-				i64(op.offset),
+				u64(op.offset),
 			)
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
@@ -509,7 +510,7 @@ when !TINA_SIMULATION_MODE {
 				ud,
 				linux.Fd(op.fd),
 				op.buffer[:op.size],
-				i64(op.offset),
+				u64(op.offset),
 			)
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
@@ -537,7 +538,14 @@ when !TINA_SIMULATION_MODE {
 				return ok
 			}
 			// No addr slot available, accept without sockaddr
-			sqe, ok := uring.accept(&backend.ring, ud, linux.Fd(op.listen_fd), nil, nil, {})
+			sqe, ok := uring.accept(
+				&backend.ring,
+				ud,
+				linux.Fd(op.listen_fd),
+				(^linux.Sock_Addr_Any)(nil),
+				nil,
+				{},
+			)
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
 			}
@@ -606,7 +614,7 @@ when !TINA_SIMULATION_MODE {
 			entry.msghdr = linux.Msg_Hdr {
 				name    = &entry.sockaddr,
 				namelen = _linux_sockaddr_len(op.address),
-				iov     = (&entry.iovec)[:1],
+				iov     = ([^]linux.IO_Vec)(&entry.iovec)[:1],
 			}
 			sqe, ok := uring.sendmsg(
 				&backend.ring,
@@ -636,7 +644,7 @@ when !TINA_SIMULATION_MODE {
 			entry.msghdr = linux.Msg_Hdr {
 				name    = &entry.sockaddr,
 				namelen = size_of(entry.sockaddr),
-				iov     = (&entry.iovec)[:1],
+				iov     = ([^]linux.IO_Vec)(&entry.iovec)[:1],
 			}
 			sqe, ok := uring.recvmsg(
 				&backend.ring,

@@ -40,23 +40,25 @@ watchdog_loop :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) 
 				_execute_graceful_shutdown(configs, states, spec)
 				return
 
-			case .SIGUSR2:
-				fmt.printfln("[WATCHDOG] Received SIGUSR2. Recovering quarantined Shards.")
-				for i in 0 ..< spec.shard_count {
-					state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
-					if state == .Quarantined {
-						// Reset tracking and unquarantine
-						tracker.stall_count[i] = 0
-						tracker.restart_count[i] = 0
-						tracker.window_start[i] = time.tick_now()
-						// Release the quarantine lock
-						sync.atomic_store_explicit(&states[i], u8(Shard_State.Running), .Release)
-						fmt.printfln("[WATCHDOG] Shard %d recovered from quarantine.", i)
+			case:
+				when ODIN_OS != .Windows {
+					#partial switch sig {
+					case .SIGUSR2:
+						fmt.printfln("[WATCHDOG] Received SIGUSR2. Recovering quarantined Shards.")
+						for i in 0 ..< spec.shard_count {
+							state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+							if state == .Quarantined {
+								tracker.stall_count[i] = 0
+								tracker.restart_count[i] = 0
+								tracker.window_start[i] = time.tick_now()
+								sync.atomic_store_explicit(&states[i], u8(Shard_State.Running), .Release)
+								fmt.printfln("[WATCHDOG] Shard %d recovered from quarantine.", i)
+							}
+						}
+					case .SIGHUP:
+						fmt.printfln("[WATCHDOG] Received SIGHUP. (Reserved for future use).")
 					}
 				}
-
-			case .SIGHUP:
-				fmt.printfln("[WATCHDOG] Received SIGHUP. (Reserved for future use).")
 			}
 		} else {
 			// Timeout (EAGAIN) — No OS signal received. Do periodic heartbeat work.

@@ -635,14 +635,15 @@ test_reactor_init_deinit :: proc(t: ^testing.T) {
 	fd_backing: [16]FD_Entry
 	buffer_backing: [1024 * 2]u8 // 2 slots of 1KB
 
-	reactor: Reactor
-	err := reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 2)
+	reactor := new(Reactor)
+	defer free(reactor)
+	err := reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 2)
 	testing.expect_value(t, err, Backend_Error.None)
 	testing.expect_value(t, reactor.pending_count, 0)
 	testing.expect_value(t, reactor.fd_table.slot_count, 16)
 	testing.expect_value(t, reactor.buffer_pool.slot_count, 2)
 
-	reactor_deinit(&reactor)
+	reactor_deinit(reactor)
 }
 
 @(test)
@@ -653,24 +654,24 @@ test_reactor_control_socket_and_shutdown :: proc(t: ^testing.T) {
 	fd_backing: [4]FD_Entry
 	buffer_backing: [1024]u8
 
-	reactor: Reactor
-	reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 1)
-	defer reactor_deinit(&reactor)
+	reactor := new(Reactor)
+	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 1)
+	defer { reactor_deinit(reactor); free(reactor) }
 
 	owner_handle := make_handle(0, 1, 0, 1)
 
 	// 1. Create a socket
-	fd_handle, sock_err := reactor_control_socket(&reactor, owner_handle, .AF_INET, .STREAM, .TCP)
+	fd_handle, sock_err := reactor_control_socket(reactor, owner_handle, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
 	testing.expect(t, fd_handle != FD_HANDLE_NONE, "Valid FD handle expected")
 
 	// 2. Validate affinity checking on shutdown
 	bad_owner := make_handle(0, 2, 0, 1) // Different type/Isolate
 
-	shut_err_bad := reactor_control_shutdown(&reactor, fd_handle, bad_owner, .SHUT_BOTH)
+	shut_err_bad := reactor_control_shutdown(reactor, fd_handle, bad_owner, .SHUT_BOTH)
 	testing.expect_value(t, shut_err_bad, Backend_Error.Not_Found) // Fails affinity check
 
-	shut_err_ok := reactor_control_shutdown(&reactor, fd_handle, owner_handle, .SHUT_WRITER)
+	shut_err_ok := reactor_control_shutdown(reactor, fd_handle, owner_handle, .SHUT_WRITER)
 
 	// Exact, strict assertions based on the testing environment:
 	when TINA_SIMULATION_MODE {
@@ -684,11 +685,11 @@ test_reactor_control_socket_and_shutdown :: proc(t: ^testing.T) {
 	}
 
 	// 3. Test FD exhaustion
-	_, _ = reactor_control_socket(&reactor, owner_handle, .AF_INET, .STREAM, .TCP)
-	_, _ = reactor_control_socket(&reactor, owner_handle, .AF_INET, .STREAM, .TCP)
-	_, _ = reactor_control_socket(&reactor, owner_handle, .AF_INET, .STREAM, .TCP)
+	_, _ = reactor_control_socket(reactor, owner_handle, .AF_INET, .STREAM, .TCP)
+	_, _ = reactor_control_socket(reactor, owner_handle, .AF_INET, .STREAM, .TCP)
+	_, _ = reactor_control_socket(reactor, owner_handle, .AF_INET, .STREAM, .TCP)
 
-	_, exhaust_err := reactor_control_socket(&reactor, owner_handle, .AF_INET, .STREAM, .TCP)
+	_, exhaust_err := reactor_control_socket(reactor, owner_handle, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, exhaust_err, Reactor_Socket_Error.FD_Table_Full)
 }
 
@@ -705,19 +706,20 @@ test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
 
-	reactor: Reactor
-	reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
-	defer reactor_deinit(&reactor)
+	reactor := new(Reactor)
+	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	defer { reactor_deinit(reactor); free(reactor) }
 
 	owner := make_handle(0, 1, 0, 1)
 
 	// Create a socket owned by this handle
-	fd_handle, sock_err := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	fd_handle, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
 	testing.expect(t, fd_handle != FD_HANDLE_NONE, "Valid FD handle expected")
 
 	// Build a minimal Shard stub with metadata for type_id=1
-	shard: Shard
+	shard := new(Shard)
+	defer free(shard)
 	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
 	defer delete(shard.metadata)
 	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
@@ -727,8 +729,8 @@ test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
 
 	// Submit an IoOp_Recv
 	io_err := reactor_submit_io(
-		&reactor,
-		&shard,
+		reactor,
+		shard,
 		owner,
 		IoOp_Recv{fd = fd_handle, buffer_size_max = 512},
 	)
@@ -749,16 +751,17 @@ test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
 
-	reactor: Reactor
-	reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
-	defer reactor_deinit(&reactor)
+	reactor := new(Reactor)
+	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	defer { reactor_deinit(reactor); free(reactor) }
 
 	owner := make_handle(0, 1, 0, 1)
 
-	fd_handle, sock_err := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	fd_handle, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
 
-	shard: Shard
+	shard := new(Shard)
+	defer free(shard)
 	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
 	defer delete(shard.metadata)
 	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
@@ -767,7 +770,7 @@ test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
 	shard.metadata[1][0].state = .Runnable
 
 	// Submit a close — fixed_file_index must be NONE (safety invariant)
-	io_err := reactor_submit_io(&reactor, &shard, owner, IoOp_Close{fd = fd_handle})
+	io_err := reactor_submit_io(reactor, shard, owner, IoOp_Close{fd = fd_handle})
 	testing.expect_value(t, io_err, IO_ERR_NONE)
 	testing.expect_value(t, reactor.pending_count, 1)
 	testing.expect_value(t, reactor.pending_submissions[0].fixed_file_index, FIXED_FILE_INDEX_NONE)
@@ -781,17 +784,18 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
 
-	reactor: Reactor
-	reactor_init(&reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
-	defer reactor_deinit(&reactor)
+	reactor := new(Reactor)
+	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	defer { reactor_deinit(reactor); free(reactor) }
 
 	owner := make_handle(0, 1, 0, 1)
 
 	// Create a socket — gets slot N via LIFO
-	fd_handle_a, _ := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	fd_handle_a, _ := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	slot_a := fd_handle_index(fd_handle_a)
 
-	shard: Shard
+	shard := new(Shard)
+	defer free(shard)
 	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
 	defer delete(shard.metadata)
 	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
@@ -800,7 +804,7 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	shard.metadata[1][0].state = .Runnable
 
 	// 1. Close fd_handle_a — frees slot back to free list
-	io_err1 := reactor_submit_io(&reactor, &shard, owner, IoOp_Close{fd = fd_handle_a})
+	io_err1 := reactor_submit_io(reactor, shard, owner, IoOp_Close{fd = fd_handle_a})
 	testing.expect_value(t, io_err1, IO_ERR_NONE)
 	testing.expect_value(t, reactor.pending_count, 1)
 
@@ -808,7 +812,7 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	testing.expect_value(t, reactor.pending_submissions[0].fixed_file_index, FIXED_FILE_INDEX_NONE)
 
 	// 2. Create a new socket — LIFO reuses slot_a
-	fd_handle_b, _ := reactor_control_socket(&reactor, owner, .AF_INET, .STREAM, .TCP)
+	fd_handle_b, _ := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	slot_b := fd_handle_index(fd_handle_b)
 	testing.expect_value(t, slot_b, slot_a) // LIFO reuse: same slot index
 
@@ -819,8 +823,8 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	fd_table_handoff(&reactor.fd_table, fd_handle_b, owner_b, .Full)
 
 	io_err2 := reactor_submit_io(
-		&reactor,
-		&shard,
+		reactor,
+		shard,
 		owner_b,
 		IoOp_Recv{fd = fd_handle_b, buffer_size_max = 512},
 	)

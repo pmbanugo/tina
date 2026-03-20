@@ -1,4 +1,4 @@
-#+build darwin
+#+build darwin, freebsd, openbsd, netbsd
 
 package tina
 
@@ -6,6 +6,8 @@ import "core:sys/posix"
 import "core:sys/kqueue"
 import "core:c"
 
+// BSD/Darwin: sigtimedwait is not available in Odin's posix bindings.
+// Use kqueue EVFILT_SIGNAL for timed signal waiting instead.
 os_wait_for_signal :: proc(timeout_ms: u32) -> (sig: posix.Signal, ok: bool) {
     kq, err := kqueue.kqueue()
     if err != nil do return nil, false

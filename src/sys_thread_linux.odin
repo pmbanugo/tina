@@ -1,6 +1,7 @@
 #+build linux
 package tina
 
+import "core:c"
 import "core:sys/posix"
 
 TINA_SIGALTSTACK_SIZE :: 65536
@@ -14,6 +15,7 @@ cpu_set_t :: struct {
 @(default_calling_convention = "c")
 foreign libc {
 	sched_setaffinity :: proc(pid: posix.pid_t, cpusetsize: uint, mask: ^cpu_set_t) -> i32 ---
+	madvise :: proc(addr: rawptr, length: uint, advice: i32) -> i32 ---
 }
 
 os_pin_thread_to_core :: proc(core_id: i32) -> bool {
@@ -51,10 +53,10 @@ os_apply_memory_policy :: proc(memory: []u8, node_id: i32, mode: Memory_Init_Mod
 	// Thread pinning handles local faulting allocation adequately for now.
 
 	// 2. Advise huge pages
-	posix.madvise(addr, size, MADV_HUGEPAGE)
+	madvise(addr, size, MADV_HUGEPAGE)
 
 	// 3. Pre-fault: Try MADV_POPULATE_WRITE (Linux 5.14+)
-	if posix.madvise(addr, size, MADV_POPULATE_WRITE) != .OK {
+	if madvise(addr, size, MADV_POPULATE_WRITE) != 0 {
 		// Fallback: Sequential touch loop to force physical allocation
 		page_size := 4096
 		for i := 0; i < len(memory); i += page_size {
@@ -88,13 +90,13 @@ os_set_current_thread_name :: proc "contextless" (name: string) {
 
 // Returns the OS-specific thread handle (pthread_t on POSIX)
 os_get_current_thread_handle :: proc "contextless" () -> rawptr {
-	return rawptr(pthread_self())
+	return rawptr(uintptr(pthread_self()))
 }
 
 // Sends a signal directly to a specific thread (for Watchdog forced recovery)
 os_signal_thread :: proc "contextless" (thread_handle: rawptr, sig: posix.Signal) {
 	// pthread_kill requires the pthread_t and the signal number
-	posix.pthread_kill(posix.pthread_t(thread_handle), c.int(sig))
+	posix.pthread_kill(posix.pthread_t(uintptr(thread_handle)), sig)
 }
 
 // Fast kernel process teardown (bypasses atexit handlers)

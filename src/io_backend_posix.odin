@@ -20,9 +20,36 @@ import "core:sys/posix"
 
 when !TINA_SIMULATION_MODE {
 
+	// Token-based correlation requires 64-bit udata in kqueue's kevent struct.
+	// On 32-bit platforms, the Submission_Token (u64) would be truncated during
+	// the rawptr round-trip, causing silent completion mis-routing.
+	#assert(size_of(uintptr) == 8, "POSIX kqueue backend requires 64-bit uintptr for token packing")
+
 	MAX_POSIX_PENDING :: 1024
-	MAX_POSIX_COMPLETED :: 256
+
+	// Derivation: up to MAX_POSIX_PENDING (1024) submissions may complete immediately
+	// during _backend_submit, but the all-or-error pre-check caps each batch to
+	// available completed slots. The overflow risk is in _backend_collect: kevent
+	// returns up to 128 events, each producing a completion. 256 (submit headroom)
+	// + 128 (kevent batch) = 384.
+	// TODO: Consider exposing via Backend_Config if workloads require larger bursts.
+	MAX_POSIX_COMPLETED :: 384
 	POSIX_WAKE_IDENT :: 69
+
+	// SO_NOSIGPIPE suppresses SIGPIPE on a per-socket basis.
+	// Available on Darwin (0x1022), FreeBSD (0x0800), and NetBSD (0x0800).
+	// OpenBSD does NOT have SO_NOSIGPIPE — it relies solely on MSG_NOSIGNAL per-send.
+	when ODIN_OS == .Darwin {
+		_SO_NOSIGPIPE :: 0x1022
+		_HAS_SO_NOSIGPIPE :: true
+	} else when ODIN_OS == .FreeBSD || ODIN_OS == .NetBSD {
+		_SO_NOSIGPIPE :: 0x0800
+		_HAS_SO_NOSIGPIPE :: true
+	} else {
+		// OpenBSD: no SO_NOSIGPIPE. SIGPIPE prevention uses MSG_NOSIGNAL on send/sendto.
+		_SO_NOSIGPIPE :: 0
+		_HAS_SO_NOSIGPIPE :: false
+	}
 
 	Pending_Posix_Op_Flag :: enum u8 {
 		Connect_In_Progress,
@@ -118,8 +145,16 @@ when !TINA_SIMULATION_MODE {
 
 				reg_err := _register_kqueue(backend, &sub)
 				if reg_err != .None {
+					// Registration failed — remove from pending and complete as error.
+					// Cannot fail the batch: earlier submissions may have already
+					// executed real syscalls (optimistic try) that cannot be rolled back.
 					backend.pending_count -= 1
-					return reg_err
+					backend.completed[backend.completed_count] = Raw_Completion {
+						token  = sub.token,
+						result = -i32(posix.Errno.EIO),
+						extra  = nil,
+					}
+					backend.completed_count += 1
 				}
 			}
 		}
@@ -174,13 +209,11 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		events_buf: [128]kq.KEvent
-		remaining := int(output_max - out)
-		buffer_size := min(remaining, len(events_buf))
 
 		n, kerr := kq.kevent(
 			kq.KQ(backend.kq_fd),
 			nil,
-			events_buf[:buffer_size],
+			events_buf[:],
 			time_spec_pointer,
 		)
 		if kerr != nil {
@@ -198,21 +231,19 @@ when !TINA_SIMULATION_MODE {
 				continue
 			}
 
-			if out >= output_max {
-				break
-			}
-
-			// Handle error events.
+			// EV_ERROR: changelist registration error propagated back through kevent.
+			// The data field carries the errno specifically when this flag is set.
 			if .Error in event.flags {
 				token := Submission_Token(u64(uintptr(event.udata)))
 				pending_idx := _find_pending(backend, token)
-				if pending_idx >= 0 && out < output_max {
-					completions[out] = Raw_Completion {
-						token  = token,
-						result = -i32(posix.Errno(event.data)),
-						extra  = nil,
-					}
-					out += 1
+				if pending_idx >= 0 {
+					_posix_deliver_completion(
+						backend,
+						completions,
+						&out,
+						output_max,
+						Raw_Completion{token = token, result = -i32(posix.Errno(event.data))},
+					)
 					_remove_pending(backend, u16(pending_idx))
 				}
 				continue
@@ -225,6 +256,7 @@ when !TINA_SIMULATION_MODE {
 			}
 
 			pop := &backend.pending[pending_idx]
+			event_has_eof := .EOF in event.flags
 
 			// Connect completion: use getsockopt(SO_ERROR) instead of re-calling connect().
 			if .Connect_In_Progress in pop.flags {
@@ -232,17 +264,24 @@ when !TINA_SIMULATION_MODE {
 					token = pop.token,
 					extra = nil,
 				}
-				err: posix.Errno
-				err_size := posix.socklen_t(size_of(err))
+				socket_error: posix.Errno
+				socket_error_size := posix.socklen_t(size_of(socket_error))
 				connect_fd := pop.operation.(Submission_Op_Connect).socket_fd
-				posix.getsockopt(posix.FD(connect_fd), posix.SOL_SOCKET, .ERROR, &err, &err_size)
-				if err != nil {
-					conn_result.result = -i32(err)
+				getsockopt_result := posix.getsockopt(
+					posix.FD(connect_fd),
+					posix.SOL_SOCKET,
+					.ERROR,
+					&socket_error,
+					&socket_error_size,
+				)
+				if getsockopt_result != .OK {
+					conn_result.result = -i32(posix.errno())
+				} else if socket_error != nil {
+					conn_result.result = -i32(socket_error)
 				} else {
 					conn_result.result = 0
 				}
-				completions[out] = conn_result
-				out += 1
+				_posix_deliver_completion(backend, completions, &out, output_max, conn_result)
 				_remove_pending(backend, u16(pending_idx))
 				continue
 			}
@@ -255,12 +294,34 @@ when !TINA_SIMULATION_MODE {
 			result, immediate := _try_syscall(&sub)
 
 			if immediate {
-				completions[out] = result
-				out += 1
+				_posix_deliver_completion(backend, completions, &out, output_max, result)
+				_remove_pending(backend, u16(pending_idx))
+			} else if event_has_eof {
+				// Peer closed but syscall returned EWOULDBLOCK — complete as EOF.
+				// Re-registering would be pointless: no further data will arrive.
+				_posix_deliver_completion(
+					backend,
+					completions,
+					&out,
+					output_max,
+					Raw_Completion{token = pop.token, result = 0},
+				)
 				_remove_pending(backend, u16(pending_idx))
 			} else {
 				// Still not ready — re-register ONESHOT.
-				_register_kqueue(backend, &sub)
+				rearm_error := _register_kqueue(backend, &sub)
+				if rearm_error != .None {
+					// Re-registration failed — complete as error to avoid stranding
+					// this operation in pending forever with no kqueue wakeup.
+					_posix_deliver_completion(
+						backend,
+						completions,
+						&out,
+						output_max,
+						Raw_Completion{token = pop.token, result = -i32(posix.Errno.EIO)},
+					)
+					_remove_pending(backend, u16(pending_idx))
+				}
 			}
 		}
 
@@ -348,15 +409,14 @@ when !TINA_SIMULATION_MODE {
 		// Set close-on-exec.
 		posix.fcntl(fd, .SETFD, posix.FD_CLOEXEC)
 
-		// Set SO_NOSIGPIPE to suppress SIGPIPE on BSD/macOS.
-		when ODIN_OS ==
-			.Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .NetBSD || ODIN_OS == .OpenBSD {
+		// Suppress SIGPIPE on this socket.
+		// On OpenBSD (no SO_NOSIGPIPE), SIGPIPE prevention relies on MSG_NOSIGNAL per-send.
+		when _HAS_SO_NOSIGPIPE {
 			nosigpipe: c.int = 1
-			SO_NOSIGPIPE :: 0x1022
 			posix.setsockopt(
 				fd,
 				posix.SOL_SOCKET,
-				transmute(posix.Sock_Option)c.int(SO_NOSIGPIPE),
+				transmute(posix.Sock_Option)c.int(_SO_NOSIGPIPE),
 				&nosigpipe,
 				size_of(nosigpipe),
 			)
@@ -478,6 +538,50 @@ when !TINA_SIMULATION_MODE {
 	// Internal Helpers
 	// ============================================================================
 
+	// Route a completion to the output slice if space remains, otherwise buffer internally.
+	// Ensures kevent events are never dropped after kernel consumption.
+	@(private = "file")
+	_posix_deliver_completion :: proc(
+		backend: ^Platform_Backend,
+		completions: []Raw_Completion,
+		out: ^u32,
+		output_max: u32,
+		raw: Raw_Completion,
+	) {
+		if out^ < output_max {
+			completions[out^] = raw
+			out^ += 1
+		} else if backend.completed_count < MAX_POSIX_COMPLETED {
+			backend.completed[backend.completed_count] = raw
+			backend.completed_count += 1
+		}
+	}
+
+	// Configure an accepted client socket: non-blocking, close-on-exec, SIGPIPE suppression.
+	// Must be called on every FD returned by accept() before it is handed to user code.
+	@(private = "file")
+	_configure_accepted_socket :: proc(fd: posix.FD) {
+		// Set non-blocking.
+		flags := posix.fcntl(fd, .GETFL)
+		if flags >= 0 {
+			posix.fcntl(fd, .SETFL, transmute(posix.O_Flags)(flags) + {.NONBLOCK})
+		}
+		// Set close-on-exec.
+		posix.fcntl(fd, .SETFD, posix.FD_CLOEXEC)
+		// Suppress SIGPIPE on the accepted socket.
+		// On OpenBSD (no SO_NOSIGPIPE), SIGPIPE prevention relies on MSG_NOSIGNAL per-send.
+		when _HAS_SO_NOSIGPIPE {
+			nosigpipe: c.int = 1
+			posix.setsockopt(
+				fd,
+				posix.SOL_SOCKET,
+				transmute(posix.Sock_Option)c.int(_SO_NOSIGPIPE),
+				&nosigpipe,
+				size_of(nosigpipe),
+			)
+		}
+	}
+
 	@(private = "file")
 	_try_syscall :: proc(sub: ^Submission) -> (Raw_Completion, bool) {
 		result := Raw_Completion {
@@ -538,13 +642,7 @@ when !TINA_SIMULATION_MODE {
 				result.result = -i32(errno)
 				return result, true
 			}
-			// Set client fd non-blocking.
-			flags := posix.fcntl(client_fd, .GETFL)
-			if flags >= 0 {
-				posix.fcntl(client_fd, .SETFL, transmute(posix.O_Flags)(flags) + {.NONBLOCK})
-			}
-			// Set close-on-exec on accepted client socket.
-			posix.fcntl(client_fd, .SETFD, posix.FD_CLOEXEC)
+			_configure_accepted_socket(client_fd)
 			result.result = 0
 			result.extra = Completion_Extra_Accept {
 				client_fd      = OS_FD(client_fd),

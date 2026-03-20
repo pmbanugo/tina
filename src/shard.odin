@@ -43,15 +43,16 @@ when ODIN_OS == .Linux {
 	@(default_calling_convention = "c")
 	foreign libc {
 		@(link_name = "_setjmp")
-		_setjmp :: proc(env: ^sigjmp_buf) -> c.int ---
-		longjmp :: proc(env: ^sigjmp_buf, val: c.int) -> ! ---
+		_tina_setjmp :: proc(env: ^sigjmp_buf, hack: rawptr = nil) -> c.int ---
+		@(link_name = "longjmp")
+		_tina_longjmp :: proc(env: ^sigjmp_buf, val: c.int) -> ! ---
 	}
 
 	sigsetjmp :: proc(env: ^sigjmp_buf, savesigs: c.int) -> c.int {
-		return _setjmp(env)
+		return _tina_setjmp(env)
 	}
 	siglongjmp :: proc(env: ^sigjmp_buf, val: c.int) -> ! {
-		longjmp(env, val)
+		_tina_longjmp(env, val)
 	}
 } else {
 	#panic("Unsupported OS for Trap Boundary bindings")

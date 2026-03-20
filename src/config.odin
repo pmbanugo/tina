@@ -5,6 +5,9 @@ import "core:testing"
 
 CACHE_LINE_SIZE :: 128
 TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
+// TINA_DEBUG_ASSERTS used to enable runtime asserts for cases that are fixed behaviour (runtime inputs don't change behaviour)
+// but needs verify invariant/structural correctness holds in a non-simulated environment
+TINA_DEBUG_ASSERTS :: #config(TINA_ASSERTS, false)
 
 Init_Fn :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
