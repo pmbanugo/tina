@@ -560,12 +560,28 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 		{id = 2, scratch_requirement_max = 4096},
 	}
 
+	children := [1]Child_Spec {
+		Static_Child_Spec{type_id = 1, restart_type = .permanent},
+	}
+	root_group := Group_Spec {
+		strategy              = .One_For_One,
+		restart_count_max     = 3,
+		window_duration_ticks = 1000,
+		children              = children[:],
+	}
+	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
 	spec := SystemSpec {
+		shard_count        = 1,
 		types              = types[:],
+		shard_specs        = shard_specs[:],
 		scratch_arena_size = 2048, // Intentionally too small
-		log_ring_size      = 65536, // Provide a valid power-of-2 size!
+		pool_slot_count    = 1024,
+		log_ring_size      = 65536,
 		timer_spoke_count  = 4096,
 		timer_entry_count  = 64,
+		timer_resolution_ns = 1_000_000,
+		default_ring_size  = 16,
 	}
 
 	err := validate_system_spec(&spec)
