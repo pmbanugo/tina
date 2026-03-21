@@ -1,6 +1,8 @@
 #+build windows
 package tina
 
+import "core:c"
+import "core:sys/posix"
 import win "core:sys/windows"
 
 TINA_SIGALTSTACK_SIZE :: 65536
@@ -36,8 +38,6 @@ os_set_current_thread_name :: proc(name: string) {
 	win.SetThreadDescription(win.GetCurrentThread(), w_name)
 	free_all(context.temp_allocator)
 }
-import "core:c"
-import "core:sys/posix"
 
 os_get_current_thread_handle :: proc "contextless" () -> rawptr {
 	// A pseudo-handle or ID is enough since we no-op the signaling

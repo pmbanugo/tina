@@ -105,23 +105,22 @@ HANDLE_TYPE_ID_SUBGROUP :: 0xFFFF
 
 // SOA metadata
 Isolate_Metadata :: struct {
-	io_peer_address:       Peer_Address, // 28 bytes
-	inbox_head:            u32, // 4 bytes
-	inbox_tail:            u32, // 4 bytes
-	pending_correlation:   u32, // 4 bytes
-	io_fd:                 FD_Handle, // 4 bytes
-	io_result:             i32, // 4 bytes
-	pending_transfer_read: Transfer_Handle, // 4 bytes
-	generation:            u32, // 4 bytes
-	working_arena_offset:  u32, // 4 bytes
-	inbox_count:           u16, // 2 bytes
-	group_index:           u16, // 2 bytes
-	io_completion_tag:     IO_Completion_Tag, // 2 bytes
-	io_buffer_index:       u16, // 2 bytes
-	state:                 Isolate_State, // 1 byte
-	flags:                 Isolate_Flags, // 1 byte (Replaces shutdown_pending: u8)
-	io_sequence:           u8, // 1 byte
-	_padding:              [1]u8, // 1 byte (Packs exactly to 72 bytes)
+	io_peer_address:       Peer_Address,
+	inbox_head:            u32,
+	inbox_tail:            u32,
+	pending_correlation:   u32,
+	io_fd:                 FD_Handle,
+	io_result:             i32,
+	pending_transfer_read: Transfer_Handle,
+	generation:            u32,
+	working_arena_offset:  u32,
+	inbox_count:           u16,
+	group_index:           u16,
+	io_completion_tag:     IO_Completion_Tag,
+	io_buffer_index:       u16,
+	state:                 Isolate_State,
+	flags:                 Isolate_Flags, // Replaces shutdown_pending: u8
+	io_sequence:           u8,
 }
 
 Shard_Counters :: struct {
@@ -133,10 +132,10 @@ Shard_Counters :: struct {
 	io_buffer_exhaustions:     u64,
 	io_submission_exhaustions: u64,
 	io_stale_completions:      u64, // TODO: In simulation, consider verifying that this counter
-	                               // equals the number of timer-wakes + shutdown-wakes that
-	                               // interrupted WAITING_FOR_IO Isolates. A mismatch would indicate
-	                               // a stale completion was lost (buffer leak) or double-counted.
-	                               // Might require tracking a separate "io_wakes" counter to compare against.
+	// equals the number of timer-wakes + shutdown-wakes that
+	// interrupted WAITING_FOR_IO Isolates. A mismatch would indicate
+	// a stale completion was lost (buffer leak) or double-counted.
+	// Might require tracking a separate "io_wakes" counter to compare against.
 	transfer_exhaustions:      u64,
 	transfer_stale_reads:      u64,
 }
@@ -510,6 +509,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 // --- Active Operations ---
 
 ctx_send :: proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, payload: []u8) -> Send_Result {
+	assert(tag >= USER_MESSAGE_TAG_BASE, "User code must not send system tags via ctx_send")
 	assert(len(payload) <= MAX_PAYLOAD_SIZE, "Payload exceeds MAX_PAYLOAD_SIZE")
 
 	envelope: Message_Envelope
@@ -521,6 +521,17 @@ ctx_send :: proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, payload: []u8)
 
 	response := _route_envelope_user(ctx.shard, to, &envelope)
 	return response
+}
+ctx_transfer_send :: proc(ctx: ^TinaContext, to: Handle, handle: Transfer_Handle) -> Send_Result {
+	envelope: Message_Envelope
+	envelope.source = ctx.self_handle
+	envelope.destination = to
+	envelope.tag = TAG_TRANSFER
+	envelope.payload_size = size_of(Transfer_Handle)
+
+	(cast(^Transfer_Handle)&envelope.payload[0])^ = handle
+
+	return _route_envelope_system(ctx.shard, to, &envelope)
 }
 
 ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
@@ -642,24 +653,21 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 		soa_meta[slot].working_arena_offset = u32(child_ctx.working_arena.offset)
 	}
 
-	if _, is_crash := effect.(Effect_Crash); is_crash {
+	_, is_crash := effect.(Effect_Crash)
+	_, is_done := effect.(Effect_Done)
+	if is_crash || is_done {
 		if spec.handoff_fd != FD_HANDLE_NONE {
-			fd_table_handoff(&shard.reactor.fd_table, spec.handoff_fd, ctx.self_handle, spec.handoff_mode)
+			fd_table_handoff(
+				&shard.reactor.fd_table,
+				spec.handoff_fd,
+				ctx.self_handle,
+				spec.handoff_mode,
+			)
 		}
-		soa_meta[slot].state = .Unallocated
-		soa_meta[slot].group_index = SUPERVISION_GROUP_NONE
-		soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-		shard.isolate_free_heads[type_id] = slot
-		return Spawn_Error.init_failed
-	}
-	if _, is_done := effect.(Effect_Done); is_done {
-		if spec.handoff_fd != FD_HANDLE_NONE {
-			fd_table_handoff(&shard.reactor.fd_table, spec.handoff_fd, ctx.self_handle, spec.handoff_mode)
-		}
-		soa_meta[slot].state = .Unallocated
-		soa_meta[slot].group_index = SUPERVISION_GROUP_NONE
-		soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-		shard.isolate_free_heads[type_id] = slot
+
+		// The teardown will safely bump the generation and sweep resources.
+		// Since we haven't set group_index yet, on_child_exit safely does nothing.
+		_teardown_isolate(shard, type_id, slot, .Crashed)
 		return Spawn_Error.init_failed
 	}
 
@@ -734,6 +742,10 @@ ctx_transfer_write :: proc(
 	return .None
 }
 
+// Reads data from a transfer buffer slot.
+// NOTE: To prevent buffer leaks, this must only be called ONCE per handler invocation.
+// If you need the data across multiple ticks or operations, you must copy it
+// into your Isolate's working arena.
 ctx_transfer_read :: proc(ctx: ^TinaContext, handle: Transfer_Handle) -> Transfer_Read_Result {
 	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
@@ -744,9 +756,15 @@ ctx_transfer_read :: proc(ctx: ^TinaContext, handle: Transfer_Handle) -> Transfe
 		return Transfer_Read_Error.Stale_Handle
 	}
 
-	// Track auto-free lifecycle. The scheduler frees this automatically on handler return.
+	// Track auto-free lifecycle.
 	type_id := extract_type_id(ctx.self_handle)
 	slot := extract_slot(ctx.self_handle)
+	when TINA_DEBUG_ASSERTS {
+		assert(
+			ctx.shard.metadata[type_id][slot].pending_transfer_read == TRANSFER_HANDLE_NONE,
+			"ctx_transfer_read can only be called ONCE per handler invocation to prevent buffer leaks.",
+		)
+	}
 	ctx.shard.metadata[type_id][slot].pending_transfer_read = handle
 
 	ptr := reactor_buffer_pool_slot_ptr(&ctx.shard.transfer_pool, index)
@@ -794,7 +812,14 @@ ctx_setsockopt :: #force_inline proc(
 	option: Socket_Option,
 	value: Socket_Option_Value,
 ) -> Backend_Error {
-	return reactor_control_setsockopt(&ctx.shard.reactor, fd, ctx.self_handle, level, option, value)
+	return reactor_control_setsockopt(
+		&ctx.shard.reactor,
+		fd,
+		ctx.self_handle,
+		level,
+		option,
+		value,
+	)
 }
 
 ctx_shutdown :: #force_inline proc(
@@ -918,7 +943,13 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 
 		if envelope.tag == TAG_TRANSFER && envelope.payload_size >= size_of(Transfer_Handle) {
 			t_handle := (cast(^Transfer_Handle)&envelope.payload[0])^
-			_transfer_pool_free(shard, transfer_handle_index(t_handle))
+			index := transfer_handle_index(t_handle)
+			generation := transfer_handle_generation(t_handle)
+
+			if index < shard.transfer_pool.slot_count &&
+			   shard.transfer_generations[index] == generation {
+				_transfer_pool_free(shard, index)
+			}
 		}
 
 		pool_free(&shard.message_pool, curr)
@@ -1041,25 +1072,25 @@ _enqueue_internal :: #force_inline proc(
 	is_reply := .Is_Reply in envelope.flags
 	is_timeout := envelope.tag == TAG_CALL_TIMEOUT
 
+	// Validation Only (No Mutation Yet)
 	if is_reply || is_timeout {
 		if soa_meta[slot].state != .Waiting_For_Reply ||
 		   soa_meta[slot].pending_correlation != envelope.correlation {
 			shard.counters.stale_delivery_drops += 1
 			return .stale_handle
 		}
-
-		soa_meta[slot].pending_correlation = 0
-		soa_meta[slot].state = .Runnable
+	} else if is_user {
+		// Capacity Check ONLY for normal user messages
+		// Replies and timeouts bypass mailbox limits to prevent deadlocks
+		if soa_meta[slot].inbox_count >= shard.type_descriptors[type_id].mailbox_capacity {
+			shard.counters.mailbox_full_drops += 1
+			return .mailbox_full
+		}
 	}
 
-	if soa_meta[slot].inbox_count >= shard.type_descriptors[type_id].mailbox_capacity {
-		shard.counters.mailbox_full_drops += 1
-		return .mailbox_full
-	}
-
+	// Pool Allocation
 	pool_index: u32
 	err: Pool_Error
-
 	// Because `is_user` is passed as a constant from the wrapper,
 	// I expect the compiler will dead-code-eliminate this IF statement.
 	if is_user {
@@ -1073,6 +1104,13 @@ _enqueue_internal :: #force_inline proc(
 		return .pool_exhausted
 	}
 
+	// Safe State Mutation (We are guaranteed to enqueue now)
+	if is_reply || is_timeout {
+		soa_meta[slot].pending_correlation = 0
+		soa_meta[slot].state = .Runnable
+	}
+
+	// Link into Mailbox
 	envelope_destination := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, pool_index)
 	envelope_destination^ = envelope^
 	envelope_destination.next_in_mailbox = POOL_NONE_INDEX
@@ -1149,6 +1187,10 @@ _interpret_effect :: proc(
 		if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
 		correlation_id := shard.next_correlation_id
 
+		// Set state before fast-fail enqueue so the timeout message is accepted
+		soa_meta[slot].pending_correlation = correlation_id
+		soa_meta[slot].state = .Waiting_For_Reply
+
 		// Quarantine Fast-Fail Check (§6.4.5.4 Step 4b)
 		destination_shard := extract_shard_id(e.to)
 		if destination_shard != shard.id &&
@@ -1161,13 +1203,9 @@ _interpret_effect :: proc(
 			timeout_env.correlation = correlation_id
 
 			_enqueue_system_msg(shard, ctx.self_handle, &timeout_env)
-			soa_meta[slot].state = .Runnable
 			shard.counters.quarantine_drops += 1
 			return
 		}
-
-		soa_meta[slot].pending_correlation = correlation_id
-		soa_meta[slot].state = .Waiting_For_Reply
 
 		timeout_ticks := (e.timeout + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
 		_register_system_timer(
@@ -1593,7 +1631,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	// Because siglongjmp bypasses defer, we must do this manually before re-hydrating!
 	reactor_deinit(&shard.reactor)
 
-    for type_desc in shard.type_descriptors {
+	for type_desc in shard.type_descriptors {
 		type_id := type_desc.id
 		soa_meta := shard.metadata[type_id]
 

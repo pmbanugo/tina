@@ -146,7 +146,6 @@ ctx_send_typed :: #force_inline proc(
 	tag: Message_Tag,
 	message: ^$T,
 ) -> Send_Result {
-	assert(size_of(T) <= MAX_PAYLOAD_SIZE, "Payload exceeds max size")
 	return ctx_send(ctx, to, tag, mem.byte_slice(message, size_of(T)))
 }
 

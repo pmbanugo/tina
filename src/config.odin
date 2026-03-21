@@ -1,8 +1,12 @@
 package tina
 
+import "core:fmt"
 import "core:mem"
 import "core:testing"
 
+MAX_SHARD_COUNT :: 255 // 8-bit shard_id, minus 0 (reserved/conceptual e.g. watchdog)
+MIN_RING_SIZE :: 16
+MAX_TYPE_DESCRIPTOR_ID :: 254 // 8-bit type_id, 255 (0xFF) is reserved for Supervision Groups
 CACHE_LINE_SIZE :: 128
 TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
 // TINA_DEBUG_ASSERTS used to enable runtime asserts for cases that are fixed behaviour (runtime inputs don't change behaviour)
@@ -89,11 +93,12 @@ SystemSpec :: struct {
 
 SystemSpecError :: enum u8 {
 	None,
-	ScratchArenaTooSmall,
-	SlotCountExceedsHandleCapacity,
-	LogRingSizeNotPowerOfTwo,
-	ReactorBufferSlotCountExceedTokenCapacity,
-	TimerSpokeCountNotPowerOfTwo,
+	ValueOutOfBounds, // Catch-all for sizes/counts too small or too large
+	ValueNotPowerOfTwo, // Catch-all for alignment/ring/pool constraints
+	DuplicateTypeId,
+	InvalidTypeId,
+	InvalidSupervisionStrategy,
+	InvalidSupervisionIntensity,
 }
 
 Supervision_Strategy :: enum u8 {
@@ -122,32 +127,325 @@ Child_Spec :: union {
 	Group_Spec,
 }
 
+@(private = "package")
 validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
-	scratch_max := 0
-	for t in spec.types {
-		if t.slot_count > MAX_ISOLATES_PER_TYPE {
-			return .SlotCountExceedsHandleCapacity
-		}
-		if t.scratch_requirement_max > scratch_max {
-			scratch_max = t.scratch_requirement_max
-		}
+	// Global & Type Constraints (What you've mostly done)
+	if err := _validate_globals_and_types(spec); err != .None do return err
+
+	// SPSC Ring Topology (Checks 8, 9, 16)
+	if err := _validate_ring_topology(spec); err != .None do return err
+
+	// Shard & Supervision Tree Rules (Checks 12, 13, 14, 15)
+	if err := _validate_shard_specs(spec); err != .None do return err
+
+	// DIO is currently out of scope, but added to SystemSpec (with bootstrap assertion).
+	// This validation is to keep the spec validation complete for when it gets implemented
+	if err := _validate_dio_config(spec); err != .None do return err
+
+	// Simulation Constraints (Check 20)
+	when TINA_SIMULATION_MODE {
+		if err := _validate_simulation(spec); err != .None do return err
 	}
+
+	// Advisory Warnings (A1 - A6)
+	_emit_advisory_warnings(spec)
+
+	return .None
+}
+
+@(private = "file")
+_validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
+	// Shard Count Validity (ADR Checks 1 & 3)
+	if spec.shard_count < 1 || spec.shard_count > MAX_SHARD_COUNT {
+		fmt.eprintfln(
+			"[FATAL] shard_count must be 1-%v, got %v",
+			MAX_SHARD_COUNT,
+			spec.shard_count,
+		)
+		return .ValueOutOfBounds
+	}
+	if len(spec.shard_specs) != int(spec.shard_count) {
+		fmt.eprintfln(
+			"[FATAL] shard_specs length (%v) != shard_count (%v)",
+			len(spec.shard_specs),
+			spec.shard_count,
+		)
+		return .ValueOutOfBounds
+	}
+
+	// Type ID Uniqueness & Bounds (ADR Checks 2, 4, & 5)
+	if len(spec.types) < 1 || len(spec.types) > MAX_TYPE_DESCRIPTOR_ID {
+		fmt.eprintfln(
+			"[FATAL] type_registry: need 1-%v types, got %v",
+			MAX_TYPE_DESCRIPTOR_ID,
+			len(spec.types),
+		)
+		return .ValueOutOfBounds
+	}
+
+	isolate_types_seen: [256]bool
+	scratch_max := 0
+
+	for t in spec.types {
+		if t.id > MAX_TYPE_DESCRIPTOR_ID {
+			fmt.eprintfln("[FATAL] Type ID %v exceeds max (%v)", t.id, MAX_TYPE_DESCRIPTOR_ID)
+			return .InvalidTypeId
+		}
+		if isolate_types_seen[t.id] {
+			fmt.eprintfln("[FATAL] Duplicate type_id: %v", t.id)
+			return .DuplicateTypeId
+		}
+		isolate_types_seen[t.id] = true
+
+		if t.slot_count > MAX_ISOLATES_PER_TYPE {
+			fmt.eprintfln(
+				"[FATAL] Type ID %v slot_count (%v) exceeds 20-bit max (%v)",
+				t.id,
+				t.slot_count,
+				MAX_ISOLATES_PER_TYPE,
+			)
+			return .ValueOutOfBounds
+		}
+		if t.scratch_requirement_max > scratch_max do scratch_max = t.scratch_requirement_max
+	}
+
+	// ADR Check 10: Scratch arena adequacy
 	if spec.scratch_arena_size < scratch_max {
-		return .ScratchArenaTooSmall
+		fmt.eprintfln(
+			"[FATAL] scratch_arena_size (%v) is smaller than max requirement (%v)",
+			spec.scratch_arena_size,
+			scratch_max,
+		)
+		return .ValueOutOfBounds
+	}
+
+	// ADR Check 7: Power of 2 Constraints
+	if spec.pool_slot_count == 0 || (spec.pool_slot_count & (spec.pool_slot_count - 1)) != 0 {
+		fmt.eprintfln("[FATAL] pool_slot_count (%v) must be a power of two", spec.pool_slot_count)
+		return .ValueNotPowerOfTwo
 	}
 
 	if spec.log_ring_size == 0 || (spec.log_ring_size & (spec.log_ring_size - 1)) != 0 {
-		return .LogRingSizeNotPowerOfTwo
-	}
-
-	// 12-bit buffer_index field in Submission_Token; 0x0FFF (4095) is the NONE sentinel
-	if spec.reactor_buffer_slot_count > 4094 {
-		return .ReactorBufferSlotCountExceedTokenCapacity
+		fmt.eprintfln("[FATAL] log_ring_size (%v) must be a power of two", spec.log_ring_size)
+		return .ValueNotPowerOfTwo
 	}
 
 	if spec.timer_spoke_count == 0 ||
 	   (spec.timer_spoke_count & (spec.timer_spoke_count - 1)) != 0 {
-		return .TimerSpokeCountNotPowerOfTwo
+		fmt.eprintfln(
+			"[FATAL] timer_spoke_count (%v) must be a power of two",
+			spec.timer_spoke_count,
+		)
+		return .ValueNotPowerOfTwo
+	}
+
+	// 12-bit buffer_index field in Submission_Token; 0x0FFF (4095) is the NONE sentinel
+	if spec.reactor_buffer_slot_count > 4094 {
+		fmt.eprintfln(
+			"[FATAL] reactor_buffer_slot_count (%v) exceeds 12-bit max (4094)",
+			spec.reactor_buffer_slot_count,
+		)
+		return .ValueOutOfBounds
+	}
+
+	return .None
+}
+
+@(private = "file")
+_validate_ring_topology :: proc(spec: ^SystemSpec) -> SystemSpecError {
+	if spec.default_ring_size < MIN_RING_SIZE {
+		fmt.eprintfln(
+			"[FATAL] default_ring_size must be >= %v, got %v",
+			MIN_RING_SIZE,
+			spec.default_ring_size,
+		)
+		return .ValueOutOfBounds
+	}
+	if (spec.default_ring_size & (spec.default_ring_size - 1)) != 0 {
+		fmt.eprintfln(
+			"[FATAL] default_ring_size (%v) is not a power of two",
+			spec.default_ring_size,
+		)
+		return .ValueNotPowerOfTwo
+	}
+
+	for o in spec.ring_overrides {
+		if o.size < MIN_RING_SIZE || (o.size & (o.size - 1)) != 0 {
+			fmt.eprintfln(
+				"[FATAL] Ring override size %v is invalid (must be >= %v and power-of-two)",
+				o.size,
+				MIN_RING_SIZE,
+			)
+			return .ValueNotPowerOfTwo
+		}
+
+		#partial switch o.type {
+		case .Pair, .All_Outbound_From:
+			if o.source >= spec.shard_count {
+				fmt.eprintfln(
+					"[FATAL] Ring override src %v >= shard_count %v",
+					o.source,
+					spec.shard_count,
+				)
+				return .ValueOutOfBounds
+			}
+		}
+
+		#partial switch o.type {
+		case .Pair, .All_Inbound_To:
+			if o.destination >= spec.shard_count {
+				fmt.eprintfln(
+					"[FATAL] Ring override dst %v >= shard_count %v",
+					o.destination,
+					spec.shard_count,
+				)
+				return .ValueOutOfBounds
+			}
+		}
+	}
+	return .None
+}
+
+@(private = "file")
+_validate_shard_specs :: proc(spec: ^SystemSpec) -> SystemSpecError {
+	if spec.timer_resolution_ns == 0 {
+		fmt.eprintfln("[FATAL] timer_resolution_ns must be > 0")
+		return .ValueOutOfBounds
+	}
+
+	// build a mask of valid type IDs to check children against
+	// Sized exactly to the maximum possible user type ID + 1
+	valid_types: [MAX_TYPE_DESCRIPTOR_ID + 1]bool
+	for t in spec.types {
+		// We already know from _validate_globals_and_types that t.id <= MAX_TYPE_DESCRIPTOR_ID
+		valid_types[t.id] = true
+	}
+
+	for &shard_spec in spec.shard_specs {
+		if err := _validate_supervision_group(&shard_spec.root_group, &valid_types); err != .None {
+			return err
+		}
+	}
+	return .None
+}
+
+@(private = "file")
+_validate_supervision_group :: proc(
+	group: ^Group_Spec,
+	valid_types: ^[MAX_TYPE_DESCRIPTOR_ID + 1]bool,
+) -> SystemSpecError {
+	if group.restart_count_max < 1 {
+		fmt.eprintfln("[FATAL] Supervision group max_restarts must be >= 1")
+		return .InvalidSupervisionIntensity
+	}
+	if group.window_duration_ticks == 0 {
+		fmt.eprintfln("[FATAL] Supervision group window_duration_ticks must be > 0")
+		return .InvalidSupervisionIntensity
+	}
+
+	if group.strategy != .One_For_One && group.dynamic_child_count_max > 0 {
+		fmt.eprintfln("[FATAL] Only .One_For_One groups may have dynamic children")
+		return .InvalidSupervisionStrategy
+	}
+
+	for &child in group.children {
+		switch &c in child {
+		case Static_Child_Spec:
+			if !valid_types[c.type_id] {
+				fmt.eprintfln("[FATAL] ChildSpec references unregistered type_id: %v", c.type_id)
+				return .InvalidTypeId
+			}
+		case Group_Spec:
+			if err := _validate_supervision_group(&c, valid_types); err != .None {
+				return err
+			}
+		}
+	}
+	return .None
+}
+
+@(private = "file")
+_emit_advisory_warnings :: proc(spec: ^SystemSpec) {
+	// Warning A1: Mailbox Capacity Risk
+	theoretical_max_messages: u32 = 0
+	for t in spec.types {
+		theoretical_max_messages += u32(t.slot_count) * u32(t.mailbox_capacity)
+	}
+
+	pool_threshold := u32(spec.pool_slot_count) / 2
+	if theoretical_max_messages > pool_threshold {
+		fmt.printfln(
+			"[WARN] Theoretical max mailbox occupancy (%v) exceeds 50%% of pool capacity (%v). " +
+			"Consider increasing pool_slot_count or reducing mailbox_capacity.",
+			theoretical_max_messages,
+			spec.pool_slot_count,
+		)
+	}
+
+	// Warning A4: Core Affinity Overlap
+	seen_cores: [256]bool
+	for s in spec.shard_specs {
+		if s.target_core >= 0 && s.target_core < 256 {
+			if seen_cores[s.target_core] {
+				fmt.printfln(
+					"[WARN] Multiple shards target core %v. " +
+					"This violates shared-nothing threading under heavy load.",
+					s.target_core,
+				)
+			}
+			seen_cores[s.target_core] = true
+		}
+	}
+}
+
+@(private = "file")
+_validate_simulation :: proc(spec: ^SystemSpec) -> SystemSpecError {
+	if spec.simulation == nil do return .None
+
+	// ADR Check 20: Uniform timer resolution in simulation
+	// Note: In the current SystemSpec, timer_resolution_ns is process-wide,
+	// but we validate it here anyway to future-proof against per-shard configs.
+	if spec.timer_resolution_ns == 0 {
+		fmt.eprintfln("[FATAL] Simulation requires timer_resolution_ns > 0")
+		return .ValueOutOfBounds
+	}
+
+	// Add any future simulation-specific struct validations here
+	// (e.g. ensuring spec.simulation.seed != 0 if I want to ban 0 seeds)
+
+	return .None
+}
+
+@(private = "file")
+_validate_dio_config :: proc(spec: ^SystemSpec) -> SystemSpecError {
+	if spec.dio == nil do return .None
+
+	if spec.dio.submission_ring_size == 0 ||
+	   (spec.dio.submission_ring_size & (spec.dio.submission_ring_size - 1)) != 0 {
+		fmt.eprintfln(
+			"[FATAL] DIO submission_ring_size (%v) must be a power of two",
+			spec.dio.submission_ring_size,
+		)
+		return .ValueNotPowerOfTwo
+	}
+	if spec.dio.completion_ring_size == 0 ||
+	   (spec.dio.completion_ring_size & (spec.dio.completion_ring_size - 1)) != 0 {
+		fmt.eprintfln(
+			"[FATAL] DIO completion_ring_size (%v) must be a power of two",
+			spec.dio.completion_ring_size,
+		)
+		return .ValueNotPowerOfTwo
+	}
+
+	// Check 19: Core overlap
+	for s in spec.shard_specs {
+		if s.target_core == spec.dio.target_core {
+			fmt.eprintfln(
+				"[FATAL] DIO target_core (%v) conflicts with a Shard's target_core",
+				spec.dio.target_core,
+			)
+			return .ValueOutOfBounds
+		}
 	}
 
 	return .None
@@ -271,7 +569,7 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	}
 
 	err := validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.ScratchArenaTooSmall)
+	testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
 
 	spec.scratch_arena_size = 4096 // Exactly enough
 	err = validate_system_spec(&spec)
@@ -280,14 +578,14 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	// Test timer_spoke_count power-of-2 validation
 	spec.timer_spoke_count = 100 // Not power of 2
 	err = validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.TimerSpokeCountNotPowerOfTwo)
+	testing.expect_value(t, err, SystemSpecError.ValueNotPowerOfTwo)
 
 	spec.timer_spoke_count = 4096 // Restore valid value
 
 	// Test reactor_buffer_slot_count exceeds 12-bit token capacity
 	spec.reactor_buffer_slot_count = 4095
 	err = validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.ReactorBufferSlotCountExceedTokenCapacity)
+	testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
 
 	spec.reactor_buffer_slot_count = 4094 // Exactly at limit
 	err = validate_system_spec(&spec)

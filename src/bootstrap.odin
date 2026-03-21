@@ -3,6 +3,7 @@ package tina
 import "core:fmt"
 import "core:os"
 import "core:sync"
+import "core:sys/info"
 import "core:sys/posix"
 import "core:thread"
 import "core:time"
@@ -142,6 +143,23 @@ tina_start :: proc(spec: ^SystemSpec) {
 	}
 
 	total_system_memory_size += spsc_memory_size
+	// System Memory Fit Check
+	if total_ram, _, _, _, ram_ok := info.ram_stats(); ram_ok {
+		safety_margin := spec.safety_margin
+		if safety_margin <= 0.0 do safety_margin = 0.9 // Default from ADR
+
+		max_allowed := f64(total_ram) * f64(safety_margin)
+		if f64(total_system_memory_size) > max_allowed {
+			fmt.eprintfln(
+				"[FATAL] Memory budget (%.2f MB) exceeds %.0f%% of available RAM (%.2f MB)",
+				f64(total_system_memory_size) / 1024.0 / 1024.0,
+				safety_margin * 100.0,
+				f64(total_ram) / 1024.0 / 1024.0,
+			)
+			os.exit(1)
+		}
+	}
+
 	fmt.printfln(
 		"[SYSTEM] Total requested memory: %v bytes (%.2f MB)",
 		total_system_memory_size,
