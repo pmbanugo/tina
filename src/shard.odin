@@ -604,6 +604,12 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	soa_meta[slot].group_index = spec.group_index
 	soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
 
+	// Sever the free-list linkage so the messaging system knows the mailbox is empty
+	soa_meta[slot].inbox_head = POOL_NONE_INDEX
+	soa_meta[slot].inbox_tail = POOL_NONE_INDEX
+	soa_meta[slot].inbox_count = 0
+	soa_meta[slot].io_completion_tag = IO_TAG_NONE
+
 	ptr := _get_isolate_ptr(shard, type_id, slot)
 	stride := shard.type_descriptors[type_id].stride
 	if ptr != nil && stride > 0 {
@@ -1587,24 +1593,30 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	// Because siglongjmp bypasses defer, we must do this manually before re-hydrating!
 	reactor_deinit(&shard.reactor)
 
-	for type_desc in shard.type_descriptors {
+    for type_desc in shard.type_descriptors {
 		type_id := type_desc.id
 		soa_meta := shard.metadata[type_id]
 
-		for slot in 0 ..< type_desc.slot_count {
+		// Reset the free head for this type
+		shard.isolate_free_heads[type_id] = POOL_NONE_INDEX
+
+		for slot := int(type_desc.slot_count) - 1; slot >= 0; slot -= 1 {
 			new_generation := (soa_meta[slot].generation + 1) & 0x0FFFFFFF
 			if new_generation == 0 do new_generation = 1
 
 			soa_meta[slot].generation = new_generation
 			soa_meta[slot].state = .Unallocated
 			soa_meta[slot].inbox_count = 0
-			soa_meta[slot].inbox_head = POOL_NONE_INDEX
 			soa_meta[slot].inbox_tail = POOL_NONE_INDEX
 			soa_meta[slot].pending_correlation = 0
 			soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
 			soa_meta[slot].io_completion_tag = IO_TAG_NONE
 			soa_meta[slot].working_arena_offset = 0
 			soa_meta[slot].flags = {}
+
+			// Re-link the intrusive free list!
+			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
+			shard.isolate_free_heads[type_id] = u32(slot)
 		}
 	}
 

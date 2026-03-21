@@ -78,6 +78,17 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			continue // Restart initialization loop
 		}
 
+		// ==========================================================
+		// S11.5 Initialize Shard time BEFORE running any init_fn
+		// or entering the scheduler loop to prevent timer wheel catch-up loops!
+		// ==========================================================
+		when !TINA_SIMULATION_MODE {
+			now_ns := os_monotonic_time_ns()
+			shard.current_tick = now_ns / shard.timer_resolution_ns
+			shard.timer_wheel.last_tick = shard.current_tick
+			sync.atomic_store_explicit(&shard.heartbeat_tick, shard.current_tick, .Relaxed)
+		}
+
 		// S12. Build Supervision Tree
 		alloc_data := Grand_Arena_Allocator_Data {
 			arena = &arena,
