@@ -59,7 +59,7 @@ when TINA_SIMULATION_MODE {
 		// 1. Spawn Pong
 		pong_spec := Spawn_Spec {
 			type_id      = PONG_TYPE_ID,
-			group_index  = 0, // Root group
+			group_id     = ctx_supervision_group_id(ctx), // Inherit the coordinator's group
 			restart_type = .temporary,
 		}
 		pong_res := ctx_spawn(ctx, pong_spec)
@@ -73,7 +73,7 @@ when TINA_SIMULATION_MODE {
 
 		ping_spec := Spawn_Spec {
 			type_id      = PING_TYPE_ID,
-			group_index  = 0, // Root group
+			group_id     = ctx_supervision_group_id(ctx), // Inherit the coordinator's group
 			restart_type = .temporary,
 			args_payload = payload,
 			args_size    = payload_len,
@@ -251,14 +251,14 @@ when TINA_SIMULATION_MODE {
 	supervisor_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
 		bystander_spec := Spawn_Spec {
 			type_id      = BYSTANDER_TYPE_ID,
-			group_index  = 0,
+			group_id     = ctx_supervision_group_id(ctx),
 			restart_type = .temporary,
 		}
 		_ = assert_spawn_success(ctx_spawn(ctx, bystander_spec), "Bystander")
 
 		exiter_spec := Spawn_Spec {
 			type_id      = EXITER_TYPE_ID,
-			group_index  = 0,
+			group_id     = ctx_supervision_group_id(ctx),
 			restart_type = .temporary,
 		}
 		_ = assert_spawn_success(ctx_spawn(ctx, exiter_spec), "Exiter")

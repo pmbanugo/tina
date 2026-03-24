@@ -5,6 +5,13 @@ import "core:mem"
 MAX_INIT_ARGS_SIZE :: 64 //Fixed-Size Payload/Args for init_fn
 MAX_ISOLATES_PER_TYPE :: 1_048_575 // 20-bit slot index
 
+Supervision_Group_Id :: distinct u16
+SUPERVISION_GROUP_ID_NONE :: Supervision_Group_Id(0xFFFF)
+SUPERVISION_GROUP_ID_ROOT :: Supervision_Group_Id(0)
+
+// Solves the 0xFFFF bitwise truncation hazard by explicitly using the 255th slot
+SUPERVISION_SUBGROUP_TYPE_ID : u8 : 255 
+
 Crash_Reason :: enum u8 {
 	None                 = 0,
 	Spawn_Failed         = 1,
@@ -95,7 +102,7 @@ Transfer_Read_Result :: union {
 
 Spawn_Spec :: struct {
 	args_payload: [MAX_INIT_ARGS_SIZE]u8,
-	group_index:  u16,
+	group_id:     Supervision_Group_Id,
 	type_id:      u8,
 	restart_type: Restart_Type,
 	args_size:    u8,

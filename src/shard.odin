@@ -98,8 +98,6 @@ Control_Signal :: enum u8 {
 	Kill     = 2,
 }
 
-SUPERVISION_GROUP_NONE :: 0xFFFF
-HANDLE_TYPE_ID_SUBGROUP :: 0xFFFF
 
 // --- Core Data Structures ---
 
@@ -115,7 +113,7 @@ Isolate_Metadata :: struct {
 	generation:            u32,
 	working_arena_offset:  u32,
 	inbox_count:           u16,
-	group_index:           u16,
+	group_id:              Supervision_Group_Id,
 	io_completion_tag:     IO_Completion_Tag,
 	io_buffer_index:       u16,
 	state:                 Isolate_State,
@@ -154,8 +152,8 @@ Supervision_Group :: struct {
 	boot_spec:             ^Group_Spec,
 	window_start_tick:     u64,
 	window_duration_ticks: u32,
-	group_index:           u16,
-	parent_index:          u16,
+	group_id:              Supervision_Group_Id,
+	parent_id:             Supervision_Group_Id,
 	child_count:           u16,
 	restart_count:         u16,
 	restart_count_max:     u16,
@@ -536,18 +534,46 @@ ctx_transfer_send :: proc(ctx: ^TinaContext, to: Handle, handle: Transfer_Handle
 
 ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	shard := ctx.shard
-	type_id := u16(spec.type_id)
 
 	// 1. Group Capacity Check (Fail early!)
 	group: ^Supervision_Group = nil
-	if spec.group_index != SUPERVISION_GROUP_NONE {
-		group = &shard.supervision_groups[spec.group_index]
+	if spec.group_id != SUPERVISION_GROUP_ID_NONE {
+		group = &shard.supervision_groups[u16(spec.group_id)]
 		if group.child_count >= u16(len(group.children_handles)) {
 			return Spawn_Error.group_full
 		}
 	}
 
-	// 2. Slot Allocation (Popping the LIFO free list)
+	// 2. Delegate to internal allocation and init
+	res := _make_isolate(shard, spec, ctx.self_handle)
+	
+	child_handle, ok := res.(Handle)
+	if !ok {
+		return res
+	}
+
+	// 3. Register with Supervision Group (Always Appends)
+	if group != nil {
+		group.children_handles[group.child_count] = child_handle
+
+		if len(group.dynamic_specs) > 0 {
+			dyn := &group.dynamic_specs[group.child_count]
+			dyn.type_id = spec.type_id
+			dyn.restart_type = spec.restart_type
+			dyn.args_size = spec.args_size
+			dyn.args_payload = spec.args_payload
+		}
+		group.child_count += 1
+	}
+
+	return child_handle
+}
+
+@(private = "package")
+_make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -> Spawn_Result {
+	type_id := u16(spec.type_id)
+
+	// 1. Slot Allocation (Popping the LIFO free list)
 	slot := shard.isolate_free_heads[type_id]
 	if slot == POOL_NONE_INDEX {
 		return Spawn_Error.arena_full
@@ -559,15 +585,21 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	child_generation := soa_meta[slot].generation
 	child_handle := make_handle(shard.id, type_id, slot, child_generation)
 
-	// 3. Validate FD Handoff Affinity
+	// 2. Validate FD Handoff Affinity
 	if spec.handoff_fd != FD_HANDLE_NONE {
 		entry, fd_err := fd_table_lookup(&shard.reactor.fd_table, spec.handoff_fd)
 		if fd_err == .None {
-			// §6.6.3 §6: Split-FD handoff requires one_for_all supervision group
+			group: ^Supervision_Group = nil
+			if spec.group_id != SUPERVISION_GROUP_ID_NONE {
+				group = &shard.supervision_groups[u16(spec.group_id)]
+			}
+			
 			if spec.handoff_mode == .Read_Only || spec.handoff_mode == .Write_Only {
 				if group == nil || group.strategy != .One_For_All {
+					// Use a dummy context for the crash log
+					dummy_ctx := TinaContext{shard = shard, self_handle = spawner_handle}
 					ctx_log(
-						ctx,
+						&dummy_ctx,
 						.ERROR,
 						LOG_TAG_ISOLATE_CRASHED,
 						transmute([]u8)string("Split-FD handoff requires one_for_all group"),
@@ -579,10 +611,10 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 			}
 			can_transfer := true
 			if spec.handoff_mode == .Full || spec.handoff_mode == .Read_Only {
-				if entry.read_owner != ctx.self_handle do can_transfer = false
+				if entry.read_owner != spawner_handle do can_transfer = false
 			}
 			if spec.handoff_mode == .Full || spec.handoff_mode == .Write_Only {
-				if entry.write_owner != ctx.self_handle do can_transfer = false
+				if entry.write_owner != spawner_handle do can_transfer = false
 			}
 
 			if can_transfer {
@@ -593,8 +625,9 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 					spec.handoff_mode,
 				)
 			} else {
+				dummy_ctx := TinaContext{shard = shard, self_handle = spawner_handle}
 				ctx_log(
-					ctx,
+					&dummy_ctx,
 					.ERROR,
 					LOG_TAG_ISOLATE_CRASHED,
 					transmute([]u8)string("FD handoff affinity violation"),
@@ -610,12 +643,11 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 		}
 	}
 
-	// 4. Initialize Isolate Memory & Context
+	// 3. Initialize Isolate Memory & Context
 	soa_meta[slot].state = .Runnable
-	soa_meta[slot].group_index = spec.group_index
+	soa_meta[slot].group_id = spec.group_id
 	soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
 
-	// Sever the free-list linkage so the messaging system knows the mailbox is empty
 	soa_meta[slot].inbox_head = POOL_NONE_INDEX
 	soa_meta[slot].inbox_tail = POOL_NONE_INDEX
 	soa_meta[slot].inbox_count = 0
@@ -641,7 +673,7 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 		mem.arena_init(&child_ctx.working_arena, working_slice)
 	}
 
-	// 5. Execute init_fn
+	// 4. Execute init_fn
 	local_spec := spec
 	effect := shard.type_descriptors[type_id].init_fn(
 		ptr,
@@ -660,32 +692,15 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 			fd_table_handoff(
 				&shard.reactor.fd_table,
 				spec.handoff_fd,
-				ctx.self_handle,
+				spawner_handle,
 				spec.handoff_mode,
 			)
 		}
-
-		// The teardown will safely bump the generation and sweep resources.
-		// Since we haven't set group_index yet, on_child_exit safely does nothing.
 		_teardown_isolate(shard, type_id, slot, .Crashed)
 		return Spawn_Error.init_failed
 	}
 
-	// 6. Register with Supervision Group
-	if group != nil {
-		group.children_handles[group.child_count] = child_handle
-
-		if len(group.dynamic_specs) > 0 {
-			dyn := &group.dynamic_specs[group.child_count]
-			dyn.type_id = spec.type_id
-			dyn.restart_type = spec.restart_type
-			dyn.args_size = spec.args_size
-			dyn.args_payload = spec.args_payload
-		}
-		group.child_count += 1
-	}
-
-	// §11: Spawns during shutdown — child immediately receives TAG_SHUTDOWN
+	// §11: Spawns during shutdown
 	if ctx_is_shutting_down(&child_ctx) {
 		soa_meta[slot].flags += {.Shutdown_Pending}
 	}
@@ -842,6 +857,16 @@ ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
 	)
 }
 
+ctx_supervision_group_id :: #force_inline proc(ctx: ^TinaContext) -> Supervision_Group_Id {
+	type_id := extract_type_id(ctx.self_handle)
+	slot := extract_slot(ctx.self_handle)
+	return ctx.shard.metadata[type_id][slot].group_id
+}
+
+ctx_root_supervision_group_id :: #force_inline proc() -> Supervision_Group_Id {
+	return SUPERVISION_GROUP_ID_ROOT
+}
+
 ctx_type_config :: #force_inline proc(ctx: ^TinaContext) -> ^TypeDescriptor {
 	type_id := extract_type_id(ctx.self_handle)
 	return &ctx.shard.type_descriptors[type_id]
@@ -960,10 +985,10 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	soa_meta[slot_index].inbox_count = 0
 
 	// Step 4: Invoke supervision subsystem
-	group_index := soa_meta[slot_index].group_index
-	if group_index != SUPERVISION_GROUP_NONE {
+	group_id := soa_meta[slot_index].group_id
+	if group_id != SUPERVISION_GROUP_ID_NONE {
 		old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
-		_on_child_exit(shard, group_index, old_handle, exit_kind)
+		_on_child_exit(shard, group_id, old_handle, exit_kind)
 	}
 
 	// Step 5: Free arena slot & push back to free list
@@ -1322,7 +1347,7 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 	for i := group.child_count; i > 0; i -= 1 {
 		handle := group.children_handles[i - 1]
 		if handle != HANDLE_NONE {
-			if extract_type_id(handle) != HANDLE_TYPE_ID_SUBGROUP {
+			if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
 				_teardown_isolate(shard, extract_type_id(handle), extract_slot(handle), .Shutdown)
 			} else {
 				_teardown_subgroup(shard, &shard.supervision_groups[extract_slot(handle)])
@@ -1331,7 +1356,7 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 	}
 	group.child_count = 0
 
-	if group.parent_index == SUPERVISION_GROUP_NONE {
+	if group.parent_id == SUPERVISION_GROUP_ID_NONE {
 		// We use Relaxed because the scheduler loop's atomic_load_explicit
 		// is the synchronization point.
 		sync.atomic_store_explicit(
@@ -1340,8 +1365,8 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 			.Relaxed,
 		)
 	} else {
-		group_handle := make_handle(shard.id, HANDLE_TYPE_ID_SUBGROUP, u32(group.group_index), 0)
-		_on_child_exit(shard, group.parent_index, group_handle, .Crashed)
+		group_handle := make_handle(shard.id, u16(SUPERVISION_SUBGROUP_TYPE_ID), u32(group.group_id), 0)
+		_on_child_exit(shard, group.parent_id, group_handle, .Crashed)
 	}
 }
 
@@ -1350,7 +1375,7 @@ _teardown_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
 	for i := group.child_count; i > 0; i -= 1 {
 		handle := group.children_handles[i - 1]
 		if handle != HANDLE_NONE {
-			if extract_type_id(handle) != HANDLE_TYPE_ID_SUBGROUP {
+			if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
 				_teardown_isolate(shard, extract_type_id(handle), extract_slot(handle), .Shutdown)
 			} else {
 				_teardown_subgroup(shard, &shard.supervision_groups[extract_slot(handle)])
@@ -1364,7 +1389,7 @@ _teardown_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
 @(private = "package")
 _respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) {
 	spec: Spawn_Spec
-	spec.group_index = group.group_index
+	spec.group_id = group.group_id
 	spec.handoff_fd = FD_HANDLE_NONE
 	spec.handoff_mode = .Full
 
@@ -1390,13 +1415,11 @@ _respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) 
 		}
 	}
 
-	ctx := TinaContext {
-		shard       = shard,
-		self_handle = HANDLE_NONE,
-	}
-	res := ctx_spawn(&ctx, spec)
+	// Directly allocate and execute init. Skips array append logic.
+	res := _make_isolate(shard, spec, HANDLE_NONE)
 
 	if handle, ok := res.(Handle); ok {
+		// IN-PLACE OVERWRITE! Solves the array-exhaustion deadlock.
 		group.children_handles[index] = handle
 	} else {
 		_escalate(shard, group)
@@ -1414,7 +1437,7 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, crashed_index:
 
 			handle := group.children_handles[target_index]
 			if handle != HANDLE_NONE {
-				if extract_type_id(handle) != HANDLE_TYPE_ID_SUBGROUP {
+				if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
 					_teardown_isolate(
 						shard,
 						extract_type_id(handle),
@@ -1449,11 +1472,11 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, crashed_index:
 @(private = "package")
 _on_child_exit :: proc(
 	shard: ^Shard,
-	group_index: u16,
+	group_id: Supervision_Group_Id,
 	child_handle: Handle,
 	exit_kind: Exit_Kind,
 ) {
-	group := &shard.supervision_groups[group_index]
+	group := &shard.supervision_groups[u16(group_id)]
 
 	if exit_kind == .Shutdown {
 		index, found := _find_child_index(group, child_handle)
@@ -1496,14 +1519,14 @@ shard_build_supervision_tree :: proc(
 	alloc_data: ^Grand_Arena_Allocator_Data = nil,
 ) {
 	next_group_index: u16 = 0
-	_build_group(shard, root_spec, SUPERVISION_GROUP_NONE, &next_group_index, alloc, alloc_data)
+	_build_group(shard, root_spec, SUPERVISION_GROUP_ID_NONE, &next_group_index, alloc, alloc_data)
 }
 
 @(private = "package")
 _build_group :: proc(
 	shard: ^Shard,
 	group_spec: ^Group_Spec,
-	parent_index: u16,
+	parent_id: Supervision_Group_Id,
 	next_group_index: ^u16,
 	alloc: mem.Allocator,
 	alloc_data: ^Grand_Arena_Allocator_Data,
@@ -1512,8 +1535,8 @@ _build_group :: proc(
 	next_group_index^ += 1
 
 	group := &shard.supervision_groups[group_index]
-	group.group_index = group_index
-	group.parent_index = parent_index
+	group.group_id = Supervision_Group_Id(group_index)
+	group.parent_id = parent_id
 	group.strategy = group_spec.strategy
 	group.boot_spec = group_spec
 	group.window_duration_ticks = group_spec.window_duration_ticks
@@ -1545,7 +1568,7 @@ _build_group :: proc(
 		case Static_Child_Spec:
 			spec := Spawn_Spec {
 				args_payload = s.args_payload,
-				group_index  = group_index,
+				group_id     = Supervision_Group_Id(group_index),
 				type_id      = s.type_id,
 				restart_type = s.restart_type,
 				args_size    = s.args_size,
@@ -1574,8 +1597,8 @@ _build_group :: proc(
 			}
 
 		case Group_Spec:
-			sub_index := _build_group(shard, &s, group_index, next_group_index, alloc, alloc_data)
-			sub_handle := make_handle(shard.id, HANDLE_TYPE_ID_SUBGROUP, u32(sub_index), 0)
+			sub_index := _build_group(shard, &s, Supervision_Group_Id(group_index), next_group_index, alloc, alloc_data)
+			sub_handle := make_handle(shard.id, u16(SUPERVISION_SUBGROUP_TYPE_ID), u32(sub_index), 0)
 			group.children_handles[group.child_count] = sub_handle
 			group.child_count += 1
 		}
