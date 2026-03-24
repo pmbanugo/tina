@@ -87,7 +87,7 @@ _register_system_timer :: proc(
 }
 
 @(private = "package")
-_timer_wheel_insert :: #force_inline proc(
+_timer_wheel_insert :: #force_inline proc "contextless" (
 	wheel: ^Timer_Wheel,
 	deliver_at: u64,
 	target: Handle,
