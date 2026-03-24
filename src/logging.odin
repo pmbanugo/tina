@@ -57,32 +57,45 @@ log_init :: proc(ring: ^Log_Ring_Buffer, backing: []u8) {
 	ring.write_cursor = 0
 }
 
-ctx_log :: proc(ctx: ^TinaContext, level: Log_Level, tag: Log_Tag, payload: []u8) {
-	timestamp := ctx.shard.current_tick
+// The public, ergonomic wrapper
+ctx_log :: #force_inline proc(ctx: ^TinaContext, level: Log_Level, tag: Log_Tag, payload: []u8) {
+	_shard_log(ctx.shard, ctx.self_handle, level, tag, payload)
+}
+
+// The internal logging primitive
+@(private = "package")
+_shard_log :: #force_inline proc(
+	shard: ^Shard,
+	source: Handle,
+	level: Log_Level,
+	tag: Log_Tag,
+	payload: []u8,
+) {
+	timestamp := shard.current_tick
 	record_size := Log_Record_Header_Size + u64(((len(payload) + 7) & ~int(7)))
 
-	capacity := ctx.shard.log_ring.capacity_mask + 1
-	if ctx.shard.log_ring.write_cursor + record_size - ctx.shard.log_ring.read_cursor > capacity {
+	capacity := shard.log_ring.capacity_mask + 1
+	if shard.log_ring.write_cursor + record_size - shard.log_ring.read_cursor > capacity {
 		return
 	}
 
 	header := Log_Record_Header {
 		timestamp      = timestamp,
-		isolate_handle = ctx.self_handle,
+		isolate_handle = source,
 		payload_size   = u16(len(payload)),
 		level          = level,
 		tag            = tag,
 	}
 
 	_write_ring_data(
-		&ctx.shard.log_ring,
-		ctx.shard.log_ring.write_cursor,
+		&shard.log_ring,
+		shard.log_ring.write_cursor,
 		mem.byte_slice(cast(^u8)&header, 24),
 	)
 	if len(payload) > 0 {
-		_write_ring_data(&ctx.shard.log_ring, ctx.shard.log_ring.write_cursor + 24, payload)
+		_write_ring_data(&shard.log_ring, shard.log_ring.write_cursor + 24, payload)
 	}
-	ctx.shard.log_ring.write_cursor += record_size
+	shard.log_ring.write_cursor += record_size
 }
 
 // SIMD-friendly 2-part ring buffer block copy

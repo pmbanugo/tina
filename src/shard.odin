@@ -596,10 +596,9 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 			
 			if spec.handoff_mode == .Read_Only || spec.handoff_mode == .Write_Only {
 				if group == nil || group.strategy != .One_For_All {
-					// Use a dummy context for the crash log
-					dummy_ctx := TinaContext{shard = shard, self_handle = spawner_handle}
-					ctx_log(
-						&dummy_ctx,
+					_shard_log(
+						shard,
+						spawner_handle,
 						.ERROR,
 						LOG_TAG_ISOLATE_CRASHED,
 						transmute([]u8)string("Split-FD handoff requires one_for_all group"),
@@ -625,9 +624,9 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 					spec.handoff_mode,
 				)
 			} else {
-				dummy_ctx := TinaContext{shard = shard, self_handle = spawner_handle}
-				ctx_log(
-					&dummy_ctx,
+				_shard_log(
+					shard,
+					spawner_handle,
 					.ERROR,
 					LOG_TAG_ISOLATE_CRASHED,
 					transmute([]u8)string("FD handoff affinity violation"),
