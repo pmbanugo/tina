@@ -1,6 +1,5 @@
 package tina
 
-import "core:c"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -9,55 +8,6 @@ import "core:testing"
 
 DISPATCH_QUOTA_PER_WEIGHT :: 256 // Baseline message processing limit per tick, per priority weight
 
-// --- Trap Boundary Platform Bindings ---
-
-when ODIN_OS == .Linux {
-	sigjmp_buf :: distinct [64]c.long // 512 bytes on x64, safe margin
-
-	foreign import libc "system:c"
-	@(default_calling_convention = "c")
-	foreign libc {
-		@(link_name = "__sigsetjmp")
-		_sigsetjmp :: proc(env: ^sigjmp_buf, savesigs: c.int) -> c.int ---
-		siglongjmp :: proc(env: ^sigjmp_buf, val: c.int) -> ! ---
-	}
-
-	sigsetjmp :: proc(env: ^sigjmp_buf, savesigs: c.int) -> c.int {
-		return _sigsetjmp(env, savesigs)
-	}
-} else when ODIN_OS ==
-	.Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
-	sigjmp_buf :: distinct [256]c.long // 2048 bytes on 64-bit, covers all BSD/Darwin targets (Safe margin)
-
-	foreign import libc "system:c"
-	@(default_calling_convention = "c")
-	foreign libc {
-		sigsetjmp :: proc(env: ^sigjmp_buf, savesigs: c.int) -> c.int ---
-		siglongjmp :: proc(env: ^sigjmp_buf, val: c.int) -> ! ---
-	}
-} else when ODIN_OS == .Windows {
-	// Windows lacks POSIX signals. Polyfill with standard setjmp for development/Simulation mode.
-	sigjmp_buf :: distinct [64]c.long
-
-	foreign import libc "system:c"
-	@(default_calling_convention = "c")
-	foreign libc {
-		@(link_name = "_setjmp")
-		_tina_setjmp :: proc(env: ^sigjmp_buf, hack: rawptr = nil) -> c.int ---
-		@(link_name = "longjmp")
-		_tina_longjmp :: proc(env: ^sigjmp_buf, val: c.int) -> ! ---
-	}
-
-	sigsetjmp :: proc(env: ^sigjmp_buf, savesigs: c.int) -> c.int {
-		return _tina_setjmp(env)
-	}
-	siglongjmp :: proc(env: ^sigjmp_buf, val: c.int) -> ! {
-		_tina_longjmp(env, val)
-	}
-} else {
-	#panic("Unsupported OS for Trap Boundary bindings")
-}
-
 RECOVERY_TIER_3 :: 1
 RECOVERY_WATCHDOG :: 2
 
@@ -65,7 +15,7 @@ RECOVERY_WATCHDOG :: 2
 g_current_shard_ptr: ^Shard
 
 trigger_tier2_panic :: proc(shard: ^Shard) -> ! {
-	siglongjmp(&shard.trap_environment_inner, 1)
+	os_trap_restore(&shard.trap_environment_inner, 1)
 }
 
 // --- Enums & Constants ---
@@ -206,8 +156,8 @@ Shard :: struct {
 
 	// --- Cold / Massive Storage ---
 	timer_wheel:            Timer_Wheel,
-	trap_environment_outer: sigjmp_buf,
-	trap_environment_inner: sigjmp_buf,
+	trap_environment_outer: OS_Trap_Environment,
+	trap_environment_inner: OS_Trap_Environment,
 	reactor:                Reactor,
 
 	// Used/Set only during simulation.
@@ -348,12 +298,12 @@ scheduler_tick :: proc(shard: ^Shard) {
 		shard.current_type_id = u16(type_id)
 		start_slot: u32 = 0
 
-		if sigsetjmp(&shard.trap_environment_inner, 0) != 0 {
+		if os_trap_save(&shard.trap_environment_inner) != 0 {
 			when !TINA_SIMULATION_MODE {
 				// Sweep orphaned temp allocations from panic string formatting.
 				free_all(context.temp_allocator)
 				// Unblock signals masked by the OS during handler execution.
-				_unblock_trap_signals()
+				os_signals_restore_thread_mask()
 			}
 
 			if shard.current_msg_slot != POOL_NONE_INDEX {

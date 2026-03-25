@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:os"
 import "core:sync"
 import "core:sys/info"
-import "core:sys/posix"
 import "core:thread"
 import "core:time"
 
@@ -167,7 +166,9 @@ tina_start :: proc(spec: ^SystemSpec) {
 	)
 
 	// 4. Install signal handlers and set signal mask
-	_bootstrap_signals()
+	when !TINA_SIMULATION_MODE {
+		os_signals_init_process()
+	}
 
 	// ========================================================================
 	// PHASE: SHARD_INIT (multi-threaded, pre-scheduler)
@@ -241,134 +242,3 @@ tina_start :: proc(spec: ^SystemSpec) {
 	fmt.printfln("[SYSTEM] Process Terminated Cleanly.")
 }
 
-// Configures process-wide signal dispositions before any threads are spawned.
-@(private = "file")
-_bootstrap_signals :: proc() {
-	when ODIN_OS ==
-		.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
-		// 4a. Ignore SIGPIPE process-wide.
-		posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
-
-		// 4b. Install SIGSEGV, SIGBUS, SIGFPE, SIGUSR1 handlers with SA_ONSTACK
-		sa_fatal: posix.sigaction_t
-		sa_fatal.sa_sigaction = fatal_signal_handler
-		sa_fatal.sa_flags = {.SIGINFO, .ONSTACK}
-		posix.sigemptyset(&sa_fatal.sa_mask)
-
-		posix.sigaction(.SIGSEGV, &sa_fatal, nil)
-		posix.sigaction(.SIGBUS, &sa_fatal, nil)
-		posix.sigaction(.SIGFPE, &sa_fatal, nil)
-		// OS-level traps resulting from software aborts/panics
-		posix.sigaction(.SIGILL, &sa_fatal, nil)
-		posix.sigaction(.SIGTRAP, &sa_fatal, nil)
-		posix.sigaction(.SIGABRT, &sa_fatal, nil)
-
-		sa_usr1: posix.sigaction_t
-		sa_usr1.sa_sigaction = sigusr1_handler
-		sa_usr1.sa_flags = {.SIGINFO, .ONSTACK}
-		posix.sigemptyset(&sa_usr1.sa_mask)
-
-		posix.sigaction(.SIGUSR1, &sa_usr1, nil)
-
-		// 4c. Block signals that will be handled synchronously via sigtimedwait by the watchdog.
-		blocked: posix.sigset_t
-		posix.sigemptyset(&blocked)
-		posix.sigaddset(&blocked, .SIGTERM)
-		posix.sigaddset(&blocked, .SIGINT)
-		posix.sigaddset(&blocked, .SIGUSR1)
-		posix.sigaddset(&blocked, .SIGUSR2)
-		posix.sigaddset(&blocked, .SIGHUP)
-
-		sig_err := posix.pthread_sigmask(.BLOCK, &blocked, nil)
-		if sig_err != .NONE {
-			fmt.eprintfln("[FATAL] Failed to set pthread_sigmask: %v", posix.strerror(sig_err))
-			os.exit(1)
-		}
-	}
-}
-
-when ODIN_OS ==
-	.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
-
-	// --- Async-Signal-Safe Helpers (write(2) only, no fmt/allocator/runtime) ---
-
-	@(private = "package")
-	_sig_append_str :: proc "contextless" (target: []u8, pos: int, source: string) -> int {
-		n := min(len(target) - pos, len(source))
-		for i in 0 ..< n do target[pos + i] = source[i]
-		return pos + n
-	}
-
-	@(private = "package")
-	_sig_append_u64 :: proc "contextless" (target: []u8, pos: int, value: u64) -> int {
-		if pos >= len(target) do return pos
-		if value == 0 {
-			target[pos] = '0'
-			return pos + 1
-		}
-		tmp: [20]u8
-		n := 0
-		v := value
-		for v > 0 {
-			tmp[n] = u8('0') + u8(v % 10)
-			v /= 10
-			n += 1
-		}
-		written := min(n, len(target) - pos)
-		for i in 0 ..< written {
-			target[pos + i] = tmp[n - 1 - i]
-		}
-		return pos + written
-	}
-
-	// The Tier 3 Fault Trap — async-signal-safe
-	@(private = "file")
-	fatal_signal_handler :: proc "c" (
-		sig: posix.Signal,
-		info: ^posix.siginfo_t,
-		ucontext: rawptr,
-	) {
-		shard := g_current_shard_ptr
-		if shard == nil {
-			// Not a Shard thread. Re-raise with default handler → abort + core dump.
-			buf: [64]u8
-			n := _sig_append_str(buf[:], 0, "[FATAL] non-shard sig=")
-			n = _sig_append_u64(buf[:], n, u64(sig))
-			n = _sig_append_str(buf[:], n, "\n")
-			_write_stderr(buf[:n])
-			posix.signal(sig, auto_cast posix.SIG_DFL)
-			posix.raise(sig)
-			return
-		}
-
-		buf: [96]u8
-		n := _sig_append_str(buf[:], 0, "[FATAL] Shard ")
-		n = _sig_append_u64(buf[:], n, u64(shard.id))
-		n = _sig_append_str(buf[:], n, " caught sig=")
-		n = _sig_append_u64(buf[:], n, u64(sig))
-		n = _sig_append_str(buf[:], n, ". Level 2 Recovery.\n")
-		_write_stderr(buf[:n])
-
-		// Emergency log flush — the "Black Box" (async-signal-safe)
-		emergency_log_flush_signal(shard)
-
-		// Warp execution back to the recovery point
-		siglongjmp(&shard.trap_environment_outer, RECOVERY_TIER_3)
-	}
-
-	// The Watchdog Cooperative Kill Trap — async-signal-safe
-	@(private = "file")
-	sigusr1_handler :: proc "c" (sig: posix.Signal, info: ^posix.siginfo_t, ucontext: rawptr) {
-		shard := g_current_shard_ptr
-		if shard == nil do return
-
-		buf: [96]u8
-		n := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
-		n = _sig_append_u64(buf[:], n, u64(shard.id))
-		n = _sig_append_str(buf[:], n, " SIGUSR1 force-kill. Level 2 Recovery.\n")
-		_write_stderr(buf[:n])
-
-		// Warp execution back to the recovery point
-		siglongjmp(&shard.trap_environment_outer, RECOVERY_WATCHDOG)
-	}
-}

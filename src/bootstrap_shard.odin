@@ -3,29 +3,7 @@ package tina
 import "base:runtime"
 import "core:fmt"
 import "core:sync"
-import "core:sys/posix"
 import "core:thread"
-
-// Manually unblocks hardware and software trap signals after siglongjmp recovery.
-// Required because sigsetjmp(savesigs=0) does not save/restore the signal mask,
-// and the OS blocks the triggering signal during handler execution. Without this,
-// a second occurrence of the same signal would bypass our handler entirely.
-@(private = "package")
-_unblock_trap_signals :: proc() {
-	when ODIN_OS ==
-		.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
-		unblock_sig: posix.sigset_t
-		posix.sigemptyset(&unblock_sig)
-		posix.sigaddset(&unblock_sig, .SIGSEGV)
-		posix.sigaddset(&unblock_sig, .SIGBUS)
-		posix.sigaddset(&unblock_sig, .SIGFPE)
-		posix.sigaddset(&unblock_sig, .SIGILL)
-		posix.sigaddset(&unblock_sig, .SIGTRAP)
-		posix.sigaddset(&unblock_sig, .SIGABRT)
-		posix.sigaddset(&unblock_sig, .SIGUSR1)
-		posix.pthread_sigmask(.UNBLOCK, &unblock_sig, nil)
-	}
-}
 
 // Custom assertion handler that routes Odin software panics into Tina's Trap Boundary.
 // Uses only async-signal-safe operations (stack buffer + write(2)). No fmt, no allocator.
@@ -51,7 +29,7 @@ tina_assertion_failure_proc :: proc(
 		n = _sig_append_str(buf[:], n, message)
 		n = _sig_append_str(buf[:], n, "\n")
 		_write_stderr(buf[:n])
-		posix.abort()
+		os_abort()
 	}
 }
 
@@ -77,12 +55,8 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 	os_pin_thread_to_core(i32(config.target_core))
 
-	when ODIN_OS ==
-		.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
-		unblock_sig: posix.sigset_t
-		posix.sigemptyset(&unblock_sig)
-		posix.sigaddset(&unblock_sig, .SIGUSR1)
-		posix.pthread_sigmask(.UNBLOCK, &unblock_sig, nil)
+	when !TINA_SIMULATION_MODE {
+		os_signals_init_thread()
 	}
 
 	sigstack_mem, sigstack_err := os_reserve_arena_with_guard(TINA_SIGALTSTACK_SIZE)
@@ -109,7 +83,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 	// S11. Install shard-level sigsetjmp recovery point
 	for {
-		recovery_reason := sigsetjmp(&shard.trap_environment_outer, 0)
+		recovery_reason := os_trap_save(&shard.trap_environment_outer)
 
 		if recovery_reason != 0 {
 			// CRASH PATH: We caught a SIGSEGV/SIGBUS/SIGFPE or Watchdog SIGUSR1
@@ -124,7 +98,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 				// orphaned by panic string formatting before full teardown.
 				free_all(context.temp_allocator)
 				// Unblock signals masked by the OS during handler execution.
-				_unblock_trap_signals()
+				os_signals_restore_thread_mask()
 			}
 
 			// This performs the in-place reset and rebuilds the tree.
