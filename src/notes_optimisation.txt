@@ -1,4 +1,5 @@
 Considerations to consider in the future
+- does it make sense to cache align `Shard_Config :: struct #align(CACHE_LINE_SIZE)` to 128 (our expected cache line size for modern servers and high-end dev setup)? I disabled for now because I want to understand and evaluate the consequences later
 - could some places doing boolean checks use enum(u8) or bit_set, and maybe we can combine/compose the behaviour/logic in a better way (better for human comprehension or machine code)
     - (also) ifs up, fors down
 -  I need to mark my procedures as contextless because I don't need Odin's implicit "context"

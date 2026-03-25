@@ -1,9 +1,59 @@
 package tina
 
+import "base:runtime"
 import "core:fmt"
 import "core:sync"
 import "core:sys/posix"
 import "core:thread"
+
+// Manually unblocks hardware and software trap signals after siglongjmp recovery.
+// Required because sigsetjmp(savesigs=0) does not save/restore the signal mask,
+// and the OS blocks the triggering signal during handler execution. Without this,
+// a second occurrence of the same signal would bypass our handler entirely.
+@(private = "package")
+_unblock_trap_signals :: proc() {
+	when ODIN_OS ==
+		.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
+		unblock_sig: posix.sigset_t
+		posix.sigemptyset(&unblock_sig)
+		posix.sigaddset(&unblock_sig, .SIGSEGV)
+		posix.sigaddset(&unblock_sig, .SIGBUS)
+		posix.sigaddset(&unblock_sig, .SIGFPE)
+		posix.sigaddset(&unblock_sig, .SIGILL)
+		posix.sigaddset(&unblock_sig, .SIGTRAP)
+		posix.sigaddset(&unblock_sig, .SIGABRT)
+		posix.sigaddset(&unblock_sig, .SIGUSR1)
+		posix.pthread_sigmask(.UNBLOCK, &unblock_sig, nil)
+	}
+}
+
+// Custom assertion handler that routes Odin software panics into Tina's Trap Boundary.
+// Uses only async-signal-safe operations (stack buffer + write(2)). No fmt, no allocator.
+tina_assertion_failure_proc :: proc(
+	prefix, message: string,
+	loc: runtime.Source_Code_Location,
+) -> ! {
+	shard := g_current_shard_ptr
+	if shard != nil {
+		buf: [256]u8
+		n := _sig_append_str(buf[:], 0, "[SOFTWARE PANIC] Shard ")
+		n = _sig_append_u64(buf[:], n, u64(shard.id))
+		n = _sig_append_str(buf[:], n, ": ")
+		n = _sig_append_str(buf[:], n, prefix)
+		n = _sig_append_str(buf[:], n, message)
+		n = _sig_append_str(buf[:], n, "\n")
+		_write_stderr(buf[:n])
+		trigger_tier2_panic(shard)
+	} else {
+		buf: [256]u8
+		n := _sig_append_str(buf[:], 0, "[FATAL PANIC] Non-shard thread: ")
+		n = _sig_append_str(buf[:], n, prefix)
+		n = _sig_append_str(buf[:], n, message)
+		n = _sig_append_str(buf[:], n, "\n")
+		_write_stderr(buf[:n])
+		posix.abort()
+	}
+}
 
 // The entry point for every Shard OS thread.
 shard_thread_entry :: proc(t: ^thread.Thread) {
@@ -13,6 +63,9 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	os_set_current_thread_name(name_string)
 
 	config.os_thread_handle = os_get_current_thread_handle()
+
+	// Hook Odin's software panics into the Tina Trap Boundary
+	context.assertion_failure_proc = tina_assertion_failure_proc
 
 	shard := new(Shard)
 	defer free(shard)
@@ -56,7 +109,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 	// S11. Install shard-level sigsetjmp recovery point
 	for {
-		recovery_reason := sigsetjmp(&shard.trap_environment, 0)
+		recovery_reason := sigsetjmp(&shard.trap_environment_outer, 0)
 
 		if recovery_reason != 0 {
 			// CRASH PATH: We caught a SIGSEGV/SIGBUS/SIGFPE or Watchdog SIGUSR1
@@ -65,6 +118,15 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 				shard.id,
 				recovery_reason,
 			)
+
+			when !TINA_SIMULATION_MODE {
+				// siglongjmp bypasses defer statements; sweep temp allocations
+				// orphaned by panic string formatting before full teardown.
+				free_all(context.temp_allocator)
+				// Unblock signals masked by the OS during handler execution.
+				_unblock_trap_signals()
+			}
+
 			// This performs the in-place reset and rebuilds the tree.
 			shard_mass_teardown(shard)
 

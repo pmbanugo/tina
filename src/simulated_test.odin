@@ -861,4 +861,25 @@ when TINA_SIMULATION_MODE {
 			u16(iso.received_tags[1]),
 		)
 	}
+
+	// ============================================================================
+	// Software Panic Containment (§6.5.1)
+	// ============================================================================
+	// End-to-end verification of assert(false) → tina_assertion_failure_proc →
+	// siglongjmp → trap boundary recovery cannot be tested inside `odin test`.
+	//
+	// Reason: Odin's test runner owns process-wide signal handlers (SIGILL,
+	// SIGTRAP, SIGABRT via libc.signal) and overrides context.assertion_failure_proc
+	// with its own test_assertion_failure_proc. These conflict with Tina's
+	// siglongjmp-based containment model — the test runner intercepts the signal
+	// before siglongjmp can transfer control.
+	//
+	// Production coverage: The inner trap boundary (scheduler_tick's sigsetjmp)
+	// and outer trap boundary (bootstrap_shard's sigsetjmp) are exercised by
+	// hardware fault paths (SIGSEGV, SIGBUS, SIGFPE) in production, which share
+	// the identical siglongjmp recovery mechanism.
+	//
+	// To verify the full software panic path, use a standalone subprocess harness
+	// that runs shard_thread_entry directly, without Odin's test runner.
+	// ============================================================================
 }

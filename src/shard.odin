@@ -64,8 +64,8 @@ RECOVERY_WATCHDOG :: 2
 @(thread_local)
 g_current_shard_ptr: ^Shard
 
-trigger_tier2_panic :: proc(shard: ^Shard) {
-	siglongjmp(&shard.trap_environment, 1)
+trigger_tier2_panic :: proc(shard: ^Shard) -> ! {
+	siglongjmp(&shard.trap_environment_inner, 1)
 }
 
 // --- Enums & Constants ---
@@ -173,45 +173,46 @@ when TINA_SIMULATION_MODE {
 
 Shard :: struct {
 	// --- Hot Pointers & Slices (8-byte aligned) ---
-	outbound_rings:       []^SPSC_Ring,
-	inbound_rings:        []^SPSC_Ring,
-	type_descriptors:     []TypeDescriptor,
-	isolate_free_heads:   []u32, // free list heads per Isolate Type
-	isolate_memory:       [][]u8,
-	working_memory:       [][]u8, // Base slices for working memory
-	scratch_memory:       []u8, // Base slice for scratch arena
-	transfer_generations: []u16,
-	metadata:             []#soa[]Isolate_Metadata,
-	supervision_groups:   []Supervision_Group,
+	outbound_rings:         []^SPSC_Ring,
+	inbound_rings:          []^SPSC_Ring,
+	type_descriptors:       []TypeDescriptor,
+	isolate_free_heads:     []u32, // free list heads per Isolate Type
+	isolate_memory:         [][]u8,
+	working_memory:         [][]u8, // Base slices for working memory
+	scratch_memory:         []u8, // Base slice for scratch arena
+	transfer_generations:   []u16,
+	metadata:               []#soa[]Isolate_Metadata,
+	supervision_groups:     []Supervision_Group,
 
 	// --- Hot Embedded Structs (8-byte aligned) ---
-	log_ring:             Log_Ring_Buffer,
-	message_pool:         Message_Pool,
-	transfer_pool:        Reactor_Buffer_Pool,
-	counters:             Shard_Counters,
+	log_ring:               Log_Ring_Buffer,
+	message_pool:           Message_Pool,
+	transfer_pool:          Reactor_Buffer_Pool,
+	counters:               Shard_Counters,
 
 	// --- Hot Scalars (Ordered largest to smallest) ---
-	current_tick:         u64, // The current time quantized to the resolution
-	timer_resolution_ns:  u64, // E.g., 1_000_000 for 1ms ticks
-	heartbeat_tick:       u64,
-	next_correlation_id:  u32,
-	current_msg_slot:     u32,
-	current_slot_index:   u32,
-	id:                   u16,
-	current_type_id:      u16,
-	peer_alive_mask:      Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
-	control_signal:       Control_Signal, // Atomic, mutually exclusive signals from watchdog
-	_padding:             [5]u8,
-	shared_state:         ^u8, // Points to external shared state (config or simulator backing)
+	current_tick:           u64, // The current time quantized to the resolution
+	timer_resolution_ns:    u64, // E.g., 1_000_000 for 1ms ticks
+	heartbeat_tick:         u64,
+	next_correlation_id:    u32,
+	current_msg_slot:       u32,
+	current_slot_index:     u32,
+	id:                     u16,
+	current_type_id:        u16,
+	peer_alive_mask:        Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
+	control_signal:         Control_Signal, // Atomic, mutually exclusive signals from watchdog
+	_padding:               [5]u8,
+	shared_state:           ^u8, // Points to external shared state (config or simulator backing)
 
 	// --- Cold / Massive Storage ---
-	timer_wheel:          Timer_Wheel,
-	trap_environment:     sigjmp_buf,
-	reactor:              Reactor,
+	timer_wheel:            Timer_Wheel,
+	trap_environment_outer: sigjmp_buf,
+	trap_environment_inner: sigjmp_buf,
+	reactor:                Reactor,
 
 	// Used/Set only during simulation.
 	// Placed at the end to prevent possible cache-line shifting of hot fields.
-	sim_state:            Simulation_State,
+	sim_state:              Simulation_State,
 }
 
 // --- Scheduler Loop ---
@@ -347,7 +348,14 @@ scheduler_tick :: proc(shard: ^Shard) {
 		shard.current_type_id = u16(type_id)
 		start_slot: u32 = 0
 
-		if sigsetjmp(&shard.trap_environment, 0) != 0 {
+		if sigsetjmp(&shard.trap_environment_inner, 0) != 0 {
+			when !TINA_SIMULATION_MODE {
+				// Sweep orphaned temp allocations from panic string formatting.
+				free_all(context.temp_allocator)
+				// Unblock signals masked by the OS during handler execution.
+				_unblock_trap_signals()
+			}
+
 			if shard.current_msg_slot != POOL_NONE_INDEX {
 				pool_free(&shard.message_pool, shard.current_msg_slot)
 				shard.current_msg_slot = POOL_NONE_INDEX
@@ -546,7 +554,7 @@ ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 
 	// 2. Delegate to internal allocation and init
 	res := _make_isolate(shard, spec, ctx.self_handle)
-	
+
 	child_handle, ok := res.(Handle)
 	if !ok {
 		return res
@@ -593,7 +601,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 			if spec.group_id != SUPERVISION_GROUP_ID_NONE {
 				group = &shard.supervision_groups[u16(spec.group_id)]
 			}
-			
+
 			if spec.handoff_mode == .Read_Only || spec.handoff_mode == .Write_Only {
 				if group == nil || group.strategy != .One_For_All {
 					_shard_log(
@@ -1364,7 +1372,12 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 			.Relaxed,
 		)
 	} else {
-		group_handle := make_handle(shard.id, u16(SUPERVISION_SUBGROUP_TYPE_ID), u32(group.group_id), 0)
+		group_handle := make_handle(
+			shard.id,
+			u16(SUPERVISION_SUBGROUP_TYPE_ID),
+			u32(group.group_id),
+			0,
+		)
 		_on_child_exit(shard, group.parent_id, group_handle, .Crashed)
 	}
 }
@@ -1596,8 +1609,20 @@ _build_group :: proc(
 			}
 
 		case Group_Spec:
-			sub_index := _build_group(shard, &s, Supervision_Group_Id(group_index), next_group_index, alloc, alloc_data)
-			sub_handle := make_handle(shard.id, u16(SUPERVISION_SUBGROUP_TYPE_ID), u32(sub_index), 0)
+			sub_index := _build_group(
+				shard,
+				&s,
+				Supervision_Group_Id(group_index),
+				next_group_index,
+				alloc,
+				alloc_data,
+			)
+			sub_handle := make_handle(
+				shard.id,
+				u16(SUPERVISION_SUBGROUP_TYPE_ID),
+				u32(sub_index),
+				0,
+			)
 			group.children_handles[group.child_count] = sub_handle
 			group.child_count += 1
 		}

@@ -122,7 +122,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 			ring_memory_size := size_of(SPSC_Ring) + int(ring_count) * size_of(Message_Envelope)
 			spsc_memory_size += ring_memory_size
 
-			// TODO (Production): mbind to the writer's (source) NUMA node here.
+			// TODO: (Production) mbind to the writer's (source) NUMA node here.
 			raw_mem, alloc_err := os_reserve_arena_with_guard(uint(ring_memory_size))
 			if alloc_err != .None {
 				fmt.eprintfln("[FATAL] Failed to allocate SPSC ring %v->%v", source, target)
@@ -258,6 +258,10 @@ _bootstrap_signals :: proc() {
 		posix.sigaction(.SIGSEGV, &sa_fatal, nil)
 		posix.sigaction(.SIGBUS, &sa_fatal, nil)
 		posix.sigaction(.SIGFPE, &sa_fatal, nil)
+		// OS-level traps resulting from software aborts/panics
+		posix.sigaction(.SIGILL, &sa_fatal, nil)
+		posix.sigaction(.SIGTRAP, &sa_fatal, nil)
+		posix.sigaction(.SIGABRT, &sa_fatal, nil)
 
 		sa_usr1: posix.sigaction_t
 		sa_usr1.sa_sigaction = sigusr1_handler
@@ -288,14 +292,14 @@ when ODIN_OS ==
 
 	// --- Async-Signal-Safe Helpers (write(2) only, no fmt/allocator/runtime) ---
 
-	@(private = "file")
+	@(private = "package")
 	_sig_append_str :: proc "contextless" (target: []u8, pos: int, source: string) -> int {
 		n := min(len(target) - pos, len(source))
 		for i in 0 ..< n do target[pos + i] = source[i]
 		return pos + n
 	}
 
-	@(private = "file")
+	@(private = "package")
 	_sig_append_u64 :: proc "contextless" (target: []u8, pos: int, value: u64) -> int {
 		if pos >= len(target) do return pos
 		if value == 0 {
@@ -349,7 +353,7 @@ when ODIN_OS ==
 		emergency_log_flush_signal(shard)
 
 		// Warp execution back to the recovery point
-		siglongjmp(&shard.trap_environment, RECOVERY_TIER_3)
+		siglongjmp(&shard.trap_environment_outer, RECOVERY_TIER_3)
 	}
 
 	// The Watchdog Cooperative Kill Trap — async-signal-safe
@@ -365,6 +369,6 @@ when ODIN_OS ==
 		_write_stderr(buf[:n])
 
 		// Warp execution back to the recovery point
-		siglongjmp(&shard.trap_environment, RECOVERY_WATCHDOG)
+		siglongjmp(&shard.trap_environment_outer, RECOVERY_WATCHDOG)
 	}
 }
