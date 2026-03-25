@@ -5,6 +5,11 @@ package tina
 import "core:sys/posix"
 import win "core:sys/windows"
 
+os_poll_watchdog_events :: proc(timeout_ms: u32) -> Watchdog_Event {
+	win.Sleep(win.DWORD(timeout_ms))
+	return .None // Windows handles shutdown via SetConsoleCtrlHandler asynchronously
+}
+
 // Windows: No POSIX signal waiting. Use a Sleep-based poll that returns EAGAIN (no signal).
 // The watchdog graceful shutdown path relies on os_wait_for_signal returning (nil, false)
 // on timeout, so heartbeat monitoring still works. Ctrl+C is handled separately by

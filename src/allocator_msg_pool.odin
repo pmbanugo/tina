@@ -82,8 +82,14 @@ pool_alloc_system :: #force_inline proc "contextless" (p: ^Message_Pool) -> (u32
 // Frees a slot by its index. O(1).
 pool_free :: proc(p: ^Message_Pool, index: u32) {
 	assert(index < p.slot_count, "Message pool free index out of bounds")
+	pool_free_unchecked(p, index)
+}
+
+// index validity is structurally guaranteed by the pool alloc/free lifecycle.
+// Must remain contextless (no assert/fmt/make/default-allocator calls).
+// intended use in hot path and guaranteed safety
+pool_free_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool, index: u32) {
 	ptr := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
-	// Type-aware intrusive push back onto the free list
 	ptr.next_in_mailbox = p.free_head
 	p.free_head = index
 	p.free_count += 1
@@ -92,6 +98,16 @@ pool_free :: proc(p: ^Message_Pool, index: u32) {
 // Resolves a pool index to its memory pointer.
 pool_get_ptr :: #force_inline proc(p: ^Message_Pool, index: u32) -> rawptr {
 	assert(index < p.slot_count, "Message pool ptr index out of bounds")
+	return pool_get_ptr_unchecked(p, index)
+}
+
+// index validity is structurally guaranteed by prior alloc or mailbox traversal.
+// Must remain contextless (no assert/fmt/make/default-allocator calls).
+// intended use in hot path and guaranteed safety
+pool_get_ptr_unchecked :: #force_inline proc "contextless" (
+	p: ^Message_Pool,
+	index: u32,
+) -> rawptr {
 	return rawptr(&p.buffer[index << p.slot_shift])
 }
 

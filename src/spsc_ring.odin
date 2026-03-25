@@ -42,7 +42,7 @@ spsc_ring_init :: proc(ring: ^SPSC_Ring, capacity: u64, buffer: []Message_Envelo
 
 // Enqueues a message into the ring but DOES NOT publish it yet.
 // no atomic barrier unless cached capacity is exhausted.
-spsc_ring_enqueue :: #force_inline proc(ring: ^SPSC_Ring, envelope: ^Message_Envelope) -> Enqueue_Result {
+spsc_ring_enqueue :: #force_inline proc "contextless" (ring: ^SPSC_Ring, envelope: ^Message_Envelope) -> Enqueue_Result {
     // Check if full using local cache
     if ring.local_write_sequence - ring.cached_read_sequence >= ring.capacity {
         // Cache says full, fetch the actual read_sequence via Acquire load
@@ -64,7 +64,7 @@ spsc_ring_enqueue :: #force_inline proc(ring: ^SPSC_Ring, envelope: ^Message_Env
 
 // Publishes all enqueued messages to the consumer simultaneously.
 // Executed once per tick in Step 5.
-spsc_ring_flush_producer :: #force_inline proc(ring: ^SPSC_Ring) {
+spsc_ring_flush_producer :: #force_inline proc "contextless" (ring: ^SPSC_Ring) {
     if ring.write_sequence != ring.local_write_sequence {
         sync.atomic_store_explicit(&ring.write_sequence, ring.local_write_sequence, sync.Atomic_Memory_Order.Release)
     }
@@ -74,7 +74,7 @@ spsc_ring_flush_producer :: #force_inline proc(ring: ^SPSC_Ring) {
 
 // Returns how many items are currently available to read.
 // Executed once per tick in Step 1.
-spsc_ring_available_to_read :: #force_inline proc(ring: ^SPSC_Ring) -> u64 {
+spsc_ring_available_to_read :: #force_inline proc "contextless" (ring: ^SPSC_Ring) -> u64 {
     if ring.cached_write_sequence <= ring.local_read_sequence {
         ring.cached_write_sequence = sync.atomic_load_explicit(&ring.write_sequence, sync.Atomic_Memory_Order.Acquire)
     }
@@ -82,14 +82,14 @@ spsc_ring_available_to_read :: #force_inline proc(ring: ^SPSC_Ring) -> u64 {
 }
 
 // Gets a pointer to the message at the given offset from the current read cursor.
-spsc_ring_get_read_ptr :: #force_inline proc(ring: ^SPSC_Ring, offset: u64) -> ^Message_Envelope {
+spsc_ring_get_read_ptr :: #force_inline proc "contextless" (ring: ^SPSC_Ring, offset: u64) -> ^Message_Envelope {
     index := (ring.local_read_sequence + offset) & ring.capacity_mask
     return &ring.buffer[index]
 }
 
 // Advances the read sequence, freeing the slots for the producer.
 // Executed after consuming the available batch.
-spsc_ring_commit_read :: #force_inline proc(ring: ^SPSC_Ring, count: u64) {
+spsc_ring_commit_read :: #force_inline proc "contextless" (ring: ^SPSC_Ring, count: u64) {
     if count == 0 do return
     ring.local_read_sequence += count
     sync.atomic_store_explicit(&ring.read_sequence, ring.local_read_sequence, sync.Atomic_Memory_Order.Release)

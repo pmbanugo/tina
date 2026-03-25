@@ -240,31 +240,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	// Step 1: Drain inbound cross-shard rings → deliver to local mailboxes
 	// ========================================================================
-	when !TINA_SIMULATION_MODE {
-		if len(shard.inbound_rings) > 0 {
-			for ring, source_shard in shard.inbound_rings {
-				if ring == nil do continue
-
-				available := spsc_ring_available_to_read(ring)
-				for i in 0 ..< available {
-					envelope := spsc_ring_get_read_ptr(ring, i)
-					_process_inbound_envelope(shard, u16(source_shard), envelope)
-				}
-
-				if available > 0 {
-					spsc_ring_commit_read(ring, available)
-				}
-			}
-		}
-	} else {
-		if shard.sim_state.network != nil {
-			for source in u16(0) ..< shard.sim_state.network.shard_count {
-				if source != shard.id {
-					sim_network_drain(shard.sim_state.network, shard, source, now)
-				}
-			}
-		}
-	}
+	transport_drain_inbound(shard, now)
 
 	// ========================================================================
 	// Step 2: Collect I/O completions
@@ -307,7 +283,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 			}
 
 			if shard.current_msg_slot != POOL_NONE_INDEX {
-				pool_free(&shard.message_pool, shard.current_msg_slot)
+				pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
 				shard.current_msg_slot = POOL_NONE_INDEX
 			}
 			_teardown_isolate(shard, shard.current_type_id, shard.current_slot_index, .Crashed)
@@ -428,7 +404,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				}
 
 				if shard.current_msg_slot != POOL_NONE_INDEX {
-					pool_free(&shard.message_pool, shard.current_msg_slot)
+					pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
 					shard.current_msg_slot = POOL_NONE_INDEX
 				}
 
@@ -445,15 +421,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	// Step 5: Flush outbound cross-shard rings
 	// ========================================================================
-	when !TINA_SIMULATION_MODE {
-		if len(shard.outbound_rings) > 0 {
-			for ring in shard.outbound_rings {
-				if ring != nil {
-					spsc_ring_flush_producer(ring)
-				}
-			}
-		}
-	}
+	transport_flush_outbound(shard)
 
 	// ========================================================================
 	// Step 6 & 7: Advance timers and Flush logs
@@ -462,688 +430,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	log_flush(shard)
 }
 
-// --- Active Operations ---
-
-ctx_send :: proc(ctx: ^TinaContext, to: Handle, tag: Message_Tag, payload: []u8) -> Send_Result {
-	assert(tag >= USER_MESSAGE_TAG_BASE, "User code must not send system tags via ctx_send")
-	assert(len(payload) <= MAX_PAYLOAD_SIZE, "Payload exceeds MAX_PAYLOAD_SIZE")
-
-	envelope: Message_Envelope
-	envelope.source = ctx.self_handle
-	envelope.destination = to
-	envelope.tag = tag
-	envelope.payload_size = u16(len(payload))
-	copy(envelope.payload[:], payload)
-
-	response := _route_envelope_user(ctx.shard, to, &envelope)
-	return response
-}
-ctx_transfer_send :: proc(ctx: ^TinaContext, to: Handle, handle: Transfer_Handle) -> Send_Result {
-	envelope: Message_Envelope
-	envelope.source = ctx.self_handle
-	envelope.destination = to
-	envelope.tag = TAG_TRANSFER
-	envelope.payload_size = size_of(Transfer_Handle)
-
-	(cast(^Transfer_Handle)&envelope.payload[0])^ = handle
-
-	return _route_envelope_system(ctx.shard, to, &envelope)
-}
-
-ctx_spawn :: proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
-	shard := ctx.shard
-
-	// 1. Group Capacity Check (Fail early!)
-	group: ^Supervision_Group = nil
-	if spec.group_id != SUPERVISION_GROUP_ID_NONE {
-		group = &shard.supervision_groups[u16(spec.group_id)]
-		if group.child_count >= u16(len(group.children_handles)) {
-			return Spawn_Error.group_full
-		}
-	}
-
-	// 2. Delegate to internal allocation and init
-	res := _make_isolate(shard, spec, ctx.self_handle)
-
-	child_handle, ok := res.(Handle)
-	if !ok {
-		return res
-	}
-
-	// 3. Register with Supervision Group (Always Appends)
-	if group != nil {
-		group.children_handles[group.child_count] = child_handle
-
-		if len(group.dynamic_specs) > 0 {
-			dyn := &group.dynamic_specs[group.child_count]
-			dyn.type_id = spec.type_id
-			dyn.restart_type = spec.restart_type
-			dyn.args_size = spec.args_size
-			dyn.args_payload = spec.args_payload
-		}
-		group.child_count += 1
-	}
-
-	return child_handle
-}
-
-@(private = "package")
-_make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -> Spawn_Result {
-	type_id := u16(spec.type_id)
-
-	// 1. Slot Allocation (Popping the LIFO free list)
-	slot := shard.isolate_free_heads[type_id]
-	if slot == POOL_NONE_INDEX {
-		return Spawn_Error.arena_full
-	}
-
-	soa_meta := shard.metadata[type_id]
-	shard.isolate_free_heads[type_id] = soa_meta[slot].inbox_head
-
-	child_generation := soa_meta[slot].generation
-	child_handle := make_handle(shard.id, type_id, slot, child_generation)
-
-	// 2. Validate FD Handoff Affinity
-	if spec.handoff_fd != FD_HANDLE_NONE {
-		entry, fd_err := fd_table_lookup(&shard.reactor.fd_table, spec.handoff_fd)
-		if fd_err == .None {
-			group: ^Supervision_Group = nil
-			if spec.group_id != SUPERVISION_GROUP_ID_NONE {
-				group = &shard.supervision_groups[u16(spec.group_id)]
-			}
-
-			if spec.handoff_mode == .Read_Only || spec.handoff_mode == .Write_Only {
-				if group == nil || group.strategy != .One_For_All {
-					_shard_log(
-						shard,
-						spawner_handle,
-						.ERROR,
-						LOG_TAG_ISOLATE_CRASHED,
-						transmute([]u8)string("Split-FD handoff requires one_for_all group"),
-					)
-					soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-					shard.isolate_free_heads[type_id] = slot
-					return Spawn_Error.init_failed
-				}
-			}
-			can_transfer := true
-			if spec.handoff_mode == .Full || spec.handoff_mode == .Read_Only {
-				if entry.read_owner != spawner_handle do can_transfer = false
-			}
-			if spec.handoff_mode == .Full || spec.handoff_mode == .Write_Only {
-				if entry.write_owner != spawner_handle do can_transfer = false
-			}
-
-			if can_transfer {
-				fd_table_handoff(
-					&shard.reactor.fd_table,
-					spec.handoff_fd,
-					child_handle,
-					spec.handoff_mode,
-				)
-			} else {
-				_shard_log(
-					shard,
-					spawner_handle,
-					.ERROR,
-					LOG_TAG_ISOLATE_CRASHED,
-					transmute([]u8)string("FD handoff affinity violation"),
-				)
-				soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-				shard.isolate_free_heads[type_id] = slot
-				return Spawn_Error.init_failed
-			}
-		} else {
-			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-			shard.isolate_free_heads[type_id] = slot
-			return Spawn_Error.init_failed
-		}
-	}
-
-	// 3. Initialize Isolate Memory & Context
-	soa_meta[slot].state = .Runnable
-	soa_meta[slot].group_id = spec.group_id
-	soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
-
-	soa_meta[slot].inbox_head = POOL_NONE_INDEX
-	soa_meta[slot].inbox_tail = POOL_NONE_INDEX
-	soa_meta[slot].inbox_count = 0
-	soa_meta[slot].io_completion_tag = IO_TAG_NONE
-
-	ptr := _get_isolate_ptr(shard, type_id, slot)
-	stride := shard.type_descriptors[type_id].stride
-	if ptr != nil && stride > 0 {
-		mem.zero(ptr, stride)
-	}
-
-	child_ctx := TinaContext {
-		shard       = shard,
-		self_handle = child_handle,
-	}
-
-	mem.arena_init(&child_ctx.scratch_arena, shard.scratch_memory)
-
-	working_stride := shard.type_descriptors[type_id].working_memory_size
-	if working_stride > 0 {
-		start_idx := int(slot) * working_stride
-		working_slice := shard.working_memory[type_id][start_idx:start_idx + working_stride]
-		mem.arena_init(&child_ctx.working_arena, working_slice)
-	}
-
-	// 4. Execute init_fn
-	local_spec := spec
-	effect := shard.type_descriptors[type_id].init_fn(
-		ptr,
-		local_spec.args_payload[:local_spec.args_size],
-		&child_ctx,
-	)
-
-	if working_stride > 0 {
-		soa_meta[slot].working_arena_offset = u32(child_ctx.working_arena.offset)
-	}
-
-	_, is_crash := effect.(Effect_Crash)
-	_, is_done := effect.(Effect_Done)
-	if is_crash || is_done {
-		if spec.handoff_fd != FD_HANDLE_NONE {
-			fd_table_handoff(
-				&shard.reactor.fd_table,
-				spec.handoff_fd,
-				spawner_handle,
-				spec.handoff_mode,
-			)
-		}
-		_teardown_isolate(shard, type_id, slot, .Crashed)
-		return Spawn_Error.init_failed
-	}
-
-	// §11: Spawns during shutdown
-	if ctx_is_shutting_down(&child_ctx) {
-		soa_meta[slot].flags += {.Shutdown_Pending}
-	}
-
-	_interpret_effect(shard, type_id, slot, effect, &child_ctx)
-	return child_handle
-}
-
-// =================================
-// Memory Management APIs (§6.9 §9)
-// =================================
-
-ctx_working_arena :: #force_inline proc(ctx: ^TinaContext) -> mem.Allocator {
-	return mem.arena_allocator(&ctx.working_arena)
-}
-
-ctx_working_arena_reset :: #force_inline proc(ctx: ^TinaContext) {
-	ctx.working_arena.offset = 0
-}
-
-ctx_scratch_arena :: #force_inline proc(ctx: ^TinaContext) -> mem.Allocator {
-	return mem.arena_allocator(&ctx.scratch_arena)
-}
-
-ctx_transfer_alloc :: proc(ctx: ^TinaContext) -> Transfer_Alloc_Result {
-	index, err := reactor_buffer_pool_alloc(&ctx.shard.transfer_pool)
-	if err != .None {
-		ctx.shard.counters.transfer_exhaustions += 1
-		return Transfer_Alloc_Error.Pool_Exhausted
-	}
-	gen := ctx.shard.transfer_generations[index]
-	return transfer_handle_make(index, gen)
-}
-
-ctx_transfer_write :: proc(
-	ctx: ^TinaContext,
-	handle: Transfer_Handle,
-	data: []u8,
-) -> Transfer_Write_Error {
-	index := transfer_handle_index(handle)
-	gen := transfer_handle_generation(handle)
-
-	if index >= ctx.shard.transfer_pool.slot_count ||
-	   ctx.shard.transfer_generations[index] != gen {
-		return .Stale_Handle
-	}
-
-	if u32(len(data)) > ctx.shard.transfer_pool.slot_size {
-		return .Bounds_Violation
-	}
-
-	target := reactor_buffer_pool_slot_ptr(&ctx.shard.transfer_pool, index)
-	mem.copy(target, raw_data(data), len(data))
-	return .None
-}
-
-// Reads data from a transfer buffer slot.
-// NOTE: To prevent buffer leaks, this must only be called ONCE per handler invocation.
-// If you need the data across multiple ticks or operations, you must copy it
-// into your Isolate's working arena.
-ctx_transfer_read :: proc(ctx: ^TinaContext, handle: Transfer_Handle) -> Transfer_Read_Result {
-	index := transfer_handle_index(handle)
-	gen := transfer_handle_generation(handle)
-
-	if index >= ctx.shard.transfer_pool.slot_count ||
-	   ctx.shard.transfer_generations[index] != gen {
-		ctx.shard.counters.transfer_stale_reads += 1
-		return Transfer_Read_Error.Stale_Handle
-	}
-
-	// Track auto-free lifecycle.
-	type_id := extract_type_id(ctx.self_handle)
-	slot := extract_slot(ctx.self_handle)
-	when TINA_DEBUG_ASSERTS {
-		assert(
-			ctx.shard.metadata[type_id][slot].pending_transfer_read == TRANSFER_HANDLE_NONE,
-			"ctx_transfer_read can only be called ONCE per handler invocation to prevent buffer leaks.",
-		)
-	}
-	ctx.shard.metadata[type_id][slot].pending_transfer_read = handle
-
-	ptr := reactor_buffer_pool_slot_ptr(&ctx.shard.transfer_pool, index)
-	return ptr[:ctx.shard.transfer_pool.slot_size]
-}
-
-// ============================================================================
-// Synchronous I/O Control Operations (§6.6.3 §4.1)
-// ============================================================================
-
-ctx_socket :: #force_inline proc(
-	ctx: ^TinaContext,
-	domain: Socket_Domain,
-	socket_type: Socket_Type,
-	protocol: Socket_Protocol,
-) -> (
-	FD_Handle,
-	Reactor_Socket_Error,
-) {
-	return reactor_control_socket(
-		&ctx.shard.reactor,
-		ctx.self_handle,
-		domain,
-		socket_type,
-		protocol,
-	)
-}
-
-ctx_bind :: #force_inline proc(
-	ctx: ^TinaContext,
-	fd: FD_Handle,
-	address: Socket_Address,
-) -> Backend_Error {
-	return reactor_control_bind(&ctx.shard.reactor, fd, ctx.self_handle, address)
-}
-
-ctx_listen :: #force_inline proc(ctx: ^TinaContext, fd: FD_Handle, backlog: u32) -> Backend_Error {
-	return reactor_control_listen(&ctx.shard.reactor, fd, ctx.self_handle, backlog)
-}
-
-ctx_setsockopt :: #force_inline proc(
-	ctx: ^TinaContext,
-	fd: FD_Handle,
-	level: Socket_Level,
-	option: Socket_Option,
-	value: Socket_Option_Value,
-) -> Backend_Error {
-	return reactor_control_setsockopt(
-		&ctx.shard.reactor,
-		fd,
-		ctx.self_handle,
-		level,
-		option,
-		value,
-	)
-}
-
-ctx_shutdown :: #force_inline proc(
-	ctx: ^TinaContext,
-	fd: FD_Handle,
-	how: Shutdown_How,
-) -> Backend_Error {
-	return reactor_control_shutdown(&ctx.shard.reactor, fd, ctx.self_handle, how)
-}
-
-ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, size: u32) -> []u8 {
-	if size <= 0 do return nil
-	return reactor_buffer_pool_read_slice(&ctx.shard.reactor.buffer_pool, buffer_index, size)
-}
-
-ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
-	return(
-		cast(Shard_State)sync.atomic_load_explicit(ctx.shard.shared_state, .Relaxed) ==
-		.Shutting_Down \
-	)
-}
-
-ctx_supervision_group_id :: #force_inline proc(ctx: ^TinaContext) -> Supervision_Group_Id {
-	type_id := extract_type_id(ctx.self_handle)
-	slot := extract_slot(ctx.self_handle)
-	return ctx.shard.metadata[type_id][slot].group_id
-}
-
-ctx_root_supervision_group_id :: #force_inline proc() -> Supervision_Group_Id {
-	return SUPERVISION_GROUP_ID_ROOT
-}
-
-ctx_type_config :: #force_inline proc(ctx: ^TinaContext) -> ^TypeDescriptor {
-	type_id := extract_type_id(ctx.self_handle)
-	return &ctx.shard.type_descriptors[type_id]
-}
-
-ctx_shard_id :: #force_inline proc(ctx: ^TinaContext) -> u16 {
-	return ctx.shard.id
-}
-
-ctx_getsockopt :: #force_inline proc(
-	ctx: ^TinaContext,
-	fd: FD_Handle,
-	level: Socket_Level,
-	option: Socket_Option,
-) -> (
-	Socket_Option_Value,
-	Backend_Error,
-) {
-	return reactor_control_getsockopt(&ctx.shard.reactor, fd, level, option)
-}
-
-// --- Internal Utilities ---
-
-@(private = "package")
-_transfer_pool_free :: #force_inline proc(shard: ^Shard, index: u16) {
-	reactor_buffer_pool_free(&shard.transfer_pool, index)
-	shard.transfer_generations[index] += 1
-	if shard.transfer_generations[index] == 0 do shard.transfer_generations[index] = 1
-}
-
-@(private = "package")
-_get_isolate_ptr :: proc(shard: ^Shard, type_id: u16, slot: u32) -> rawptr {
-	stride := shard.type_descriptors[type_id].stride
-	if stride == 0 {return nil}
-
-	assert(int(type_id) < len(shard.isolate_memory), "type_id out of bounds")
-	assert(int(slot) * stride < len(shard.isolate_memory[type_id]), "slot out of bounds")
-
-	return rawptr(&shard.isolate_memory[type_id][int(slot) * stride])
-}
-
-@(private = "package")
-_teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kind: Exit_Kind) {
-	soa_meta := shard.metadata[type_id]
-
-	// Step 1: Bump generation (seal the Isolate) - 28-bit mask
-	old_generation := soa_meta[slot_index].generation
-	new_generation := (old_generation + 1) & 0x0FFFFFFF
-	if new_generation == 0 do new_generation = 1
-	soa_meta[slot_index].generation = new_generation
-
-	// Step 2: Clear pending .call state & working arena offset
-	soa_meta[slot_index].pending_correlation = 0
-	soa_meta[slot_index].working_arena_offset = 0
-
-	// Step 2b: Reclaim pending I/O and Transfer buffers
-	if soa_meta[slot_index].io_completion_tag != IO_TAG_NONE {
-		if soa_meta[slot_index].io_buffer_index != BUFFER_INDEX_NONE {
-			reactor_buffer_pool_free(
-				&shard.reactor.buffer_pool,
-				soa_meta[slot_index].io_buffer_index,
-			)
-		}
-		soa_meta[slot_index].io_completion_tag = IO_TAG_NONE
-		soa_meta[slot_index].io_buffer_index = BUFFER_INDEX_NONE
-	}
-	if soa_meta[slot_index].pending_transfer_read != TRANSFER_HANDLE_NONE {
-		idx := transfer_handle_index(soa_meta[slot_index].pending_transfer_read)
-		_transfer_pool_free(shard, idx)
-		soa_meta[slot_index].pending_transfer_read = TRANSFER_HANDLE_NONE
-	}
-
-	// Step 2c: FD Table Cleanup
-	handle_to_match := make_handle(shard.id, type_id, slot_index, old_generation)
-	in_flight_fd := soa_meta[slot_index].io_fd
-	is_waiting_for_io := soa_meta[slot_index].state == .Waiting_For_Io
-
-	for i in 0 ..< shard.reactor.fd_table.slot_count {
-		entry := &shard.reactor.fd_table.entries[i]
-		if entry.read_owner == HANDLE_NONE && entry.write_owner == HANDLE_NONE {
-			continue
-		}
-		if entry.read_owner == handle_to_match || entry.write_owner == handle_to_match {
-			fd_h := fd_handle_make(u16(i), entry.generation)
-
-			if is_waiting_for_io && fd_h == in_flight_fd {
-				fd_table_mark_close_on_completion(&shard.reactor.fd_table, fd_h)
-			} else {
-				reactor_internal_close_fd(&shard.reactor, fd_h)
-			}
-		}
-	}
-
-	// Step 3: Drain mailbox
-	curr := soa_meta[slot_index].inbox_head
-	for curr != POOL_NONE_INDEX {
-		envelope := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, curr)
-		next := envelope.next_in_mailbox
-
-		if envelope.tag == TAG_TRANSFER && envelope.payload_size >= size_of(Transfer_Handle) {
-			t_handle := (cast(^Transfer_Handle)&envelope.payload[0])^
-			index := transfer_handle_index(t_handle)
-			generation := transfer_handle_generation(t_handle)
-
-			if index < shard.transfer_pool.slot_count &&
-			   shard.transfer_generations[index] == generation {
-				_transfer_pool_free(shard, index)
-			}
-		}
-
-		pool_free(&shard.message_pool, curr)
-		curr = next
-	}
-	soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
-	soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
-	soa_meta[slot_index].inbox_count = 0
-
-	// Step 4: Invoke supervision subsystem
-	group_id := soa_meta[slot_index].group_id
-	if group_id != SUPERVISION_GROUP_ID_NONE {
-		old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
-		_on_child_exit(shard, group_id, old_handle, exit_kind)
-	}
-
-	// Step 5: Free arena slot & push back to free list
-	soa_meta[slot_index].state = .Unallocated
-	soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
-	shard.isolate_free_heads[type_id] = slot_index
-}
-
-@(private = "package")
-_route_envelope_user :: #force_inline proc(
-	shard: ^Shard,
-	to: Handle,
-	envelope: ^Message_Envelope,
-) -> Send_Result {
-	return _route_envelope_internal(shard, to, envelope, true)
-}
-
-@(private = "package")
-_route_envelope_system :: #force_inline proc(
-	shard: ^Shard,
-	to: Handle,
-	envelope: ^Message_Envelope,
-) -> Send_Result {
-	return _route_envelope_internal(shard, to, envelope, false)
-}
-
-@(private = "file")
-_route_envelope_internal :: #force_inline proc(
-	shard: ^Shard,
-	to: Handle,
-	envelope: ^Message_Envelope,
-	is_user: bool,
-) -> Send_Result {
-	destination := extract_shard_id(to)
-
-	if destination == shard.id {
-		return _enqueue_internal(shard, to, envelope, is_user)
-	} else {
-		when !TINA_SIMULATION_MODE {
-			if !shard_mask_contains(&shard.peer_alive_mask, destination) {
-				shard.counters.quarantine_drops += 1
-				return .stale_handle
-			}
-
-			ring := shard.outbound_rings[destination]
-			if ring == nil {
-				shard.counters.stale_delivery_drops += 1
-				return .stale_handle
-			}
-			if spsc_ring_enqueue(ring, envelope) == .Full {
-				shard.counters.ring_full_drops += 1
-				return .mailbox_full
-			}
-			return .ok
-		} else {
-			if !shard_mask_contains(&shard.peer_alive_mask, destination) {
-				shard.counters.quarantine_drops += 1
-				return .stale_handle
-			}
-			return sim_network_enqueue(
-				shard.sim_state.network,
-				shard,
-				destination,
-				envelope^,
-				shard.current_tick,
-				shard.sim_state.fault_config,
-			)
-		}
-	}
-}
-
-@(private = "package")
-_enqueue_user_msg :: #force_inline proc(
-	shard: ^Shard,
-	to: Handle,
-	envelope: ^Message_Envelope,
-) -> Send_Result {
-	return _enqueue_internal(shard, to, envelope, true)
-}
-
-@(private = "package")
-_enqueue_system_msg :: #force_inline proc(
-	shard: ^Shard,
-	to: Handle,
-	envelope: ^Message_Envelope,
-) -> Send_Result {
-	return _enqueue_internal(shard, to, envelope, false)
-}
-
-@(private = "file")
-_enqueue_internal :: #force_inline proc(
-	shard: ^Shard,
-	to: Handle,
-	envelope: ^Message_Envelope,
-	is_user: bool,
-) -> Send_Result {
-	type_id := extract_type_id(to)
-	slot := extract_slot(to)
-	soa_meta := shard.metadata[type_id]
-
-	if soa_meta[slot].generation != extract_generation(to) {
-		shard.counters.stale_delivery_drops += 1
-		return .stale_handle
-	}
-
-	is_reply := .Is_Reply in envelope.flags
-	is_timeout := envelope.tag == TAG_CALL_TIMEOUT
-
-	// Validation Only (No Mutation Yet)
-	if is_reply || is_timeout {
-		if soa_meta[slot].state != .Waiting_For_Reply ||
-		   soa_meta[slot].pending_correlation != envelope.correlation {
-			shard.counters.stale_delivery_drops += 1
-			return .stale_handle
-		}
-	} else if is_user {
-		// Capacity Check ONLY for normal user messages
-		// Replies and timeouts bypass mailbox limits to prevent deadlocks
-		if soa_meta[slot].inbox_count >= shard.type_descriptors[type_id].mailbox_capacity {
-			shard.counters.mailbox_full_drops += 1
-			return .mailbox_full
-		}
-	}
-
-	// Pool Allocation
-	pool_index: u32
-	err: Pool_Error
-	// Because `is_user` is passed as a constant from the wrapper,
-	// I expect the compiler will dead-code-eliminate this IF statement.
-	if is_user {
-		pool_index, err = pool_alloc_user(&shard.message_pool)
-	} else {
-		pool_index, err = pool_alloc_system(&shard.message_pool)
-	}
-
-	if err != .None {
-		shard.counters.pool_exhaustion_drops += 1
-		return .pool_exhausted
-	}
-
-	// Safe State Mutation (We are guaranteed to enqueue now)
-	if is_reply || is_timeout {
-		soa_meta[slot].pending_correlation = 0
-		soa_meta[slot].state = .Runnable
-	}
-
-	// Link into Mailbox
-	envelope_destination := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, pool_index)
-	envelope_destination^ = envelope^
-	envelope_destination.next_in_mailbox = POOL_NONE_INDEX
-
-	if soa_meta[slot].inbox_head == POOL_NONE_INDEX {
-		soa_meta[slot].inbox_head = pool_index
-	} else {
-		tail_envelope := cast(^Message_Envelope)pool_get_ptr(
-			&shard.message_pool,
-			soa_meta[slot].inbox_tail,
-		)
-		tail_envelope.next_in_mailbox = pool_index
-	}
-
-	soa_meta[slot].inbox_tail = pool_index
-	soa_meta[slot].inbox_count += 1
-
-	if soa_meta[slot].state == .Waiting {soa_meta[slot].state = .Runnable}
-	return .ok
-}
-
-@(private = "package")
-_dequeue :: proc(
-	shard: ^Shard,
-	type_id: u16,
-	slot: u32,
-	out_message: ^Message,
-	out_correlation: ^u32,
-	out_flags: ^Envelope_Flags,
-) -> u32 {
-	soa_meta := shard.metadata[type_id]
-	head_index := soa_meta[slot].inbox_head
-	if head_index == POOL_NONE_INDEX {return POOL_NONE_INDEX}
-
-	envelope := cast(^Message_Envelope)pool_get_ptr(&shard.message_pool, head_index)
-
-	out_message.tag = envelope.tag
-	out_message.body.user.source = envelope.source
-	out_message.body.user.payload_size = envelope.payload_size
-	copy(out_message.body.user.payload[:], envelope.payload[:])
-
-	out_correlation^ = envelope.correlation
-	out_flags^ = envelope.flags
-
-	next_index := envelope.next_in_mailbox
-	soa_meta[slot].inbox_head = next_index
-	if next_index == POOL_NONE_INDEX {soa_meta[slot].inbox_tail = POOL_NONE_INDEX}
-	soa_meta[slot].inbox_count -= 1
-
-	return head_index
-}
+// --- Effect Interpreter ---
 
 @(private = "package")
 _interpret_effect :: proc(
@@ -1250,347 +537,173 @@ _interpret_effect :: proc(
 	}
 }
 
-// --- Supervision & Control Plane ---
+// --- Message Routing ---
 
 @(private = "package")
-_find_child_index :: proc(group: ^Supervision_Group, handle: Handle) -> (u16, bool) {
-	for i in 0 ..< group.child_count {
-		if group.children_handles[i] == handle do return i, true
-	}
-	return 0, false
+_route_envelope_user :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _route_envelope_internal(shard, to, envelope, true)
 }
 
 @(private = "package")
-_remove_child_at :: proc(group: ^Supervision_Group, index: u16) {
-	for i in index ..< group.child_count - 1 {
-		group.children_handles[i] = group.children_handles[i + 1]
-		if len(group.dynamic_specs) > 0 {
-			group.dynamic_specs[i] = group.dynamic_specs[i + 1]
-		}
-	}
-	group.child_count -= 1
+_route_envelope_system :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _route_envelope_internal(shard, to, envelope, false)
 }
 
-@(private = "package")
-_get_child_restart_type :: proc(group: ^Supervision_Group, index: u16) -> Restart_Type {
-	if len(group.dynamic_specs) > 0 {
-		return group.dynamic_specs[index].restart_type
+@(private = "file")
+_route_envelope_internal :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+	is_user: bool,
+) -> Send_Result {
+	destination := extract_shard_id(to)
+
+	if destination == shard.id {
+		return _enqueue_internal(shard, to, envelope, is_user)
 	} else {
-		child_spec_ptr := &group.boot_spec.children[index]
-		#partial switch &s in child_spec_ptr {
-		case Static_Child_Spec:
-			return s.restart_type
-		case Group_Spec:
-			return .permanent // Subgroups are permanent
-		}
+		return transport_route_envelope(shard, destination, envelope)
 	}
-	return .temporary
 }
 
 @(private = "package")
-_check_and_record_restart :: proc(shard: ^Shard, group: ^Supervision_Group) -> bool {
-	now := shard.current_tick
-	if now - group.window_start_tick >= u64(group.window_duration_ticks) {
-		group.window_start_tick = now
-		group.restart_count = 1
-		return false
-	}
-	group.restart_count += 1
-	return group.restart_count > group.restart_count_max
+_enqueue_user_msg :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _enqueue_internal(shard, to, envelope, true)
 }
 
 @(private = "package")
-_escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
-	for i := group.child_count; i > 0; i -= 1 {
-		handle := group.children_handles[i - 1]
-		if handle != HANDLE_NONE {
-			if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
-				_teardown_isolate(shard, extract_type_id(handle), extract_slot(handle), .Shutdown)
-			} else {
-				_teardown_subgroup(shard, &shard.supervision_groups[extract_slot(handle)])
-			}
+_enqueue_system_msg :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _enqueue_internal(shard, to, envelope, false)
+}
+
+// Hot path: must remain contextless (no assert/fmt/make/default-allocator calls).
+// Index validity is structurally guaranteed by pool alloc/free lifecycle.
+@(private = "file")
+_enqueue_internal :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Handle,
+	envelope: ^Message_Envelope,
+	is_user: bool,
+) -> Send_Result {
+	type_id := extract_type_id(to)
+	slot := extract_slot(to)
+	soa_meta := shard.metadata[type_id]
+
+	if soa_meta[slot].generation != extract_generation(to) {
+		shard.counters.stale_delivery_drops += 1
+		return .stale_handle
+	}
+
+	is_reply := .Is_Reply in envelope.flags
+	is_timeout := envelope.tag == TAG_CALL_TIMEOUT
+
+	// Validation Only (No Mutation Yet)
+	if is_reply || is_timeout {
+		if soa_meta[slot].state != .Waiting_For_Reply ||
+		   soa_meta[slot].pending_correlation != envelope.correlation {
+			shard.counters.stale_delivery_drops += 1
+			return .stale_handle
+		}
+	} else if is_user {
+		// Capacity Check ONLY for normal user messages
+		// Replies and timeouts bypass mailbox limits to prevent deadlocks
+		if soa_meta[slot].inbox_count >= shard.type_descriptors[type_id].mailbox_capacity {
+			shard.counters.mailbox_full_drops += 1
+			return .mailbox_full
 		}
 	}
-	group.child_count = 0
 
-	if group.parent_id == SUPERVISION_GROUP_ID_NONE {
-		// We use Relaxed because the scheduler loop's atomic_load_explicit
-		// is the synchronization point.
-		sync.atomic_store_explicit(
-			cast(^u8)&shard.control_signal,
-			u8(Control_Signal.Kill),
-			.Relaxed,
+	// Pool Allocation
+	pool_index: u32
+	err: Pool_Error
+	// Because `is_user` is passed as a constant from the wrapper,
+	// I expect the compiler will dead-code-eliminate this IF statement.
+	if is_user {
+		pool_index, err = pool_alloc_user(&shard.message_pool)
+	} else {
+		pool_index, err = pool_alloc_system(&shard.message_pool)
+	}
+
+	if err != .None {
+		shard.counters.pool_exhaustion_drops += 1
+		return .pool_exhausted
+	}
+
+	// Safe State Mutation (We are guaranteed to enqueue now)
+	if is_reply || is_timeout {
+		soa_meta[slot].pending_correlation = 0
+		soa_meta[slot].state = .Runnable
+	}
+
+	// Link into Mailbox
+	envelope_destination := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, pool_index)
+	envelope_destination^ = envelope^
+	envelope_destination.next_in_mailbox = POOL_NONE_INDEX
+
+	if soa_meta[slot].inbox_head == POOL_NONE_INDEX {
+		soa_meta[slot].inbox_head = pool_index
+	} else {
+		tail_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+			&shard.message_pool,
+			soa_meta[slot].inbox_tail,
 		)
-	} else {
-		group_handle := make_handle(
-			shard.id,
-			u16(SUPERVISION_SUBGROUP_TYPE_ID),
-			u32(group.group_id),
-			0,
-		)
-		_on_child_exit(shard, group.parent_id, group_handle, .Crashed)
+		tail_envelope.next_in_mailbox = pool_index
 	}
+
+	soa_meta[slot].inbox_tail = pool_index
+	soa_meta[slot].inbox_count += 1
+
+	if soa_meta[slot].state == .Waiting {soa_meta[slot].state = .Runnable}
+	return .ok
 }
 
 @(private = "package")
-_teardown_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
-	for i := group.child_count; i > 0; i -= 1 {
-		handle := group.children_handles[i - 1]
-		if handle != HANDLE_NONE {
-			if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
-				_teardown_isolate(shard, extract_type_id(handle), extract_slot(handle), .Shutdown)
-			} else {
-				_teardown_subgroup(shard, &shard.supervision_groups[extract_slot(handle)])
-			}
-		}
-	}
-	group.restart_count = 0
-	group.window_start_tick = shard.current_tick
-}
-
-@(private = "package")
-_respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) {
-	spec: Spawn_Spec
-	spec.group_id = group.group_id
-	spec.handoff_fd = FD_HANDLE_NONE
-	spec.handoff_mode = .Full
-
-	if len(group.dynamic_specs) > 0 {
-		dyn := &group.dynamic_specs[index]
-		spec.type_id = dyn.type_id
-		spec.restart_type = dyn.restart_type
-		spec.args_size = dyn.args_size
-		spec.args_payload = dyn.args_payload
-	} else {
-		child_spec_ptr := &group.boot_spec.children[index]
-		#partial switch &s in child_spec_ptr {
-		case Static_Child_Spec:
-			spec.type_id = s.type_id
-			spec.restart_type = s.restart_type
-			spec.args_size = s.args_size
-			spec.args_payload = s.args_payload
-		case Group_Spec:
-			sub_handle := group.children_handles[index]
-			sub_index := extract_slot(sub_handle)
-			_rebuild_subgroup(shard, &shard.supervision_groups[sub_index])
-			return
-		}
-	}
-
-	// Directly allocate and execute init. Skips array append logic.
-	res := _make_isolate(shard, spec, HANDLE_NONE)
-
-	if handle, ok := res.(Handle); ok {
-		// IN-PLACE OVERWRITE! Solves the array-exhaustion deadlock.
-		group.children_handles[index] = handle
-	} else {
-		_escalate(shard, group)
-	}
-}
-
-@(private = "package")
-_apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, crashed_index: u16) {
-	start_index: u16 = group.strategy == .Rest_For_One ? crashed_index + 1 : 0
-
-	if group.strategy == .One_For_All || group.strategy == .Rest_For_One {
-		for i := group.child_count; i > start_index; i -= 1 {
-			target_index := i - 1
-			if target_index == crashed_index do continue
-
-			handle := group.children_handles[target_index]
-			if handle != HANDLE_NONE {
-				if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
-					_teardown_isolate(
-						shard,
-						extract_type_id(handle),
-						extract_slot(handle),
-						.Shutdown,
-					)
-					group.children_handles[target_index] = HANDLE_NONE
-				} else {
-					_teardown_subgroup(shard, &shard.supervision_groups[extract_slot(handle)])
-				}
-			}
-		}
-	}
-
-	restart_start: u16
-	restart_end: u16
-
-	switch group.strategy {
-	case .One_For_One:
-		restart_start = crashed_index; restart_end = crashed_index + 1
-	case .One_For_All:
-		restart_start = 0; restart_end = group.child_count
-	case .Rest_For_One:
-		restart_start = crashed_index; restart_end = group.child_count
-	}
-
-	for i in restart_start ..< restart_end {
-		_respawn_child_at(shard, group, i)
-	}
-}
-
-@(private = "package")
-_on_child_exit :: proc(
+_dequeue :: proc "contextless" (
 	shard: ^Shard,
-	group_id: Supervision_Group_Id,
-	child_handle: Handle,
-	exit_kind: Exit_Kind,
-) {
-	group := &shard.supervision_groups[u16(group_id)]
+	type_id: u16,
+	slot: u32,
+	out_message: ^Message,
+	out_correlation: ^u32,
+	out_flags: ^Envelope_Flags,
+) -> u32 {
+	soa_meta := shard.metadata[type_id]
+	head_index := soa_meta[slot].inbox_head
+	if head_index == POOL_NONE_INDEX {return POOL_NONE_INDEX}
 
-	if exit_kind == .Shutdown {
-		index, found := _find_child_index(group, child_handle)
-		if found do _remove_child_at(group, index)
-		return
-	}
+	envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, head_index)
 
-	index, found := _find_child_index(group, child_handle)
-	if !found do return
+	out_message.tag = envelope.tag
+	out_message.body.user.source = envelope.source
+	out_message.body.user.payload_size = envelope.payload_size
+	copy(out_message.body.user.payload[:], envelope.payload[:])
 
-	restart_type := _get_child_restart_type(group, index)
+	out_correlation^ = envelope.correlation
+	out_flags^ = envelope.flags
 
-	should_restart := false
-	switch exit_kind {
-	case .Normal:
-		should_restart = (restart_type == .permanent)
-	case .Crashed:
-		should_restart = (restart_type != .temporary)
-	case .Shutdown:
-	}
+	next_index := envelope.next_in_mailbox
+	soa_meta[slot].inbox_head = next_index
+	if next_index == POOL_NONE_INDEX {soa_meta[slot].inbox_tail = POOL_NONE_INDEX}
+	soa_meta[slot].inbox_count -= 1
 
-	if !should_restart {
-		_remove_child_at(group, index)
-		return
-	}
-
-	if _check_and_record_restart(shard, group) {
-		_escalate(shard, group)
-		return
-	}
-
-	_apply_strategy(shard, group, index)
+	return head_index
 }
 
-@(private = "package")
-shard_build_supervision_tree :: proc(
-	shard: ^Shard,
-	root_spec: ^Group_Spec,
-	alloc: mem.Allocator,
-	alloc_data: ^Grand_Arena_Allocator_Data = nil,
-) {
-	next_group_index: u16 = 0
-	_build_group(shard, root_spec, SUPERVISION_GROUP_ID_NONE, &next_group_index, alloc, alloc_data)
-}
-
-@(private = "package")
-_build_group :: proc(
-	shard: ^Shard,
-	group_spec: ^Group_Spec,
-	parent_id: Supervision_Group_Id,
-	next_group_index: ^u16,
-	alloc: mem.Allocator,
-	alloc_data: ^Grand_Arena_Allocator_Data,
-) -> u16 {
-	group_index := next_group_index^
-	next_group_index^ += 1
-
-	group := &shard.supervision_groups[group_index]
-	group.group_id = Supervision_Group_Id(group_index)
-	group.parent_id = parent_id
-	group.strategy = group_spec.strategy
-	group.boot_spec = group_spec
-	group.window_duration_ticks = group_spec.window_duration_ticks
-	group.restart_count_max = group_spec.restart_count_max
-	group.restart_count = 0
-	group.window_start_tick = shard.current_tick
-
-	capacity: int = int(group_spec.dynamic_child_count_max)
-	if capacity == 0 {
-		capacity = len(group_spec.children)
-	}
-
-	// Only allocate if we haven't already! (Crucial for Level 2 recovery)
-	if len(group.children_handles) == 0 && capacity > 0 {
-		if alloc_data != nil do alloc_data.current_name = fmt.tprintf("Group_%d_Handles", group_index)
-		group.children_handles = make([]Handle, capacity, alloc)
-	}
-
-	if group_spec.dynamic_child_count_max > 0 && len(group.dynamic_specs) == 0 {
-		if alloc_data != nil do alloc_data.current_name = fmt.tprintf("Group_%d_Dynamic_Specs", group_index)
-		group.dynamic_specs = make([]Dynamic_Child_Spec, capacity, alloc)
-	}
-
-	group.child_count = 0
-	for i in 0 ..< len(group_spec.children) {
-		child_spec_ptr := &group_spec.children[i]
-
-		#partial switch &s in child_spec_ptr {
-		case Static_Child_Spec:
-			spec := Spawn_Spec {
-				args_payload = s.args_payload,
-				group_id     = Supervision_Group_Id(group_index),
-				type_id      = s.type_id,
-				restart_type = s.restart_type,
-				args_size    = s.args_size,
-				handoff_fd   = FD_HANDLE_NONE,
-				handoff_mode = .Full,
-			}
-			ctx := TinaContext {
-				shard       = shard,
-				self_handle = HANDLE_NONE,
-			}
-
-			spawn_loop: for {
-				res := ctx_spawn(&ctx, spec)
-				if _, ok := res.(Handle); ok {
-					break spawn_loop
-				} else {
-					// Init failed!
-					if _check_and_record_restart(shard, group) {
-						fmt.eprintfln(
-							"[FATAL] Supervision intensity exceeded during boot/recovery for group %d",
-							group_index,
-						)
-						os.exit(1) // Level 3 abort
-					}
-				}
-			}
-
-		case Group_Spec:
-			sub_index := _build_group(
-				shard,
-				&s,
-				Supervision_Group_Id(group_index),
-				next_group_index,
-				alloc,
-				alloc_data,
-			)
-			sub_handle := make_handle(
-				shard.id,
-				u16(SUPERVISION_SUBGROUP_TYPE_ID),
-				u32(sub_index),
-				0,
-			)
-			group.children_handles[group.child_count] = sub_handle
-			group.child_count += 1
-		}
-	}
-
-	return group_index
-}
-
-@(private = "package")
-_rebuild_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
-	group.child_count = 0
-	for i in 0 ..< len(group.boot_spec.children) {
-		_respawn_child_at(shard, group, u16(i))
-		group.child_count += 1
-	}
-	group.restart_count = 0
-	group.window_start_tick = shard.current_tick
-}
+// --- Mass Teardown & Recovery ---
 
 @(private = "package")
 shard_mass_teardown :: proc(shard: ^Shard) {
@@ -1666,30 +779,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	env.source = HANDLE_NONE
 	env.destination = HANDLE_NONE
 	env.tag = TAG_SHARD_RESTARTED
-	when TINA_SIMULATION_MODE {
-		if shard.sim_state.network != nil {
-			for target_shard in u16(0) ..< shard.sim_state.network.shard_count {
-				if target_shard != shard.id {
-					_ = sim_network_enqueue(
-						shard.sim_state.network,
-						shard,
-						target_shard,
-						env,
-						shard.current_tick,
-						shard.sim_state.fault_config,
-					)
-				}
-			}
-		}
-	} else {
-		if len(shard.outbound_rings) > 0 {
-			for outbound_ring in shard.outbound_rings {
-				if outbound_ring != nil {
-					spsc_ring_enqueue(outbound_ring, &env)
-				}
-			}
-		}
-	}
+	transport_broadcast_envelope(shard, &env)
 
 
 	// SAFETY: We use a dummy allocator that panics on allocation to prove that
@@ -1733,7 +823,7 @@ shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
 }
 
 @(private = "package")
-_process_inbound_envelope :: #force_inline proc(
+_process_inbound_envelope :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	source_shard: u16,
 	envelope: ^Message_Envelope,

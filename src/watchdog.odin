@@ -5,7 +5,14 @@ import "core:sync"
 import "core:sys/posix"
 import "core:time"
 
-// Structure of Arrays (SoA) for maximum cache locality during the EAGAIN heartbeat loop
+// Cross-platform watchdog events, translated from OS signals by os_poll_watchdog_events.
+Watchdog_Event :: enum u8 {
+	None,
+	Shutdown,
+	Recover_Quarantine,
+	Reload_Config,
+}
+
 Watchdog_Tracker :: struct {
 	last_seen_heartbeat: [MAX_SHARDS]u64,
 	stall_count:         [MAX_SHARDS]u8,
@@ -28,39 +35,31 @@ watchdog_loop :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) 
 	fmt.printfln("[SYSTEM] Process running. Watchdog active (interval: %v ms).", interval_ms)
 
 	for {
-		sig, sig_ok := os_wait_for_signal(interval_ms)
+		event := os_poll_watchdog_events(interval_ms)
 
-		if sig_ok {
-			#partial switch sig {
-			case .SIGTERM, .SIGINT:
-				fmt.printfln(
-					"\n[WATCHDOG] Received signal %v. Initiating Graceful Shutdown...",
-					sig,
-				)
-				_execute_graceful_shutdown(configs, states, spec)
-				return
+		switch event {
+		case .Shutdown:
+			fmt.printfln("\n[WATCHDOG] Initiating Graceful Shutdown...")
+			_execute_graceful_shutdown(configs, states, spec)
+			return
 
-			case:
-				when ODIN_OS != .Windows {
-					#partial switch sig {
-					case .SIGUSR2:
-						fmt.printfln("[WATCHDOG] Received SIGUSR2. Recovering quarantined Shards.")
-						for i in 0 ..< spec.shard_count {
-							state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
-							if state == .Quarantined {
-								tracker.stall_count[i] = 0
-								tracker.restart_count[i] = 0
-								tracker.window_start[i] = time.tick_now()
-								sync.atomic_store_explicit(&states[i], u8(Shard_State.Running), .Release)
-								fmt.printfln("[WATCHDOG] Shard %d recovered from quarantine.", i)
-							}
-						}
-					case .SIGHUP:
-						fmt.printfln("[WATCHDOG] Received SIGHUP. (Reserved for future use).")
-					}
+		case .Recover_Quarantine:
+			fmt.printfln("[WATCHDOG] Recovering quarantined Shards.")
+			for i in 0 ..< spec.shard_count {
+				state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+				if state == .Quarantined {
+					tracker.stall_count[i] = 0
+					tracker.restart_count[i] = 0
+					tracker.window_start[i] = time.tick_now()
+					sync.atomic_store_explicit(&states[i], u8(Shard_State.Running), .Release)
+					fmt.printfln("[WATCHDOG] Shard %d recovered from quarantine.", i)
 				}
 			}
-		} else {
+
+		case .Reload_Config:
+			fmt.printfln("[WATCHDOG] Reload config requested. (Reserved for future use).")
+
+		case .None:
 			// Timeout (EAGAIN) — No OS signal received. Do periodic heartbeat work.
 			for i in 0 ..< spec.shard_count {
 				state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
@@ -208,8 +207,8 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, states: []u8, spec: 
 	// Phase 2: Monitor drain with continued heartbeat checking
 	for {
 		// Check for second SIGTERM (immediate force-kill escalation, §5.4)
-		sig, sig_ok := os_wait_for_signal(100)
-		if sig_ok && (sig == .SIGTERM || sig == .SIGINT) {
+		event := os_poll_watchdog_events(100)
+		if event == .Shutdown {
 			fmt.eprintfln("[FATAL] Second signal received. Executing Phase 3 Force-Kill.")
 			_execute_phase3_force_kill(configs, states, spec)
 		}

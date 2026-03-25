@@ -8,6 +8,18 @@ import "core:c"
 
 // BSD/Darwin: sigtimedwait is not available in Odin's posix bindings.
 // Use kqueue EVFILT_SIGNAL for timed signal waiting instead.
+os_poll_watchdog_events :: proc(timeout_ms: u32) -> Watchdog_Event {
+	sig, ok := os_wait_for_signal(timeout_ms)
+	if !ok do return .None
+
+	#partial switch sig {
+	case .SIGTERM, .SIGINT: return .Shutdown
+	case .SIGUSR2:          return .Recover_Quarantine
+	case .SIGHUP:           return .Reload_Config
+	case:                   return .None
+	}
+}
+
 os_wait_for_signal :: proc(timeout_ms: u32) -> (sig: posix.Signal, ok: bool) {
     kq, err := kqueue.kqueue()
     if err != nil do return nil, false

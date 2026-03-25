@@ -7,6 +7,18 @@ import "core:sys/posix"
 
 // Linux: use rt_sigtimedwait for timed signal waiting.
 // BSD/Darwin use kqueue EVFILT_SIGNAL (see sys_signals_bsd.odin).
+os_poll_watchdog_events :: proc(timeout_ms: u32) -> Watchdog_Event {
+	sig, ok := os_wait_for_signal(timeout_ms)
+	if !ok do return .None
+
+	#partial switch sig {
+	case .SIGTERM, .SIGINT: return .Shutdown
+	case .SIGUSR2:          return .Recover_Quarantine
+	case .SIGHUP:           return .Reload_Config
+	case:                   return .None
+	}
+}
+
 os_wait_for_signal :: proc(timeout_ms: u32) -> (sig: posix.Signal, ok: bool) {
     set: linux.Sig_Set
     // Zero-init, then set the bits for the signals we care about.

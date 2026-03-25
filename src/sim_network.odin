@@ -29,7 +29,10 @@ when TINA_SIMULATION_MODE {
 		q.count = 0
 	}
 
-	delay_queue_push :: proc(q: ^DelayQueue, item: DelayedEnvelope) -> Enqueue_Result {
+	delay_queue_push :: #force_inline proc "contextless" (
+		q: ^DelayQueue,
+		item: DelayedEnvelope,
+	) -> Enqueue_Result {
 		if q.count >= q.capacity do return .Full
 		q.buffer[q.tail] = item
 		q.tail = (q.tail + 1) & (q.capacity - 1)
@@ -37,7 +40,12 @@ when TINA_SIMULATION_MODE {
 		return .Success
 	}
 
-	delay_queue_pop :: proc(q: ^DelayQueue) -> (DelayedEnvelope, bool) {
+	delay_queue_pop :: #force_inline proc "contextless" (
+		q: ^DelayQueue,
+	) -> (
+		DelayedEnvelope,
+		bool,
+	) {
 		if q.count == 0 do return DelayedEnvelope{}, false
 		item := q.buffer[q.head]
 		q.head = (q.head + 1) & (q.capacity - 1)
@@ -45,7 +53,12 @@ when TINA_SIMULATION_MODE {
 		return item, true
 	}
 
-	delay_queue_peek :: proc(q: ^DelayQueue) -> (^DelayedEnvelope, bool) {
+	delay_queue_peek :: #force_inline proc "contextless" (
+		q: ^DelayQueue,
+	) -> (
+		^DelayedEnvelope,
+		bool,
+	) {
 		if q.count == 0 do return nil, false
 		return &q.buffer[q.head], true
 	}
@@ -88,7 +101,8 @@ when TINA_SIMULATION_MODE {
 	}
 
 	// Enqueue: Called by Source Shard
-	sim_network_enqueue :: proc(
+	// must remain contextless (no assert/fmt/make/default-allocator calls).
+	sim_network_enqueue :: #force_inline proc "contextless" (
 		net: ^SimulatedNetwork,
 		source_shard: ^Shard,
 		target: u16,
@@ -125,7 +139,8 @@ when TINA_SIMULATION_MODE {
 	}
 
 	// Drain: Called by Destination Shard (Step 1 drain)
-	sim_network_drain :: proc(
+	// must remain contextless (no assert/fmt/make/default-allocator calls).
+	sim_network_drain :: #force_inline proc "contextless" (
 		net: ^SimulatedNetwork,
 		target_shard: ^Shard,
 		source: u16,
