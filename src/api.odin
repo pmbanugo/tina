@@ -10,7 +10,7 @@ SUPERVISION_GROUP_ID_NONE :: Supervision_Group_Id(0xFFFF)
 SUPERVISION_GROUP_ID_ROOT :: Supervision_Group_Id(0)
 
 // Solves the 0xFFFF bitwise truncation hazard by explicitly using the 255th slot
-SUPERVISION_SUBGROUP_TYPE_ID : u8 : 255 
+SUPERVISION_SUBGROUP_TYPE_ID: u8 : 255
 
 Crash_Reason :: enum u8 {
 	None                 = 0,
@@ -118,7 +118,8 @@ Context_Flag :: enum u8 {
 Context_Flags :: distinct bit_set[Context_Flag;u8]
 
 TinaContext :: struct {
-	shard:                  ^Shard,
+	// Opaque pointer to internal Shard state to prevents user mutation.
+	_shard:                 rawptr,
 	self_handle:            Handle,
 	current_message_source: Handle,
 	// Memory surfaces (initialized per handler invocation by the scheduler)
@@ -135,6 +136,15 @@ Enqueue_Result :: enum u8 {
 }
 
 // ============================================================================
+// Internal Helpers
+// ============================================================================
+
+@(private = "package")
+_ctx_extract_shard :: #force_inline proc "contextless" (ctx: ^TinaContext) -> ^Shard {
+	return cast(^Shard)ctx._shard
+}
+
+// ============================================================================
 // Ergonomic Helpers (§7.2 §8)
 // ============================================================================
 
@@ -147,13 +157,20 @@ payload_as :: #force_inline proc($T: typeid, payload: []u8) -> ^T {
 	return cast(^T)raw_data(payload)
 }
 
+@(require_results)
 ctx_send_typed :: #force_inline proc(
 	ctx: ^TinaContext,
 	to: Handle,
 	tag: Message_Tag,
 	message: ^$T,
-) -> Send_Result {
-	return ctx_send(ctx, to, tag, mem.byte_slice(message, size_of(T)))
+) -> Send_Result where size_of(T) <=
+	MAX_PAYLOAD_SIZE {
+	return ctx_send_raw(ctx, to, tag, mem.byte_slice(message, size_of(T)))
+}
+
+ctx_send :: proc {
+	ctx_send_raw,
+	ctx_send_typed,
 }
 
 make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8, size: u8) {

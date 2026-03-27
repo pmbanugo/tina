@@ -58,8 +58,13 @@ log_init :: proc(ring: ^Log_Ring_Buffer, backing: []u8) {
 }
 
 // The public, ergonomic wrapper
-ctx_log :: #force_inline proc "contextless" (ctx: ^TinaContext, level: Log_Level, tag: Log_Tag, payload: []u8) {
-	_shard_log(ctx.shard, ctx.self_handle, level, tag, payload)
+ctx_log :: #force_inline proc "contextless" (
+	ctx: ^TinaContext,
+	level: Log_Level,
+	tag: Log_Tag,
+	payload: []u8,
+) {
+	_shard_log(_ctx_extract_shard(ctx), ctx.self_handle, level, tag, payload)
 }
 
 // The internal logging primitive
@@ -100,7 +105,11 @@ _shard_log :: #force_inline proc "contextless" (
 
 // SIMD-friendly 2-part ring buffer block copy
 @(private = "package")
-_write_ring_data :: #force_inline proc "contextless" (ring: ^Log_Ring_Buffer, offset: u64, data: []u8) {
+_write_ring_data :: #force_inline proc "contextless" (
+	ring: ^Log_Ring_Buffer,
+	offset: u64,
+	data: []u8,
+) {
 	size := u64(len(data))
 	if size == 0 do return
 
@@ -122,7 +131,11 @@ _write_ring_data :: #force_inline proc "contextless" (ring: ^Log_Ring_Buffer, of
 
 // SIMD-friendly 2-part ring buffer block read
 @(private = "package")
-_read_ring_data :: #force_inline proc "contextless" (ring: ^Log_Ring_Buffer, offset: u64, data: []u8) {
+_read_ring_data :: #force_inline proc "contextless" (
+	ring: ^Log_Ring_Buffer,
+	offset: u64,
+	data: []u8,
+) {
 	size := u64(len(data))
 	if size == 0 do return
 

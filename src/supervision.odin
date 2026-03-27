@@ -291,7 +291,7 @@ _build_group :: proc(
 				handoff_mode = .Full,
 			}
 			ctx := TinaContext {
-				shard       = shard,
+				_shard      = shard,
 				self_handle = HANDLE_NONE,
 			}
 

@@ -60,15 +60,15 @@ timer_wheel_reset :: proc(wheel: ^Timer_Wheel, current_tick: u64) {
 }
 
 ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag) {
-	wheel := &ctx.shard.timer_wheel
+	shard := _ctx_extract_shard(ctx)
+	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
 		ctx_log(ctx, .ERROR, USER_LOG_TAG_BASE, transmute([]u8)string("Timer pool exhausted"))
 		return
 	}
 	// Convert nanoseconds to ticks
-	delay_ticks :=
-		(duration_ns + ctx.shard.timer_resolution_ns - 1) / ctx.shard.timer_resolution_ns
-	_timer_wheel_insert(wheel, ctx.shard.current_tick + delay_ticks, ctx.self_handle, tag, 0)
+	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
+	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, ctx.self_handle, tag, 0)
 }
 
 @(private = "package")

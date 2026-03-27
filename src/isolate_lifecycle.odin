@@ -92,7 +92,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	}
 
 	child_ctx := TinaContext {
-		shard       = shard,
+		_shard      = shard,
 		self_handle = child_handle,
 	}
 
@@ -107,6 +107,11 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 
 	// 4. Execute init_fn
 	local_spec := spec
+
+	// Set up the implicit context for the user init_fn
+	context.allocator = mem.arena_allocator(&child_ctx.scratch_arena)
+	context.temp_allocator = mem.arena_allocator(&child_ctx.scratch_arena)
+
 	effect := shard.type_descriptors[type_id].init_fn(
 		ptr,
 		local_spec.args_payload[:local_spec.args_size],

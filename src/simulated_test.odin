@@ -101,26 +101,26 @@ when TINA_SIMULATION_MODE {
 		msg := PingMsg {
 			seq = 0,
 		}
-		ctx_send_typed(ctx, p.pong_handle, APP_TAG_PING, &msg)
+		_ = ctx_send(ctx, p.pong_handle, APP_TAG_PING, &msg)
 
 		return Effect_Receive{}
 	}
 
 	ping_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
-		p := cast(^PingIsolate)self
-		pong := payload_as(PongMsg, message.body.user.payload[:])
+		using p := cast(^PingIsolate)self
+		pong := payload_as(PongMsg, message.user.payload[:])
 
-		p.count += 1
+		count += 1
 
 		// Stop after 100 round trips
-		if p.count >= 100 {
+		if count >= 100 {
 			return Effect_Done{}
 		}
 
 		msg := PingMsg {
 			seq = pong.seq + 1,
 		}
-		ctx_send_typed(ctx, p.pong_handle, APP_TAG_PING, &msg)
+		_ = ctx_send(ctx, p.pong_handle, APP_TAG_PING, &msg)
 		return Effect_Receive{}
 	}
 
@@ -132,12 +132,12 @@ when TINA_SIMULATION_MODE {
 	}
 
 	pong_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
-		ping := payload_as(PingMsg, message.body.user.payload[:])
+		ping := payload_as(PingMsg, message.user.payload[:])
 
 		msg := PongMsg {
 			seq = ping.seq,
 		}
-		ctx_send_typed(ctx, message.body.user.source, APP_TAG_PONG, &msg)
+		_ = ctx_send(ctx, message.user.source, APP_TAG_PONG, &msg)
 
 		return Effect_Receive{}
 	}
@@ -321,7 +321,11 @@ when TINA_SIMULATION_MODE {
 		iso.fd = fd
 
 		// Register a timer that will fire in 2 ticks (before I/O completes)
-		ctx_register_timer(ctx, 2 * ctx.shard.timer_resolution_ns, APP_TAG_IO_TIMEOUT)
+		ctx_register_timer(
+			ctx,
+			2 * _ctx_extract_shard(ctx).timer_resolution_ns,
+			APP_TAG_IO_TIMEOUT,
+		)
 
 		// Submit a recv — I/O delay is configured to be much longer than the timer
 		iso.state = .Waiting_For_Io
@@ -349,72 +353,106 @@ when TINA_SIMULATION_MODE {
 
 		types := [7]TypeDescriptor {
 			{
-				id = COORDINATOR_TYPE_ID, slot_count = 1, stride = size_of(Coordinator),
+				id = COORDINATOR_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Coordinator),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = coordinator_init, handler_fn = coordinator_handler,
+				init_fn = coordinator_init,
+				handler_fn = coordinator_handler,
 			},
 			{
-				id = PING_TYPE_ID, slot_count = 1, stride = size_of(PingIsolate),
+				id = PING_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(PingIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = ping_init, handler_fn = ping_handler,
+				init_fn = ping_init,
+				handler_fn = ping_handler,
 			},
 			{
-				id = PONG_TYPE_ID, slot_count = 1, stride = size_of(PongIsolate),
+				id = PONG_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(PongIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = pong_init, handler_fn = pong_handler,
+				init_fn = pong_init,
+				handler_fn = pong_handler,
 			},
 			{
-				id = SUPERVISOR_TYPE_ID, slot_count = 1, stride = size_of(Supervisor),
+				id = SUPERVISOR_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Supervisor),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = supervisor_init, handler_fn = supervisor_handler,
+				init_fn = supervisor_init,
+				handler_fn = supervisor_handler,
 			},
 			{
-				id = EXITER_TYPE_ID, slot_count = 1, stride = size_of(Exiter),
+				id = EXITER_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Exiter),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = exiter_init, handler_fn = exiter_handler,
+				init_fn = exiter_init,
+				handler_fn = exiter_handler,
 			},
 			{
-				id = BYSTANDER_TYPE_ID, slot_count = 1, stride = size_of(Bystander),
+				id = BYSTANDER_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Bystander),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = bystander_init, handler_fn = bystander_handler,
+				init_fn = bystander_init,
+				handler_fn = bystander_handler,
 			},
 			{
-				id = IO_TIMEOUT_TYPE_ID, slot_count = 1, stride = size_of(IoTimeoutIsolate),
+				id = IO_TIMEOUT_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(IoTimeoutIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = io_timeout_init, handler_fn = io_timeout_handler,
-				mailbox_capacity = 16, budget_weight = 1,
+				init_fn = io_timeout_init,
+				handler_fn = io_timeout_handler,
+				mailbox_capacity = 16,
+				budget_weight = 1,
 			},
 		}
 
-		children := [1]Child_Spec{
+		children := [1]Child_Spec {
 			Static_Child_Spec{type_id = IO_TIMEOUT_TYPE_ID, restart_type = .temporary},
 		}
 
-		root_group := Group_Spec{
-			strategy = .One_For_One, restart_count_max = 3,
-			window_duration_ticks = 1000, children = children[:],
+		root_group := Group_Spec {
+			strategy                = .One_For_One,
+			restart_count_max       = 3,
+			window_duration_ticks   = 1000,
+			children                = children[:],
 			dynamic_child_count_max = 4,
 		}
 
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
-		sim_config := SimulationConfig{
-			seed = t.seed, ticks_max = 500,
-			terminate_on_quiescent = true, checker_interval_ticks = 10,
+		sim_config := SimulationConfig {
+			seed                   = t.seed,
+			ticks_max              = 500,
+			terminate_on_quiescent = true,
+			checker_interval_ticks = 10,
 		}
 
-		spec := SystemSpec{
-			shard_count = 1, types = types[:], shard_specs = shard_specs[:],
-			simulation = &sim_config, pool_slot_count = 256,
+		spec := SystemSpec {
+			shard_count               = 1,
+			types                     = types[:],
+			shard_specs               = shard_specs[:],
+			simulation                = &sim_config,
+			pool_slot_count           = 256,
 			// I/O delay must be much longer than the timer (2 ticks) so the
 			// timer fires first and the completion becomes stale.
-			reactor_buffer_slot_count = 8, reactor_buffer_slot_size = 1024,
-			transfer_slot_count = 4, transfer_slot_size = 1024,
-			timer_spoke_count = 256, timer_entry_count = 256,
-			timer_resolution_ns = 1_000_000, // 1ms per tick
-			fd_table_slot_count = 16, fd_entry_size = size_of(FD_Entry),
-			log_ring_size = 4096, supervision_groups_max = 8,
-			scratch_arena_size = 8192,
+			reactor_buffer_slot_count = 8,
+			reactor_buffer_slot_size  = 1024,
+			transfer_slot_count       = 4,
+			transfer_slot_size        = 1024,
+			timer_spoke_count         = 256,
+			timer_entry_count         = 256,
+			timer_resolution_ns       = 1_000_000, // 1ms per tick
+			fd_table_slot_count       = 16,
+			fd_entry_size             = size_of(FD_Entry),
+			log_ring_size             = 4096,
+			supervision_groups_max    = 8,
+			scratch_arena_size        = 8192,
 		}
 
 		sim: Simulator
@@ -563,10 +601,10 @@ when TINA_SIMULATION_MODE {
 			shard.metadata[EXITER_TYPE_ID].generation[0],
 		)
 		ctx := TinaContext {
-			shard       = shard,
+			_shard      = shard,
 			self_handle = HANDLE_NONE,
 		}
-		ctx_send_typed(&ctx, exiter_handle, APP_TAG_PING, &PingMsg{seq = 0})
+		_ = ctx_send(&ctx, exiter_handle, APP_TAG_PING, &PingMsg{seq = 0})
 
 		simulator_run(&sim)
 
@@ -610,7 +648,7 @@ when TINA_SIMULATION_MODE {
 	write_crasher_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
 		// Crash exactly on tick 1 (when Writer's send completion arrives).
 		// On any other tick (after restart), exit cleanly.
-		if ctx.shard.current_tick == 1 do return Effect_Crash{reason = .None}
+		if _ctx_extract_shard(ctx).current_tick == 1 do return Effect_Crash{reason = .None}
 		return Effect_Done{}
 	}
 
@@ -624,9 +662,9 @@ when TINA_SIMULATION_MODE {
 
 		return Effect_Io {
 			operation = IoOp_Send {
-				fd             = w.fd,
+				fd = w.fd,
 				payload_offset = u16(offset_of(WriteWriterIsolate, send_buf)),
-				payload_size   = 32,
+				payload_size = 32,
 			},
 		}
 	}
@@ -642,18 +680,24 @@ when TINA_SIMULATION_MODE {
 
 		types := [2]TypeDescriptor {
 			{
-				id = WRITE_CRASHER_TYPE_ID, slot_count = 1,
+				id = WRITE_CRASHER_TYPE_ID,
+				slot_count = 1,
 				stride = size_of(WriteCrasherIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = write_crasher_init, handler_fn = write_crasher_handler,
-				mailbox_capacity = 16, budget_weight = 1,
+				init_fn = write_crasher_init,
+				handler_fn = write_crasher_handler,
+				mailbox_capacity = 16,
+				budget_weight = 1,
 			},
 			{
-				id = WRITE_WRITER_TYPE_ID, slot_count = 1,
+				id = WRITE_WRITER_TYPE_ID,
+				slot_count = 1,
 				stride = size_of(WriteWriterIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = write_writer_init, handler_fn = write_writer_handler,
-				mailbox_capacity = 16, budget_weight = 1,
+				init_fn = write_writer_init,
+				handler_fn = write_writer_handler,
+				mailbox_capacity = 16,
+				budget_weight = 1,
 			},
 		}
 
@@ -762,11 +806,14 @@ when TINA_SIMULATION_MODE {
 
 		types := [1]TypeDescriptor {
 			{
-				id = PRIORITY_TYPE_ID, slot_count = 1,
+				id = PRIORITY_TYPE_ID,
+				slot_count = 1,
 				stride = size_of(PriorityTestIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = priority_test_init, handler_fn = priority_test_handler,
-				mailbox_capacity = 16, budget_weight = 1,
+				init_fn = priority_test_init,
+				handler_fn = priority_test_handler,
+				mailbox_capacity = 16,
+				budget_weight = 1,
 			},
 		}
 
@@ -844,11 +891,7 @@ when TINA_SIMULATION_MODE {
 		iso_ptr := _get_isolate_ptr(shard, u16(PRIORITY_TYPE_ID), 0)
 		iso := cast(^PriorityTestIsolate)iso_ptr
 		testing.expect_value(t, iso.received_count, 2)
-		testing.expect_value(
-			t,
-			iso.received_tags[0],
-			Message_Tag(IO_TAG_RECV_COMPLETE),
-		)
+		testing.expect_value(t, iso.received_tags[0], Message_Tag(IO_TAG_RECV_COMPLETE))
 		testing.expect_value(t, iso.received_tags[1], TAG_SHUTDOWN)
 
 		// 7. Buffer must have been freed after the I/O completion dispatch

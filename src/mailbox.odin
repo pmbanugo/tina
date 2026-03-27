@@ -23,7 +23,7 @@ Envelope_Flags :: bit_set[Envelope_Flag;u16]
 
 // Structured to cleanly separate User payloads from I/O completions
 Message :: struct {
-	body: struct #raw_union {
+	using body: struct #raw_union {
 		user: struct {
 			source:       Handle,
 			payload_size: u16,

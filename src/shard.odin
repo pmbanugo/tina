@@ -321,18 +321,18 @@ scheduler_tick :: proc(shard: ^Shard) {
 				// Dispatch Priority: I/O > Shutdown > Inbox (ADR §6.13.4)
 				if io_completions[slot] != IO_TAG_NONE {
 					message.tag = Message_Tag(io_completions[slot])
-					message.body.io.result = io_results[slot]
-					message.body.io.fd = io_fds[slot]
-					message.body.io.buffer_index = io_buffer_indices[slot]
-					message.body.io.peer_address = io_peer_addresses[slot]
+					message.io.result = io_results[slot]
+					message.io.fd = io_fds[slot]
+					message.io.buffer_index = io_buffer_indices[slot]
+					message.io.peer_address = io_peer_addresses[slot]
 
 					message_pointer = &message
 					is_io_completion = true
 					buffer_to_free = io_buffer_indices[slot]
 				} else if .Shutdown_Pending in flags[slot] {
 					message.tag = TAG_SHUTDOWN
-					message.body.user.source = HANDLE_NONE
-					message.body.user.payload_size = 0
+					message.user.source = HANDLE_NONE
+					message.user.payload_size = 0
 
 					message_pointer = &message
 					flags[slot] -= {.Shutdown_Pending}
@@ -354,14 +354,14 @@ scheduler_tick :: proc(shard: ^Shard) {
 				if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
 
 				ctx := TinaContext {
-					shard                  = shard,
+					_shard                 = shard,
 					self_handle            = make_handle(
 						shard.id,
 						u16(type_id),
 						slot,
 						generations[slot],
 					),
-					current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.body.user.source : HANDLE_NONE,
+					current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : HANDLE_NONE,
 					current_correlation    = correlation,
 					flags                  = ctx_flags,
 				}
@@ -381,6 +381,11 @@ scheduler_tick :: proc(shard: ^Shard) {
 				}
 
 				ptr := _get_isolate_ptr(shard, u16(type_id), slot)
+
+				// Set up the implicit context for the user handler
+				context.allocator = mem.arena_allocator(&ctx.scratch_arena)
+				context.temp_allocator = mem.arena_allocator(&ctx.scratch_arena)
+
 				effect := type_descriptor.handler_fn(ptr, message_pointer, &ctx)
 
 				// Write back working arena offset
@@ -492,8 +497,8 @@ _interpret_effect :: proc(
 		envelope.correlation = correlation_id
 		envelope.flags += {.Is_Call}
 		envelope.tag = local_msg.tag
-		envelope.payload_size = local_msg.body.user.payload_size
-		copy(envelope.payload[:], local_msg.body.user.payload[:])
+		envelope.payload_size = local_msg.user.payload_size
+		copy(envelope.payload[:], local_msg.user.payload[:])
 
 		_route_envelope_user(shard, e.to, &envelope)
 
@@ -518,8 +523,8 @@ _interpret_effect :: proc(
 		envelope.correlation = ctx.current_correlation
 		envelope.flags += {.Is_Reply}
 		envelope.tag = local_msg.tag
-		envelope.payload_size = local_msg.body.user.payload_size
-		copy(envelope.payload[:], local_msg.body.user.payload[:])
+		envelope.payload_size = local_msg.user.payload_size
+		copy(envelope.payload[:], local_msg.user.payload[:])
 
 		_route_envelope_user(shard, ctx.current_message_source, &envelope)
 
@@ -688,9 +693,9 @@ _dequeue :: proc "contextless" (
 	envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, head_index)
 
 	out_message.tag = envelope.tag
-	out_message.body.user.source = envelope.source
-	out_message.body.user.payload_size = envelope.payload_size
-	copy(out_message.body.user.payload[:], envelope.payload[:])
+	out_message.user.source = envelope.source
+	out_message.user.payload_size = envelope.payload_size
+	copy(out_message.user.payload[:], envelope.payload[:])
 
 	out_correlation^ = envelope.correlation
 	out_flags^ = envelope.flags
