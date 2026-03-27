@@ -57,14 +57,44 @@ log_init :: proc(ring: ^Log_Ring_Buffer, backing: []u8) {
 	ring.write_cursor = 0
 }
 
-// The public, ergonomic wrapper
-ctx_log :: #force_inline proc "contextless" (
+// Public Logging API with raw-byte
+ctx_log_raw :: #force_inline proc "contextless" (
 	ctx: ^TinaContext,
 	level: Log_Level,
-	tag: Log_Tag,
+	$tag: Log_Tag,
 	payload: []u8,
 ) {
+	#assert(
+		tag >= USER_LOG_TAG_BASE,
+		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
+	)
 	_shard_log(_ctx_extract_shard(ctx), ctx.self_handle, level, tag, payload)
+}
+
+// Public Logging API with typed wrapper
+ctx_log_typed :: #force_inline proc "contextless" (
+	ctx: ^TinaContext,
+	level: Log_Level,
+	$tag: Log_Tag,
+	message: ^$T,
+) where size_of(T) <=
+	MAX_PAYLOAD_SIZE {
+	#assert(
+		tag >= USER_LOG_TAG_BASE,
+		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
+	)
+	_shard_log(
+		_ctx_extract_shard(ctx),
+		ctx.self_handle,
+		level,
+		tag,
+		mem.byte_slice(message, size_of(T)),
+	)
+}
+
+ctx_log :: proc {
+	ctx_log_raw,
+	ctx_log_typed,
 }
 
 // The internal logging primitive
@@ -77,7 +107,8 @@ _shard_log :: #force_inline proc "contextless" (
 	payload: []u8,
 ) {
 	timestamp := shard.current_tick
-	record_size := Log_Record_Header_Size + u64(((len(payload) + 7) & ~int(7)))
+	clamped_size := min(len(payload), MAX_PAYLOAD_SIZE)
+	record_size := Log_Record_Header_Size + u64(((clamped_size + 7) & ~int(7)))
 
 	capacity := shard.log_ring.capacity_mask + 1
 	if shard.log_ring.write_cursor + record_size - shard.log_ring.read_cursor > capacity {
@@ -87,7 +118,7 @@ _shard_log :: #force_inline proc "contextless" (
 	header := Log_Record_Header {
 		timestamp      = timestamp,
 		isolate_handle = source,
-		payload_size   = u16(len(payload)),
+		payload_size   = u16(clamped_size),
 		level          = level,
 		tag            = tag,
 	}
@@ -98,12 +129,12 @@ _shard_log :: #force_inline proc "contextless" (
 		mem.byte_slice(cast(^u8)&header, 24),
 	)
 	if len(payload) > 0 {
-		_write_ring_data(&shard.log_ring, shard.log_ring.write_cursor + 24, payload)
+		_write_ring_data(&shard.log_ring, shard.log_ring.write_cursor + 24, payload[:clamped_size])
 	}
 	shard.log_ring.write_cursor += record_size
 }
 
-// SIMD-friendly 2-part ring buffer block copy
+// 2-part ring buffer block copy (SIMD-friendly)
 @(private = "package")
 _write_ring_data :: #force_inline proc "contextless" (
 	ring: ^Log_Ring_Buffer,
@@ -129,7 +160,7 @@ _write_ring_data :: #force_inline proc "contextless" (
 	}
 }
 
-// SIMD-friendly 2-part ring buffer block read
+// 2-part ring buffer block read (SIMD-friendly)
 @(private = "package")
 _read_ring_data :: #force_inline proc "contextless" (
 	ring: ^Log_Ring_Buffer,
@@ -157,34 +188,35 @@ _read_ring_data :: #force_inline proc "contextless" (
 
 // Step 7: Flush logs to OS stream via PIPE_BUF chunks
 log_flush :: proc(shard: ^Shard) {
-	temp_buf: [POSIX_PIPE_BUF_SIZE]u8
+	temp_buffer: [POSIX_PIPE_BUF_SIZE]u8
 	temp_size := 0
 	ring := &shard.log_ring
+	commit_cursor := ring.read_cursor
 
-	for ring.read_cursor < ring.write_cursor {
-		if ring.write_cursor - ring.read_cursor < Log_Record_Header_Size {break}
+	for commit_cursor < ring.write_cursor {
+		if ring.write_cursor - commit_cursor < Log_Record_Header_Size {break}
 
 		header: Log_Record_Header
 		_read_ring_data(
 			ring,
-			ring.read_cursor,
+			commit_cursor,
 			mem.byte_slice(cast(^u8)&header, Log_Record_Header_Size),
 		)
 		record_size := Log_Record_Header_Size + u64((header.payload_size + 7) & ~u16(7))
 
-		if ring.write_cursor - ring.read_cursor < record_size {break}
+		if ring.write_cursor - commit_cursor < record_size {break}
 
 		payload_buf: [MAX_PAYLOAD_SIZE]u8
 		_read_ring_data(
 			ring,
-			ring.read_cursor + Log_Record_Header_Size,
+			commit_cursor + Log_Record_Header_Size,
 			payload_buf[:header.payload_size],
 		)
 
 		line_buffer: [MAX_FORMATTED_LOG_LINE]u8
-		b := strings.builder_from_bytes(line_buffer[:])
+		string_builder := strings.builder_from_bytes(line_buffer[:])
 		fmt.sbprintf(
-			&b,
+			&string_builder,
 			"[%v] %v[Tag:%X] Handle:%X - %s\n",
 			header.timestamp,
 			header.level,
@@ -193,18 +225,24 @@ log_flush :: proc(shard: ^Shard) {
 			string(payload_buf[:header.payload_size]),
 		)
 
-		if temp_size + len(b.buf) > POSIX_PIPE_BUF_SIZE {
-			os.write(os.stderr, temp_buf[:temp_size])
+		if temp_size + len(string_builder.buf) > POSIX_PIPE_BUF_SIZE {
+			written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])
+			if write_error != nil || written_size < temp_size {
+				break
+			}
+			ring.read_cursor = commit_cursor
 			temp_size = 0
 		}
-		copy(temp_buf[temp_size:], b.buf[:])
-		temp_size += len(b.buf)
+		copy(temp_buffer[temp_size:], string_builder.buf[:])
+		temp_size += len(string_builder.buf)
 
-		ring.read_cursor += record_size
+		commit_cursor += record_size
 	}
 
 	if temp_size > 0 {
-		// TODO: check the os.write result for errors/EAGAIN? or do something different and assert earlier?
-		os.write(os.stderr, temp_buf[:temp_size])
+		written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])
+		if write_error == nil && written_size == temp_size {
+			ring.read_cursor = commit_cursor
+		}
 	}
 }

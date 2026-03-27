@@ -161,10 +161,11 @@ payload_as :: #force_inline proc($T: typeid, payload: []u8) -> ^T {
 ctx_send_typed :: #force_inline proc(
 	ctx: ^TinaContext,
 	to: Handle,
-	tag: Message_Tag,
+	$tag: Message_Tag,
 	message: ^$T,
 ) -> Send_Result where size_of(T) <=
 	MAX_PAYLOAD_SIZE {
+	#assert(tag >= USER_MESSAGE_TAG_BASE, "ctx_send: Cannot forge system messages. Tag must be >= 0x0040.")
 	return ctx_send_raw(ctx, to, tag, mem.byte_slice(message, size_of(T)))
 }
 

@@ -4,18 +4,18 @@ package tina
 // Used by signal handlers and the assertion failure proc for safe string formatting.
 
 @(private = "package")
-_sig_append_str :: proc "contextless" (target: []u8, pos: int, source: string) -> int {
-	n := min(len(target) - pos, len(source))
-	for i in 0 ..< n do target[pos + i] = source[i]
-	return pos + n
+_sig_append_str :: proc "contextless" (target: []u8, position: int, source: string) -> int {
+	n := min(len(target) - position, len(source))
+	for i in 0 ..< n do target[position + i] = source[i]
+	return position + n
 }
 
 @(private = "package")
-_sig_append_u64 :: proc "contextless" (target: []u8, pos: int, value: u64) -> int {
-	if pos >= len(target) do return pos
+_sig_append_u64 :: proc "contextless" (target: []u8, position: int, value: u64) -> int {
+	if position >= len(target) do return position
 	if value == 0 {
-		target[pos] = '0'
-		return pos + 1
+		target[position] = '0'
+		return position + 1
 	}
 	tmp: [20]u8
 	n := 0
@@ -25,9 +25,9 @@ _sig_append_u64 :: proc "contextless" (target: []u8, pos: int, value: u64) -> in
 		v /= 10
 		n += 1
 	}
-	written := min(n, len(target) - pos)
+	written := min(n, len(target) - position)
 	for i in 0 ..< written {
-		target[pos + i] = tmp[n - 1 - i]
+		target[position + i] = tmp[n - 1 - i]
 	}
-	return pos + written
+	return position + written
 }

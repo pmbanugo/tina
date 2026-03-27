@@ -7,12 +7,11 @@ import "core:sync"
 ctx_send_raw :: #force_inline proc(
 	ctx: ^TinaContext,
 	to: Handle,
-	tag: Message_Tag,
+	$tag: Message_Tag,
 	payload: []u8,
 ) -> Send_Result {
+	#assert(tag >= USER_MESSAGE_TAG_BASE, "ctx_send: Cannot forge system messages. Tag must be >= 0x0040.")
 	shard := _ctx_extract_shard(ctx)
-	assert(tag >= USER_MESSAGE_TAG_BASE, "User code must not send system tags via ctx_send")
-	assert(len(payload) <= MAX_PAYLOAD_SIZE, "Payload exceeds MAX_PAYLOAD_SIZE")
 
 	envelope: Message_Envelope
 	envelope.source = ctx.self_handle
@@ -108,7 +107,7 @@ ctx_transfer_alloc :: #force_inline proc(ctx: ^TinaContext) -> Transfer_Alloc_Re
 	return transfer_handle_make(index, gen)
 }
 
-ctx_transfer_write :: #force_inline proc(
+ctx_transfer_write_raw :: #force_inline proc(
 	ctx: ^TinaContext,
 	handle: Transfer_Handle,
 	data: []u8,
@@ -128,6 +127,19 @@ ctx_transfer_write :: #force_inline proc(
 	target := reactor_buffer_pool_slot_ptr(&shard.transfer_pool, index)
 	mem.copy(target, raw_data(data), len(data))
 	return .None
+}
+
+ctx_transfer_write_typed :: #force_inline proc(
+	ctx: ^TinaContext,
+	handle: Transfer_Handle,
+	message: ^$T,
+) -> Transfer_Write_Error {
+	return ctx_transfer_write_raw(ctx, handle, mem.byte_slice(message, size_of(T)))
+}
+
+ctx_transfer_write :: proc {
+	ctx_transfer_write_raw,
+	ctx_transfer_write_typed,
 }
 
 // Reads data from a transfer buffer slot.
@@ -195,7 +207,7 @@ ctx_listen :: #force_inline proc(ctx: ^TinaContext, fd: FD_Handle, backlog: u32)
 	return reactor_control_listen(&shard.reactor, fd, ctx.self_handle, backlog)
 }
 
-ctx_setsockopt :: #force_inline proc(
+ctx_setsockopt_raw :: #force_inline proc(
 	ctx: ^TinaContext,
 	fd: FD_Handle,
 	level: Socket_Level,
@@ -204,6 +216,43 @@ ctx_setsockopt :: #force_inline proc(
 ) -> Backend_Error {
 	shard := _ctx_extract_shard(ctx)
 	return reactor_control_setsockopt(&shard.reactor, fd, ctx.self_handle, level, option, value)
+}
+
+ctx_setsockopt_bool :: #force_inline proc(
+	ctx: ^TinaContext,
+	fd: FD_Handle,
+	level: Socket_Level,
+	option: Socket_Option,
+	value: bool,
+) -> Backend_Error {
+	return ctx_setsockopt_raw(ctx, fd, level, option, value)
+}
+
+ctx_setsockopt_i32 :: #force_inline proc(
+	ctx: ^TinaContext,
+	fd: FD_Handle,
+	level: Socket_Level,
+	option: Socket_Option,
+	value: i32,
+) -> Backend_Error {
+	return ctx_setsockopt_raw(ctx, fd, level, option, value)
+}
+
+ctx_setsockopt_linger :: #force_inline proc(
+	ctx: ^TinaContext,
+	fd: FD_Handle,
+	level: Socket_Level,
+	option: Socket_Option,
+	value: Socket_Linger,
+) -> Backend_Error {
+	return ctx_setsockopt_raw(ctx, fd, level, option, value)
+}
+
+ctx_setsockopt :: proc {
+	ctx_setsockopt_raw,
+	ctx_setsockopt_bool,
+	ctx_setsockopt_i32,
+	ctx_setsockopt_linger,
 }
 
 ctx_shutdown :: #force_inline proc(

@@ -455,7 +455,7 @@ _interpret_effect :: proc(
 	case Effect_Receive:
 		soa_meta[slot].state = .Waiting
 	case Effect_Crash:
-		ctx_log(ctx, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Voluntary crash"))
+		_shard_log(shard, ctx.self_handle, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Voluntary crash"))
 		_teardown_isolate(shard, type_id, slot, .Crashed)
 	case Effect_Call:
 		shard.next_correlation_id += 1
@@ -506,8 +506,9 @@ _interpret_effect :: proc(
 	case Effect_Reply:
 		if .Is_Call not_in ctx.flags {
 			// if !(.Is_Call in ctx.flags) {
-			ctx_log(
-				ctx,
+			_shard_log(
+				shard,
+				ctx.self_handle,
 				.ERROR,
 				LOG_TAG_ISOLATE_CRASHED,
 				transmute([]u8)string("Reply effect without call context"),

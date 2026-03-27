@@ -53,18 +53,39 @@ emergency_log_flush_signal :: proc "contextless" (shard: ^Shard) {
 		if record_size > (ring.capacity_mask + 1) do break
 		if limit - cursor < record_size do break
 
-		// Write payload bytes to stderr in chunks
-		payload_remaining := int(payload_size)
-		payload_offset := cursor + header_size
-		for payload_remaining > 0 {
-			chunk: [256]u8
-			n := min(payload_remaining, len(chunk))
-			_ring_copy_raw(ring, payload_offset, chunk[:n])
-			_write_stderr(chunk[:n])
-			payload_offset += u64(n)
-			payload_remaining -= n
+		// Extract handle (bytes 8..15, little-endian u64)
+		handle: u64 = 0
+		for i in 0 ..< 8 {
+			handle |= u64(header_bytes[8 + i]) << (u64(i) * 8)
 		}
-		_write_stderr({'\n'})
+		// Extract tag (byte 23 in the header struct — Log_Tag is at offset 21)
+		tag := u64(header_bytes[21])
+
+		buffer: [4096]u8
+		position := 0
+		position = _sig_append_str(buffer[:], position, "[EMERGENCY] Handle: ")
+		position = _sig_append_u64(buffer[:], position, handle)
+		position = _sig_append_str(buffer[:], position, " Tag: ")
+		position = _sig_append_u64(buffer[:], position, tag)
+		position = _sig_append_str(buffer[:], position, " - ")
+
+		// Copy payload into buffer
+		payload_len := int(payload_size)
+		if position + payload_len + 1 > len(buffer) {
+			payload_len = len(buffer) - position - 1
+		}
+		if payload_len > 0 {
+			payload_tmp: [MAX_PAYLOAD_SIZE]u8
+			_ring_copy_raw(ring, cursor + header_size, payload_tmp[:payload_size])
+			for i in 0 ..< payload_len {
+				buffer[position + i] = payload_tmp[i]
+			}
+			position += payload_len
+		}
+		buffer[position] = '\n'
+		position += 1
+
+		_write_stderr(buffer[:position])
 
 		cursor += record_size
 	}
@@ -91,17 +112,37 @@ emergency_log_flush_snapshot :: proc "contextless" (shard: ^Shard) {
 		if record_size > (ring.capacity_mask + 1) do break
 		if limit - cursor < record_size do break
 
-		payload_remaining := int(payload_size)
-		payload_offset := cursor + header_size
-		for payload_remaining > 0 {
-			chunk: [256]u8
-			n := min(payload_remaining, len(chunk))
-			_ring_copy_raw(ring, payload_offset, chunk[:n])
-			_write_stderr(chunk[:n])
-			payload_offset += u64(n)
-			payload_remaining -= n
+		// Extract handle (bytes 8..15, little-endian u64)
+		handle: u64 = 0
+		for i in 0 ..< 8 {
+			handle |= u64(header_bytes[8 + i]) << (u64(i) * 8)
 		}
-		_write_stderr({'\n'})
+		tag := u64(header_bytes[21])
+
+		buffer: [4096]u8
+		position := 0
+		position = _sig_append_str(buffer[:], position, "[EMERGENCY] Handle: ")
+		position = _sig_append_u64(buffer[:], position, handle)
+		position = _sig_append_str(buffer[:], position, " Tag: ")
+		position = _sig_append_u64(buffer[:], position, tag)
+		position = _sig_append_str(buffer[:], position, " - ")
+
+		payload_len := int(payload_size)
+		if position + payload_len + 1 > len(buffer) {
+			payload_len = len(buffer) - position - 1
+		}
+		if payload_len > 0 {
+			payload_tmp: [MAX_PAYLOAD_SIZE]u8
+			_ring_copy_raw(ring, cursor + header_size, payload_tmp[:payload_size])
+			for i in 0 ..< payload_len {
+				buffer[position + i] = payload_tmp[i]
+			}
+			position += payload_len
+		}
+		buffer[position] = '\n'
+		position += 1
+
+		_write_stderr(buffer[:position])
 
 		cursor += record_size
 	}

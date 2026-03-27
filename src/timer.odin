@@ -63,7 +63,7 @@ ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag
 	shard := _ctx_extract_shard(ctx)
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
-		ctx_log(ctx, .ERROR, USER_LOG_TAG_BASE, transmute([]u8)string("Timer pool exhausted"))
+		_shard_log(_ctx_extract_shard(ctx), ctx.self_handle, .ERROR, USER_LOG_TAG_BASE, transmute([]u8)string("Timer pool exhausted"))
 		return
 	}
 	// Convert nanoseconds to ticks
