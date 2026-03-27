@@ -14,7 +14,6 @@ MAX_SHARDS :: 256
 
 // Passed to each Shard thread upon creation.
 Shard_Config :: struct {
-	// Shard_Config :: struct #align(CACHE_LINE_SIZE) {
 	// Massive inline arrays (256 * 8 = 2048 bytes each)
 	outbound_rings:    [MAX_SHARDS]^SPSC_Ring,
 	inbound_rings:     [MAX_SHARDS]^SPSC_Ring,
@@ -241,4 +240,3 @@ tina_start :: proc(spec: ^SystemSpec) {
 	set_process_phase(.Terminated)
 	fmt.printfln("[SYSTEM] Process Terminated Cleanly.")
 }
-
