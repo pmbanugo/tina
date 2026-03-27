@@ -230,23 +230,23 @@ _advance_timers :: proc(
 }
 
 // O(N) scan to find the earliest deadline across the hashed wheel.
-// This is safe and ok ATM because it is ONLY called by the
-// Simulator, and ONLY when the entire system is 100% quiescent (idle).
-// We can consider improving or finding a different solution in future
-@(private = "package")
-timer_wheel_earliest_deadline :: proc(wheel: ^Timer_Wheel) -> u64 {
-	if wheel.resident_count == 0 do return max(u64)
+// Erased from production to prevent accidental hot-path usage.
+when TINA_SIMULATION_MODE {
+	@(private = "package")
+	timer_wheel_earliest_deadline :: proc(wheel: ^Timer_Wheel) -> u64 {
+		if wheel.resident_count == 0 do return max(u64)
 
-	earliest: u64 = max(u64)
-	for spoke in wheel.spokes {
-		current := spoke
-		for current != POOL_NONE_INDEX {
-			entry := &wheel.entries[current]
-			if entry.deliver_at < earliest {
-				earliest = entry.deliver_at
+		earliest: u64 = max(u64)
+		for spoke in wheel.spokes {
+			current := spoke
+			for current != POOL_NONE_INDEX {
+				entry := &wheel.entries[current]
+				if entry.deliver_at < earliest {
+					earliest = entry.deliver_at
+				}
+				current = entry.next
 			}
-			current = entry.next
 		}
+		return earliest
 	}
-	return earliest
 }

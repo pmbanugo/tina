@@ -78,7 +78,7 @@ prng_uint_less_than :: #force_inline proc "contextless" (p: ^Prng, bound: u32) -
 // Evaluates a fractional probability using pure integer math.
 // e.g. Ratio{1, 1000} evaluates to true 0.1% of the time.
 ratio_chance :: #force_inline proc "contextless" (r: Ratio, p: ^Prng) -> bool {
-	if r.denominator == 0 || r.numerator == 0 do return false
+	if r.numerator == 0 do return false
 	if r.numerator >= r.denominator do return true
 
 	val := prng_uint_less_than(p, r.denominator)

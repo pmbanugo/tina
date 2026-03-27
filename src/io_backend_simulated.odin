@@ -158,6 +158,21 @@ when TINA_SIMULATION_MODE {
 
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
+		// Simulate OS async cancel latency/failure.
+		// Hash phase 0x3 keeps this PRNG draw independent of I/O errors/delays.
+		if backend.config.fault_rate.denominator > 0 {
+			h := _sim_op_hash(backend.seed ~ 0x3, backend.tick_count, token)
+			threshold := u32(
+				(u64(backend.config.fault_rate.numerator) * u64(max(u32))) /
+				u64(backend.config.fault_rate.denominator),
+			)
+
+			if u32(h >> 32) < threshold {
+				return .Too_Late // The kernel was too slow; the completion will still fire later!
+			}
+		}
+
+		// Normal successful cancel
 		for i: u16 = 0; i < backend.pending_count; i += 1 {
 			if backend.pending[i].token == token {
 				backend.pending_count -= 1

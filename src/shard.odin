@@ -116,9 +116,11 @@ when TINA_SIMULATION_MODE {
 		network:      ^SimulatedNetwork,
 		fault_config: ^FaultConfig,
 	}
+	Sim_State_Mixin :: struct {
+		sim_state: Simulation_State,
+	}
 } else {
-	// Zero bytes in production!
-	Simulation_State :: struct {}
+	Sim_State_Mixin :: struct {}
 }
 
 Shard :: struct {
@@ -160,9 +162,8 @@ Shard :: struct {
 	trap_environment_inner: OS_Trap_Environment,
 	reactor:                Reactor,
 
-	// Used/Set only during simulation.
 	// Placed at the end to prevent possible cache-line shifting of hot fields.
-	sim_state:              Simulation_State,
+	using _sim_mixin:       Sim_State_Mixin,
 }
 
 // --- Scheduler Loop ---
@@ -656,7 +657,10 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	}
 
 	// Link into Mailbox
-	envelope_destination := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, pool_index)
+	envelope_destination := cast(^Message_Envelope)pool_get_ptr_unchecked(
+		&shard.message_pool,
+		pool_index,
+	)
 	envelope_destination^ = envelope^
 	envelope_destination.next_in_mailbox = POOL_NONE_INDEX
 

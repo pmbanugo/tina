@@ -57,6 +57,14 @@ ShardSpec :: struct {
 	root_group:  Group_Spec, // The root of the supervision tree for this Shard
 }
 
+when TINA_SIMULATION_MODE {
+	Sim_Config_Mixin :: struct {
+		simulation: ^SimulationConfig,
+	}
+} else {
+	Sim_Config_Mixin :: struct {}
+}
+
 SystemSpec :: struct {
 	// Process-Wide Parameters
 	app_version:               u32,
@@ -88,7 +96,9 @@ SystemSpec :: struct {
 	shard_count:               u16,
 	default_ring_size:         u32,
 	ring_overrides:            []Ring_Override,
-	simulation:                ^SimulationConfig, // nil means production
+
+	// Injects `simulation: ^SimulationConfig` ONLY in sim mode.
+	using _sim:                Sim_Config_Mixin,
 }
 
 SystemSpecError :: enum u8 {
@@ -398,22 +408,36 @@ _emit_advisory_warnings :: proc(spec: ^SystemSpec) {
 	}
 }
 
-@(private = "file")
-_validate_simulation :: proc(spec: ^SystemSpec) -> SystemSpecError {
-	if spec.simulation == nil do return .None
+when TINA_SIMULATION_MODE {
+	@(private = "file")
+	_validate_simulation :: proc(spec: ^SystemSpec) -> SystemSpecError {
+		if spec.simulation == nil do return .None
 
-	// ADR Check 20: Uniform timer resolution in simulation
-	// Note: In the current SystemSpec, timer_resolution_ns is process-wide,
-	// but we validate it here anyway to future-proof against per-shard configs.
-	if spec.timer_resolution_ns == 0 {
-		fmt.eprintfln("[FATAL] Simulation requires timer_resolution_ns > 0")
-		return .ValueOutOfBounds
+		// ADR Check 20: Uniform timer resolution in simulation
+		// Note: In the current SystemSpec, timer_resolution_ns is process-wide,
+		// but we validate it here anyway to future-proof against per-shard configs.
+		if spec.timer_resolution_ns == 0 {
+			fmt.eprintfln("[FATAL] Simulation requires timer_resolution_ns > 0")
+			return .ValueOutOfBounds
+		}
+
+		// Fault ratio denominators must be non-zero when the numerator is non-zero.
+		// A user writing Ratio{1, 0} likely intends 100% but would silently get 0%.
+		// Ratio{0, 0} is fine — it means "disabled" (numerator == 0 → always false).
+		f := spec.simulation.faults
+		_bad_ratio :: proc(r: Ratio) -> bool { return r.numerator > 0 && r.denominator == 0 }
+		if _bad_ratio(f.io_error_rate) ||
+		   _bad_ratio(f.network_drop_rate) ||
+		   _bad_ratio(f.network_partition_rate) ||
+		   _bad_ratio(f.network_partition_heal_rate) ||
+		   _bad_ratio(f.isolate_crash_rate) ||
+		   _bad_ratio(f.init_failure_rate) {
+			fmt.eprintfln("[FATAL] Simulation fault ratio has non-zero numerator with zero denominator")
+			return .ValueOutOfBounds
+		}
+
+		return .None
 	}
-
-	// Add any future simulation-specific struct validations here
-	// (e.g. ensuring spec.simulation.seed != 0 if I want to ban 0 seeds)
-
-	return .None
 }
 
 @(private = "file")
