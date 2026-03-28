@@ -72,6 +72,18 @@ grand_arena_alloc_named :: proc "contextless" (
 	return ptr, .None
 }
 
+grand_arena_alloc_slice :: #force_inline proc "contextless" (
+	arena: ^Grand_Arena,
+	name: string,
+	size: int,
+) -> (
+	result: []u8,
+	err: mem.Allocator_Error,
+) {
+	ptr := grand_arena_alloc_named(arena, name, size) or_return
+	return (cast([^]u8)ptr)[:size], .None
+}
+
 // Custom Allocator Wrapper for Grand_Arena
 Grand_Arena_Allocator_Data :: struct {
 	arena:        ^Grand_Arena,
@@ -186,21 +198,27 @@ hydrate_shard :: proc(
 			}
 		}
 		if desc.working_memory_size > 0 {
-			wm_size := desc.slot_count * desc.working_memory_size
-			wm_ptr := grand_arena_alloc_named(arena, fmt.tprintf("Working_Memory_%d", desc.id), wm_size) or_return
-			shard.working_memory[i] = (cast([^]u8)wm_ptr)[:wm_size]
+			shard.working_memory[i] = grand_arena_alloc_slice(
+				arena,
+				fmt.tprintf("Working_Memory_%d", desc.id),
+				desc.slot_count * desc.working_memory_size,
+			) or_return
 		}
 	}
 
 	// 4. Subsystems (raw byte buffers bypass zeroing — OS guarantees zero-filled pages from mmap/VirtualAlloc)
-	msg_pool_size := spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE
-	msg_pool_ptr := grand_arena_alloc_named(arena, "Message_Pool", msg_pool_size) or_return
-	msg_pool_buf := (cast([^]u8)msg_pool_ptr)[:msg_pool_size]
+	msg_pool_buf := grand_arena_alloc_slice(
+		arena,
+		"Message_Pool",
+		spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE,
+	) or_return
 	pool_init(&shard.message_pool, msg_pool_buf, MESSAGE_ENVELOPE_SIZE)
 
-	transfer_size := spec.transfer_slot_count * spec.transfer_slot_size
-	transfer_ptr := grand_arena_alloc_named(arena, "Transfer_Buffer_Pool", transfer_size) or_return
-	transfer_buf := (cast([^]u8)transfer_ptr)[:transfer_size]
+	transfer_buf := grand_arena_alloc_slice(
+		arena,
+		"Transfer_Buffer_Pool",
+		spec.transfer_slot_count * spec.transfer_slot_size,
+	) or_return
 	reactor_buffer_pool_init(
 		&shard.transfer_pool,
 		transfer_buf,
@@ -229,16 +247,21 @@ hydrate_shard :: proc(
 	alloc_data.current_name = "Supervision_Group_Table"
 	shard.supervision_groups = make([]Supervision_Group, spec.supervision_groups_max, alloc)
 
-	scratch_ptr := grand_arena_alloc_named(arena, "Scratch_Arena", spec.scratch_arena_size) or_return
-	shard.scratch_memory = (cast([^]u8)scratch_ptr)[:spec.scratch_arena_size]
+	shard.scratch_memory = grand_arena_alloc_slice(
+		arena,
+		"Scratch_Arena",
+		spec.scratch_arena_size,
+	) or_return
 
 	// 5. Reactor
 	alloc_data.current_name = "FD_Table"
 	fd_buf := make([]FD_Entry, spec.fd_table_slot_count, alloc)
 
-	rx_size := spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size
-	rx_ptr := grand_arena_alloc_named(arena, "Reactor_Buffer_Pool", rx_size) or_return
-	rx_buf := (cast([^]u8)rx_ptr)[:rx_size]
+	rx_buf := grand_arena_alloc_slice(
+		arena,
+		"Reactor_Buffer_Pool",
+		spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size,
+	) or_return
 
 	backend_config := Backend_Config {
 		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
@@ -248,7 +271,7 @@ hydrate_shard :: proc(
 			// Derive a per-shard I/O seed from the simulation master seed and shard ID.
 			// This is a bootstrap seed — the full Prng_Tree wiring replaces it during
 			// simulator setup when the tree is available.
-			io_seed := spec.simulation.seed ~ (u64(shard.id) *~ u64(0x9E3779B97F4A7C15))
+			io_seed := spec.simulation.seed ~ (u64(shard.id) * ~u64(0x9E3779B97F4A7C15))
 			backend_config.sim_config = Simulation_IO_Config {
 				fault_rate        = spec.simulation.faults.io_error_rate,
 				delay_range_ticks = spec.simulation.faults.io_delay_range_ticks,
