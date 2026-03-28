@@ -47,20 +47,16 @@ grand_arena_alloc_named :: proc "contextless" (
 		return nil, .None
 	}
 
-	base_ptr := uintptr(raw_data(arena.base))
-	curr_ptr := base_ptr + uintptr(arena.offset)
-	align_offset := int(
-		(uintptr(alignment) - (curr_ptr % uintptr(alignment))) % uintptr(alignment),
-	)
-
-	actual_offset := arena.offset + align_offset
+	// Bitwise align-forward (works because alignment is a power of 2)
+	actual_offset := (arena.offset + alignment - 1) & ~(alignment - 1)
+	align_offset := actual_offset - arena.offset
 	total_alloc := size + align_offset
 
 	if arena.offset + total_alloc > arena.total_size {
 		return nil, .Out_Of_Memory
 	}
 
-	ptr := rawptr(base_ptr + uintptr(actual_offset))
+	ptr := rawptr(uintptr(raw_data(arena.base)) + uintptr(actual_offset))
 	arena.offset += total_alloc
 
 	// Only record if the tracking array has been allocated
@@ -106,7 +102,13 @@ grand_arena_allocator_proc :: proc(
 		return nil, .Mode_Not_Implemented
 	case .Free, .Free_All:
 		return nil, .None // Silently ignore, arenas free all at once structurally
-	case .Query_Features, .Query_Info, .Alloc_Non_Zeroed, .Resize_Non_Zeroed:
+	case .Alloc_Non_Zeroed:
+		// Arena bumps a pointer; non-zeroed is identical to zeroed allocation
+		actual_alignment := max(alignment, CACHE_LINE_SIZE)
+		ptr, err := grand_arena_alloc_named(data.arena, data.current_name, size, actual_alignment)
+		if err != .None do return nil, err
+		return (cast([^]byte)ptr)[:size], .None
+	case .Query_Features, .Query_Info, .Resize_Non_Zeroed:
 		return nil, .Mode_Not_Implemented
 	}
 	return nil, nil
@@ -184,18 +186,21 @@ hydrate_shard :: proc(
 			}
 		}
 		if desc.working_memory_size > 0 {
-			alloc_data.current_name = fmt.tprintf("Working_Memory_%d", desc.id)
-			shard.working_memory[i] = make([]u8, desc.slot_count * desc.working_memory_size, alloc)
+			wm_size := desc.slot_count * desc.working_memory_size
+			wm_ptr := grand_arena_alloc_named(arena, fmt.tprintf("Working_Memory_%d", desc.id), wm_size) or_return
+			shard.working_memory[i] = (cast([^]u8)wm_ptr)[:wm_size]
 		}
 	}
 
-	// 4. Subsystems
-	alloc_data.current_name = "Message_Pool"
-	msg_pool_buf := make([]u8, spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE, alloc)
+	// 4. Subsystems (raw byte buffers bypass zeroing — OS guarantees zero-filled pages from mmap/VirtualAlloc)
+	msg_pool_size := spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE
+	msg_pool_ptr := grand_arena_alloc_named(arena, "Message_Pool", msg_pool_size) or_return
+	msg_pool_buf := (cast([^]u8)msg_pool_ptr)[:msg_pool_size]
 	pool_init(&shard.message_pool, msg_pool_buf, MESSAGE_ENVELOPE_SIZE)
 
-	alloc_data.current_name = "Transfer_Buffer_Pool"
-	transfer_buf := make([]u8, spec.transfer_slot_count * spec.transfer_slot_size, alloc)
+	transfer_size := spec.transfer_slot_count * spec.transfer_slot_size
+	transfer_ptr := grand_arena_alloc_named(arena, "Transfer_Buffer_Pool", transfer_size) or_return
+	transfer_buf := (cast([^]u8)transfer_ptr)[:transfer_size]
 	reactor_buffer_pool_init(
 		&shard.transfer_pool,
 		transfer_buf,
@@ -224,15 +229,16 @@ hydrate_shard :: proc(
 	alloc_data.current_name = "Supervision_Group_Table"
 	shard.supervision_groups = make([]Supervision_Group, spec.supervision_groups_max, alloc)
 
-	alloc_data.current_name = "Scratch_Arena"
-	shard.scratch_memory = make([]u8, spec.scratch_arena_size, alloc)
+	scratch_ptr := grand_arena_alloc_named(arena, "Scratch_Arena", spec.scratch_arena_size) or_return
+	shard.scratch_memory = (cast([^]u8)scratch_ptr)[:spec.scratch_arena_size]
 
 	// 5. Reactor
 	alloc_data.current_name = "FD_Table"
 	fd_buf := make([]FD_Entry, spec.fd_table_slot_count, alloc)
 
-	alloc_data.current_name = "Reactor_Buffer_Pool"
-	rx_buf := make([]u8, spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size, alloc)
+	rx_size := spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size
+	rx_ptr := grand_arena_alloc_named(arena, "Reactor_Buffer_Pool", rx_size) or_return
+	rx_buf := (cast([^]u8)rx_ptr)[:rx_size]
 
 	backend_config := Backend_Config {
 		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,

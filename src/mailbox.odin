@@ -36,18 +36,21 @@ Message :: struct {
 			buffer_index: u16, // 2 bytes — reactor buffer pool index
 		},
 	},
-	tag:  Message_Tag,
+	tag:        Message_Tag,
 }
 
 // 128 bytes exactly. Fields ordered largest-to-smallest to eliminate implicit padding.
 Message_Envelope :: struct #align (128) {
-	source:          Handle, // 8 bytes
-	destination:     Handle, // 8 bytes
-	correlation:     u32, // 4 bytes
-	next_in_mailbox: u32, // 4 bytes (The queue linkage, overwrites index)
-	tag:             Message_Tag, // 2 bytes
-	flags:           Envelope_Flags, // 2 bytes
-	payload_size:    u16, // 2 bytes
-	_padding:        u16, // 2 bytes (Packs to exactly 32 bytes before payload)
-	payload:         [MAX_PAYLOAD_SIZE]u8, // 96 bytes
+	using _lifecycle: struct #raw_union {
+		source:         Handle, // ALIVE STATE: Sender's Handle
+		next_free_slot: u32, // DEAD STATE: Intrusive pool free-list linkage
+	},
+	destination:      Handle,
+	correlation:      u32,
+	next_in_mailbox:  u32, // (The queue linkage, overwrites index)
+	tag:              Message_Tag,
+	flags:            Envelope_Flags,
+	payload_size:     u16,
+	_padding:         u16,
+	payload:          [MAX_PAYLOAD_SIZE]u8, // 96 bytes
 }

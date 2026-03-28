@@ -1,5 +1,6 @@
 package tina
 
+import "core:math/bits"
 import "core:mem"
 import "core:testing"
 
@@ -33,15 +34,11 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 	p.buffer = backing
 	p.slot_size = slot_size
 
-	// Calculate log2(slot_size) to get the shift amount
-	shift: u32 = 0
-	for temp := slot_size; temp > 1; temp >>= 1 {
-		shift += 1
-	}
-	p.slot_shift = shift
+	// slot_size is structurally guaranteed by assert to be a power of 2
+	p.slot_shift = u32(bits.trailing_zeros(slot_size))
 
 	// Total capacity via bit-shift division
-	p.slot_count = u32(len(backing)) >> shift
+	p.slot_count = u32(len(backing)) >> p.slot_shift
 	p.free_count = 0
 	p.free_head = POOL_NONE_INDEX
 
@@ -51,7 +48,7 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 	// Intrusive push. Slot 0 at the head for sequential cache warmth.
 	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
 		ptr := cast(^Message_Envelope)&p.buffer[u32(i) << p.slot_shift]
-		ptr.next_in_mailbox = p.free_head
+		ptr.next_free_slot = p.free_head
 		p.free_head = u32(i)
 		p.free_count += 1
 	}
@@ -61,7 +58,7 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 _pool_alloc_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool) -> u32 {
 	slot_index := p.free_head
 	ptr := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
-	p.free_head = ptr.next_in_mailbox
+	p.free_head = ptr.next_free_slot
 	p.free_count -= 1
 	mem.zero(ptr, int(p.slot_size))
 	return slot_index
@@ -90,7 +87,7 @@ pool_free :: proc(p: ^Message_Pool, index: u32) {
 // intended use in hot path and guaranteed safety
 pool_free_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool, index: u32) {
 	ptr := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
-	ptr.next_in_mailbox = p.free_head
+	ptr.next_free_slot = p.free_head
 	p.free_head = index
 	p.free_count += 1
 }
