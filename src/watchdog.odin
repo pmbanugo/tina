@@ -20,7 +20,7 @@ Watchdog_Tracker :: struct {
 	window_start:        [MAX_SHARDS]time.Tick,
 }
 
-watchdog_loop :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) {
+watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 	interval_ms := spec.watchdog.check_interval_ms
 	if interval_ms == 0 do interval_ms = 500
 
@@ -40,18 +40,18 @@ watchdog_loop :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) 
 		switch event {
 		case .Shutdown:
 			fmt.printfln("\n[WATCHDOG] Initiating Graceful Shutdown...")
-			_execute_graceful_shutdown(configs, states, spec)
+			_execute_graceful_shutdown(configs, spec)
 			return
 
 		case .Recover_Quarantine:
 			fmt.printfln("[WATCHDOG] Recovering quarantined Shards.")
 			for i in 0 ..< spec.shard_count {
-				state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 				if state == .Quarantined {
 					tracker.stall_count[i] = 0
 					tracker.restart_count[i] = 0
 					tracker.window_start[i] = time.tick_now()
-					sync.atomic_store_explicit(&states[i], u8(Shard_State.Running), .Release)
+					sync.atomic_store_explicit(&configs[i].watchdog_state, u8(Shard_State.Running), .Release)
 					fmt.printfln("[WATCHDOG] Shard %d recovered from quarantine.", i)
 				}
 			}
@@ -62,7 +62,7 @@ watchdog_loop :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) 
 		case .None:
 			// Timeout (EAGAIN) — No OS signal received. Do periodic heartbeat work.
 			for i in 0 ..< spec.shard_count {
-				state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 				if state != .Running do continue
 
 				shard := configs[i].shard_ptr
@@ -87,7 +87,7 @@ watchdog_loop :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) 
 
 					} else if tracker.stall_count[i] >= phase_2_threshold {
 						// Phase 2: Forced Recovery (SIGUSR1)
-						_handle_forced_recovery(shard, &configs[i], &states[i], &tracker, spec)
+						_handle_forced_recovery(shard, &configs[i], &tracker, spec)
 					}
 				} else {
 					// Progress made! Reset tracker.
@@ -103,7 +103,6 @@ watchdog_loop :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) 
 _handle_forced_recovery :: proc(
 	shard: ^Shard,
 	config: ^Shard_Config,
-	state: ^u8,
 	tracker: ^Watchdog_Tracker,
 	spec: ^SystemSpec,
 ) {
@@ -137,7 +136,7 @@ _handle_forced_recovery :: proc(
 			os_force_exit(1)
 		} else {
 			fmt.eprintfln("[QUARANTINE] Shard %d exceeded restart limits. Quarantining.", shard_id)
-			sync.atomic_store_explicit(state, u8(Shard_State.Quarantined), .Release)
+			sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Quarantined), .Release)
 
 			// Broadcast TAG_SHARD_QUARANTINED so peers can fast-fail.
 			// The watchdog thread does this on behalf of the frozen Shard.
@@ -171,12 +170,12 @@ _handle_forced_recovery :: proc(
 }
 
 @(private = "file")
-_execute_graceful_shutdown :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) {
+_execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 	set_process_phase(.Shutting_Down)
 
 	// Notify all running shards via control signal
 	for i in 0 ..< spec.shard_count {
-		state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+		state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 		if state == .Running {
 			shard := configs[i].shard_ptr
 			if shard != nil {
@@ -210,13 +209,13 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, states: []u8, spec: 
 		event := os_poll_watchdog_events(100)
 		if event == .Shutdown {
 			fmt.eprintfln("[FATAL] Second signal received. Executing Phase 3 Force-Kill.")
-			_execute_phase3_force_kill(configs, states, spec)
+			_execute_phase3_force_kill(configs, spec)
 		}
 
 		// Check if all shards have cleanly terminated
 		all_terminated := true
 		for i in 0 ..< spec.shard_count {
-			state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+			state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 			if state != .Terminated && state != .Quarantined {
 				all_terminated = false
 				break
@@ -230,7 +229,7 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, states: []u8, spec: 
 
 		// Heartbeat monitoring during drain (§5.2 — watchdog remains active)
 		for i in 0 ..< spec.shard_count {
-			state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+			state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 			if state != .Shutting_Down do continue
 
 			shard := configs[i].shard_ptr
@@ -260,17 +259,17 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, states: []u8, spec: 
 				"[FATAL] Graceful shutdown timeout expired (%v ms). Executing Phase 3 Force-Kill.",
 				timeout_ms,
 			)
-			_execute_phase3_force_kill(configs, states, spec)
+			_execute_phase3_force_kill(configs, spec)
 		}
 	}
 }
 
 @(private = "file")
-_execute_phase3_force_kill :: proc(configs: []Shard_Config, states: []u8, spec: ^SystemSpec) -> ! {
+_execute_phase3_force_kill :: proc(configs: []Shard_Config, spec: ^SystemSpec) -> ! {
 	// Step 1: Log diagnostic
 	alive := 0
 	for i in 0 ..< spec.shard_count {
-		state := cast(Shard_State)sync.atomic_load_explicit(&states[i], .Relaxed)
+		state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 		if state != .Terminated && state != .Quarantined {
 			alive += 1
 		}

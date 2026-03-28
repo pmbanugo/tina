@@ -13,7 +13,7 @@ import "core:time"
 MAX_SHARDS :: 256
 
 // Passed to each Shard thread upon creation.
-Shard_Config :: struct {
+Shard_Config :: struct #align (CACHE_LINE_SIZE) {
 	// Massive inline arrays (256 * 8 = 2048 bytes each)
 	outbound_rings:    [MAX_SHARDS]^SPSC_Ring,
 	inbound_rings:     [MAX_SHARDS]^SPSC_Ring,
@@ -22,7 +22,7 @@ Shard_Config :: struct {
 	shard_spec:        ^ShardSpec,
 	barrier:           ^sync.Barrier,
 	shard_ptr:         ^Shard,
-	watchdog_state:    ^u8,
+	watchdog_state:    u8,
 	os_thread_handle:  rawptr,
 	total_memory_size: int,
 	shard_id:          u16,
@@ -77,7 +77,6 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 	// 5. Initialize coordination structures
 	shard_configs := make([]Shard_Config, spec.shard_count)
-	watchdog_states := make([]u8, spec.shard_count)
 
 	barrier := new(sync.Barrier)
 	sync.barrier_init(barrier, int(spec.shard_count)) // Main thread does NOT wait on this
@@ -100,7 +99,6 @@ tina_start :: proc(spec: ^SystemSpec) {
 			config.shard_spec = &spec.shard_specs[i]
 		}
 		config.barrier = barrier
-		config.watchdog_state = &watchdog_states[i]
 		config.total_memory_size = shard_memory_size
 		config.shard_id = i
 		config.target_core = u8(i) // Mapped directly to shard_id by default
@@ -195,7 +193,10 @@ tina_start :: proc(spec: ^SystemSpec) {
 	init_loop: for {
 		all_running := true
 		for index in 0 ..< spec.shard_count {
-			state := cast(Shard_State)sync.atomic_load_explicit(&watchdog_states[index], .Relaxed)
+			state := cast(Shard_State)sync.atomic_load_explicit(
+				&shard_configs[index].watchdog_state,
+				.Relaxed,
+			)
 			if state != .Running {
 				all_running = false
 				break
@@ -207,7 +208,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 		if time.stopwatch_duration(stopwatch) > timeout_duration {
 			for index in 0 ..< spec.shard_count {
 				state := cast(Shard_State)sync.atomic_load_explicit(
-					&watchdog_states[index],
+					&shard_configs[index].watchdog_state,
 					.Relaxed,
 				)
 				if state == .Init {
@@ -229,7 +230,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	set_process_phase(.Running)
 
 	// 10. Enter Watchdog loop (sigtimedwait / kqueue)
-	watchdog_loop(shard_configs, watchdog_states, spec)
+	watchdog_loop(shard_configs, spec)
 
 	// Await graceful termination
 	for t in threads {

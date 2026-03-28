@@ -51,7 +51,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	config.shard_ptr = shard
 	g_current_shard_ptr = shard
 	shard.id = config.shard_id
-	shard.shared_state = config.watchdog_state
+	shard.shared_state = &config.watchdog_state
 
 	os_pin_thread_to_core(i32(config.target_core))
 
@@ -133,11 +133,11 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			sync.barrier_wait(config.barrier)
 		}
 
-		sync.atomic_store_explicit(config.watchdog_state, u8(Shard_State.Running), .Release)
+		sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Running), .Release)
 
 		// S16. Enter scheduler loop
 		for {
-			state := cast(Shard_State)sync.atomic_load_explicit(config.watchdog_state, .Relaxed)
+			state := cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed)
 			if state == .Shutting_Down {
 				if !shard_has_live_isolates(shard) {
 					break
@@ -163,5 +163,5 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	}
 
 	log_flush(shard)
-	sync.atomic_store_explicit(config.watchdog_state, u8(Shard_State.Terminated), .Release)
+	sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Terminated), .Release)
 }
