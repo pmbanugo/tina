@@ -108,6 +108,18 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	// 4. Execute init_fn
 	local_spec := spec
 
+	when TINA_SIMULATION_MODE {
+		if ratio_chance(
+			shard.sim_state.fault_config.init_failure_rate,
+			shard.sim_state.crash_prng,
+		) {
+			soa_meta[slot].state = .Unallocated
+			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
+			shard.isolate_free_heads[type_id] = slot
+			return Spawn_Error.init_failed
+		}
+	}
+
 	// Set up the implicit context for the user init_fn
 	context.allocator = mem.arena_allocator(&child_ctx.scratch_arena)
 	context.temp_allocator = mem.arena_allocator(&child_ctx.scratch_arena)

@@ -115,6 +115,7 @@ when TINA_SIMULATION_MODE {
 	Simulation_State :: struct {
 		network:      ^SimulatedNetwork,
 		fault_config: ^FaultConfig,
+		crash_prng:   ^Prng,
 	}
 	Sim_State_Mixin :: struct {
 		sim_state: Simulation_State,
@@ -386,6 +387,17 @@ scheduler_tick :: proc(shard: ^Shard) {
 				// Set up the implicit context for the user handler
 				context.allocator = mem.arena_allocator(&ctx.scratch_arena)
 				context.temp_allocator = mem.arena_allocator(&ctx.scratch_arena)
+
+				when TINA_SIMULATION_MODE {
+					if ratio_chance(shard.sim_state.fault_config.isolate_crash_rate, shard.sim_state.crash_prng) {
+						if shard.current_msg_slot != POOL_NONE_INDEX {
+							pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
+							shard.current_msg_slot = POOL_NONE_INDEX
+						}
+						_teardown_isolate(shard, u16(type_id), slot, .Crashed)
+						continue slot_loop
+					}
+				}
 
 				effect := type_descriptor.handler_fn(ptr, message_pointer, &ctx)
 

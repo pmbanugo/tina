@@ -69,6 +69,7 @@ when TINA_SIMULATION_MODE {
 			shard.id = u16(i)
 			shard.sim_state.network = &sim.network
 			shard.sim_state.fault_config = &spec.simulation.faults
+			shard.sim_state.crash_prng = &sim.prng_tree.shard_crash[i]
 
 			// Use standard memory allocation for the Grand Arena in simulation
 			// (we bypass mmap/guard pages because we are single-threaded and testing logic)
