@@ -74,12 +74,12 @@ when TINA_SIMULATION_MODE {
 		channels:         [][]Channel,
 		partition_matrix: []Shard_Mask,
 		drop_prng:        ^Prng,
-		shard_count:      u16,
+		shard_count:      u8,
 	}
 
 	sim_network_init :: proc(
 		net: ^SimulatedNetwork,
-		shard_count: u16,
+		shard_count: u8,
 		ring_sizes: [][]u32,
 		drop_prng: ^Prng,
 		allocator: mem.Allocator,
@@ -105,7 +105,7 @@ when TINA_SIMULATION_MODE {
 	sim_network_enqueue :: #force_inline proc "contextless" (
 		net: ^SimulatedNetwork,
 		source_shard: ^Shard,
-		target: u16,
+		target: u8,
 		envelope: Message_Envelope,
 		current_tick: u64,
 		fault_config: ^FaultConfig,
@@ -143,7 +143,7 @@ when TINA_SIMULATION_MODE {
 	sim_network_drain :: #force_inline proc "contextless" (
 		net: ^SimulatedNetwork,
 		target_shard: ^Shard,
-		source: u16,
+		source: u8,
 		current_tick: u64,
 	) {
 		target := target_shard.id
@@ -167,7 +167,7 @@ when TINA_SIMULATION_MODE {
 		partition_prng: ^Prng,
 		fault_config:   ^FaultConfig,
 		network:        ^SimulatedNetwork,
-		shard_count:    u16,
+		shard_count:    u8,
 	}
 
 	fault_engine_tick :: proc(engine: ^FaultEngine, round: u64) {
@@ -189,7 +189,7 @@ when TINA_SIMULATION_MODE {
 		part_rate := engine.fault_config.network_partition_rate
 		if part_rate.numerator > 0 {
 			if ratio_chance(part_rate, engine.partition_prng) {
-				victim := u16(prng_uint_less_than(engine.partition_prng, u32(engine.shard_count)))
+				victim := u8(prng_uint_less_than(engine.partition_prng, u32(engine.shard_count)))
 				for other in 0 ..< engine.shard_count {
 					if other != victim {
 						shard_mask_include(&engine.network.partition_matrix[victim], other)

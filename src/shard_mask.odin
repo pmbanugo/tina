@@ -5,15 +5,15 @@ import "core:testing"
 // 256-bit mask for Shard tracking.
 Shard_Mask :: distinct [4]u64
 
-shard_mask_contains :: #force_inline proc "contextless" (m: ^Shard_Mask, id: u16) -> bool {
+shard_mask_contains :: #force_inline proc "contextless" (m: ^Shard_Mask, id: u8) -> bool {
 	return (m[id >> 6] & (u64(1) << (id & 63))) != 0
 }
 
-shard_mask_include :: #force_inline proc "contextless" (m: ^Shard_Mask, id: u16) {
+shard_mask_include :: #force_inline proc "contextless" (m: ^Shard_Mask, id: u8) {
 	m[id >> 6] |= (u64(1) << (id & 63))
 }
 
-shard_mask_exclude :: #force_inline proc "contextless" (m: ^Shard_Mask, id: u16) {
+shard_mask_exclude :: #force_inline proc "contextless" (m: ^Shard_Mask, id: u8) {
 	m[id >> 6] &= ~(u64(1) << (id & 63))
 }
 
@@ -22,7 +22,7 @@ test_shard_mask_empty_state :: proc(t: ^testing.T) {
 	mask: Shard_Mask // Odin zero-initializes this to {0, 0, 0, 0}
 
 	// Prove nothing is contained initially
-	for i in u16(0) ..= 255 {
+	for i in u8(0) ..= 255 {
 		testing.expectf(t, !shard_mask_contains(&mask, i), "Bit %d should be empty initially", i)
 	}
 }
@@ -52,7 +52,7 @@ test_shard_mask_bucket_boundaries :: proc(t: ^testing.T) {
 
 	// These specific numbers test the transition between the four 64-bit buckets
 	// Bucket 0: 0-63, Bucket 1: 64-127, Bucket 2: 128-191, Bucket 3: 192-255
-	boundaries := []u16{0, 63, 64, 127, 128, 191, 192, 255}
+	boundaries := []u8{0, 63, 64, 127, 128, 191, 192, 255}
 
 	for b in boundaries {
 		shard_mask_include(&mask, b)
@@ -82,7 +82,7 @@ test_shard_mask_all_alive_default :: proc(t: ^testing.T) {
 	mask := Shard_Mask{~u64(0), ~u64(0), ~u64(0), ~u64(0)}
 
 	// Prove all 256 bits are alive
-	for i in u16(0) ..= 255 {
+	for i in u8(0) ..= 255 {
 		testing.expectf(
 			t,
 			shard_mask_contains(&mask, i),
@@ -109,7 +109,7 @@ test_shard_mask_max_capacity :: proc(t: ^testing.T) {
 	mask: Shard_Mask
 
 	// Populate the entire bitmask
-	for i in u16(0) ..= 255 {
+	for i in u8(0) ..= 255 {
 		shard_mask_include(&mask, i)
 	}
 

@@ -25,7 +25,7 @@ Shard_Config :: struct #align (CACHE_LINE_SIZE) {
 	watchdog_state:    u8,
 	os_thread_handle:  rawptr,
 	total_memory_size: int,
-	shard_id:          u16,
+	shard_id:          u8,
 	target_core:       u8,
 }
 

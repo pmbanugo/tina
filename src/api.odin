@@ -165,7 +165,10 @@ ctx_send_typed :: #force_inline proc(
 	message: ^$T,
 ) -> Send_Result where size_of(T) <=
 	MAX_PAYLOAD_SIZE {
-	#assert(tag >= USER_MESSAGE_TAG_BASE, "ctx_send: Cannot forge system messages. Tag must be >= 0x0040.")
+	#assert(
+		tag >= USER_MESSAGE_TAG_BASE,
+		"ctx_send: Cannot forge system messages. Tag must be >= 0x0040.",
+	)
 	return ctx_send_raw(ctx, to, tag, mem.byte_slice(message, size_of(T)))
 }
 
@@ -181,9 +184,12 @@ make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8
 }
 
 // Consistent key-based partitioning utility
-// NOTE: `shard_count` is u16 because the maximum number of shards is 256,
-// which overflows a u8. The result of (key % 256) is guaranteed to be in the
-// range [0, 255], so it safely truncates back to a u8 without data loss.
-key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u16) -> u8 {
+// Uses simple modulo to map a logical key (e.g., session_id, user_id)
+// to a Shard ID.
+// Use this when you need to decide which Shard should spawn a new Isolate
+// or handle a specific piece of data.
+// If your keys are not uniformly distributed (e.g., memory addresses),
+// perhaps hash them before passing them here.
+key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u8) -> u8 {
 	return u8(key % u64(shard_count))
 }

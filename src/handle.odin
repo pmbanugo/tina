@@ -7,7 +7,7 @@ Handle :: distinct u64
 HANDLE_NONE :: Handle(0)
 
 make_handle :: #force_inline proc "contextless" (
-	shard_id: u16,
+	shard_id: u8,
 	type_id: u16,
 	slot: u32,
 	generation: u32,
@@ -17,15 +17,15 @@ make_handle :: #force_inline proc "contextless" (
 	// slot_idx: 20 bits (47-28)
 	// generation: 28 bits (27-0)
 	return Handle(
-		(u64(shard_id & 0xFF) << 56) |
+		(u64(shard_id) << 56) |
 		(u64(type_id & 0xFF) << 48) |
 		(u64(slot & 0xFFFFF) << 28) |
 		(u64(generation & 0x0FFFFFFF)),
 	)
 }
 
-extract_shard_id :: #force_inline proc "contextless" (h: Handle) -> u16 {
-	return u16((u64(h) >> 56) & 0xFF)
+extract_shard_id :: #force_inline proc "contextless" (h: Handle) -> u8 {
+	return u8((u64(h) >> 56) & 0xFF)
 }
 
 extract_type_id :: #force_inline proc "contextless" (h: Handle) -> u16 {

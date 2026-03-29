@@ -4,7 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:testing"
 
-MAX_SHARD_COUNT :: 255 // 8-bit shard_id, minus 0 (reserved/conceptual e.g. watchdog)
+MAX_SHARD_COUNT :: 255 // Max count fits in u8. Sacrifices the 256th slot to avoid u16 counts.
 MIN_RING_SIZE :: 16
 MAX_TYPE_DESCRIPTOR_ID :: 254 // 8-bit type_id, 255 (0xFF) is reserved for Supervision Groups
 CACHE_LINE_SIZE :: 128
@@ -52,7 +52,7 @@ Dio_Config :: struct {
 }
 
 ShardSpec :: struct {
-	shard_id:    u16, // TODO: I can turn this later to distinct type
+	shard_id:    u8, // TODO: I can turn this later to distinct type
 	target_core: i32, // -1 means no specific core (or fallback to shard_id)
 	root_group:  Group_Spec, // The root of the supervision tree for this Shard
 }
@@ -93,7 +93,7 @@ SystemSpec :: struct {
 	log_ring_size:             int,
 	supervision_groups_max:    int,
 	scratch_arena_size:        int,
-	shard_count:               u16,
+	shard_count:               u8,
 	default_ring_size:         u32,
 	ring_overrides:            []Ring_Override,
 
@@ -676,15 +676,15 @@ Ring_Override_Type :: enum u8 {
 
 Ring_Override :: struct {
 	type:        Ring_Override_Type,
-	source:      u16, // Valid for .Pair and .All_Outbound_From
-	destination: u16, // Valid for .Pair and .All_Inbound_To
+	source:      u8, // Valid for .Pair and .All_Outbound_From
+	destination: u8, // Valid for .Pair and .All_Inbound_To
 	size:        u32, // Must be power of 2 in production, but used as capacity here
 }
 
 // Painter's Algorithm: Computes a 2D matrix of ring capacities.
 // Returns a slice of slices: sizes[source_shard][target_shard]
 compute_ring_sizes :: proc(
-	shard_count: u16,
+	shard_count: u8,
 	default_size: u32,
 	overrides: []Ring_Override,
 	allocator: mem.Allocator,
@@ -710,13 +710,13 @@ compute_ring_sizes :: proc(
 		case .All_Inbound_To:
 			if o.destination < shard_count {
 				for i in 0 ..< shard_count {
-					if u16(i) != o.destination {sizes[i][o.destination] = o.size}
+					if i != o.destination {sizes[i][o.destination] = o.size}
 				}
 			}
 		case .All_Outbound_From:
 			if o.source < shard_count {
 				for j in 0 ..< shard_count {
-					if o.source != u16(j) {sizes[o.source][j] = o.size}
+					if o.source != j {sizes[o.source][j] = o.size}
 				}
 			}
 		}

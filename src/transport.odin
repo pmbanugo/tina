@@ -12,7 +12,7 @@ transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now:
 				available := spsc_ring_available_to_read(ring)
 				for i in 0 ..< available {
 					envelope := spsc_ring_get_read_ptr(ring, i)
-					_process_inbound_envelope(shard, u16(source_shard), envelope)
+					_process_inbound_envelope(shard, u8(source_shard), envelope)
 				}
 
 				if available > 0 {
@@ -22,7 +22,7 @@ transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now:
 		}
 	} else {
 		if shard.sim_state.network != nil {
-			for source in u16(0) ..< shard.sim_state.network.shard_count {
+			for source in u8(0) ..< shard.sim_state.network.shard_count {
 				if source != shard.id {
 					sim_network_drain(shard.sim_state.network, shard, source, now)
 				}
@@ -47,7 +47,7 @@ transport_flush_outbound :: #force_inline proc "contextless" (shard: ^Shard) {
 @(private = "package")
 transport_route_envelope :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	dest_shard: u16,
+	dest_shard: u8,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
 	when !TINA_SIMULATION_MODE {
@@ -86,7 +86,7 @@ transport_route_envelope :: #force_inline proc "contextless" (
 transport_broadcast_envelope :: #force_inline proc "contextless" (shard: ^Shard, env: ^Message_Envelope) {
 	when TINA_SIMULATION_MODE {
 		if shard.sim_state.network != nil {
-			for target_shard in u16(0) ..< shard.sim_state.network.shard_count {
+			for target_shard in u8(0) ..< shard.sim_state.network.shard_count {
 				if target_shard != shard.id {
 					_ = sim_network_enqueue(
 						shard.sim_state.network,

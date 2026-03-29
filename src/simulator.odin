@@ -66,7 +66,7 @@ when TINA_SIMULATION_MODE {
 
 		for i in 0 ..< spec.shard_count {
 			shard := &sim.shards[i]
-			shard.id = u16(i)
+			shard.id = u8(i)
 			shard.sim_state.network = &sim.network
 			shard.sim_state.fault_config = &spec.simulation.faults
 			shard.sim_state.crash_prng = &sim.prng_tree.shard_crash[i]
@@ -125,8 +125,8 @@ when TINA_SIMULATION_MODE {
 		ticks_max := sim.spec.simulation.ticks_max
 
 		// Pre-allocate array for shuffled shard execution order
-		order := make([]u16, sim.spec.shard_count, context.temp_allocator)
-		for i in 0 ..< sim.spec.shard_count do order[i] = u16(i)
+		order := make([]u8, sim.spec.shard_count, context.temp_allocator)
+		for i in 0 ..< sim.spec.shard_count do order[i] = u8(i)
 
 		for round < ticks_max {
 			// 1. Advance simulated time globally & Fast-Forward Logic
