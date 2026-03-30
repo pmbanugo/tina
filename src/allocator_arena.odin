@@ -107,9 +107,17 @@ grand_arena_allocator_proc :: proc(
 		// Enforce cache-line alignment to ensure clean hardware prefetching and
 		// prevent cache-line splits on dense array iteration.
 		// over-padded: The 48 bytes wasted on dispatch_cursors/isolate_free_heads
-		// is a harmless casualty of a blunt, safe default. Switching to e.g. Bimodal Alignment
+		// is a harmless casualty of a blunt, safe default.
+		//
+		// Switching to e.g. Bimodal Alignment,
 		// I risk misaligning the start of a massive SOA array.
 		// Optimise post-V1 if profiling shows L1d eviction pressure.
+		//
+		// Bimodal Alignment (rough idea):
+		// massive chunks of memory (Message Pools, Reactor Buffers, Typed Arenas)
+		// should be cache-line aligned for prefetching and SIMD efficiency.
+		// But tiny metadata slices (Slice Headers, dispatch_cursors, isolate_free_heads)
+		// should be tightly packed.
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
 		ptr, err := grand_arena_alloc_named(data.arena, data.current_name, size, actual_alignment)
 		if err != .None do return nil, err
