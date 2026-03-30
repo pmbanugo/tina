@@ -16,6 +16,7 @@ TINA_DEBUG_ASSERTS :: #config(TINA_ASSERTS, false)
 Init_Fn :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
 
+// Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 TypeDescriptor :: struct {
 	id:                      u8,
 	slot_count:              int,
@@ -51,6 +52,7 @@ Dio_Config :: struct {
 	completion_ring_size: u32,
 }
 
+// Defines the configuration, resource pools, and root supervision tree for a single Shard (OS thread).
 ShardSpec :: struct {
 	shard_id:    u8, // TODO: I can turn this later to distinct type
 	target_core: i32, // -1 means no specific core (or fallback to shard_id)
@@ -65,6 +67,8 @@ when TINA_SIMULATION_MODE {
 	Sim_Config_Mixin :: struct {}
 }
 
+// The root, compile-time boot specification for the entire Tina process.
+// All configuration parameters are immutable after initialization.
 SystemSpec :: struct {
 	// Process-Wide Parameters
 	app_version:               u32,

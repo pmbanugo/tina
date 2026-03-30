@@ -57,7 +57,8 @@ log_init :: proc(ring: ^Log_Ring_Buffer, backing: []u8) {
 	ring.write_cursor = 0
 }
 
-// Public Logging API with raw-byte
+// Writes a diagnostic log to the Shard's environment.
+// The message is raw-byte
 ctx_log_raw :: #force_inline proc "contextless" (
 	ctx: ^TinaContext,
 	level: Log_Level,
@@ -71,7 +72,8 @@ ctx_log_raw :: #force_inline proc "contextless" (
 	_shard_log(_ctx_extract_shard(ctx), ctx.self_handle, level, tag, payload)
 }
 
-// Public Logging API with typed wrapper
+// Writes a diagnostic log to the Shard's environment.
+// The message is typed
 ctx_log_typed :: #force_inline proc "contextless" (
 	ctx: ^TinaContext,
 	level: Log_Level,

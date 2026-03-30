@@ -10,7 +10,10 @@ ctx_send_raw :: #force_inline proc(
 	$tag: Message_Tag,
 	payload: []u8,
 ) -> Send_Result {
-	#assert(tag >= USER_MESSAGE_TAG_BASE, "ctx_send: Cannot forge system messages. Tag must be >= 0x0040.")
+	#assert(
+		tag >= USER_MESSAGE_TAG_BASE,
+		"ctx_send: Cannot forge system messages. Tag must be >= 0x0040.",
+	)
 	shard := _ctx_extract_shard(ctx)
 
 	envelope: Message_Envelope
@@ -41,6 +44,7 @@ ctx_transfer_send :: #force_inline proc(
 	return _route_envelope_system(shard, to, &envelope)
 }
 
+// Spawns a new Isolate and attaches it to the specified supervision group.
 @(require_results)
 ctx_spawn :: #force_inline proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
 	shard := _ctx_extract_shard(ctx)
@@ -142,10 +146,8 @@ ctx_transfer_write :: proc {
 	ctx_transfer_write_typed,
 }
 
-// Reads data from a transfer buffer slot.
-// NOTE: To prevent buffer leaks, this must only be called ONCE per handler invocation.
-// If you need the data across multiple ticks or operations, you must copy it
-// into your Isolate's working arena.
+// Reads large payload data from a transfer buffer slot.
+// MUST only be called ONCE per handler invocation to prevent buffer leaks.
 @(require_results)
 ctx_transfer_read :: #force_inline proc(
 	ctx: ^TinaContext,

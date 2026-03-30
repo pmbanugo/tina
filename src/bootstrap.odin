@@ -31,7 +31,8 @@ Shard_Config :: struct #align (CACHE_LINE_SIZE) {
 
 // #assert(size_of(Shard_Config) == 4160, "Shard_Config alignment/size drifted.")
 
-// The single entry point for the Tina process.
+// The single entry point to start the Tina process.
+// Validates the boot specification, allocates the Grand Arenas, and spawns Shard threads.
 tina_start :: proc(spec: ^SystemSpec) {
 	// ========================================================================
 	// PHASE: BOOTSTRAP (single-threaded)

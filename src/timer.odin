@@ -59,6 +59,8 @@ timer_wheel_reset :: proc(wheel: ^Timer_Wheel, current_tick: u64) {
 	}
 }
 
+// Registers a timer that will enqueue a message with the specified tag back to this Isolate.
+// The duration is specified in nanoseconds.
 ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag) {
 	shard := _ctx_extract_shard(ctx)
 	wheel := &shard.timer_wheel

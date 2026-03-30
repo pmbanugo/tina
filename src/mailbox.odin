@@ -21,7 +21,8 @@ Envelope_Flag :: enum {
 
 Envelope_Flags :: bit_set[Envelope_Flag;u16]
 
-// Structured to cleanly separate User payloads from I/O completions
+// The tagged union representing an incoming event to an Isolate.
+// Structurally separates user-defined message payloads from framework I/O completions.
 Message :: struct {
 	using body: struct #raw_union {
 		user: struct {

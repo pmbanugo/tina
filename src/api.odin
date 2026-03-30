@@ -44,6 +44,8 @@ Effect_Io :: struct {
 	operation: IoOp,
 }
 
+// The state transition returned by an Isolate handler.
+// It tells the scheduler exactly what to do with the Isolate next (e.g., park, crash, wait for I/O).
 Effect :: union {
 	Effect_Done,
 	Effect_Crash,
@@ -100,6 +102,7 @@ Transfer_Read_Result :: union {
 	Transfer_Read_Error,
 }
 
+// Configuration passed to `ctx_spawn` to dynamically create a new Isolate at runtime.
 Spawn_Spec :: struct {
 	args_payload: [MAX_INIT_ARGS_SIZE]u8,
 	group_id:     Supervision_Group_Id,
@@ -107,7 +110,7 @@ Spawn_Spec :: struct {
 	restart_type: Restart_Type,
 	args_size:    u8,
 	handoff_mode: Handoff_Mode,
-	_padding:     [2]u8, // 2 bytes padding -> makes 72 to this point
+	_padding:     [2]u8,
 	handoff_fd:   FD_Handle,
 }
 
@@ -117,6 +120,8 @@ Context_Flag :: enum u8 {
 }
 Context_Flags :: distinct bit_set[Context_Flag;u8]
 
+// The primary API gateway for Isolates during execution.
+// Passed into `init_fn` and `handler_fn` to provide access to messaging, spawning, and memory.
 TinaContext :: struct {
 	// Opaque pointer to internal Shard state to prevents user mutation.
 	_shard:                 rawptr,
@@ -145,18 +150,22 @@ _ctx_extract_shard :: #force_inline proc "contextless" (ctx: ^TinaContext) -> ^S
 }
 
 // ============================================================================
-// Ergonomic Helpers (§7.2 §8)
+// Ergonomic Helpers
 // ============================================================================
 
+// Helper to safely cast a typed struct pointer into a byte slice for sending.
 bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 	return mem.byte_slice(ptr, size_of(T))
 }
 
+// Helper to safely cast an incoming message payload byte slice into a typed pointer.
 payload_as :: #force_inline proc($T: typeid, payload: []u8) -> ^T {
 	assert(size_of(T) <= len(payload), "Payload slice too small for type")
 	return cast(^T)raw_data(payload)
 }
 
+// Sends a typed message to a target (Isolate), identified by its Handle.
+// Returns a Send_Result immediately to provide backpressure feedback (e.g., mailbox full, dead handle).
 @(require_results)
 ctx_send_typed :: #force_inline proc(
 	ctx: ^TinaContext,
