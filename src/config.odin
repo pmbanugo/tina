@@ -483,8 +483,8 @@ compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	// 3 per type (Typed Arena, SOA Metadata, Working Memory)
 	// + 10 static framework regions
 	// + 1 for the SubRegion tracker array itself
-	// + 1 for the Slice Headers
-	return (types_count * 3) + 10 + 1 + 1
+	// + 2 for the Slice Headers and Dispatch Cursors tracking
+	return (types_count * 3) + 10 + 1 + 2
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
 	// 2. Message Pool
@@ -562,7 +562,8 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 		types_count *
 		(size_of(TypeDescriptor) + size_of([]u8) * 2 + size_of(#soa[]Isolate_Metadata))
 	total += slice_headers_overhead
-	total += types_count * size_of(u32)
+	// Account for the bytes of BOTH u32 arrays: isolate_free_heads AND dispatch_cursors
+	total += types_count * size_of(u32) * 2
 
 	// Find the largest supervision tree across all shards and budget for its arrays
 	tree_memory_max := 0

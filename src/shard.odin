@@ -130,6 +130,7 @@ Shard :: struct {
 	inbound_rings:          []^SPSC_Ring,
 	type_descriptors:       []TypeDescriptor,
 	isolate_free_heads:     []u32, // free list heads per Isolate Type
+	dispatch_cursors:       []u32, // Resumption index for budgeted dispatch
 	isolate_memory:         [][]u8,
 	working_memory:         [][]u8, // Base slices for working memory
 	scratch_memory:         []u8, // Base slice for scratch arena
@@ -274,7 +275,10 @@ scheduler_tick :: proc(shard: ^Shard) {
 		dispatched_count: u32 = 0
 
 		shard.current_type_id = u16(type_id)
-		start_slot: u32 = 0
+
+		// Capture original cursor before trap to calculate distance if a crash occurs
+		original_cursor := shard.dispatch_cursors[type_id]
+		slots_to_check := slot_count
 
 		if os_trap_save(&shard.trap_environment_inner) != 0 {
 			when !TINA_SIMULATION_MODE {
@@ -289,10 +293,37 @@ scheduler_tick :: proc(shard: ^Shard) {
 				shard.current_msg_slot = POOL_NONE_INDEX
 			}
 			_teardown_isolate(shard, shard.current_type_id, shard.current_slot_index, .Crashed)
-			start_slot = shard.current_slot_index + 1
+
+			// TRAP RECOVERY: Advance the cursor past the crashed isolate
+			next_cursor := shard.current_slot_index + 1
+			if next_cursor >= slot_count do next_cursor = 0
+			shard.dispatch_cursors[type_id] = next_cursor
+
+			// siglongjmp wipes the loop counter. We must calculate
+			// how many slots was evaluated before the crash so it doesn't wrap around
+			// and double-evaluate slots in the same tick.
+			checked: u32 = 0
+			if shard.current_slot_index >= original_cursor {
+				checked = shard.current_slot_index - original_cursor
+			} else {
+				checked = shard.current_slot_index + u32(slot_count) - original_cursor
+			}
+			checked += 1 // Include the slot that just crashed
+
+			if checked >= slot_count {
+				slots_to_check = 0 // We checked the whole arena
+			} else {
+				slots_to_check = slot_count - checked
+			}
 		}
 
-		slot_loop: for slot in start_slot ..< slot_count {
+		cursor := shard.dispatch_cursors[type_id]
+
+		// Loop runs 'slots_to_check' times, calculating physical slot with fast wrap-around
+		slot_loop: for i in 0 ..< slots_to_check {
+			slot := cursor + i
+			if slot >= slot_count do slot -= slot_count
+
 			state := states[slot]
 
 			// FAST-PATH REJECT: If empty, skip immediately.
@@ -306,7 +337,11 @@ scheduler_tick :: proc(shard: ^Shard) {
 				(.Shutdown_Pending in flags[slot])
 
 			if has_work {
-				if dispatched_count >= dispatch_budget do break slot_loop // Type budget exhausted, yield
+				if dispatched_count >= dispatch_budget {
+					// Budget exhausted: save the CURRENT slot to resume exactly here on the next tick
+					shard.dispatch_cursors[type_id] = slot
+					break slot_loop
+				}
 				dispatched_count += 1
 
 				shard.current_slot_index = slot
@@ -389,7 +424,10 @@ scheduler_tick :: proc(shard: ^Shard) {
 				context.temp_allocator = mem.arena_allocator(&ctx.scratch_arena)
 
 				when TINA_SIMULATION_MODE {
-					if ratio_chance(shard.sim_state.fault_config.isolate_crash_rate, shard.sim_state.crash_prng) {
+					if ratio_chance(
+						shard.sim_state.fault_config.isolate_crash_rate,
+						shard.sim_state.crash_prng,
+					) {
 						if shard.current_msg_slot != POOL_NONE_INDEX {
 							pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
 							shard.current_msg_slot = POOL_NONE_INDEX
@@ -429,6 +467,11 @@ scheduler_tick :: proc(shard: ^Shard) {
 				_interpret_effect(shard, u16(type_id), slot, effect, &ctx)
 			}
 		}
+
+		// If we drained all work without exhausting the budget, reset the cursor
+		if dispatched_count < dispatch_budget {
+			shard.dispatch_cursors[type_id] = 0
+		}
 	}
 
 	// ========================================================================
@@ -467,7 +510,13 @@ _interpret_effect :: proc(
 	case Effect_Receive:
 		soa_meta[slot].state = .Waiting
 	case Effect_Crash:
-		_shard_log(shard, ctx.self_handle, .ERROR, LOG_TAG_ISOLATE_CRASHED, transmute([]u8)string("Voluntary crash"))
+		_shard_log(
+			shard,
+			ctx.self_handle,
+			.ERROR,
+			LOG_TAG_ISOLATE_CRASHED,
+			transmute([]u8)string("Voluntary crash"),
+		)
 		_teardown_isolate(shard, type_id, slot, .Crashed)
 	case Effect_Call:
 		shard.next_correlation_id += 1
@@ -769,6 +818,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
 		// Reset the free head for this type
 		shard.isolate_free_heads[type_id] = POOL_NONE_INDEX
+		shard.dispatch_cursors[type_id] = 0
 
 		for slot := int(type_desc.slot_count) - 1; slot >= 0; slot -= 1 {
 			new_generation := (soa_meta[slot].generation + 1) & 0x0FFFFFFF

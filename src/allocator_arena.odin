@@ -104,7 +104,12 @@ grand_arena_allocator_proc :: proc(
 	data := cast(^Grand_Arena_Allocator_Data)allocator_data
 	switch mode {
 	case .Alloc:
-		// Enforce cache-line alignment to prevent false sharing between sub-regions
+		// Enforce cache-line alignment to ensure clean hardware prefetching and
+		// prevent cache-line splits on dense array iteration.
+		// over-padded: The 48 bytes wasted on dispatch_cursors/isolate_free_heads
+		// is a harmless casualty of a blunt, safe default. Switching to e.g. Bimodal Alignment
+		// I risk misaligning the start of a massive SOA array.
+		// Optimise post-V1 if profiling shows L1d eviction pressure.
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
 		ptr, err := grand_arena_alloc_named(data.arena, data.current_name, size, actual_alignment)
 		if err != .None do return nil, err
@@ -167,6 +172,9 @@ hydrate_shard :: proc(
 	shard.working_memory = make([][]u8, types_count, alloc)
 	shard.metadata = make([]#soa[]Isolate_Metadata, types_count, alloc)
 	shard.isolate_free_heads = make([]u32, types_count, alloc)
+
+	alloc_data.current_name = "Dispatch_Cursors"
+	shard.dispatch_cursors = make([]u32, types_count, alloc)
 
 	// 3. Allocate Type-Specific Data (Inner slices)
 	for t, i in spec.types {
