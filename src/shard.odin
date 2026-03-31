@@ -10,6 +10,24 @@ DISPATCH_QUOTA_PER_WEIGHT :: 256 // Baseline message processing limit per tick, 
 
 RECOVERY_TIER_3 :: 1
 RECOVERY_WATCHDOG :: 2
+RECOVERY_ROOT_ESCALATE :: 3
+RECOVERY_SOFT_KILL :: 4
+
+@(private = "package")
+recovery_reason_label :: proc "contextless" (reason: i32) -> string {
+	@(static, rodata)
+	labels := [5]string {
+		"None",
+		"Signal (SIGSEGV/BUS/FPE)",
+		"Watchdog (SIGUSR1)",
+		"Root Escalate",
+		"Soft Kill",
+	}
+	if reason >= 0 && reason < i32(len(labels)) {
+		return labels[reason]
+	}
+	return "Unknown"
+}
 
 @(thread_local)
 g_current_shard_pointer: ^Shard
@@ -224,7 +242,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				}
 			}
 		case .Kill:
-			os_trap_restore(&shard.trap_environment_outer, 4)
+			os_trap_restore(&shard.trap_environment_outer, RECOVERY_SOFT_KILL)
 		}
 	}
 

@@ -89,9 +89,9 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		if recovery_reason != 0 {
 			// CRASH PATH: Caught SIGSEGV/BUS/FPE (1), Watchdog SIGUSR1 (2), Root Escalate (3), Soft Kill (4)
 			fmt.eprintfln(
-				"[RECOVERY] Shard %d performing Level 2 recovery (Reason: %d)",
+				"[RECOVERY] Shard %d performing Level 2 recovery (Reason: %s)",
 				shard.id,
-				recovery_reason,
+				recovery_reason_label(recovery_reason),
 			)
 
 			when !TINA_SIMULATION_MODE {

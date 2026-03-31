@@ -67,7 +67,7 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 
 	if group.parent_id == SUPERVISION_GROUP_ID_NONE {
 		// Root group failure. Jump to the outer recovery loop.
-		os_trap_restore(&shard.trap_environment_outer, 3)
+		os_trap_restore(&shard.trap_environment_outer, RECOVERY_ROOT_ESCALATE)
 	} else {
 		group_handle := make_handle(
 			shard.id,
