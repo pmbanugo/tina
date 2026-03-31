@@ -164,6 +164,11 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			poll_interval := time.Duration(poll_ms) * time.Millisecond
 
 			for cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed) == .Quarantined {
+				phase := get_process_phase()
+				if phase == .Shutting_Down || phase == .Terminated {
+					sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Terminated), .Release)
+					return // Safely exit thread to unblock watchdog join
+				}
 				when !TINA_SIMULATION_MODE {
 					time.sleep(poll_interval)
 				}

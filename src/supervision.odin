@@ -188,8 +188,8 @@ _on_child_exit :: proc(
 	group := &shard.supervision_groups[u16(group_id)]
 
 	if exit_kind == .Shutdown {
-		index, found := _find_child_index(group, child_handle)
-		if found do _remove_child_at(group, index)
+		// Do not physically remove/shift the array. 
+		// _apply_strategy is iterating over it and will overwrite it.
 		return
 	}
 

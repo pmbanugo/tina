@@ -234,17 +234,19 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
 	soa_meta[slot_index].inbox_count = 0
 
-	// Step 4: Invoke supervision subsystem
+	// Extract supervision metadata BEFORE freeing the slot
 	group_id := soa_meta[slot_index].group_id
-	if group_id != SUPERVISION_GROUP_ID_NONE {
-		old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
-		_on_child_exit(shard, group_id, old_handle, exit_kind)
-	}
+	old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
 
-	// Step 5: Free arena slot & push back to free list
+	// Step 4: Free arena slot & push back to free list
 	soa_meta[slot_index].state = .Unallocated
 	soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
 	shard.isolate_free_heads[type_id] = slot_index
+
+	// Step 5: Invoke supervision subsystem (can now safely execute inline restarts)
+	if group_id != SUPERVISION_GROUP_ID_NONE {
+		_on_child_exit(shard, group_id, old_handle, exit_kind)
+	}
 }
 
 @(private = "package")

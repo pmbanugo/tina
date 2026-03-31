@@ -806,6 +806,18 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		if shard.transfer_generations[i] == 0 do shard.transfer_generations[i] = 1
 	}
 
+	// Sweep unsubmitted I/O buffers from the reactor's pending queue.
+	// If a Level 2 fault interrupted the thread during Step 3 (Dispatch),
+	// these buffers were allocated but never reached the OS kernel.
+	for i in 0 ..< shard.reactor.pending_count {
+		sub := &shard.reactor.pending_submissions[i]
+		buffer_index := submission_token_buffer_index(sub.token)
+		if buffer_index != BUFFER_INDEX_NONE {
+			reactor_buffer_pool_free(&shard.reactor.buffer_pool, buffer_index)
+		}
+	}
+	shard.reactor.pending_count = 0
+
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]
 
@@ -815,10 +827,6 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			fd_table_free(&shard.reactor.fd_table, fd_handle)
 		}
 	}
-	// Explicitly destroy the OS-level I/O backend (io_uring/kqueue).
-	// Because siglongjmp bypasses defer, we must do this manually before re-hydrating!
-	reactor_deinit(&shard.reactor)
-
 	for type_desc in shard.type_descriptors {
 		type_id := type_desc.id
 		soa_meta := shard.metadata[type_id]
@@ -828,6 +836,13 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		shard.dispatch_cursors[type_id] = 0
 
 		for slot := int(type_desc.slot_count) - 1; slot >= 0; slot -= 1 {
+			// SWEEP: Reclaim completed but undispatched I/O buffers before wiping metadata
+			if soa_meta[slot].io_completion_tag != IO_TAG_NONE {
+				if soa_meta[slot].io_buffer_index != BUFFER_INDEX_NONE {
+					reactor_buffer_pool_free(&shard.reactor.buffer_pool, soa_meta[slot].io_buffer_index)
+				}
+			}
+
 			new_generation := (soa_meta[slot].generation + 1) & 0x0FFFFFFF
 			if new_generation == 0 do new_generation = 1
 

@@ -23,7 +23,7 @@ LOG_TAG_IO_EXHAUSTION: Log_Tag : 0x08
 USER_LOG_TAG_BASE: Log_Tag : 0x40
 
 POSIX_PIPE_BUF_SIZE :: 4096 // Guaranteed atomic write size on POSIX
-MAX_FORMATTED_LOG_LINE :: 256 // Max size for the string builder output
+MAX_FORMATTED_LOG_LINE :: 512 // Max size for the formatted log line output
 
 Log_Record_Header :: struct {
 	timestamp:      u64,
@@ -216,9 +216,8 @@ log_flush :: proc(shard: ^Shard) {
 		)
 
 		line_buffer: [MAX_FORMATTED_LOG_LINE]u8
-		string_builder := strings.builder_from_bytes(line_buffer[:])
-		fmt.sbprintf(
-			&string_builder,
+		line_str := fmt.bprintf(
+			line_buffer[:],
 			"[%v] %v[Tag:%X] Handle:%X - %s\n",
 			header.timestamp,
 			header.level,
@@ -226,17 +225,18 @@ log_flush :: proc(shard: ^Shard) {
 			u64(header.isolate_handle),
 			string(payload_buf[:header.payload_size]),
 		)
+		line_bytes := transmute([]u8)line_str
 
-		if temp_size + len(string_builder.buf) > POSIX_PIPE_BUF_SIZE {
+		if temp_size + len(line_bytes) > POSIX_PIPE_BUF_SIZE {
 			written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])
 			if write_error != nil || written_size < temp_size {
-				break
+				break // Retain data for next tick (Capacitor behavior)
 			}
 			ring.read_cursor = commit_cursor
 			temp_size = 0
 		}
-		copy(temp_buffer[temp_size:], string_builder.buf[:])
-		temp_size += len(string_builder.buf)
+		copy(temp_buffer[temp_size:], line_bytes)
+		temp_size += len(line_bytes)
 
 		commit_cursor += record_size
 	}
