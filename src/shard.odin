@@ -122,7 +122,8 @@ Supervision_Group :: struct {
 	window_duration_ticks: u32,
 	group_id:              Supervision_Group_Id,
 	parent_id:             Supervision_Group_Id,
-	child_count:           u16,
+	static_child_count:    u16,
+	dynamic_child_count:   u16,
 	restart_count:         u16,
 	restart_count_max:     u16,
 	strategy:              Supervision_Strategy,
@@ -892,32 +893,6 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	env.destination = HANDLE_NONE
 	env.tag = TAG_SHARD_RESTARTED
 	transport_broadcast_envelope(shard, &env)
-
-
-	// SAFETY: We use a dummy allocator that panics on allocation to prove that
-	// Level 2 Recovery NEVER touches the OS or the Grand Arena. It relies purely on
-	// state resets and the LIFO free lists.
-	panic_allocator_proc :: proc(
-		allocator_data: rawptr,
-		mode: mem.Allocator_Mode,
-		size, alignment: int,
-		old_memory: rawptr,
-		old_size: int,
-		loc := #caller_location,
-	) -> (
-		[]byte,
-		mem.Allocator_Error,
-	) {
-		if mode == .Alloc do panic("Level 2 Recovery attempted to allocate memory! Strict DOD violation.")
-		return nil, .None
-	}
-	panic_alloc := mem.Allocator {
-		procedure = panic_allocator_proc,
-		data      = nil,
-	}
-
-	root_group_spec := shard.supervision_groups[0].boot_spec
-	shard_build_supervision_tree(shard, root_group_spec, panic_alloc, nil)
 }
 
 // Checks if any Isolates are still alive across all types on this Shard.

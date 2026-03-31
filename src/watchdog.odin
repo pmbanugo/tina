@@ -49,6 +49,8 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 				if state == .Quarantined {
 					tracker.stall_count[i] = 0
+					configs[i].restart_count_shard = 0
+					configs[i].window_start_shard_ns = os_monotonic_time_ns()
 					sync.atomic_store_explicit(&configs[i].watchdog_state, u8(Shard_State.Running), .Release)
 					buf: [64]u8
 					position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")

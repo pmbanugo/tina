@@ -6,6 +6,24 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
+@(private = "package")
+_check_and_record_shard_restart :: proc(config: ^Shard_Config, wall_now_ns: u64) -> bool {
+	window_ns := u64(config.system_spec.watchdog.shard_restart_window_ms) * 1_000_000
+	if window_ns == 0 do window_ns = 30 * u64(time.Second)
+
+	limit := config.system_spec.watchdog.shard_restart_max
+	if limit == 0 do limit = 3
+
+	if config.window_start_shard_ns == 0 || wall_now_ns - config.window_start_shard_ns >= window_ns {
+		config.window_start_shard_ns = wall_now_ns
+		config.restart_count_shard = 1
+		return false
+	}
+
+	config.restart_count_shard += 1
+	return config.restart_count_shard > limit
+}
+
 // Custom assertion handler that routes Odin software panics into Tina's Trap Boundary.
 // Uses only async-signal-safe operations (stack buffer + write(2)). No fmt, no allocator.
 tina_assertion_failure_proc :: proc(
@@ -99,23 +117,9 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 				os_signals_restore_thread_mask()
 			}
 
-			// 1. Evaluate Restart Intensity (mirrors _check_and_record_restart)
-			now := shard.current_tick
-			window_ticks := u64(config.shard_spec.root_group.window_duration_ticks)
-			if window_ticks == 0 do window_ticks = 30_000 // 30s default at 1ms resolution
-
-			limit := config.shard_spec.root_group.restart_count_max
-			if limit == 0 do limit = 3
-
-			if now - config.window_start_tick >= window_ticks {
-				config.window_start_tick = now
-				config.restart_count = 1
-			} else {
-				config.restart_count += 1
-			}
-
-			// 2. Policy Enforcement
-			if config.restart_count > limit {
+			// 1. Evaluate Shard Restart Intensity using watchdog-owned policy.
+			wall_now_ns := os_monotonic_time_ns()
+			if _check_and_record_shard_restart(config, wall_now_ns) {
 				if config.system_spec.quarantine_policy == .Abort {
 					fmt.eprintfln(
 						"[FATAL] Shard %d exceeded restart limits. Policy: Abort. Force Killing Process.",
@@ -151,7 +155,6 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 				shard.current_tick = now_ns / shard.timer_resolution_ns
 				shard.timer_wheel.last_tick = shard.current_tick
 				sync.atomic_store_explicit(&shard.heartbeat_tick, shard.current_tick, .Relaxed)
-				config.window_start_tick = shard.current_tick
 			}
 		}
 
@@ -175,8 +178,8 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			}
 
 			// Recovered from quarantine! Reset limits and force a clean rebuild.
-			config.restart_count = 0
-			config.window_start_tick = shard.current_tick
+			config.restart_count_shard = 0
+			config.window_start_shard_ns = os_monotonic_time_ns()
 			shard_mass_teardown(shard)
 		}
 

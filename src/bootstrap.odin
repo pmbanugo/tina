@@ -27,9 +27,9 @@ Shard_Config :: struct #align (CACHE_LINE_SIZE) {
 	total_memory_size: int,
 	shard_id:          u8,
 	target_core:       u8,
-	restart_count:     u16,
-	_padding:          [4]u8,
-	window_start_tick: u64,
+	restart_count_shard: u16,
+	_padding:            [4]u8,
+	window_start_shard_ns: u64,
 }
 
 // #assert(size_of(Shard_Config) == 4160, "Shard_Config alignment/size drifted.")

@@ -41,9 +41,11 @@ Quarantine_Policy :: enum u8 {
 }
 
 Watchdog_Config :: struct {
-	check_interval_ms: u32,
-	phase_2_threshold: u8,
-	_padding:          [3]u8,
+	check_interval_ms:      u32,
+	shard_restart_window_ms:u32,
+	shard_restart_max:      u16,
+	phase_2_threshold:      u8,
+	_padding:               u8,
 }
 
 Dio_Config :: struct {
@@ -515,12 +517,11 @@ _aligned_capacity :: #force_inline proc(count: int) -> int {
 @(private = "package")
 _compute_group_capacity :: proc(group: ^Group_Spec) -> int {
 	mem_size := 0
-	cap := int(group.dynamic_child_count_max)
-	if cap == 0 do cap = len(group.children)
+	cap := len(group.children) + int(group.dynamic_child_count_max)
 
 	mem_size += cap * size_of(Handle) // children_handles array
 	if group.dynamic_child_count_max > 0 {
-		mem_size += cap * size_of(Dynamic_Child_Spec) // dynamic_specs array
+		mem_size += int(group.dynamic_child_count_max) * size_of(Dynamic_Child_Spec)
 	}
 
 	// Recurse for sub-groups
