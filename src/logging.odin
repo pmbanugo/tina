@@ -1,9 +1,7 @@
 package tina
 
-import "core:fmt"
 import "core:mem"
 import "core:os"
-import "core:strings"
 
 Log_Level :: enum u8 {
 	ERROR = 0,
@@ -188,6 +186,14 @@ _read_ring_data :: #force_inline proc "contextless" (
 	}
 }
 
+@(private = "package")
+log_level_label :: #force_inline proc "contextless" (level: Log_Level) -> string {
+	@(static, rodata)
+	labels := [4]string{"ERROR", "WARN", "INFO", "DEBUG"}
+	if u8(level) < 4 do return labels[u8(level)]
+	return "UNKNOWN"
+}
+
 // Step 7: Flush logs to OS stream via PIPE_BUF chunks
 log_flush :: proc(shard: ^Shard) {
 	temp_buffer: [POSIX_PIPE_BUF_SIZE]u8
@@ -216,16 +222,24 @@ log_flush :: proc(shard: ^Shard) {
 		)
 
 		line_buffer: [MAX_FORMATTED_LOG_LINE]u8
-		line_str := fmt.bprintf(
-			line_buffer[:],
-			"[%v] %v[Tag:%X] Handle:%X - %s\n",
-			header.timestamp,
-			header.level,
-			header.tag,
-			u64(header.isolate_handle),
-			string(payload_buf[:header.payload_size]),
-		)
-		line_bytes := transmute([]u8)line_str
+		position := 0
+		position = _sig_append_str(line_buffer[:], position, "[")
+		position = _sig_append_u64(line_buffer[:], position, header.timestamp)
+		position = _sig_append_str(line_buffer[:], position, "] ")
+		position = _sig_append_str(line_buffer[:], position, log_level_label(header.level))
+		position = _sig_append_str(line_buffer[:], position, "[Tag:")
+		position = _sig_append_hex(line_buffer[:], position, u64(header.tag))
+		position = _sig_append_str(line_buffer[:], position, "] Handle:")
+		position = _sig_append_hex(line_buffer[:], position, u64(header.isolate_handle))
+		position = _sig_append_str(line_buffer[:], position, " - ")
+		payload_size := min(int(header.payload_size), len(line_buffer) - position - 1)
+		for i in 0 ..< payload_size {
+			line_buffer[position + i] = payload_buf[i]
+		}
+		position += payload_size
+		line_buffer[position] = '\n'
+		position += 1
+		line_bytes := line_buffer[:position]
 
 		if temp_size + len(line_bytes) > POSIX_PIPE_BUF_SIZE {
 			written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])

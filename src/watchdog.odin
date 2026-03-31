@@ -1,6 +1,5 @@
 package tina
 
-import "core:fmt"
 import "core:sync"
 import "core:sys/posix"
 import "core:time"
@@ -27,30 +26,40 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 
 	tracker: Watchdog_Tracker
 
-	fmt.printfln("[SYSTEM] Process running. Watchdog active (interval: %v ms).", interval_ms)
+	{
+		buf: [128]u8
+		position := _sig_append_str(buf[:], 0, "[SYSTEM] Process running. Watchdog active (interval: ")
+		position = _sig_append_u64(buf[:], position, u64(interval_ms))
+		position = _sig_append_str(buf[:], position, " ms).\n")
+		_write_stderr(buf[:position])
+	}
 
 	for {
 		event := os_poll_watchdog_events(interval_ms)
 
 		switch event {
 		case .Shutdown:
-			fmt.printfln("\n[WATCHDOG] Initiating Graceful Shutdown...")
+			_write_stderr(transmute([]u8)string("\n[WATCHDOG] Initiating Graceful Shutdown...\n"))
 			_execute_graceful_shutdown(configs, spec)
 			return
 
 		case .Recover_Quarantine:
-			fmt.printfln("[WATCHDOG] Recovering quarantined Shards.")
+			_write_stderr(transmute([]u8)string("[WATCHDOG] Recovering quarantined Shards.\n"))
 			for i in 0 ..< spec.shard_count {
 				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 				if state == .Quarantined {
 					tracker.stall_count[i] = 0
 					sync.atomic_store_explicit(&configs[i].watchdog_state, u8(Shard_State.Running), .Release)
-					fmt.printfln("[WATCHDOG] Shard %d recovered from quarantine.", i)
+					buf: [64]u8
+					position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
+					position = _sig_append_u64(buf[:], position, u64(i))
+					position = _sig_append_str(buf[:], position, " recovered from quarantine.\n")
+					_write_stderr(buf[:position])
 				}
 			}
 
 		case .Reload_Config:
-			fmt.printfln("[WATCHDOG] Reload config requested. (Reserved for future use).")
+			_write_stderr(transmute([]u8)string("[WATCHDOG] Reload config requested. (Reserved for future use).\n"))
 
 		case .None:
 			// Timeout (EAGAIN) — No OS signal received. Do periodic heartbeat work.
@@ -73,14 +82,19 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 							u8(Control_Signal.Kill),
 							.Relaxed,
 						)
-						fmt.printfln(
-							"[WATCHDOG] Shard %d stalled. Phase 1 (Cooperative Kill) requested.",
-							i,
-						)
+						buf: [96]u8
+						position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
+						position = _sig_append_u64(buf[:], position, u64(i))
+						position = _sig_append_str(buf[:], position, " stalled. Phase 1 (Cooperative Kill) requested.\n")
+						_write_stderr(buf[:position])
 
 					} else if tracker.stall_count[i] >= phase_2_threshold {
 						// Phase 2: Forced Recovery (SIGUSR1)
-						fmt.printfln("[WATCHDOG] Shard %d hard-stalled. Phase 2 (Forced SIGUSR1) dispatched.", i)
+						buf: [96]u8
+						position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
+						position = _sig_append_u64(buf[:], position, u64(i))
+						position = _sig_append_str(buf[:], position, " hard-stalled. Phase 2 (Forced SIGUSR1) dispatched.\n")
+						_write_stderr(buf[:position])
 						os_signal_thread(configs[i].os_thread_handle, posix.Signal.SIGUSR1)
 						tracker.stall_count[i] = 0
 					}
@@ -130,7 +144,7 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 		// Check for second SIGTERM (immediate force-kill escalation, §5.4)
 		event := os_poll_watchdog_events(100)
 		if event == .Shutdown {
-			fmt.eprintfln("[FATAL] Second signal received. Executing Phase 3 Force-Kill.")
+			_write_stderr(transmute([]u8)string("[FATAL] Second signal received. Executing Phase 3 Force-Kill.\n"))
 			_execute_phase3_force_kill(configs, spec)
 		}
 
@@ -145,7 +159,7 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 		}
 
 		if all_terminated {
-			fmt.printfln("[SYSTEM] All Shards gracefully drained. Shutting down.")
+			_write_stderr(transmute([]u8)string("[SYSTEM] All Shards gracefully drained. Shutting down.\n"))
 			return
 		}
 
@@ -161,10 +175,13 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 			if current_heartbeat == tracker.last_seen_heartbeat[i] {
 				tracker.stall_count[i] += 1
 				if tracker.stall_count[i] >= phase_2_threshold {
-					fmt.eprintfln(
-						"[WATCHDOG] Shard %d stalled during shutdown drain. Sending SIGUSR1.",
-						i,
-					)
+					{
+						buf: [96]u8
+						position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
+						position = _sig_append_u64(buf[:], position, u64(i))
+						position = _sig_append_str(buf[:], position, " stalled during shutdown drain. Sending SIGUSR1.\n")
+						_write_stderr(buf[:position])
+					}
 					os_signal_thread(configs[i].os_thread_handle, posix.Signal.SIGUSR1)
 					tracker.stall_count[i] = 0
 				}
@@ -177,10 +194,11 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 		// Phase 3 deadline check
 		if time.tick_diff(deadline, time.tick_now()) >
 		   (time.Duration(timeout_ms) * time.Millisecond) {
-			fmt.eprintfln(
-				"[FATAL] Graceful shutdown timeout expired (%v ms). Executing Phase 3 Force-Kill.",
-				timeout_ms,
-			)
+			buf: [96]u8
+			position := _sig_append_str(buf[:], 0, "[FATAL] Graceful shutdown timeout expired (")
+			position = _sig_append_u64(buf[:], position, u64(timeout_ms))
+			position = _sig_append_str(buf[:], position, " ms). Executing Phase 3 Force-Kill.\n")
+			_write_stderr(buf[:position])
 			_execute_phase3_force_kill(configs, spec)
 		}
 	}
@@ -189,17 +207,20 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 @(private = "file")
 _execute_phase3_force_kill :: proc(configs: []Shard_Config, spec: ^SystemSpec) -> ! {
 	// Step 1: Log diagnostic
-	alive := 0
+	alive_count := 0
 	for i in 0 ..< spec.shard_count {
 		state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 		if state != .Terminated && state != .Quarantined {
-			alive += 1
+			alive_count += 1
 		}
 	}
-	fmt.eprintfln(
-		"[FATAL] Phase 3 force-kill: %d shard(s) still alive. Emergency log flush.",
-		alive,
-	)
+	{
+		buf: [96]u8
+		position := _sig_append_str(buf[:], 0, "[FATAL] Phase 3 force-kill: ")
+		position = _sig_append_u64(buf[:], position, u64(alive_count))
+		position = _sig_append_str(buf[:], position, " shard(s) still alive. Emergency log flush.\n")
+		_write_stderr(buf[:position])
+	}
 
 	// Step 2: Emergency log flush for all shards (best-effort, accepts data race)
 	for i in 0 ..< spec.shard_count {

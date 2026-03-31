@@ -14,7 +14,7 @@ RECOVERY_ROOT_ESCALATE :: 3
 RECOVERY_SOFT_KILL :: 4
 
 @(private = "package")
-recovery_reason_label :: proc "contextless" (reason: i32) -> string {
+recovery_reason_label :: #force_inline proc "contextless" (reason: i32) -> string {
 	@(static, rodata)
 	labels := [5]string {
 		"None",
