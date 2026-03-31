@@ -75,10 +75,10 @@ emergency_log_flush_signal :: proc "contextless" (shard: ^Shard) {
 			payload_len = len(buffer) - position - 1
 		}
 		if payload_len > 0 {
-			payload_tmp: [MAX_PAYLOAD_SIZE]u8
-			_ring_copy_raw(ring, cursor + header_size, payload_tmp[:payload_size])
+			payload_buffer: [MAX_PAYLOAD_SIZE]u8
+			_ring_copy_raw(ring, cursor + header_size, payload_buffer[:payload_size])
 			for i in 0 ..< payload_len {
-				buffer[position + i] = payload_tmp[i]
+				buffer[position + i] = payload_buffer[i]
 			}
 			position += payload_len
 		}
@@ -132,10 +132,10 @@ emergency_log_flush_snapshot :: proc "contextless" (shard: ^Shard) {
 			payload_len = len(buffer) - position - 1
 		}
 		if payload_len > 0 {
-			payload_tmp: [MAX_PAYLOAD_SIZE]u8
-			_ring_copy_raw(ring, cursor + header_size, payload_tmp[:payload_size])
+			payload_buffer: [MAX_PAYLOAD_SIZE]u8
+			_ring_copy_raw(ring, cursor + header_size, payload_buffer[:payload_size])
 			for i in 0 ..< payload_len {
-				buffer[position + i] = payload_tmp[i]
+				buffer[position + i] = payload_buffer[i]
 			}
 			position += payload_len
 		}

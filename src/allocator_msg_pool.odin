@@ -47,8 +47,8 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 
 	// Intrusive push. Slot 0 at the head for sequential cache warmth.
 	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
-		ptr := cast(^Message_Envelope)&p.buffer[u32(i) << p.slot_shift]
-		ptr.next_free_slot = p.free_head
+		slot_pointer := cast(^Message_Envelope)&p.buffer[u32(i) << p.slot_shift]
+		slot_pointer.next_free_slot = p.free_head
 		p.free_head = u32(i)
 		p.free_count += 1
 	}
@@ -57,10 +57,10 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 @(private = "file")
 _pool_alloc_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool) -> u32 {
 	slot_index := p.free_head
-	ptr := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
-	p.free_head = ptr.next_free_slot
+	slot_pointer := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
+	p.free_head = slot_pointer.next_free_slot
 	p.free_count -= 1
-	mem.zero(ptr, int(p.slot_size))
+	mem.zero(slot_pointer, int(p.slot_size))
 	return slot_index
 }
 
@@ -86,8 +86,8 @@ pool_free :: proc(p: ^Message_Pool, index: u32) {
 // Must remain contextless (no assert/fmt/make/default-allocator calls).
 // intended use in hot path and guaranteed safety
 pool_free_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool, index: u32) {
-	ptr := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
-	ptr.next_free_slot = p.free_head
+	slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+	slot_pointer.next_free_slot = p.free_head
 	p.free_head = index
 	p.free_count += 1
 }
@@ -146,8 +146,8 @@ test_message_pool :: proc(t: ^testing.T) {
 	testing.expect_value(t, stats_full.used_count, 10)
 
 	// Test pointer resolution
-	ptr := pool_get_ptr(&pool, indices[0])
-	testing.expect(t, ptr == raw_data(backing[:]), "Index 0 should map to backing buffer start")
+	slot_pointer := pool_get_ptr(&pool, indices[0])
+	testing.expect(t, slot_pointer == raw_data(backing[:]), "Index 0 should map to backing buffer start")
 
 	// Free them all back
 	for i in 0 ..< 10 {

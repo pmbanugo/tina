@@ -28,8 +28,8 @@ _get_child_restart_type :: proc(group: ^Supervision_Group, index: u16) -> Restar
 	if len(group.dynamic_specs) > 0 {
 		return group.dynamic_specs[index].restart_type
 	} else {
-		child_spec_ptr := &group.boot_spec.children[index]
-		#partial switch &s in child_spec_ptr {
+		child_spec_pointer := &group.boot_spec.children[index]
+		#partial switch &s in child_spec_pointer {
 		case Static_Child_Spec:
 			return s.restart_type
 		case Group_Spec:
@@ -109,8 +109,8 @@ _respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) 
 		spec.args_size = dyn.args_size
 		spec.args_payload = dyn.args_payload
 	} else {
-		child_spec_ptr := &group.boot_spec.children[index]
-		#partial switch &s in child_spec_ptr {
+		child_spec_pointer := &group.boot_spec.children[index]
+		#partial switch &s in child_spec_pointer {
 		case Static_Child_Spec:
 			spec.type_id = s.type_id
 			spec.restart_type = s.restart_type
@@ -271,9 +271,9 @@ _build_group :: proc(
 
 	group.child_count = 0
 	for i in 0 ..< len(group_spec.children) {
-		child_spec_ptr := &group_spec.children[i]
+		child_spec_pointer := &group_spec.children[i]
 
-		#partial switch &s in child_spec_ptr {
+		#partial switch &s in child_spec_pointer {
 		case Static_Child_Spec:
 			spec := Spawn_Spec {
 				args_payload = s.args_payload,

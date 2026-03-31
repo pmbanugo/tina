@@ -17,17 +17,17 @@ _sig_append_u64 :: proc "contextless" (target: []u8, position: int, value: u64) 
 		target[position] = '0'
 		return position + 1
 	}
-	tmp: [20]u8
+	digits: [20]u8
 	n := 0
 	v := value
 	for v > 0 {
-		tmp[n] = u8('0') + u8(v % 10)
+		digits[n] = u8('0') + u8(v % 10)
 		v /= 10
 		n += 1
 	}
 	written := min(n, len(target) - position)
 	for i in 0 ..< written {
-		target[position + i] = tmp[n - 1 - i]
+		target[position + i] = digits[n - 1 - i]
 	}
 	return position + written
 }

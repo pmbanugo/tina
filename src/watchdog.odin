@@ -58,7 +58,7 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 				if state != .Running do continue
 
-				shard := configs[i].shard_ptr
+				shard := configs[i].shard_pointer
 				if shard == nil do continue
 
 				current_heartbeat := sync.atomic_load_explicit(&shard.heartbeat_tick, .Relaxed)
@@ -102,7 +102,7 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 	for i in 0 ..< spec.shard_count {
 		state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 		if state == .Running {
-			shard := configs[i].shard_ptr
+			shard := configs[i].shard_pointer
 			if shard != nil {
 				sync.atomic_store_explicit(
 					cast(^u8)&shard.control_signal,
@@ -154,7 +154,7 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 			state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 			if state != .Shutting_Down do continue
 
-			shard := configs[i].shard_ptr
+			shard := configs[i].shard_pointer
 			if shard == nil do continue
 
 			current_heartbeat := sync.atomic_load_explicit(&shard.heartbeat_tick, .Relaxed)
@@ -203,7 +203,7 @@ _execute_phase3_force_kill :: proc(configs: []Shard_Config, spec: ^SystemSpec) -
 
 	// Step 2: Emergency log flush for all shards (best-effort, accepts data race)
 	for i in 0 ..< spec.shard_count {
-		shard := configs[i].shard_ptr
+		shard := configs[i].shard_pointer
 		if shard != nil {
 			when ODIN_OS == .Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD || ODIN_OS == .Windows {
 				emergency_log_flush_snapshot(shard)

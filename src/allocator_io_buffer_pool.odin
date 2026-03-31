@@ -39,8 +39,8 @@ reactor_buffer_pool_init :: proc(
 	pool.free_head = BUFFER_INDEX_NONE
 
 	for i := int(slot_count) - 1; i >= 0; i -= 1 {
-		slot_ptr := _buffer_pool_slot_ptr(pool, u16(i))
-		(cast(^u16)slot_ptr)^ = pool.free_head
+		slot_pointer := _buffer_pool_slot_ptr(pool, u16(i))
+		(cast(^u16)slot_pointer)^ = pool.free_head
 		pool.free_head = u16(i)
 		pool.free_count += 1
 	}
@@ -52,12 +52,12 @@ reactor_buffer_pool_alloc :: proc(pool: ^Reactor_Buffer_Pool) -> (u16, Buffer_Po
 	}
 
 	index := pool.free_head
-	slot_ptr := _buffer_pool_slot_ptr(pool, index)
+	slot_pointer := _buffer_pool_slot_ptr(pool, index)
 
-	pool.free_head = (cast(^u16)slot_ptr)^
+	pool.free_head = (cast(^u16)slot_pointer)^
 	pool.free_count -= 1
 
-	mem.zero(slot_ptr, int(pool.slot_size))
+	mem.zero(slot_pointer, int(pool.slot_size))
 
 	return index, .None
 }
@@ -65,9 +65,9 @@ reactor_buffer_pool_alloc :: proc(pool: ^Reactor_Buffer_Pool) -> (u16, Buffer_Po
 reactor_buffer_pool_free :: proc(pool: ^Reactor_Buffer_Pool, index: u16) {
 	assert(index < pool.slot_count, "buffer index out of bounds")
 
-	slot_ptr := _buffer_pool_slot_ptr(pool, index)
+	slot_pointer := _buffer_pool_slot_ptr(pool, index)
 
-	(cast(^u16)slot_ptr)^ = pool.free_head
+	(cast(^u16)slot_pointer)^ = pool.free_head
 	pool.free_head = index
 	pool.free_count += 1
 }
@@ -84,9 +84,9 @@ reactor_buffer_pool_slot_ptr :: #force_inline proc(
 // Get a read-only slice of the buffer data for a completed read.
 reactor_buffer_pool_read_slice :: proc(pool: ^Reactor_Buffer_Pool, index: u16, size: u32) -> []u8 {
 	assert(index < pool.slot_count, "buffer index out of bounds")
-	ptr := _buffer_pool_slot_ptr(pool, index)
+	slot_pointer := _buffer_pool_slot_ptr(pool, index)
 	actual_size := min(size, pool.slot_size)
-	return ptr[:actual_size]
+	return slot_pointer[:actual_size]
 }
 
 // Copy payload from an Isolate's struct into a buffer slot (copy-on-submit for writes).

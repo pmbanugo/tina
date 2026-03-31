@@ -231,8 +231,8 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(t, pong_state, Isolate_State.Waiting)
 
 		// Prove Ping hit 100 iterations
-		ping_ptr := _get_isolate_ptr(shard, u16(PING_TYPE_ID), 0)
-		ping_memory := cast(^PingIsolate)ping_ptr
+		ping_pointer := _get_isolate_ptr(shard, u16(PING_TYPE_ID), 0)
+		ping_memory := cast(^PingIsolate)ping_pointer
 		testing.expect_value(t, ping_memory.count, 100)
 
 		fmt.printfln(
@@ -866,13 +866,13 @@ when TINA_SIMULATION_MODE {
 		// Manually inject the simultaneous I/O completion + shutdown state:
 
 		// 1. Allocate a buffer to simulate a recv completion with data
-		buf_idx, buf_err := reactor_buffer_pool_alloc(&shard.reactor.buffer_pool)
-		testing.expect_value(t, buf_err, Buffer_Pool_Error.None)
+		buffer_index, buffer_error := reactor_buffer_pool_alloc(&shard.reactor.buffer_pool)
+		testing.expect_value(t, buffer_error, Buffer_Pool_Error.None)
 
 		// 2. Set I/O completion in SOA metadata
 		soa := shard.metadata[PRIORITY_TYPE_ID]
 		soa[0].io_completion_tag = IO_TAG_RECV_COMPLETE
-		soa[0].io_buffer_index = buf_idx
+		soa[0].io_buffer_index = buffer_index
 		soa[0].io_result = 128
 		soa[0].state = .Runnable
 
@@ -888,8 +888,8 @@ when TINA_SIMULATION_MODE {
 		scheduler_tick(shard)
 
 		// 6. Verify the received tag order
-		iso_ptr := _get_isolate_ptr(shard, u16(PRIORITY_TYPE_ID), 0)
-		iso := cast(^PriorityTestIsolate)iso_ptr
+		isolate_pointer := _get_isolate_ptr(shard, u16(PRIORITY_TYPE_ID), 0)
+		iso := cast(^PriorityTestIsolate)isolate_pointer
 		testing.expect_value(t, iso.received_count, 2)
 		testing.expect_value(t, iso.received_tags[0], Message_Tag(IO_TAG_RECV_COMPLETE))
 		testing.expect_value(t, iso.received_tags[1], TAG_SHUTDOWN)
@@ -1031,8 +1031,8 @@ when TINA_SIMULATION_MODE {
 
 		// Verify every single worker got a fair share of the 2,560 total dispatches
 		for i in 0 ..< 300 {
-			worker_ptr := _get_isolate_ptr(shard, u16(STARVATION_WORKER_ID), u32(i))
-			worker := cast(^StarvationWorker)worker_ptr
+			worker_pointer := _get_isolate_ptr(shard, u16(STARVATION_WORKER_ID), u32(i))
+			worker := cast(^StarvationWorker)worker_pointer
 
 			if worker.run_count == 0 {
 				starved_count += 1

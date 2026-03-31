@@ -85,10 +85,10 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	soa_meta[slot].inbox_count = 0
 	soa_meta[slot].io_completion_tag = IO_TAG_NONE
 
-	ptr := _get_isolate_ptr(shard, type_id, slot)
+	isolate_pointer := _get_isolate_ptr(shard, type_id, slot)
 	stride := shard.type_descriptors[type_id].stride
-	if ptr != nil && stride > 0 {
-		mem.zero(ptr, stride)
+	if isolate_pointer != nil && stride > 0 {
+		mem.zero(isolate_pointer, stride)
 	}
 
 	child_ctx := TinaContext {
@@ -100,8 +100,8 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 
 	working_stride := shard.type_descriptors[type_id].working_memory_size
 	if working_stride > 0 {
-		start_idx := int(slot) * working_stride
-		working_slice := shard.working_memory[type_id][start_idx:start_idx + working_stride]
+		start_index := int(slot) * working_stride
+		working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
 		mem.arena_init(&child_ctx.working_arena, working_slice)
 	}
 
@@ -125,7 +125,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	context.temp_allocator = mem.arena_allocator(&child_ctx.scratch_arena)
 
 	effect := shard.type_descriptors[type_id].init_fn(
-		ptr,
+		isolate_pointer,
 		local_spec.args_payload[:local_spec.args_size],
 		&child_ctx,
 	)
@@ -184,8 +184,8 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 		soa_meta[slot_index].io_buffer_index = BUFFER_INDEX_NONE
 	}
 	if soa_meta[slot_index].pending_transfer_read != TRANSFER_HANDLE_NONE {
-		idx := transfer_handle_index(soa_meta[slot_index].pending_transfer_read)
-		_transfer_pool_free(shard, idx)
+		transfer_index := transfer_handle_index(soa_meta[slot_index].pending_transfer_read)
+		_transfer_pool_free(shard, transfer_index)
 		soa_meta[slot_index].pending_transfer_read = TRANSFER_HANDLE_NONE
 	}
 

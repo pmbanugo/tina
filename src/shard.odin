@@ -12,7 +12,7 @@ RECOVERY_TIER_3 :: 1
 RECOVERY_WATCHDOG :: 2
 
 @(thread_local)
-g_current_shard_ptr: ^Shard
+g_current_shard_pointer: ^Shard
 
 trigger_tier2_panic :: proc(shard: ^Shard) -> ! {
 	os_trap_restore(&shard.trap_environment_inner, 1)
@@ -407,8 +407,8 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 				working_stride := type_descriptor.working_memory_size
 				if working_stride > 0 {
-					start_idx := int(slot) * working_stride
-					working_slice := shard.working_memory[type_id][start_idx:start_idx +
+					start_index := int(slot) * working_stride
+					working_slice := shard.working_memory[type_id][start_index:start_index +
 					working_stride]
 					ctx.working_arena = mem.Arena {
 						data   = working_slice,
@@ -416,7 +416,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 					}
 				}
 
-				ptr := _get_isolate_ptr(shard, u16(type_id), slot)
+				isolate_pointer := _get_isolate_ptr(shard, u16(type_id), slot)
 
 				// Set up the implicit context for the user handler
 				context.allocator = mem.arena_allocator(&ctx.scratch_arena)
@@ -436,7 +436,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 					}
 				}
 
-				effect := type_descriptor.handler_fn(ptr, message_pointer, &ctx)
+				effect := type_descriptor.handler_fn(isolate_pointer, message_pointer, &ctx)
 
 				// Write back working arena offset
 				if working_stride > 0 {
@@ -791,16 +791,16 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	shard.message_pool.free_count = shard.message_pool.slot_count
 	shard.message_pool.free_head = POOL_NONE_INDEX
 	for i := int(shard.message_pool.slot_count) - 1; i >= 0; i -= 1 {
-		ptr := pool_get_ptr(&shard.message_pool, u32(i))
-		(cast(^u32)ptr)^ = shard.message_pool.free_head
+		slot_pointer := pool_get_ptr(&shard.message_pool, u32(i))
+		(cast(^u32)slot_pointer)^ = shard.message_pool.free_head
 		shard.message_pool.free_head = u32(i)
 	}
 
 	shard.transfer_pool.free_count = shard.transfer_pool.slot_count
 	shard.transfer_pool.free_head = BUFFER_INDEX_NONE
 	for i := int(shard.transfer_pool.slot_count) - 1; i >= 0; i -= 1 {
-		ptr := reactor_buffer_pool_slot_ptr(&shard.transfer_pool, u16(i))
-		(cast(^u16)ptr)^ = shard.transfer_pool.free_head
+		slot_pointer := reactor_buffer_pool_slot_ptr(&shard.transfer_pool, u16(i))
+		(cast(^u16)slot_pointer)^ = shard.transfer_pool.free_head
 		shard.transfer_pool.free_head = u16(i)
 		shard.transfer_generations[i] += 1
 		if shard.transfer_generations[i] == 0 do shard.transfer_generations[i] = 1

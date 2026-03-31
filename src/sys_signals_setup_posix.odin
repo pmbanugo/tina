@@ -76,7 +76,7 @@ os_abort :: #force_inline proc "contextless" () -> ! {
 // The Tier 3 Fault Trap
 @(private = "file")
 _fatal_signal_handler :: proc "c" (sig: posix.Signal, info: ^posix.siginfo_t, ucontext: rawptr) {
-	shard := g_current_shard_ptr
+	shard := g_current_shard_pointer
 	if shard == nil {
 		buf: [64]u8
 		n := _sig_append_str(buf[:], 0, "[FATAL] non-shard sig=")
@@ -103,7 +103,7 @@ _fatal_signal_handler :: proc "c" (sig: posix.Signal, info: ^posix.siginfo_t, uc
 // The Watchdog Cooperative Kill Trap
 @(private = "file")
 _sigusr1_handler :: proc "c" (sig: posix.Signal, info: ^posix.siginfo_t, ucontext: rawptr) {
-	shard := g_current_shard_ptr
+	shard := g_current_shard_pointer
 	if shard == nil do return
 
 	buf: [96]u8

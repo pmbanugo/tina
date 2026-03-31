@@ -153,9 +153,9 @@ hydrate_shard :: proc(
 	// 1. Allocate the tracking array FOR the arena, FROM the arena!
 	regions_max := compute_max_sub_regions(spec)
 	tracker_size := regions_max * size_of(SubRegion)
-	tracker_ptr := grand_arena_alloc_named(arena, "Arena_Regions_Tracker", tracker_size) or_return
+	tracker_pointer := grand_arena_alloc_named(arena, "Arena_Regions_Tracker", tracker_size) or_return
 
-	arena.regions = (cast([^]SubRegion)tracker_ptr)[:regions_max]
+	arena.regions = (cast([^]SubRegion)tracker_pointer)[:regions_max]
 	arena.regions[0] = SubRegion{"Arena_Regions_Tracker", 0, tracker_size}
 	arena.region_count = 1
 

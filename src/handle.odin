@@ -14,7 +14,7 @@ make_handle :: #force_inline proc "contextless" (
 ) -> Handle {
 	// shard_id: 8 bits (63-56)
 	// type_id: 8 bits (55-48)
-	// slot_idx: 20 bits (47-28)
+	// slot_index: 20 bits (47-28)
 	// generation: 28 bits (27-0)
 	return Handle(
 		(u64(shard_id) << 56) |

@@ -235,8 +235,8 @@ when !TINA_SIMULATION_MODE {
 			// The data field carries the errno specifically when this flag is set.
 			if .Error in event.flags {
 				token := Submission_Token(u64(uintptr(event.udata)))
-				pending_idx := _find_pending(backend, token)
-				if pending_idx >= 0 {
+				pending_index := _find_pending(backend, token)
+				if pending_index >= 0 {
 					_posix_deliver_completion(
 						backend,
 						completions,
@@ -244,18 +244,18 @@ when !TINA_SIMULATION_MODE {
 						output_max,
 						Raw_Completion{token = token, result = -i32(posix.Errno(event.data))},
 					)
-					_remove_pending(backend, u16(pending_idx))
+					_remove_pending(backend, u16(pending_index))
 				}
 				continue
 			}
 
 			token := Submission_Token(u64(uintptr(event.udata)))
-			pending_idx := _find_pending(backend, token)
-			if pending_idx < 0 {
+			pending_index := _find_pending(backend, token)
+			if pending_index < 0 {
 				continue
 			}
 
-			pop := &backend.pending[pending_idx]
+			pop := &backend.pending[pending_index]
 			event_has_eof := .EOF in event.flags
 
 			// Connect completion: use getsockopt(SO_ERROR) instead of re-calling connect().
@@ -282,7 +282,7 @@ when !TINA_SIMULATION_MODE {
 					conn_result.result = 0
 				}
 				_posix_deliver_completion(backend, completions, &out, output_max, conn_result)
-				_remove_pending(backend, u16(pending_idx))
+				_remove_pending(backend, u16(pending_index))
 				continue
 			}
 
@@ -295,7 +295,7 @@ when !TINA_SIMULATION_MODE {
 
 			if immediate {
 				_posix_deliver_completion(backend, completions, &out, output_max, result)
-				_remove_pending(backend, u16(pending_idx))
+				_remove_pending(backend, u16(pending_index))
 			} else if event_has_eof {
 				// Peer closed but syscall returned EWOULDBLOCK — complete as EOF.
 				// Re-registering would be pointless: no further data will arrive.
@@ -306,7 +306,7 @@ when !TINA_SIMULATION_MODE {
 					output_max,
 					Raw_Completion{token = pop.token, result = 0},
 				)
-				_remove_pending(backend, u16(pending_idx))
+				_remove_pending(backend, u16(pending_index))
 			} else {
 				// Still not ready — re-register ONESHOT.
 				rearm_error := _register_kqueue(backend, &sub)
@@ -320,7 +320,7 @@ when !TINA_SIMULATION_MODE {
 						output_max,
 						Raw_Completion{token = pop.token, result = -i32(posix.Errno.EIO)},
 					)
-					_remove_pending(backend, u16(pending_idx))
+					_remove_pending(backend, u16(pending_index))
 				}
 			}
 		}

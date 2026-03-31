@@ -525,8 +525,8 @@ _compute_group_capacity :: proc(group: ^Group_Spec) -> int {
 
 	// Recurse for sub-groups
 	for i in 0 ..< len(group.children) {
-		child_ptr := &group.children[i]
-		#partial switch &s in child_ptr {
+		child_pointer := &group.children[i]
+		#partial switch &s in child_pointer {
 		case Group_Spec:
 			mem_size += _compute_group_capacity(&s)
 		}

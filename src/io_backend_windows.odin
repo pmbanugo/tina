@@ -136,12 +136,12 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		for &sub in submissions {
-			entry_idx := _win_alloc_entry(backend)
-			if entry_idx < 0 {
+			entry_index := _win_alloc_entry(backend)
+			if entry_index < 0 {
 				return .Queue_Full
 			}
 
-			entry := &backend.entries[entry_idx]
+			entry := &backend.entries[entry_index]
 			entry.token = sub.token
 			entry.operation = sub.operation
 			entry.overlapped = {}

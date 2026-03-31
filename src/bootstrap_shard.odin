@@ -12,7 +12,7 @@ tina_assertion_failure_proc :: proc(
 	prefix, message: string,
 	loc: runtime.Source_Code_Location,
 ) -> ! {
-	shard := g_current_shard_ptr
+	shard := g_current_shard_pointer
 	if shard != nil {
 		buf: [256]u8
 		n := _sig_append_str(buf[:], 0, "[SOFTWARE PANIC] Shard ")
@@ -49,8 +49,8 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	shard := new(Shard)
 	defer free(shard)
 
-	config.shard_ptr = shard
-	g_current_shard_ptr = shard
+	config.shard_pointer = shard
+	g_current_shard_pointer = shard
 	shard.id = config.shard_id
 	shard.shared_state = &config.watchdog_state
 

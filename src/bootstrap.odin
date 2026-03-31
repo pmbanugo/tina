@@ -21,7 +21,7 @@ Shard_Config :: struct #align (CACHE_LINE_SIZE) {
 	system_spec:       ^SystemSpec,
 	shard_spec:        ^ShardSpec,
 	barrier:           ^sync.Barrier,
-	shard_ptr:         ^Shard,
+	shard_pointer:     ^Shard,
 	watchdog_state:    u8,
 	os_thread_handle:  rawptr,
 	total_memory_size: int,
@@ -131,9 +131,9 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 			// Map the struct to the start, and the buffer right after it
 			ring := cast(^SPSC_Ring)raw_data(raw_mem)
-			buffer_ptr := cast([^]Message_Envelope)(uintptr(raw_data(raw_mem)) +
+			buffer_pointer := cast([^]Message_Envelope)(uintptr(raw_data(raw_mem)) +
 				size_of(SPSC_Ring))
-			spsc_ring_init(ring, u64(ring_count), buffer_ptr[:ring_count])
+			spsc_ring_init(ring, u64(ring_count), buffer_pointer[:ring_count])
 
 			os_apply_memory_policy(raw_mem, i32(source), spec.memory_init_mode)
 			// Wire directly into the pre-allocated configs

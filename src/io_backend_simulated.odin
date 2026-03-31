@@ -148,8 +148,8 @@ when TINA_SIMULATION_MODE {
 		if backend.config.reorder && completed_count > 1 {
 			for j: u32 = 0; j < completed_count - 1; j += 1 {
 				remaining := completed_count - j
-				swap_idx := j + u32(prng_uint_less_than(&backend.prng, remaining))
-				completions[j], completions[swap_idx] = completions[swap_idx], completions[j]
+				swap_index := j + u32(prng_uint_less_than(&backend.prng, remaining))
+				completions[j], completions[swap_index] = completions[swap_index], completions[j]
 			}
 		}
 
