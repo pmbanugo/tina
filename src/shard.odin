@@ -224,8 +224,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				}
 			}
 		case .Kill:
-			shard_mass_teardown(shard)
-			return
+			os_trap_restore(&shard.trap_environment_outer, 4)
 		}
 	}
 
@@ -493,7 +492,14 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 // --- Effect Interpreter ---
 
-@(private = "package")
+@(rodata, private = "package")
+CRASH_REASONS_INTERPRETED := [Crash_Reason]string {
+	.None                 = "Voluntary crash: None",
+	.Spawn_Failed         = "Voluntary crash: Spawn_Failed",
+	.Unimplemented_Effect = "Voluntary crash: Unimplemented_Effect",
+	.Init_Failed          = "Voluntary crash: Init_Failed",
+}
+
 _interpret_effect :: proc(
 	shard: ^Shard,
 	type_id: u16,
@@ -510,12 +516,13 @@ _interpret_effect :: proc(
 	case Effect_Receive:
 		soa_meta[slot].state = .Waiting
 	case Effect_Crash:
+		reason_str := CRASH_REASONS_INTERPRETED[e.reason]
 		_shard_log(
 			shard,
 			ctx.self_handle,
 			.ERROR,
 			LOG_TAG_ISOLATE_CRASHED,
-			transmute([]u8)string("Voluntary crash"),
+			transmute([]u8)reason_str,
 		)
 		_teardown_isolate(shard, type_id, slot, .Crashed)
 	case Effect_Call:

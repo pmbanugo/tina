@@ -23,15 +23,15 @@ FD_Handle :: distinct u32
 
 FD_HANDLE_NONE :: FD_Handle(0)
 
-fd_handle_make :: #force_inline proc(index: u16, generation: u16) -> FD_Handle {
+fd_handle_make :: #force_inline proc "contextless" (index: u16, generation: u16) -> FD_Handle {
 	return FD_Handle(u32(index) | (u32(generation) << 16))
 }
 
-fd_handle_index :: #force_inline proc(h: FD_Handle) -> u16 {
+fd_handle_index :: #force_inline proc "contextless" (h: FD_Handle) -> u16 {
 	return u16(u32(h) & 0xFFFF)
 }
 
-fd_handle_generation :: #force_inline proc(h: FD_Handle) -> u16 {
+fd_handle_generation :: #force_inline proc "contextless" (h: FD_Handle) -> u16 {
 	return u16(u32(h) >> 16)
 }
 

@@ -233,6 +233,18 @@ when TINA_SIMULATION_MODE {
 				return true
 			}
 
+			// Pool integrity: transfer buffer pool
+			t_pool := &shard.transfer_pool
+			if t_pool.free_count > t_pool.slot_count {
+				fmt.eprintfln(
+					"[CHECKER] Shard %d: transfer pool corruption — free_count (%d) > slot_count (%d)",
+					i,
+					t_pool.free_count,
+					t_pool.slot_count,
+				)
+				return true
+			}
+
 			// Generation monotonicity: generations must never be zero
 			// (zero is reserved for HANDLE_NONE / stale sentinel)
 			for type_desc in shard.type_descriptors {

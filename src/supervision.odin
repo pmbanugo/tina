@@ -3,7 +3,6 @@ package tina
 import "core:fmt"
 import "core:mem"
 import "core:os"
-import "core:sync"
 
 @(private = "package")
 _find_child_index :: proc(group: ^Supervision_Group, handle: Handle) -> (u16, bool) {
@@ -67,13 +66,8 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 	group.child_count = 0
 
 	if group.parent_id == SUPERVISION_GROUP_ID_NONE {
-		// We use Relaxed because the scheduler loop's atomic_load_explicit
-		// is the synchronization point.
-		sync.atomic_store_explicit(
-			cast(^u8)&shard.control_signal,
-			u8(Control_Signal.Kill),
-			.Relaxed,
-		)
+		// Root group failure. Jump to the outer recovery loop.
+		os_trap_restore(&shard.trap_environment_outer, 3)
 	} else {
 		group_handle := make_handle(
 			shard.id,

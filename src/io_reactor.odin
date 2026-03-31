@@ -845,6 +845,29 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	testing.expect_value(t, reactor.pending_submissions[1].fixed_file_index, slot_b)
 }
 
+@(private = "package")
+emergency_print_stalled_io_snapshot :: proc "contextless" (shard: ^Shard) {
+	for type_idx in 0 ..< len(shard.metadata) {
+		soa_meta := shard.metadata[type_idx]
+		for slot_idx in 0 ..< len(soa_meta) {
+			if soa_meta[slot_idx].state == .Waiting_For_Io {
+				buf: [128]u8
+				n := 0
+				n = _sig_append_str(buf[:], n, "[STALLED IO] Shard: ")
+				n = _sig_append_u64(buf[:], n, u64(shard.id))
+				n = _sig_append_str(buf[:], n, " Type: ")
+				n = _sig_append_u64(buf[:], n, u64(type_idx))
+				n = _sig_append_str(buf[:], n, " Slot: ")
+				n = _sig_append_u64(buf[:], n, u64(slot_idx))
+				n = _sig_append_str(buf[:], n, " FD: ")
+				n = _sig_append_u64(buf[:], n, u64(fd_handle_index(soa_meta[slot_idx].io_fd)))
+				n = _sig_append_str(buf[:], n, "\n")
+				_write_stderr(buf[:n])
+			}
+		}
+	}
+}
+
 when TINA_SIMULATION_MODE {
     // The equivalent is named test_io_sequence_stale_completion_reclamation
     // which is in the simulation test file, and runs only in simulation mode

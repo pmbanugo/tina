@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:sync"
 import "core:thread"
+import "core:time"
 
 // Custom assertion handler that routes Odin software panics into Tina's Trap Boundary.
 // Uses only async-signal-safe operations (stack buffer + write(2)). No fmt, no allocator.
@@ -86,7 +87,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		recovery_reason := os_trap_save(&shard.trap_environment_outer)
 
 		if recovery_reason != 0 {
-			// CRASH PATH: We caught a SIGSEGV/SIGBUS/SIGFPE or Watchdog SIGUSR1
+			// CRASH PATH: Caught SIGSEGV/BUS/FPE (1), Watchdog SIGUSR1 (2), Root Escalate (3), Soft Kill (4)
 			fmt.eprintfln(
 				"[RECOVERY] Shard %d performing Level 2 recovery (Reason: %d)",
 				shard.id,
@@ -94,60 +95,119 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			)
 
 			when !TINA_SIMULATION_MODE {
-				// siglongjmp bypasses defer statements; sweep temp allocations
-				// orphaned by panic string formatting before full teardown.
 				free_all(context.temp_allocator)
-				// Unblock signals masked by the OS during handler execution.
 				os_signals_restore_thread_mask()
 			}
 
-			// This performs the in-place reset and rebuilds the tree.
-			shard_mass_teardown(shard)
+			// 1. Evaluate Restart Intensity (mirrors _check_and_record_restart)
+			now := shard.current_tick
+			window_ticks := u64(config.shard_spec.root_group.window_duration_ticks)
+			if window_ticks == 0 do window_ticks = 30_000 // 30s default at 1ms resolution
 
-			// Skip the barrier and go straight back into the scheduler.
+			limit := config.shard_spec.root_group.restart_count_max
+			if limit == 0 do limit = 3
+
+			if now - config.window_start_tick >= window_ticks {
+				config.window_start_tick = now
+				config.restart_count = 1
+			} else {
+				config.restart_count += 1
+			}
+
+			// 2. Policy Enforcement
+			if config.restart_count > limit {
+				if config.system_spec.quarantine_policy == .Abort {
+					fmt.eprintfln(
+						"[FATAL] Shard %d exceeded restart limits. Policy: Abort. Force Killing Process.",
+						shard.id,
+					)
+					os_force_exit(1)
+				} else {
+					fmt.eprintfln(
+						"[QUARANTINE] Shard %d exceeded restart limits. Quarantining.",
+						shard.id,
+					)
+					sync.atomic_store_explicit(
+						&config.watchdog_state,
+						u8(Shard_State.Quarantined),
+						.Release,
+					)
+
+					// Single Writer Principle: Shard broadcasts its own quarantine state
+					env: Message_Envelope
+					env.source = HANDLE_NONE
+					env.destination = HANDLE_NONE
+					env.tag = TAG_SHARD_QUARANTINED
+					transport_broadcast_envelope(shard, &env)
+					transport_flush_outbound(shard)
+				}
+			} else {
+				shard_mass_teardown(shard)
+			}
 		} else {
-			// FIRST-TIME BOOT PATH:
+			// FIRST-TIME BOOT PATH
 			when !TINA_SIMULATION_MODE {
 				now_ns := os_monotonic_time_ns()
 				shard.current_tick = now_ns / shard.timer_resolution_ns
 				shard.timer_wheel.last_tick = shard.current_tick
 				sync.atomic_store_explicit(&shard.heartbeat_tick, shard.current_tick, .Relaxed)
+				config.window_start_tick = shard.current_tick
+			}
+		}
+
+		// 3. The Dormant Sleep Loop (Fixes Silent Escapes)
+		state := cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed)
+		if state == .Quarantined {
+			// Poll interval derived from watchdog cadence — never faster than the watchdog can act.
+			poll_ms := config.system_spec.watchdog.check_interval_ms
+			if poll_ms == 0 do poll_ms = 500
+			poll_interval := time.Duration(poll_ms) * time.Millisecond
+
+			for cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed) == .Quarantined {
+				when !TINA_SIMULATION_MODE {
+					time.sleep(poll_interval)
+				}
 			}
 
-			alloc_data := Grand_Arena_Allocator_Data {
-				arena = &arena,
-			}
-			arena_alloc := grand_arena_allocator(&alloc_data)
-			shard_build_supervision_tree(
-				shard,
-				&config.shard_spec.root_group,
-				arena_alloc,
-				&alloc_data,
-			)
+			// Recovered from quarantine! Reset limits and force a clean rebuild.
+			config.restart_count = 0
+			config.window_start_tick = shard.current_tick
+			shard_mass_teardown(shard)
+		}
 
-			if config.shard_id == 0 {
-				arena_print_layout(&arena)
-			}
+		// 4. Rebuild & Run
+		alloc_data := Grand_Arena_Allocator_Data {
+			arena = &arena,
+		}
+		arena_alloc := grand_arena_allocator(&alloc_data)
+		shard_build_supervision_tree(
+			shard,
+			&config.shard_spec.root_group,
+			arena_alloc,
+			&alloc_data,
+		)
 
-			// Synchronize with all Shards (First boot only)
+		if recovery_reason == 0 {
+			if config.shard_id == 0 do arena_print_layout(&arena)
 			sync.barrier_wait(config.barrier)
 		}
 
+		// Safe transition to Running (Never blindly overwrite a Quarantined state)
 		sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Running), .Release)
 
 		// S16. Enter scheduler loop
 		for {
-			state := cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed)
-			if state == .Shutting_Down {
-				if !shard_has_live_isolates(shard) {
-					break
-				}
-			}
+			current_state := cast(Shard_State)sync.atomic_load_explicit(
+				&config.watchdog_state,
+				.Relaxed,
+			)
+			if current_state == .Shutting_Down && !shard_has_live_isolates(shard) do break
+			if current_state != .Running && current_state != .Shutting_Down do break
+
 			scheduler_tick(shard)
 		}
 
-		// Break out of recovery loop if we gracefully shut down
-		break
+		if cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed) != .Running do break
 	}
 
 	when TINA_DEBUG_ASSERTS {

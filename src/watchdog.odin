@@ -16,8 +16,6 @@ Watchdog_Event :: enum u8 {
 Watchdog_Tracker :: struct {
 	last_seen_heartbeat: [MAX_SHARDS]u64,
 	stall_count:         [MAX_SHARDS]u8,
-	restart_count:       [MAX_SHARDS]u16,
-	window_start:        [MAX_SHARDS]time.Tick,
 }
 
 watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
@@ -28,9 +26,6 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 	if phase_2_threshold == 0 do phase_2_threshold = 2
 
 	tracker: Watchdog_Tracker
-	for i in 0 ..< spec.shard_count {
-		tracker.window_start[i] = time.tick_now()
-	}
 
 	fmt.printfln("[SYSTEM] Process running. Watchdog active (interval: %v ms).", interval_ms)
 
@@ -49,8 +44,6 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
 				if state == .Quarantined {
 					tracker.stall_count[i] = 0
-					tracker.restart_count[i] = 0
-					tracker.window_start[i] = time.tick_now()
 					sync.atomic_store_explicit(&configs[i].watchdog_state, u8(Shard_State.Running), .Release)
 					fmt.printfln("[WATCHDOG] Shard %d recovered from quarantine.", i)
 				}
@@ -87,7 +80,9 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 
 					} else if tracker.stall_count[i] >= phase_2_threshold {
 						// Phase 2: Forced Recovery (SIGUSR1)
-						_handle_forced_recovery(shard, &configs[i], &tracker, spec)
+						fmt.printfln("[WATCHDOG] Shard %d hard-stalled. Phase 2 (Forced SIGUSR1) dispatched.", i)
+						os_signal_thread(configs[i].os_thread_handle, posix.Signal.SIGUSR1)
+						tracker.stall_count[i] = 0
 					}
 				} else {
 					// Progress made! Reset tracker.
@@ -97,76 +92,6 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 			}
 		}
 	}
-}
-
-@(private = "file")
-_handle_forced_recovery :: proc(
-	shard: ^Shard,
-	config: ^Shard_Config,
-	tracker: ^Watchdog_Tracker,
-	spec: ^SystemSpec,
-) {
-	shard_id := shard.id
-	now := time.tick_now()
-
-	// ADR §6.5.5.2 Quarantine Window Calculation
-	// Use root group spec for shard-level restart tracking (or default)
-	window_duration :=
-		time.Duration(spec.shard_specs[shard_id].root_group.window_duration_ticks) *
-		time.Millisecond
-	if window_duration == 0 do window_duration = 30 * time.Second
-
-	restart_count_max := spec.shard_specs[shard_id].root_group.restart_count_max
-	if restart_count_max == 0 do restart_count_max = 3
-
-	if time.tick_diff(tracker.window_start[shard_id], now) >= window_duration {
-		// Outside window, reset tracking
-		tracker.window_start[shard_id] = now
-		tracker.restart_count[shard_id] = 1
-	} else {
-		tracker.restart_count[shard_id] += 1
-	}
-
-	if tracker.restart_count[shard_id] > restart_count_max {
-		if spec.quarantine_policy == .Abort {
-			fmt.eprintfln(
-				"[FATAL] Shard %d exceeded restart limits. Policy: Abort. Force Killing Process.",
-				shard_id,
-			)
-			os_force_exit(1)
-		} else {
-			fmt.eprintfln("[QUARANTINE] Shard %d exceeded restart limits. Quarantining.", shard_id)
-			sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Quarantined), .Release)
-
-			// Broadcast TAG_SHARD_QUARANTINED so peers can fast-fail.
-			// The watchdog thread does this on behalf of the frozen Shard.
-			when !TINA_SIMULATION_MODE {
-				env: Message_Envelope
-				env.source = HANDLE_NONE
-				env.destination = HANDLE_NONE
-				env.tag = TAG_SHARD_QUARANTINED
-
-				if len(config.outbound_rings) > 0 {
-					for outbound_ring in config.outbound_rings {
-						if outbound_ring != nil {
-							spsc_ring_enqueue(outbound_ring, &env)
-							// Watchdog is the only writer now; must flush manually
-							spsc_ring_flush_producer(outbound_ring)
-						}
-					}
-				}
-			}
-			return
-		}
-	}
-
-	// Not quarantined, send the violent SIGUSR1
-	fmt.printfln(
-		"[WATCHDOG] Shard %d hard-stalled. Phase 2 (Forced SIGUSR1) dispatched.",
-		shard_id,
-	)
-	os_signal_thread(config.os_thread_handle, posix.Signal.SIGUSR1)
-	tracker.stall_count[shard_id] = 0
 }
 
 @(private = "file")
@@ -199,9 +124,6 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 	if phase_2_threshold == 0 do phase_2_threshold = 2
 
 	tracker: Watchdog_Tracker
-	for i in 0 ..< spec.shard_count {
-		tracker.window_start[i] = time.tick_now()
-	}
 
 	// Phase 2: Monitor drain with continued heartbeat checking
 	for {
@@ -283,9 +205,9 @@ _execute_phase3_force_kill :: proc(configs: []Shard_Config, spec: ^SystemSpec) -
 	for i in 0 ..< spec.shard_count {
 		shard := configs[i].shard_ptr
 		if shard != nil {
-			when ODIN_OS ==
-				.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
+			when ODIN_OS == .Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD || ODIN_OS == .Windows {
 				emergency_log_flush_snapshot(shard)
+				emergency_print_stalled_io_snapshot(shard)
 			}
 		}
 	}
