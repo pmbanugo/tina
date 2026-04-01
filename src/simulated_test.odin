@@ -183,7 +183,7 @@ when TINA_SIMULATION_MODE {
 			restart_count_max       = 3,
 			window_duration_ticks   = 1000,
 			children                = children[:],
-			dynamic_child_count_max = 10,
+			child_count_dynamic_max = 10,
 		}
 
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
@@ -421,7 +421,7 @@ when TINA_SIMULATION_MODE {
 			restart_count_max       = 3,
 			window_duration_ticks   = 1000,
 			children                = children[:],
-			dynamic_child_count_max = 4,
+			child_count_dynamic_max = 4,
 		}
 
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
@@ -557,7 +557,7 @@ when TINA_SIMULATION_MODE {
 			restart_count_max       = 3,
 			window_duration_ticks   = 1000,
 			children                = children[:],
-			dynamic_child_count_max = 10,
+			child_count_dynamic_max = 10,
 		}
 
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
@@ -692,7 +692,7 @@ when TINA_SIMULATION_MODE {
 			restart_count_max       = 3,
 			window_duration_ticks   = 1000,
 			children                = root_children[:],
-			dynamic_child_count_max = 4,
+			child_count_dynamic_max = 4,
 		}
 
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
@@ -729,8 +729,8 @@ when TINA_SIMULATION_MODE {
 		shard := &sim.shards[0]
 		root := &shard.supervision_groups[0]
 
-		testing.expect_value(t, root.static_child_count, u16(2))
-		testing.expect_value(t, root.dynamic_child_count, u16(2))
+		testing.expect_value(t, root.child_count_static, u16(2))
+		testing.expect_value(t, root.child_count_dynamic, u16(2))
 		testing.expect_value(
 			t,
 			extract_type_id(root.children_handles[0]),
@@ -752,8 +752,8 @@ when TINA_SIMULATION_MODE {
 
 		simulator_run(&sim)
 
-		testing.expect_value(t, root.static_child_count, u16(2))
-		testing.expect_value(t, root.dynamic_child_count, u16(1))
+		testing.expect_value(t, root.child_count_static, u16(2))
+		testing.expect_value(t, root.child_count_dynamic, u16(1))
 		testing.expect_value(
 			t,
 			extract_type_id(root.children_handles[0]),
@@ -788,20 +788,20 @@ when TINA_SIMULATION_MODE {
 
 		exceeded := _check_and_record_shard_restart(&config, 100)
 		testing.expect_value(t, exceeded, false)
-		testing.expect_value(t, config.restart_count_shard, u16(1))
+		testing.expect_value(t, config.shard_restart_count, u16(1))
 
 		exceeded = _check_and_record_shard_restart(&config, 500_000_000)
 		testing.expect_value(t, exceeded, false)
-		testing.expect_value(t, config.restart_count_shard, u16(2))
+		testing.expect_value(t, config.shard_restart_count, u16(2))
 
 		exceeded = _check_and_record_shard_restart(&config, 900_000_000)
 		testing.expect_value(t, exceeded, true)
-		testing.expect_value(t, config.restart_count_shard, u16(3))
+		testing.expect_value(t, config.shard_restart_count, u16(3))
 
 		exceeded = _check_and_record_shard_restart(&config, 1_500_000_000)
 		testing.expect_value(t, exceeded, false)
-		testing.expect_value(t, config.restart_count_shard, u16(1))
-		testing.expect_value(t, config.window_start_shard_ns, u64(1_500_000_000))
+		testing.expect_value(t, config.shard_restart_count, u16(1))
+		testing.expect_value(t, config.shard_restart_window_ns, u64(1_500_000_000))
 	}
 
 	// ============================================================================
@@ -1172,7 +1172,7 @@ when TINA_SIMULATION_MODE {
 			restart_count_max       = 3,
 			window_duration_ticks   = 1000,
 			children                = children[:],
-			dynamic_child_count_max = 305, // Room for 1 Coord + 300 Workers + padding/wiggle-room
+			child_count_dynamic_max = 305, // Room for 1 Coord + 300 Workers + padding/wiggle-room
 		}
 
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}

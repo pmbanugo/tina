@@ -135,7 +135,7 @@ Group_Spec :: struct {
 	restart_count_max:       u16,
 	window_duration_ticks:   u32,
 	children:                []Child_Spec,
-	dynamic_child_count_max: u16, // > 0 implies a dynamic one_for_one group
+	child_count_dynamic_max: u16, // > 0 implies a dynamic one_for_one group
 }
 
 Child_Spec :: union {
@@ -359,7 +359,7 @@ _validate_supervision_group :: proc(
 		return .InvalidSupervisionIntensity
 	}
 
-	if group.strategy != .One_For_One && group.dynamic_child_count_max > 0 {
+	if group.strategy != .One_For_One && group.child_count_dynamic_max > 0 {
 		fmt.eprintfln("[FATAL] Only .One_For_One groups may have dynamic children")
 		return .InvalidSupervisionStrategy
 	}
@@ -517,11 +517,11 @@ _aligned_capacity :: #force_inline proc(count: int) -> int {
 @(private = "package")
 _compute_group_capacity :: proc(group: ^Group_Spec) -> int {
 	mem_size := 0
-	cap := len(group.children) + int(group.dynamic_child_count_max)
+	cap := len(group.children) + int(group.child_count_dynamic_max)
 
 	mem_size += cap * size_of(Handle) // children_handles array
-	if group.dynamic_child_count_max > 0 {
-		mem_size += int(group.dynamic_child_count_max) * size_of(Dynamic_Child_Spec)
+	if group.child_count_dynamic_max > 0 {
+		mem_size += int(group.child_count_dynamic_max) * size_of(Dynamic_Child_Spec)
 	}
 
 	// Recurse for sub-groups

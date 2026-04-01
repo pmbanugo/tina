@@ -8,20 +8,21 @@ import "core:time"
 
 @(private = "package")
 _check_and_record_shard_restart :: proc(config: ^Shard_Config, wall_now_ns: u64) -> bool {
-	window_ns := u64(config.system_spec.watchdog.shard_restart_window_ms) * 1_000_000
-	if window_ns == 0 do window_ns = 30 * u64(time.Second)
+	window_duration_ns := u64(config.system_spec.watchdog.shard_restart_window_ms) * 1_000_000
+	if window_duration_ns == 0 do window_duration_ns = 30 * u64(time.Second)
 
-	limit := config.system_spec.watchdog.shard_restart_max
-	if limit == 0 do limit = 3
+	restart_count_max := config.system_spec.watchdog.shard_restart_max
+	if restart_count_max == 0 do restart_count_max = 3
 
-	if config.window_start_shard_ns == 0 || wall_now_ns - config.window_start_shard_ns >= window_ns {
-		config.window_start_shard_ns = wall_now_ns
-		config.restart_count_shard = 1
+	if config.shard_restart_window_ns == 0 ||
+	   wall_now_ns - config.shard_restart_window_ns >= window_duration_ns {
+		config.shard_restart_window_ns = wall_now_ns
+		config.shard_restart_count = 1
 		return false
 	}
 
-	config.restart_count_shard += 1
-	return config.restart_count_shard > limit
+	config.shard_restart_count += 1
+	return config.shard_restart_count > restart_count_max
 }
 
 // Custom assertion handler that routes Odin software panics into Tina's Trap Boundary.
@@ -178,21 +179,21 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			}
 
 			// Recovered from quarantine! Reset limits and force a clean rebuild.
-			config.restart_count_shard = 0
-			config.window_start_shard_ns = os_monotonic_time_ns()
+			config.shard_restart_count = 0
+			config.shard_restart_window_ns = os_monotonic_time_ns()
 			shard_mass_teardown(shard)
 		}
 
 		// 4. Rebuild & Run
-		alloc_data := Grand_Arena_Allocator_Data {
+		arena_alloc_data := Grand_Arena_Allocator_Data {
 			arena = &arena,
 		}
-		arena_alloc := grand_arena_allocator(&alloc_data)
+		arena_alloc := grand_arena_allocator(&arena_alloc_data)
 		shard_build_supervision_tree(
 			shard,
 			&config.shard_spec.root_group,
 			arena_alloc,
-			&alloc_data,
+			&arena_alloc_data,
 		)
 
 		if recovery_reason == 0 {

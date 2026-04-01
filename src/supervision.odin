@@ -12,16 +12,16 @@ Build_Result :: enum u8 {
 _assert_group_layout :: #force_inline proc(group: ^Supervision_Group) {
 	when TINA_DEBUG_ASSERTS {
 		assert(
-			group.static_child_count == u16(len(group.boot_spec.children)),
-			"static_child_count must match boot_spec child count",
+			group.child_count_static == u16(len(group.boot_spec.children)),
+			"child_count_static must match boot_spec child count",
 		)
 		assert(
-			group.static_child_count + group.dynamic_child_count <= u16(len(group.children_handles)),
+			group.child_count_static + group.child_count_dynamic <= u16(len(group.children_handles)),
 			"group child counts exceed children_handles capacity",
 		)
 		assert(
-			group.dynamic_child_count <= u16(len(group.dynamic_specs)),
-			"group dynamic_child_count exceeds dynamic_specs capacity",
+			group.child_count_dynamic <= u16(len(group.dynamic_specs)),
+			"group child_count_dynamic exceeds dynamic_specs capacity",
 		)
 	}
 }
@@ -29,7 +29,7 @@ _assert_group_layout :: #force_inline proc(group: ^Supervision_Group) {
 @(private = "package")
 _group_total_child_count :: #force_inline proc(group: ^Supervision_Group) -> u16 {
 	_assert_group_layout(group)
-	return group.static_child_count + group.dynamic_child_count
+	return group.child_count_static + group.child_count_dynamic
 }
 
 @(private = "package")
@@ -41,33 +41,33 @@ _find_child_index :: proc(group: ^Supervision_Group, handle: Handle) -> (u16, bo
 }
 
 @(private = "package")
-_remove_child_at :: proc(group: ^Supervision_Group, index: u16) {
+_remove_child_at :: proc(group: ^Supervision_Group, child_index: u16) {
 	_assert_group_layout(group)
-	if index < group.static_child_count {
-		group.children_handles[index] = HANDLE_NONE
+	if child_index < group.child_count_static {
+		group.children_handles[child_index] = HANDLE_NONE
 		return
 	}
 
-	dynamic_index := index - group.static_child_count
-	last_dynamic_index := group.dynamic_child_count - 1
+	child_index_dynamic := child_index - group.child_count_static
+	child_index_dynamic_last := group.child_count_dynamic - 1
 
-	for i in dynamic_index ..< last_dynamic_index {
-		target := group.static_child_count + i
+	for i in child_index_dynamic ..< child_index_dynamic_last {
+		target := group.child_count_static + i
 		source := target + 1
 		group.children_handles[target] = group.children_handles[source]
 		group.dynamic_specs[i] = group.dynamic_specs[i + 1]
 	}
 
-	last_slot := group.static_child_count + last_dynamic_index
+	last_slot := group.child_count_static + child_index_dynamic_last
 	group.children_handles[last_slot] = HANDLE_NONE
-	group.dynamic_child_count -= 1
+	group.child_count_dynamic -= 1
 }
 
 @(private = "package")
-_get_child_restart_type :: proc(group: ^Supervision_Group, index: u16) -> Restart_Type {
+_get_child_restart_type :: proc(group: ^Supervision_Group, child_index: u16) -> Restart_Type {
 	_assert_group_layout(group)
-	if index < group.static_child_count {
-		child_spec_pointer := &group.boot_spec.children[index]
+	if child_index < group.child_count_static {
+		child_spec_pointer := &group.boot_spec.children[child_index]
 		#partial switch &s in child_spec_pointer {
 		case Static_Child_Spec:
 			return s.restart_type
@@ -77,7 +77,7 @@ _get_child_restart_type :: proc(group: ^Supervision_Group, index: u16) -> Restar
 		return .temporary
 	}
 
-	return group.dynamic_specs[index - group.static_child_count].restart_type
+	return group.dynamic_specs[child_index - group.child_count_static].restart_type
 }
 
 @(private = "package")
@@ -104,7 +104,7 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 			}
 		}
 	}
-	group.dynamic_child_count = 0
+	group.child_count_dynamic = 0
 
 	if group.parent_id == SUPERVISION_GROUP_ID_NONE {
 		os_trap_restore(&shard.trap_environment_outer, RECOVERY_ROOT_ESCALATE)
@@ -132,23 +132,23 @@ _teardown_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
 		}
 	}
 
-	for i in group.static_child_count ..< _group_total_child_count(group) {
+	for i in group.child_count_static ..< _group_total_child_count(group) {
 		group.children_handles[i] = HANDLE_NONE
 	}
-	group.dynamic_child_count = 0
+	group.child_count_dynamic = 0
 	group.restart_count = 0
 	group.window_start_tick = shard.current_tick
 }
 
 @(private = "package")
-_spawn_static_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) -> bool {
+_spawn_static_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, child_index: u16) -> bool {
 	_assert_group_layout(group)
 	spec: Spawn_Spec
 	spec.group_id = group.group_id
 	spec.handoff_fd = FD_HANDLE_NONE
 	spec.handoff_mode = .Full
 
-	child_spec_pointer := &group.boot_spec.children[index]
+	child_spec_pointer := &group.boot_spec.children[child_index]
 	#partial switch &s in child_spec_pointer {
 	case Static_Child_Spec:
 		spec.type_id = s.type_id
@@ -161,30 +161,30 @@ _spawn_static_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: 
 
 	res := _make_isolate(shard, spec, HANDLE_NONE)
 	if handle, ok := res.(Handle); ok {
-		group.children_handles[index] = handle
+		group.children_handles[child_index] = handle
 		return true
 	}
 	return false
 }
 
 @(private = "package")
-_respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) -> Build_Result {
+_respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, child_index: u16) -> Build_Result {
 	_assert_group_layout(group)
-	if index < group.static_child_count {
-		child_spec_pointer := &group.boot_spec.children[index]
+	if child_index < group.child_count_static {
+		child_spec_pointer := &group.boot_spec.children[child_index]
 		#partial switch &s in child_spec_pointer {
 		case Static_Child_Spec:
-			if _spawn_static_child_at(shard, group, index) {
+			if _spawn_static_child_at(shard, group, child_index) {
 				return .Ok
 			}
 		case Group_Spec:
-			sub_handle := group.children_handles[index]
-			sub_index := extract_slot(sub_handle)
-			return _rebuild_subgroup(shard, &shard.supervision_groups[sub_index])
+			subgroup_handle := group.children_handles[child_index]
+			subgroup_index := extract_slot(subgroup_handle)
+			return _rebuild_subgroup(shard, &shard.supervision_groups[subgroup_index])
 		}
 	} else {
-		dynamic_index := index - group.static_child_count
-		dyn := &group.dynamic_specs[dynamic_index]
+		child_index_dynamic := child_index - group.child_count_static
+		dyn := &group.dynamic_specs[child_index_dynamic]
 
 		spec := Spawn_Spec {
 			group_id     = group.group_id,
@@ -198,7 +198,7 @@ _respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) 
 
 		res := _make_isolate(shard, spec, HANDLE_NONE)
 		if handle, ok := res.(Handle); ok {
-			group.children_handles[index] = handle
+			group.children_handles[child_index] = handle
 			return .Ok
 		}
 	}
@@ -208,17 +208,17 @@ _respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, index: u16) 
 }
 
 @(private = "package")
-_apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, crashed_index: u16) -> Build_Result {
+_apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, child_index_crashed: u16) -> Build_Result {
 	_assert_group_layout(group)
-	start_index: u16 = group.strategy == .Rest_For_One ? crashed_index + 1 : 0
-	total_children := _group_total_child_count(group)
+	child_index_start: u16 = group.strategy == .Rest_For_One ? child_index_crashed + 1 : 0
+	child_count := _group_total_child_count(group)
 
 	if group.strategy == .One_For_All || group.strategy == .Rest_For_One {
-		for i := total_children; i > start_index; i -= 1 {
-			target_index := i - 1
-			if target_index == crashed_index do continue
+		for i := child_count; i > child_index_start; i -= 1 {
+			child_index_target := i - 1
+			if child_index_target == child_index_crashed do continue
 
-			handle := group.children_handles[target_index]
+			handle := group.children_handles[child_index_target]
 			if handle != HANDLE_NONE {
 				if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
 					_teardown_isolate(
@@ -227,7 +227,7 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, crashed_index:
 						extract_slot(handle),
 						.Shutdown,
 					)
-					group.children_handles[target_index] = HANDLE_NONE
+					group.children_handles[child_index_target] = HANDLE_NONE
 				} else {
 					_teardown_subgroup(shard, &shard.supervision_groups[extract_slot(handle)])
 				}
@@ -240,11 +240,11 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, crashed_index:
 
 	switch group.strategy {
 	case .One_For_One:
-		restart_start = crashed_index; restart_end = crashed_index + 1
+		restart_start = child_index_crashed; restart_end = child_index_crashed + 1
 	case .One_For_All:
-		restart_start = 0; restart_end = total_children
+		restart_start = 0; restart_end = child_count
 	case .Rest_For_One:
-		restart_start = crashed_index; restart_end = total_children
+		restart_start = child_index_crashed; restart_end = child_count
 	}
 
 	for i in restart_start ..< restart_end {
@@ -269,10 +269,10 @@ _on_child_exit :: proc(
 		return
 	}
 
-	index, found := _find_child_index(group, child_handle)
+	child_index, found := _find_child_index(group, child_handle)
 	if !found do return
 
-	restart_type := _get_child_restart_type(group, index)
+	restart_type := _get_child_restart_type(group, child_index)
 
 	should_restart := false
 	switch exit_kind {
@@ -284,7 +284,7 @@ _on_child_exit :: proc(
 	}
 
 	if !should_restart {
-		_remove_child_at(group, index)
+		_remove_child_at(group, child_index)
 		return
 	}
 
@@ -293,7 +293,7 @@ _on_child_exit :: proc(
 		return
 	}
 
-	_ = _apply_strategy(shard, group, index)
+	_ = _apply_strategy(shard, group, child_index)
 }
 
 @(private = "package")
@@ -301,10 +301,17 @@ shard_build_supervision_tree :: proc(
 	shard: ^Shard,
 	root_spec: ^Group_Spec,
 	alloc: mem.Allocator,
-	alloc_data: ^Grand_Arena_Allocator_Data = nil,
+	arena_alloc_data: ^Grand_Arena_Allocator_Data = nil,
 ) {
-	next_group_index: u16 = 0
-	_ = _build_group(shard, root_spec, SUPERVISION_GROUP_ID_NONE, &next_group_index, alloc, alloc_data)
+	group_index_next: u16 = 0
+	_ = _build_group(
+		shard,
+		root_spec,
+		SUPERVISION_GROUP_ID_NONE,
+		&group_index_next,
+		alloc,
+		arena_alloc_data,
+	)
 }
 
 @(private = "package")
@@ -312,12 +319,12 @@ _build_group :: proc(
 	shard: ^Shard,
 	group_spec: ^Group_Spec,
 	parent_id: Supervision_Group_Id,
-	next_group_index: ^u16,
+	group_index_next: ^u16,
 	alloc: mem.Allocator,
-	alloc_data: ^Grand_Arena_Allocator_Data,
+	arena_alloc_data: ^Grand_Arena_Allocator_Data,
 ) -> Build_Result {
-	group_index := next_group_index^
-	next_group_index^ += 1
+	group_index := group_index_next^
+	group_index_next^ += 1
 
 	group := &shard.supervision_groups[group_index]
 	group.group_id = Supervision_Group_Id(group_index)
@@ -328,19 +335,19 @@ _build_group :: proc(
 	group.restart_count_max = group_spec.restart_count_max
 	group.restart_count = 0
 	group.window_start_tick = shard.current_tick
-	group.static_child_count = u16(len(group_spec.children))
-	group.dynamic_child_count = 0
+	group.child_count_static = u16(len(group_spec.children))
+	group.child_count_dynamic = 0
 	_assert_group_layout(group)
 
-	capacity := len(group_spec.children) + int(group_spec.dynamic_child_count_max)
-	if len(group.children_handles) == 0 && capacity > 0 {
-		if alloc_data != nil do alloc_data.current_name = fmt.tprintf("Group_%d_Handles", group_index)
-		group.children_handles = make([]Handle, capacity, alloc)
+	child_capacity_count := len(group_spec.children) + int(group_spec.child_count_dynamic_max)
+	if len(group.children_handles) == 0 && child_capacity_count > 0 {
+		if arena_alloc_data != nil do arena_alloc_data.current_name = fmt.tprintf("Group_%d_Handles", group_index)
+		group.children_handles = make([]Handle, child_capacity_count, alloc)
 	}
 
-	if group_spec.dynamic_child_count_max > 0 && len(group.dynamic_specs) == 0 {
-		if alloc_data != nil do alloc_data.current_name = fmt.tprintf("Group_%d_Dynamic_Specs", group_index)
-		group.dynamic_specs = make([]Dynamic_Child_Spec, group_spec.dynamic_child_count_max, alloc)
+	if group_spec.child_count_dynamic_max > 0 && len(group.dynamic_specs) == 0 {
+		if arena_alloc_data != nil do arena_alloc_data.current_name = fmt.tprintf("Group_%d_Dynamic_Specs", group_index)
+		group.dynamic_specs = make([]Dynamic_Child_Spec, group_spec.child_count_dynamic_max, alloc)
 	}
 
 	for i in 0 ..< len(group.children_handles) {
@@ -364,11 +371,11 @@ _build_group :: proc(
 			}
 
 		case Group_Spec:
-			sub_index := next_group_index^
+			subgroup_index := group_index_next^
 			group.children_handles[i] = make_handle(
 				shard.id,
 				u16(SUPERVISION_SUBGROUP_TYPE_ID),
-				u32(sub_index),
+				u32(subgroup_index),
 				0,
 			)
 
@@ -376,9 +383,9 @@ _build_group :: proc(
 				shard,
 				&s,
 				Supervision_Group_Id(group_index),
-				next_group_index,
+				group_index_next,
 				alloc,
-				alloc_data,
+				arena_alloc_data,
 			) == .Escalated {
 				return .Escalated
 			}

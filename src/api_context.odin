@@ -54,7 +54,7 @@ ctx_spawn :: #force_inline proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Re
 	if spec.group_id != SUPERVISION_GROUP_ID_NONE {
 		group = &shard.supervision_groups[u16(spec.group_id)]
 		_assert_group_layout(group)
-		if group.dynamic_child_count >= u16(len(group.dynamic_specs)) {
+		if group.child_count_dynamic >= u16(len(group.dynamic_specs)) {
 			return Spawn_Error.group_full
 		}
 	}
@@ -70,15 +70,15 @@ ctx_spawn :: #force_inline proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Re
 	// 3. Register with Supervision Group (Always Appends)
 	if group != nil {
 		_assert_group_layout(group)
-		index := group.static_child_count + group.dynamic_child_count
-		group.children_handles[index] = child_handle
+		child_index := group.child_count_static + group.child_count_dynamic
+		group.children_handles[child_index] = child_handle
 
-		dyn := &group.dynamic_specs[group.dynamic_child_count]
+		dyn := &group.dynamic_specs[group.child_count_dynamic]
 		dyn.type_id = spec.type_id
 		dyn.restart_type = spec.restart_type
 		dyn.args_size = spec.args_size
 		dyn.args_payload = spec.args_payload
-		group.dynamic_child_count += 1
+		group.child_count_dynamic += 1
 	}
 
 	return child_handle
