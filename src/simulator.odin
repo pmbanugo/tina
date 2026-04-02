@@ -5,6 +5,12 @@ import "core:mem"
 
 when TINA_SIMULATION_MODE {
 
+	Termination_Reason :: enum u8 {
+		Ticks_Max,
+		Quiescent,
+		Checker_Violation,
+	}
+
 	Simulator :: struct {
 		spec:               ^SystemSpec,
 		shards:             []Shard, // Allocated as a flat array
@@ -15,7 +21,16 @@ when TINA_SIMULATION_MODE {
 
 		// For fast-forward and clock management
 		tick_resolution_ns: u64,
+
+		// Post-run observable state
+		final_round:        u64,
+		termination_reason: Termination_Reason,
 	}
+
+	// Simulation is a structural overlay over the production runtime, not a
+	// separate scheduler architecture. The harness may replace the clock,
+	// transport, and backend implementations, but it must preserve the
+	// scheduler-facing contracts those subsystems expose.
 
 	// ============================================================================
 	// Simulation Bootstrap (§10.1 in SIMULATION_MODE_DST.md)
@@ -29,9 +44,8 @@ when TINA_SIMULATION_MODE {
 		sim.shards = make([]Shard, spec.shard_count, allocator)
 		sim.shard_states = make([]u8, spec.shard_count, allocator)
 
-		// Validate uniform timer resolution (ADR constraint)
-		sim.tick_resolution_ns = 1_000_000 // Default 1ms
-		// In a real implementation we'd read this from the spec, but we enforce uniformity.
+		// Use the validated timer resolution from the spec (uniform across all shards)
+		sim.tick_resolution_ns = spec.timer_resolution_ns
 
 		// SI-1: Initialize PRNG Tree
 		seed := spec.simulation.seed
@@ -123,12 +137,17 @@ when TINA_SIMULATION_MODE {
 
 		round: u64 = 0
 		ticks_max := sim.spec.simulation.ticks_max
+		reason := Termination_Reason.Ticks_Max
 
 		// Pre-allocate array for shuffled shard execution order
 		order := make([]u8, sim.spec.shard_count, context.temp_allocator)
 		for i in 0 ..< sim.spec.shard_count do order[i] = u8(i)
 
-		for round < ticks_max {
+		loop: for round < ticks_max {
+			// Round contract:
+			// - every shard ticks exactly once
+			// - interleaving diversity comes from execution order, not skipping
+			// - all shards observe the same simulated "now" for the round
 			// 1. Advance simulated time globally & Fast-Forward Logic
 			if sim.spec.simulation.terminate_on_quiescent && simulator_is_globally_idle(sim) {
 				earliest_deadline: u64 = max(u64)
@@ -139,11 +158,8 @@ when TINA_SIMULATION_MODE {
 				}
 
 				if earliest_deadline == max(u64) {
-					fmt.printfln(
-						"[SIM] Terminating early at round %d: System is globally quiescent with no timers.",
-						round,
-					)
-					break
+					reason = .Quiescent
+					break loop
 				} else if earliest_deadline > round {
 					// Time Travel: Instantly fast-forward to the exact tick the next timer fires
 					round = earliest_deadline
@@ -172,125 +188,96 @@ when TINA_SIMULATION_MODE {
 			// 5. Run structural checkers at interval
 			if sim.spec.simulation.checker_interval_ticks > 0 &&
 			   round % u64(sim.spec.simulation.checker_interval_ticks) == 0 {
-				violation := simulator_run_checkers(sim, round)
-				if violation {
-					fmt.eprintfln("[SIM] Checker violation at round %d. Aborting.", round)
-					break
+				if simulator_run_checkers(sim, round) {
+					reason = .Checker_Violation
+					break loop
 				}
 			}
 
 			// 6. Quiescence Check
 			if sim.spec.simulation.terminate_on_quiescent {
 				if simulator_is_globally_idle(sim) {
-					fmt.printfln(
-						"[SIM] Terminating early at round %d: System is globally quiescent.",
-						round,
-					)
-					break
+					reason = .Quiescent
+					break loop
 				}
 			}
 
 			round += 1
 		}
 
-		fmt.printfln("[SIM] Simulation complete at round %d.", round)
+		sim.final_round = round
+		sim.termination_reason = reason
+
+		// Unconditional final checker run at simulation end
+		if reason != .Checker_Violation {
+			if simulator_run_checkers(sim, round) {
+				sim.termination_reason = .Checker_Violation
+			}
+		}
+
+		simulator_print_summary(sim)
 	}
 
 	// ============================================================================
-	// Structural Checkers (§7 in SIMULATION_MODE_DST.md)
+	// End-of-Simulation Summary
 	// ============================================================================
-
-	// Returns true if any checker detected a violation.
-	simulator_run_checkers :: proc(sim: ^Simulator, round: u64) -> bool {
-		for i in 0 ..< sim.spec.shard_count {
-			shard := &sim.shards[i]
-
-			// Pool integrity: reactor buffer pool
-			// The free_count + buffers held in completions + buffers in-flight in
-			// the backend must equal the total slot_count. Since we can't easily
-			// count in-flight buffers, we verify a weaker invariant:
-			// free_count must not exceed slot_count (underflow/corruption).
-			pool := &shard.reactor.buffer_pool
-			if pool.free_count > pool.slot_count {
-				fmt.eprintfln(
-					"[CHECKER] Shard %d: reactor buffer pool corruption — free_count (%d) > slot_count (%d)",
-					i,
-					pool.free_count,
-					pool.slot_count,
-				)
-				return true
-			}
-
-			// Pool integrity: message pool
-			msg_pool := &shard.message_pool
-			if msg_pool.free_count > msg_pool.slot_count {
-				fmt.eprintfln(
-					"[CHECKER] Shard %d: message pool corruption — free_count (%d) > slot_count (%d)",
-					i,
-					msg_pool.free_count,
-					msg_pool.slot_count,
-				)
-				return true
-			}
-
-			// Pool integrity: transfer buffer pool
-			t_pool := &shard.transfer_pool
-			if t_pool.free_count > t_pool.slot_count {
-				fmt.eprintfln(
-					"[CHECKER] Shard %d: transfer pool corruption — free_count (%d) > slot_count (%d)",
-					i,
-					t_pool.free_count,
-					t_pool.slot_count,
-				)
-				return true
-			}
-
-			// Generation monotonicity: generations must never be zero
-			// (zero is reserved for HANDLE_NONE / stale sentinel)
-			for type_desc in shard.type_descriptors {
-				type_id := type_desc.id
-				for slot in 0 ..< type_desc.slot_count {
-					gen := shard.metadata[type_id].generation[slot]
-					if gen == 0 {
-						fmt.eprintfln(
-							"[CHECKER] Shard %d: generation zero at type=%d slot=%d (round %d)",
-							i,
-							type_id,
-							slot,
-							round,
-						)
-						return true
-					}
-				}
-			}
-		}
-		return false
-	}
-
-	simulator_is_globally_idle :: proc(sim: ^Simulator) -> bool {
-		for i in 0 ..< sim.spec.shard_count {
-			shard := &sim.shards[i]
-
-			// Check if any Isolate has pending work in its mailbox or is waiting for I/O
-			for type_desc in shard.type_descriptors {
-				type_id := type_desc.id
-				slot_count := type_desc.slot_count
-
-				for slot in 0 ..< slot_count {
-					if shard.metadata[type_id].inbox_count[slot] > 0 do return false
-					if shard.metadata[type_id].state[slot] == .Waiting_For_Io do return false
-				}
-			}
-
-			// Check if the SimulatedIO backend has pending completions
-			if shard.reactor.backend.pending_count > 0 do return false
-
-			// Check if any timers are registered
-			if shard.timer_wheel.resident_count > 0 do return false
+	@(private = "file")
+	simulator_print_summary :: proc(sim: ^Simulator) {
+		reason_label: string
+		switch sim.termination_reason {
+		case .Ticks_Max:
+			reason_label = "maximum ticks reached"
+		case .Quiescent:
+			reason_label = "quiescent (no pending work or timers)"
+		case .Checker_Violation:
+			reason_label = "checker violation"
 		}
 
-		// Note: We also need to check the SimulatedNetwork delay queues,
-		// but for now this covers the basics.
-		return true
+		fmt.printfln(
+			"[SIM] Simulation complete: seed=0x%16X, rounds=%d, termination=%s",
+			sim.spec.simulation.seed,
+			sim.final_round,
+			reason_label,
+		)
+
+		// Aggregate counters across shards
+		total_stale_delivery: u64 = 0
+		total_ring_full: u64 = 0
+		total_quarantine: u64 = 0
+		total_pool_exhaustion: u64 = 0
+		total_mailbox_full: u64 = 0
+		total_io_buffer_exhaustion: u64 = 0
+		total_io_stale: u64 = 0
+		total_transfer_exhaustion: u64 = 0
+		total_transfer_stale: u64 = 0
+
+		for i in 0 ..< sim.spec.shard_count {
+			c := &sim.shards[i].counters
+			total_stale_delivery += c.stale_delivery_drops
+			total_ring_full += c.ring_full_drops
+			total_quarantine += c.quarantine_drops
+			total_pool_exhaustion += c.pool_exhaustion_drops
+			total_mailbox_full += c.mailbox_full_drops
+			total_io_buffer_exhaustion += c.io_buffer_exhaustions
+			total_io_stale += c.io_stale_completions
+			total_transfer_exhaustion += c.transfer_exhaustions
+			total_transfer_stale += c.transfer_stale_reads
+		}
+
+		fmt.printfln(
+			"[SIM] Backpressure: mailbox_full=%d, pool_exhaustion=%d, ring_full=%d, stale_delivery=%d, quarantine=%d",
+			total_mailbox_full,
+			total_pool_exhaustion,
+			total_ring_full,
+			total_stale_delivery,
+			total_quarantine,
+		)
+		fmt.printfln(
+			"[SIM] I/O: stale_completions=%d, buffer_exhaustions=%d, transfer_exhaustions=%d, transfer_stale=%d",
+			total_io_stale,
+			total_io_buffer_exhaustion,
+			total_transfer_exhaustion,
+			total_transfer_stale,
+		)
 	}
 }

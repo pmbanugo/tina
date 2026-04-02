@@ -6,7 +6,7 @@ Deferred design cleanup. No behavior change is proposed in this memo.
 
 ## Context
 
-The recent supervision and shard-restart repair work improved several names:
+The recent supervision and shard-restart repair work changed several names:
 
 - `child_count_static`
 - `child_count_dynamic`

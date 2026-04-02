@@ -1,6 +1,12 @@
 package tina
 
 // Transport layer abstraction: physical SPSC rings vs. simulated network.
+//
+// Contract:
+// - scheduler and mailbox code should not need to care which transport backs it
+// - simulation may inject delay/drop/partition, but must preserve per-channel FIFO
+// - same-round visibility differences come from shard execution order, not from a
+//   different mailbox contract
 
 @(private = "package")
 transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now: u64) {
@@ -22,6 +28,9 @@ transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now:
 		}
 	} else {
 		if shard.sim_state.network != nil {
+			// Drain sources in ascending shard order. This keeps delivery order
+			// stable and matches the fixed ordered-drain discipline expected by
+			// the simulation ADR.
 			for source in u8(0) ..< shard.sim_state.network.shard_count {
 				if source != shard.id {
 					sim_network_drain(shard.sim_state.network, shard, source, now)

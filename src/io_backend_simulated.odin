@@ -6,7 +6,8 @@ import "core:testing"
 // SimulatedIO Backend (§6.6.2 §5.4) — Deterministic Testing
 // ============================================================================
 //
-// No kernel interaction. PRNG-driven delays, fault injection, reordering.
+// No kernel interaction. Deterministic delay/error derivation, fault injection,
+// and optional completion reordering.
 // Same seed + same submit/collect sequence = same completions.
 //
 // Active when TINA_SIM=true (overrides OS selection).
@@ -277,8 +278,10 @@ when TINA_SIMULATION_MODE {
 	// --- Internal Helpers ---
 
 	// Derive a deterministic per-operation value from (seed, tick, token).
-	// Uses the existing PRNG engine: mixes inputs into a seed, inits a
-	// throwaway Prng, and draws one step. Invariant to batch size/order (§6.6.2 §5.4).
+	// This is an accepted implementation of the ADR's per-domain determinism goal:
+	// the seed still roots the backend in the shard's simulation domain, while the
+	// hash-style derivation avoids accidental dependence on local iteration order
+	// or batch packing details inside backend_submit/backend_collect.
 	@(private = "file")
 	_sim_op_hash :: #force_inline proc "contextless" (
 		seed: u64,

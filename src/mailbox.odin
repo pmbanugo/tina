@@ -23,6 +23,7 @@ Envelope_Flags :: bit_set[Envelope_Flag;u16]
 
 // The tagged union representing an incoming event to an Isolate.
 // Structurally separates user-defined message payloads from framework I/O completions.
+// TODO (future): I could name this MessageEnvelope and body.user becomes body.message (or leave as user)
 Message :: struct {
 	using body: struct #raw_union {
 		user: struct {

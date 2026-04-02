@@ -337,7 +337,6 @@ _build_group :: proc(
 	group.window_start_tick = shard.current_tick
 	group.child_count_static = u16(len(group_spec.children))
 	group.child_count_dynamic = 0
-	_assert_group_layout(group)
 
 	child_capacity_count := len(group_spec.children) + int(group_spec.child_count_dynamic_max)
 	if len(group.children_handles) == 0 && child_capacity_count > 0 {
@@ -349,6 +348,8 @@ _build_group :: proc(
 		if arena_alloc_data != nil do arena_alloc_data.current_name = fmt.tprintf("Group_%d_Dynamic_Specs", group_index)
 		group.dynamic_specs = make([]Dynamic_Child_Spec, group_spec.child_count_dynamic_max, alloc)
 	}
+
+	_assert_group_layout(group)
 
 	for i in 0 ..< len(group.children_handles) {
 		group.children_handles[i] = HANDLE_NONE

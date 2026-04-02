@@ -419,6 +419,14 @@ when TINA_SIMULATION_MODE {
 	_validate_simulation :: proc(spec: ^SystemSpec) -> SystemSpecError {
 		if spec.simulation == nil do return .None
 
+		sim := spec.simulation
+
+		// ticks_max must be > 0
+		if sim.ticks_max == 0 {
+			fmt.eprintfln("[FATAL] Simulation ticks_max must be > 0")
+			return .ValueOutOfBounds
+		}
+
 		// ADR Check 20: Uniform timer resolution in simulation
 		// Note: In the current SystemSpec, timer_resolution_ns is process-wide,
 		// but we validate it here anyway to future-proof against per-shard configs.
@@ -430,7 +438,7 @@ when TINA_SIMULATION_MODE {
 		// Fault ratio denominators must be non-zero when the numerator is non-zero.
 		// A user writing Ratio{1, 0} likely intends 100% but would silently get 0%.
 		// Ratio{0, 0} is fine — it means "disabled" (numerator == 0 → always false).
-		f := spec.simulation.faults
+		f := sim.faults
 		_bad_ratio :: proc(r: Ratio) -> bool { return r.numerator > 0 && r.denominator == 0 }
 		if _bad_ratio(f.io_error_rate) ||
 		   _bad_ratio(f.network_drop_rate) ||
@@ -439,6 +447,39 @@ when TINA_SIMULATION_MODE {
 		   _bad_ratio(f.isolate_crash_rate) ||
 		   _bad_ratio(f.init_failure_rate) {
 			fmt.eprintfln("[FATAL] Simulation fault ratio has non-zero numerator with zero denominator")
+			return .ValueOutOfBounds
+		}
+
+		// Numerator must not exceed denominator (would mean > 100% probability)
+		_over_ratio :: proc(r: Ratio) -> bool {
+			return r.denominator > 0 && r.numerator > r.denominator
+		}
+		if _over_ratio(f.io_error_rate) ||
+		   _over_ratio(f.network_drop_rate) ||
+		   _over_ratio(f.network_partition_rate) ||
+		   _over_ratio(f.network_partition_heal_rate) ||
+		   _over_ratio(f.isolate_crash_rate) ||
+		   _over_ratio(f.init_failure_rate) {
+			fmt.eprintfln("[FATAL] Simulation fault ratio has numerator exceeding denominator")
+			return .ValueOutOfBounds
+		}
+
+		// Delay range validation: min <= max
+		if f.io_delay_range_ticks[0] > f.io_delay_range_ticks[1] && f.io_delay_range_ticks[1] > 0 {
+			fmt.eprintfln(
+				"[FATAL] Simulation io_delay_range_ticks min (%v) > max (%v)",
+				f.io_delay_range_ticks[0],
+				f.io_delay_range_ticks[1],
+			)
+			return .ValueOutOfBounds
+		}
+		if f.network_delay_range_ticks[0] > f.network_delay_range_ticks[1] &&
+		   f.network_delay_range_ticks[1] > 0 {
+			fmt.eprintfln(
+				"[FATAL] Simulation network_delay_range_ticks min (%v) > max (%v)",
+				f.network_delay_range_ticks[0],
+				f.network_delay_range_ticks[1],
+			)
 			return .ValueOutOfBounds
 		}
 
@@ -640,6 +681,92 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	spec.reactor_buffer_slot_count = 0 // Restore
 }
 
+when TINA_SIMULATION_MODE {
+	@(test)
+	test_simulation_config_validation :: proc(t: ^testing.T) {
+		types := [1]TypeDescriptor {
+			{id = 0, scratch_requirement_max = 0},
+		}
+
+		children := [1]Child_Spec {
+			Static_Child_Spec{type_id = 0, restart_type = .permanent},
+		}
+		root_group := Group_Spec {
+			strategy              = .One_For_One,
+			restart_count_max     = 3,
+			window_duration_ticks = 1000,
+			children              = children[:],
+		}
+		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+		// Base valid simulation config
+		sim_config := SimulationConfig {
+			seed      = 42,
+			ticks_max = 1000,
+			builtin_checkers = CHECKER_FLAGS_ALL,
+		}
+
+		spec := SystemSpec {
+			shard_count         = 1,
+			types               = types[:],
+			shard_specs         = shard_specs[:],
+			pool_slot_count     = 1024,
+			log_ring_size       = 4096,
+			timer_spoke_count   = 1024,
+			timer_entry_count   = 64,
+			timer_resolution_ns = 1_000_000,
+			default_ring_size   = 16,
+			simulation          = &sim_config,
+		}
+
+		// Valid config should pass
+		err := validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.None)
+
+		// ticks_max = 0 should fail
+		sim_config.ticks_max = 0
+		err = validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		sim_config.ticks_max = 1000
+
+		// Bad ratio: numerator > 0 with denominator = 0
+		sim_config.faults.io_error_rate = Ratio{1, 0}
+		err = validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		sim_config.faults.io_error_rate = Ratio{0, 0} // disabled, OK
+
+		// Bad ratio: numerator > denominator
+		sim_config.faults.network_drop_rate = Ratio{10, 5}
+		err = validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		sim_config.faults.network_drop_rate = Ratio{0, 1}
+
+		// Bad delay range: min > max (with max > 0)
+		sim_config.faults.io_delay_range_ticks = {10, 5}
+		err = validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		sim_config.faults.io_delay_range_ticks = {0, 0}
+
+		// Bad network delay range: min > max
+		sim_config.faults.network_delay_range_ticks = {100, 50}
+		err = validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		sim_config.faults.network_delay_range_ticks = {0, 0}
+
+		// Valid delay range: min == max is OK
+		sim_config.faults.io_delay_range_ticks = {5, 5}
+		err = validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.None)
+		sim_config.faults.io_delay_range_ticks = {0, 0}
+
+		// Valid ratio: numerator == denominator (100%)
+		sim_config.faults.io_error_rate = Ratio{100, 100}
+		err = validate_system_spec(&spec)
+		testing.expect_value(t, err, SystemSpecError.None)
+		sim_config.faults.io_error_rate = Ratio{0, 0}
+	}
+}
+
 // --- Simulation Configuration ---
 
 Ratio :: struct {
@@ -663,13 +790,39 @@ when TINA_SIMULATION_MODE {
 	FaultConfig :: struct {}
 }
 
+Checker_Fn :: #type proc(shards: []Shard, tick: u64) -> Check_Result
+
+Check_Result :: union {
+	Check_Ok,
+	Check_Violation,
+}
+
+Check_Ok :: struct {}
+
+Check_Violation :: struct {
+	message: string,
+}
+
+Checker_Flags :: bit_set[Checker_Flag; u16]
+
+Checker_Flag :: enum u8 {
+	Pool_Integrity,
+	Generation_Monotonic,
+}
+
+CHECKER_FLAGS_ALL :: Checker_Flags{.Pool_Integrity, .Generation_Monotonic}
+CHECKER_FLAGS_NONE :: Checker_Flags{}
+
 SimulationConfig :: struct {
 	seed:                   u64,
 	ticks_max:              u64,
+	single_threaded:        bool,
 	shuffle_shard_order:    bool,
-	faults:                 FaultConfig,
-	checker_interval_ticks: u32,
 	terminate_on_quiescent: bool,
+	faults:                 FaultConfig,
+	builtin_checkers:       Checker_Flags,
+	user_checkers:          []Checker_Fn,
+	checker_interval_ticks: u32,
 }
 
 // --- Topology / Painter's Algorithm ---
