@@ -24,6 +24,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-03
       - name: odin check (${{ matrix.target }})
         run: odin check src/ -define:TINA_SIM=true -define:TINA_ASSERTS=true -target:${{ matrix.target }}
 
@@ -42,6 +43,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-03
       - name: Run platform tests
         run: odin test src/ -define:TINA_ASSERTS=true
 
@@ -53,5 +55,6 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-03
       - name: Run simulation tests
         run: odin test src/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
