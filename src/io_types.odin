@@ -37,18 +37,21 @@ fd_handle_generation :: #force_inline proc "contextless" (h: FD_Handle) -> u16 {
 
 // --- IO Completion Tags (§6.6.1 §5, §6.6.3 §7, PUBLIC_API_SURFACE §7.2) ---
 
-IO_Completion_Tag :: distinct u16
+// IO completion tags use Message_Tag for unified tag switching.
+// IO_Completion_Tag is kept as a type alias for internal SOA metadata.
+@(private = "package")
+IO_Completion_Tag :: Message_Tag
 
-IO_TAG_NONE: IO_Completion_Tag : 0x0000
-IO_TAG_READ_COMPLETE: IO_Completion_Tag : 0x0010
-IO_TAG_WRITE_COMPLETE: IO_Completion_Tag : 0x0011
-IO_TAG_ACCEPT_COMPLETE: IO_Completion_Tag : 0x0012
-IO_TAG_CONNECT_COMPLETE: IO_Completion_Tag : 0x0013
-IO_TAG_SEND_COMPLETE: IO_Completion_Tag : 0x0014
-IO_TAG_RECV_COMPLETE: IO_Completion_Tag : 0x0015
-IO_TAG_SENDTO_COMPLETE: IO_Completion_Tag : 0x0016
-IO_TAG_RECVFROM_COMPLETE: IO_Completion_Tag : 0x0017
-IO_TAG_CLOSE_COMPLETE: IO_Completion_Tag : 0x0018
+IO_TAG_NONE: Message_Tag : 0x0000
+IO_TAG_READ_COMPLETE: Message_Tag : 0x0010
+IO_TAG_WRITE_COMPLETE: Message_Tag : 0x0011
+IO_TAG_ACCEPT_COMPLETE: Message_Tag : 0x0012
+IO_TAG_CONNECT_COMPLETE: Message_Tag : 0x0013
+IO_TAG_SEND_COMPLETE: Message_Tag : 0x0014
+IO_TAG_RECV_COMPLETE: Message_Tag : 0x0015
+IO_TAG_SENDTO_COMPLETE: Message_Tag : 0x0016
+IO_TAG_RECVFROM_COMPLETE: Message_Tag : 0x0017
+IO_TAG_CLOSE_COMPLETE: Message_Tag : 0x0018
 
 // --- Socket Types (§6.6.3 §4, §9, §10) ---
 

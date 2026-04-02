@@ -243,7 +243,7 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		}
 
 		// Valid Completion Delivery
-		soa_meta[slot_index].io_completion_tag = IO_Completion_Tag(op_tag)
+		soa_meta[slot_index].io_completion_tag = Message_Tag(op_tag)
 		soa_meta[slot_index].io_result = completion.result
 		soa_meta[slot_index].io_buffer_index = buffer_index
 
@@ -319,7 +319,7 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) {
 		soa_meta := shard.metadata[type_index]
 
 		if u8(soa_meta[slot_index].generation) == submission_token_generation(sub.token) {
-			soa_meta[slot_index].io_completion_tag = IO_Completion_Tag(
+			soa_meta[slot_index].io_completion_tag = Message_Tag(
 				submission_token_operation_tag(sub.token),
 			)
 			soa_meta[slot_index].io_result = i32(IO_ERR_SUBMISSION_FULL)
@@ -555,7 +555,7 @@ reactor_submit_io :: proc(
 // ================
 
 @(private = "package")
-_io_op_to_completion_tag :: #force_inline proc(op: IoOp) -> IO_Completion_Tag {
+_io_op_to_completion_tag :: #force_inline proc(op: IoOp) -> Message_Tag {
 	switch _ in op {
 	case IoOp_Read:
 		return IO_TAG_READ_COMPLETE

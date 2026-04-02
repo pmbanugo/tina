@@ -375,7 +375,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 				// Dispatch Priority: I/O > Shutdown > Inbox (ADR §6.13.4)
 				if io_completions[slot] != IO_TAG_NONE {
-					message.tag = Message_Tag(io_completions[slot])
+					message.tag = io_completions[slot]
 					message.io.result = io_results[slot]
 					message.io.fd = io_fds[slot]
 					message.io.buffer_index = io_buffer_indices[slot]

@@ -164,6 +164,92 @@ payload_as :: #force_inline proc($T: typeid, payload: []u8) -> ^T {
 	return cast(^T)raw_data(payload)
 }
 
+// Serializes typed init args into a fixed-size buffer for Spawn_Spec.
+init_args_of :: #force_inline proc(args: ^$T) -> (payload: [MAX_INIT_ARGS_SIZE]u8, size: u8) {
+	#assert(size_of(T) <= MAX_INIT_ARGS_SIZE, "Init args exceed MAX_INIT_ARGS_SIZE")
+	mem.copy(&payload[0], args, size_of(T))
+	return payload, u8(size_of(T))
+}
+
+// Debug-checked cast from rawptr to a typed Isolate pointer.
+// Validates at runtime (under TINA_DEBUG_ASSERTS) that the registered stride
+// matches the target type, catching wrong-type casts before they corrupt memory.
+self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: ^TinaContext) -> ^T {
+	when TINA_DEBUG_ASSERTS {
+		shard := _ctx_extract_shard(ctx)
+		type_id := extract_type_id(ctx.self_handle)
+		registered_stride := shard.type_descriptors[type_id].stride
+		assert(
+			registered_stride == size_of(T),
+			"self_as: type stride mismatch — registered stride does not match target type size",
+		)
+	}
+	return cast(^T)self_raw
+}
+
+// Computes the byte offset of a buffer within an Isolate's stable memory region.
+// In debug builds, validates the slice actually lives inside the Isolate struct.
+payload_offset_of :: #force_inline proc(self: ^$Isolate, buffer: []u8) -> u16 {
+	base := uintptr(self)
+	buf_start := uintptr(raw_data(buffer))
+	when TINA_DEBUG_ASSERTS {
+		assert(buf_start >= base, "payload_offset_of: buffer starts before isolate base")
+		assert(
+			buf_start + uintptr(len(buffer)) <= base + size_of(Isolate),
+			"payload_offset_of: buffer extends past isolate end",
+		)
+	}
+	return u16(buf_start - base)
+}
+
+// Builds an Effect that sends data from an Isolate's buffer over a socket.
+// Computes payload_offset automatically from the buffer slice.
+io_send :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Effect {
+	return Effect_Io {
+		operation = IoOp_Send {
+			fd             = fd,
+			payload_offset = payload_offset_of(self, buffer),
+			payload_size   = u32(len(buffer)),
+		},
+	}
+}
+
+// Builds an Effect that writes data from an Isolate's buffer to a file descriptor at a byte offset.
+// Computes payload_offset automatically from the buffer slice.
+io_write :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8, offset: u64) -> Effect {
+	return Effect_Io {
+		operation = IoOp_Write {
+			fd             = fd,
+			payload_offset = payload_offset_of(self, buffer),
+			payload_size   = u32(len(buffer)),
+			offset         = offset,
+		},
+	}
+}
+
+// Builds an Effect that sends data from an Isolate's buffer to a specific network address (UDP).
+// Computes payload_offset automatically from the buffer slice.
+io_sendto :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8, address: Socket_Address) -> Effect {
+	return Effect_Io {
+		operation = IoOp_Sendto {
+			fd             = fd,
+			address        = address,
+			payload_offset = payload_offset_of(self, buffer),
+			payload_size   = u32(len(buffer)),
+		},
+	}
+}
+
+// Constructs an IPv4 socket address.
+ipv4 :: #force_inline proc "contextless" (a, b, c, d: u8, port: u16) -> Socket_Address {
+	return Socket_Address_Inet4{address = {a, b, c, d}, port = port}
+}
+
+// Constructs an IPv6 socket address.
+ipv6 :: #force_inline proc "contextless" (addr: [16]u8, port: u16, flow: u32 = 0, scope: u32 = 0) -> Socket_Address {
+	return Socket_Address_Inet6{address = addr, port = port, flow = flow, scope = scope}
+}
+
 // Sends a typed message to a target (Isolate), identified by its Handle.
 // Returns a Send_Result immediately to provide backpressure feedback (e.g., mailbox full, dead handle).
 @(require_results)

@@ -426,7 +426,7 @@ when TINA_SIMULATION_MODE {
 
 		received := cast(^PriorityTestIsolate)_get_isolate_ptr(shard, u16(PRIORITY_TYPE_ID), 0)
 		testing.expect_value(t, received.received_count, u8(2))
-		testing.expect_value(t, received.received_tags[0], Message_Tag(IO_TAG_RECV_COMPLETE))
+		testing.expect_value(t, received.received_tags[0], IO_TAG_RECV_COMPLETE)
 		testing.expect_value(t, received.received_tags[1], TAG_SHUTDOWN)
 
 		pool := &shard.reactor.buffer_pool
