@@ -26,7 +26,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: dev-2026-03
       - name: odin check (${{ matrix.target }})
-        run: odin check src/ -define:TINA_SIM=true -define:TINA_ASSERTS=true -target:${{ matrix.target }}
+        run: odin check src/ -strict-style -no-entry-point -define:TINA_SIM=true -define:TINA_ASSERTS=true -target:${{ matrix.target }}
 
   test-platform:
     name: Platform tests (${{ matrix.os }})
