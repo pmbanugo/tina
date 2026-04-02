@@ -2,23 +2,20 @@
 
 ## Building
 
-Both examples live in the `src/` package. Only one `main` proc can exist at build time, so build each example by excluding the other:
+Each example is a standalone `package main` file that imports the tina library. Build each one individually:
 
 ```sh
 # TCP Echo Server
-odin build src/ -out:tina_echo -define:EXAMPLE=echo \
-  -exclude-files:example_task_dispatcher.odin
+odin build examples/example_tcp_echo.odin -file -out:tina_echo
 
 # Task Dispatcher
-odin build src/ -out:tina_dispatch -define:EXAMPLE=dispatch \
-  -exclude-files:example_tcp_echo.odin
+odin build examples/example_task_dispatcher.odin -file -out:tina_dispatch
 ```
 
 To enable debug assertions (validates `self_as` casts, `payload_offset_of` bounds, etc.):
 
 ```sh
-odin build src/ -out:tina_echo -define:TINA_ASSERTS=true \
-  -exclude-files:example_task_dispatcher.odin
+odin build examples/example_tcp_echo.odin -file -out:tina_echo -define:TINA_ASSERTS=true
 ```
 
 ---
@@ -61,15 +58,13 @@ All flags are compile-time via `-define:FLAG=value`.
 ./tina_echo
 
 # Make quarantine happen faster
-odin build src/ -out:tina_echo \
-  -exclude-files:example_task_dispatcher.odin \
+odin build examples/example_tcp_echo.odin -file -out:tina_echo \
   -define:TINA_DEMO_ECHO_CHAOS_START_TICK=2000 \
   -define:TINA_DEMO_ECHO_CHAOS_RESTART_MAX=2
 ./tina_echo
 
 # Abort on quarantine instead of isolating the shard
-odin build src/ -out:tina_echo \
-  -exclude-files:example_task_dispatcher.odin \
+odin build examples/example_tcp_echo.odin -file -out:tina_echo \
   -define:TINA_DEMO_ECHO_ABORT_ON_QUARANTINE=true
 ./tina_echo
 ```
@@ -112,18 +107,25 @@ A single-shard task dispatch system that demonstrates messaging, supervision, an
 ### Running
 
 ```sh
+# Run directly without a separate build step
+odin run examples/example_task_dispatcher.odin -file \
+  -define:TINA_SIM=false \
+  -define:TINA_DEMO_CRASH_EVERY=1 \
+  -define:TINA_DEMO_ROOT_RESTART_MAX=1 \
+  -define:TINA_DEMO_ROOT_WINDOW_TICKS=10000 \
+  -define:TINA_DEMO_SHARD_RESTART_MAX=1 \
+  -define:TINA_DEMO_SHARD_RESTART_WINDOW_MS=10000
+
 # Default: Workers crash every 5th job
 ./tina_dispatch
 
 # Disable crashes entirely
-odin build src/ -out:tina_dispatch \
-  -exclude-files:example_tcp_echo.odin \
+odin build examples/example_task_dispatcher.odin -file -out:tina_dispatch \
   -define:TINA_DEMO_CRASH_EVERY=0
 ./tina_dispatch
 
 # Crash every 2nd job with a tight restart window
-odin build src/ -out:tina_dispatch \
-  -exclude-files:example_tcp_echo.odin \
+odin build examples/example_task_dispatcher.odin -file -out:tina_dispatch \
   -define:TINA_DEMO_CRASH_EVERY=2 \
   -define:TINA_DEMO_ROOT_RESTART_MAX=3
 ./tina_dispatch
