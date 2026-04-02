@@ -4,7 +4,8 @@ ADR/
 adr-temp
 adr-temp2
 .DS_Store
-src.bin
+*.bin
+example_*.odin.txt
 
 # Prerequisites
 *.d
