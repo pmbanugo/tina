@@ -1,0 +1,10 @@
+Tina
+Copyright 2026 Peter Mbanugo (IT-Services Peter Mbanugo)
+
+This product includes software developed by Peter Mbanugo.
+Website:  https://pmbanugo.me
+LinkedIn: https://www.linkedin.com/in/pmbanugo/
+
+Tina is a high-performance, shared-nothing concurrency framework
+for systems languages (Odin), combining Erlang-style fault tolerance
+with thread-per-core hardware performance and deterministic simulation.
