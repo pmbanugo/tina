@@ -513,10 +513,10 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 @(rodata, private = "package")
 CRASH_REASONS_INTERPRETED := [Crash_Reason]string {
-	.None                 = "Voluntary crash: None",
-	.Spawn_Failed         = "Voluntary crash: Spawn_Failed",
-	.Unimplemented_Effect = "Voluntary crash: Unimplemented_Effect",
-	.Init_Failed          = "Voluntary crash: Init_Failed",
+	.None                 = "Voluntary crash reason: None",
+	.Spawn_Failed         = "Voluntary crash reason: Spawn_Failed",
+	.Unimplemented_Effect = "Voluntary crash reason: Unimplemented_Effect",
+	.Init_Failed          = "Voluntary crash reason: Init_Failed",
 }
 
 _interpret_effect :: proc(
@@ -858,7 +858,10 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			// SWEEP: Reclaim completed but undispatched I/O buffers before wiping metadata
 			if soa_meta[slot].io_completion_tag != IO_TAG_NONE {
 				if soa_meta[slot].io_buffer_index != BUFFER_INDEX_NONE {
-					reactor_buffer_pool_free(&shard.reactor.buffer_pool, soa_meta[slot].io_buffer_index)
+					reactor_buffer_pool_free(
+						&shard.reactor.buffer_pool,
+						soa_meta[slot].io_buffer_index,
+					)
 				}
 			}
 
