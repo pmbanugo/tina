@@ -1,8 +1,9 @@
-# Tina - Erlang's fault tolerance. System-level performance. No VM, no GC, no async/await.
+# Tina - Erlang's fault tolerance. System-level performance. No async/await.
+> *An Actor-like, thread-per-core concurrency framework — No VM, no GC, no async/await.*
 
 Tina is a thread-per-core concurrency engine built in Odin, inspired by Erlang's supervision and Seastar's hardware sympathy. It is designed for **Safety, Performance, Simplicity and Predictability**. There is no `async/await`, no hidden mutexes, no garbage collector pausing your threads.
 
-Instead, Tina enforces strict physical laws on your software. You trade the illusion of "easy" concurrency for actual, deterministic control over your hardware and fault boundaries.
+Modern frameworks and libraries sell you the illusion of "easy" concurrency while hiding the actual cost. Tina forces you to think with [mechanical sympathy](https://mechanical-sympathy.blogspot.com/2011/07/why-mechanical-sympathy.html). You trade the comfort of invisible state machines for absolute, deterministic control over your hardware and fault boundaries.
 
 [![asciicast](https://asciinema.org/a/WdF4hD8OLTEV2M8n.svg)](https://asciinema.org/a/WdF4hD8OLTEV2M8n)
 
@@ -26,7 +27,7 @@ Cross-shard communication happens exclusively via messaging and pre-allocated ma
 Isolates are lightweight, typed state machines that live inside a Shard. They receive a message, return an Effect, and exit. 
 If one panics — or segfaults — the Shard's **Trap Boundary** catches the fault, wipes the Isolate's memory, and notifies the Supervisor, then it is rebuilt in microseconds. 
 
-> In Erlang, a C extension (NIF) segfault kills the entire VM. Those exceptional cases in the BEAM are safe in Tina.
+**Surviving the Unsurvivable:** In Erlang, a C extension (NIF) segfault kills the entire VM. Those exceptional cases in the BEAM are safe in Tina because things like segfaults are handled as regular faults. The Shard’s Trap Boundary catches the OS-level memory violation, wipes the Isolate, and restarts it.
 
 ### 3. The Grand Arena — Pre-Allocate the Universe, Then Never Call malloc
 At boot, each Shard requests one block of memory from the OS. Every Isolate, every message pool, every I/O buffer is carved from this space.
@@ -34,22 +35,19 @@ If memory runs out, the system applies structural backpressure — it does not c
 
 ## Tina Is Not For You If...
 
-- You want a the status-quo async ecosystem → use Tokio, Node.js 
-- You're building a quick script or service → use Go  
-- You want hidden magic to handle concurrency for you → use anything else  
+- You want a the status-quo async ecosystem → use Tokio or Node.js.
+- You're building a quick script or disposable microservice → use Go.
+- You want hidden magic to handle concurrency for you → use almost anything else.
 
-**Tina is for engineers who are tired of invisible state machines, unpredictable latency spikes, and systems that collapse because one background task panicked.**
+**Tina is for engineers who are tired of invisible state machines, unpredictable latency spikes, and systems that collapse globally because one background task panicked.**
 
 ## How to Understand Tina
 
-Go to [`/examples`](./examples). Run the **TCP Echo Chaos Test** or Job scheduler, and read what the logs are telling you. 
-That is the fastest path to understanding what Tina does and why it is structured the way it is.
+Tina is in an early, highly-stable state. The architecture and code works (mostly tested on macOS but CI tests pass on Linux). There is no hand-holding tutorial yet. The documentation is the code and the [`/examples`](./examples). There's lots of comments in the example code and the logs it generate should give you an idea of what's happening. If you want to see how a system can survive intentional internal sabotage, go to the [`/examples`](./examples) directory, run the **TCP Echo Chaos Test** and read what the logs are telling you. 
+
+Feel free to break it, inspect it, and open a GitHub Discussion.
 
 [![asciicast](https://asciinema.org/a/x3ysgs51MXyaQntr.svg)](https://asciinema.org/a/x3ysgs51MXyaQntr)
-
-👉 **[Read the Examples README](./examples/README.md)**
-
-The documentation is but the engine is at a stable and usable state. So feel free to play with the code, open discussions here on GitHub if you need help or have questions
 
 ## Following the Build
 
