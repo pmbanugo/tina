@@ -1,7 +1,7 @@
 # Tina - Erlang's fault tolerance. System-level performance. No async/await.
 > *An Actor-like, thread-per-core concurrency framework — No VM, no GC, no async/await.*
 
-Tina is a thread-per-core concurrency engine built in Odin, inspired by Erlang's supervision and Seastar's hardware sympathy. It is designed for **Safety, Performance, Simplicity and Predictability**. There is no `async/await`, no hidden mutexes, no garbage collector pausing your threads.
+Tina is a thread-per-core concurrency engine built in Odin, inspired by Erlang's supervision and Seastar's hardware sympathy. It is designed for **Safety, Performance, Simplicity and Predictability**.
 
 Modern frameworks and libraries sell you the illusion of "easy" concurrency while hiding the actual cost. Tina forces you to think with [mechanical sympathy](https://mechanical-sympathy.blogspot.com/2011/07/why-mechanical-sympathy.html). You trade the comfort of invisible state machines for absolute, deterministic control over your hardware and fault boundaries.
 
