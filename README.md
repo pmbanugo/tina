@@ -9,7 +9,7 @@ Modern frameworks and libraries sell you the illusion of "easy" concurrency whil
 
 *↑ Three workers. Every 5th job intentionally panics one of them. Watch the Supervisor catch the fault, 
 tear down the Isolate, and restart it — while the others never pause. 
-This is not a demo mode. This is just how Tina works today, and you can [try it](./examples).*
+This is not a demo mode. This is just how Tina works today, and you can [try it](/examples).*
 
 ## Tina is made of:
 1. **Thread-per-Core (Shared-Nothing):** Each core is an isolated Shard. Cores communicate exclusively via messaging. 
