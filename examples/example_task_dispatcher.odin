@@ -1,10 +1,10 @@
 package main
 
+import tina "../src"
 import "core:fmt"
 import "core:os"
-import tina "../src"
 
-DEMO_CRASH_EVERY :: #config(TINA_DEMO_CRASH_EVERY, 5)
+DEMO_CRASH_EVERY :: #config(TINA_DEMO_CRASH_EVERY, 3)
 DEMO_ROOT_RESTART_MAX :: #config(TINA_DEMO_ROOT_RESTART_MAX, 10)
 DEMO_ROOT_WINDOW_TICKS :: #config(TINA_DEMO_ROOT_WINDOW_TICKS, 5_000)
 DEMO_SHARD_RESTART_MAX :: #config(TINA_DEMO_SHARD_RESTART_MAX, 3)
@@ -48,7 +48,7 @@ JobDoneMsg :: struct {
 }
 
 // ============================================================================
-// The Worker Isolate
+// The Worker: crash, reboot, check in with a new identity
 // ============================================================================
 
 WorkerIsolate :: struct {
@@ -64,6 +64,11 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tin
 	self.id = init_args.id
 	self.dispatcher = init_args.dispatcher
 
+	// After restart, the worker gets a new handle — the old one is dead.
+	// If you know Elixir, this is like a process re-registering its PID.
+	// If you know Go, there's no shared state to clean up from the dead worker.
+	// If you know Rust, the old handle is a revoked capability, not a dangling pointer.
+
 	// 2. The Check-in Pattern: Tell the boss we are alive and hand over our ephemeral Handle.
 	// If we just crashed and restarted, ctx.self_handle is now a brand new Handle!
 	ready_msg := WorkerReadyMsg {
@@ -72,10 +77,22 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tin
 	}
 	_ = tina.ctx_send(ctx, self.dispatcher, TAG_WORKER_READY, &ready_msg)
 
+	str := fmt.bprintf(
+		ctx.scratch_arena.data,
+		"[RECOVER] Worker %d checked in with handle %X",
+		self.id,
+		u64(ctx.self_handle),
+	)
+	tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+
 	return tina.Effect_Receive{}
 }
 
-worker_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
+worker_handler :: proc(
+	self_raw: rawptr,
+	message: ^tina.Message,
+	ctx: ^tina.TinaContext,
+) -> tina.Effect {
 	using self := tina.self_as(WorkerIsolate, self_raw, ctx)
 	// log_buf: [128]u8
 
@@ -86,13 +103,14 @@ worker_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.Tina
 		if DEMO_CRASH_EVERY > 0 && msg.job_id % u32(DEMO_CRASH_EVERY) == 0 {
 			str := fmt.bprintf(
 				ctx.scratch_arena.data, // log_buf[:],
-				"Worker %d: Job %d is cursed! I am PANICKING!",
+				"[FAIL] Worker %d crashed on Job %d. Watch: it will come back with a NEW handle.",
 				id,
 				msg.job_id,
 			)
 			tina.ctx_log(ctx, .ERROR, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
-			// Returning .Crash triggers the Trap Boundary. The Supervisor will instantly tear us down.
+			// The supervisor tears it down and rebuilds from the boot spec.
+			// Old handle becomes permanently stale — sends to it return .stale_handle.
 			return tina.Effect_Crash{reason = .None}
 		}
 
@@ -114,7 +132,7 @@ worker_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.Tina
 }
 
 // ============================================================================
-// The Dispatcher Isolate
+// The Dispatcher: keep assigning work, shed load for the dead
 // ============================================================================
 
 NUM_WORKERS :: 3
@@ -160,7 +178,11 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) ->
 	return tina.Effect_Receive{}
 }
 
-dispatcher_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
+dispatcher_handler :: proc(
+	self_raw: rawptr,
+	message: ^tina.Message,
+	ctx: ^tina.TinaContext,
+) -> tina.Effect {
 	using self := tina.self_as(DispatcherIsolate, self_raw, ctx)
 	log_buf: [128]u8
 
@@ -168,15 +190,34 @@ dispatcher_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.
 	case TAG_WORKER_READY:
 		// A worker checked in! This happens at boot, AND after a worker recovers from a crash.
 		msg := tina.payload_as(WorkerReadyMsg, message.user.payload[:])
+
+		old_handle := workers[msg.id]
 		workers[msg.id] = msg.handle
 
-		str := fmt.bprintf(
-			log_buf[:],
-			"Dispatcher: Worker %d checked in. (Handle: %X)",
-			msg.id,
-			u64(msg.handle),
-		)
-		tina.ctx_log(ctx, .DEBUG, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+		if old_handle != tina.HANDLE_NONE && old_handle != msg.handle {
+			str := fmt.bprintf(
+				log_buf[:],
+				"[RECOVER] Worker %d reborn. old=%X new=%X",
+				msg.id,
+				u64(old_handle),
+				u64(msg.handle),
+			)
+			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+
+			str2 := fmt.bprintf(
+				ctx.scratch_arena.data,
+				"[INSIGHT] Same role. New identity. Stale sends fail safely.",
+			)
+			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str2)
+		} else {
+			str := fmt.bprintf(
+				log_buf[:],
+				"[RECOVER] Worker %d online. (Handle: %X)",
+				msg.id,
+				u64(msg.handle),
+			)
+			tina.ctx_log(ctx, .DEBUG, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+		}
 		return tina.Effect_Receive{}
 
 	case TAG_JOB_DONE:
@@ -201,11 +242,11 @@ dispatcher_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.
 				}
 				res := tina.ctx_send(ctx, target_handle, TAG_JOB, &job)
 
-				// LOAD SHEDDING: If the handle is stale, the worker crashed and hasn't checked back in yet!
+				// The worker died, so this job gets dropped. No retry, no coordination needed.
 				if res == .stale_handle {
 					str := fmt.bprintf(
 						log_buf[:],
-						"Dispatcher: Worker %d is dead! Dropping Job %d. Awaiting respawn...",
+						"[FAIL] Worker %d handle is stale! Dropping Job %d.",
 						target_id,
 						job_counter,
 					)
@@ -313,20 +354,29 @@ main :: proc() {
 		shutdown_timeout_ms = 3_000,
 	}
 
-	fmt.println("Starting Tina Task Dispatcher. Press Ctrl+C to shut down.")
+	fmt.println(
+		"═══════════════════════════════════════════════════════════════",
+	)
+	fmt.println(" Tina Task Dispatcher — \"A Dead Worker Is Not a Dead System\"")
+	fmt.println(
+		"═══════════════════════════════════════════════════════════════",
+	)
+	fmt.println("")
+	fmt.printfln("[WATCH] Every %dth job is cursed. A worker WILL crash.", DEMO_CRASH_EVERY)
+	fmt.println("[QUESTION] Will the dispatcher panic, block, or keep assigning work?")
+	fmt.println("[WATCH] Notice what changes after restart: the handle, not the role.")
+	fmt.println("")
 	fmt.printfln(
-		"[DEMO] crash_every=%d root_max=%d root_window_ticks=%d shard_max=%d shard_window_ms=%d quarantine_policy=%v pid=%d",
+		"  crash_every=%d  restart_budget=%d  window_ticks=%d  pid=%d",
 		DEMO_CRASH_EVERY,
 		DEMO_ROOT_RESTART_MAX,
 		DEMO_ROOT_WINDOW_TICKS,
-		DEMO_SHARD_RESTART_MAX,
-		DEMO_SHARD_RESTART_WINDOW_MS,
-		quarantine_policy,
 		os.get_pid(),
 	)
 	when ODIN_OS ==
 		.Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
-		fmt.println("[DEMO] To recover quarantined shards, run: kill -USR2 <pid>")
+		fmt.printfln("[RECOVER] To revive quarantined shards: kill -USR2 %d", os.get_pid())
 	}
+	fmt.println("")
 	tina.tina_start(&spec)
 }
