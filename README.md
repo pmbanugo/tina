@@ -10,7 +10,7 @@ Instead, Tina enforces strict physical laws on your software. You trade the illu
 tear down the Isolate, and restart it — while the others never pause. 
 This is not a demo mode. This is just how Tina works today, and you can [try it](./examples).*
 
-## The Laws of Physics in Tina:
+## Tina is made of:
 1. **Thread-per-Core (Shared-Nothing):** Each core is an isolated Shard. Cores communicate exclusively via messaging. 
 2. **Static Allocation:** Zero dynamic memory allocation on the hot path.
 3. **Let It Crash:** You do not write defensive spaghetti code. If an Isolate panics, the framework's Trap Boundary catches it, tears it down, and the Supervisor restarts it in microseconds. 
