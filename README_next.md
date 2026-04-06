@@ -69,7 +69,7 @@ Tina achieves C-level performance and Erlang-level reliability by strictly limit
 
 *   🚫 **No Garbage Collection.** Memory is managed via typed arenas and Shard-owned pools. No GC pauses, no manual `free()`. Lifetimes are structurally guaranteed.
 *   🚫 **No `async` / `await`.** Colored functions fragment ecosystems. Tina uses a cooperative user-space scheduler. Handlers are standard functions that return `Effect` values.
-*   🚫 **No Mutexes. Shared-Nothing.** Tina runs thread-per-core. Isolates never share memory. All cross-core communication uses lock-free SPSC ring buffers.
+*   🚫 **No Mutexes. Shared-Nothing.** Tina runs thread-per-core. Isolates never share memory. All cross-core communication uses lock-free ring buffers (mailboxes).
 *   🚫 **No Hidden Allocations.** All memory is sized and pre-allocated at startup via a static boot spec. If your workload exceeds capacity, Tina sheds load predictably rather than OOM-crashing.
 *   ✅ **100% Deterministic Simulation.** The clock, network, and I/O are abstracted behind the scheduler. Tina supports TigerBeetle-style Deterministic Simulation Testing. *Same seed + same config = same execution, every time.*
 
