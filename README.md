@@ -15,7 +15,10 @@ This is not a demo mode. This is just how Tina works today, and you can [try it]
 1. **Thread-per-Core (Shared-Nothing):** Each core is an isolated Shard. Cores communicate exclusively via messaging. 
 2. **Static Allocation:** Zero dynamic memory allocation on the hot path.
 3. **Let It Crash:** You do not write defensive spaghetti code. If an Isolate panics, the framework's Trap Boundary catches it, tears it down, and the Supervisor restarts it in microseconds. 
-4. **Synchronous-Looking Handlers:** No async colored functions. No promise chaining. You write asynchonous code like they're regular synchronous functions
+4. **Synchronous-Looking Handlers:** No async colored functions. No promise chaining. You write asynchonous code like they're regular synchronous functions.
+
+## The Philosophy
+You can have Erlang's fault tolerance, Seastar's thread-per-core performance, and C's memory control — with synchronous-looking code.
 
 ## The Architecture
 
