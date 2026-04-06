@@ -63,7 +63,7 @@ If this Isolate crashes — or *segfaults* — the Shard's trap boundary catches
 
 ---
 
-## Design Constraints
+## Features via Constraints
 
 Tina achieves C-level performance and Erlang-level reliability by strictly limiting what you can do. Architecture solves problems better than language features.
 
