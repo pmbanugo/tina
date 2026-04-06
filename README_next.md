@@ -1,6 +1,6 @@
-# Tina - Designed For Massive Concurrency, Safety, Fault-tolerance
+# Tina
 
-**A strictly bounded, thread-per-core concurrency framework for Odin.**
+**A strictly bounded, thread-per-core concurrency framework for Odin.** It is designed For Massive Concurrency, Safety, and  Fault-tolerance
 > Write simple, synchronous-looking state machines. Get massive multi-core throughput, automatic fault isolation, and 100% deterministic simulation testing.
 
 [![Odin Version](https://img.shields.io/badge/Odin-2026-blue)](#)
@@ -58,6 +58,10 @@ echo_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaCo
 If this Isolate crashes — or *segfaults* — the Shard's trap boundary catches the fault, wipes the Isolate, and the supervisor restarts it. The other Isolates on the same core never notice.
 
 ![tcp echo demo](media_assets/tcp_echo.gif)
+
+*↑ Two shards, one chaos client. Shard 1 crashes and gets quarantined. Shard 0 never stops serving. This is not a demo mode — this is just how Tina works. [Run it yourself →](./examples)*
+
+---
 
 ## Design Constraints
 
@@ -133,7 +137,7 @@ The echo example runs a two-shard TCP server. A chaos client crashes after a few
 
 ## Production Readiness & Status
 
-**Status: Alpha.**
+**Status: Stable.**
 
 Tina is in an early but functional state. The core architecture is implemented and working:
 
@@ -146,17 +150,17 @@ Tina is in an early but functional state. The core architecture is implemented a
 - ✅ Deterministic simulation testing with fault injection, structural checkers, and seed-based replay
 - 🚧 Documentation beyond examples and design notes
 
-Tested primarily on macOS (Apple Silicon). CI tests pass on Linux. If you find a bug, open an issue. If you want to discuss the design, open a GitHub Discussion.
+Tested primarily on macOS (Apple Silicon). CI tests pass on Linux and Windows. If you find a bug, open an issue. If you want to discuss the design, open a GitHub Discussion.
 
 ## Inspirations & Acknowledgments
 
 Tina did not invent its ideas. It synthesizes them:
 
-| Idea | Source |
+| Idea | My Source |
 |---|---|
 | Supervision trees, "Let it Crash", Error Kernel | Joe Armstrong — Erlang/OTP |
-| Thread-per-core, shared-nothing, reactor loop | Seastar — ScyllaDB |
-| Deterministic simulation testing, static allocation, Tiger Style | TigerBeetle — FoundationDB |
+| Thread-per-core, shared-nothing, reactor loop | Seastar by ScyllaDB |
+| Deterministic simulation testing, static allocation, Tiger Style | TigerBeetle & FoundationDB |
 | Ring buffer design, mechanical sympathy | Martin Thompson — LMAX Disruptor, Aeron |
 | Memory Lifetimes | Casey Muratori |
 | Pool allocators, intrusive free lists | Ginger Bill |
