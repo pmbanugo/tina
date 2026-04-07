@@ -57,7 +57,7 @@ Every byte of memory in a Shard belongs to one of three lifetime generations. Th
 │ Born: Shard init                    Dies: Process exit             │
 │                                                                    │
 │ Typed arenas, Isolate metadata, message pool, reactor buffer pool,     │
-│ transfer pool, timer wheel, FD table, log ring, supervision        │
+│ transfer pool, timer wheel, FD table, Logging Subsystem, supervision        │
 │ groups, working memory regions, scratch arena backing store.       │
 │                                                                    │
 │  ┌──────────────────────────────────────────────────────────────┐  │

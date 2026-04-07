@@ -33,7 +33,7 @@ The root boot specification for the entire Tina process.
 | `timer_entry_count` | `int` | — | **Required.** Timer entry pool size. |
 | `fd_table_slot_count` | `int` | `0` | FD table capacity per Shard. |
 | `fd_entry_size` | `int` | `0` | Size of each FD entry. Use `size_of(tina.FD_Entry)`. |
-| `log_ring_size` | `int` | — | **Required.** Log ring buffer capacity. Must be a power of 2. |
+| `log_ring_size` | `int` | — | **Required.** Logging Subsystem buffer capacity. Must be a power of 2. |
 | `supervision_groups_max` | `int` | `0` | Max supervision groups per Shard. |
 | `scratch_arena_size` | `int` | `0` | Scratch arena size in bytes. Must be >= the largest `TypeDescriptor.scratch_requirement_max`. |
 | `default_ring_size` | `u32` | — | **Required.** Default cross-shard messaging channel capacity. Must be a power of 2, >= 16. |

@@ -27,7 +27,7 @@ A Shard is not just a thread. It is a self-contained runtime:
 │  Supervision Groups                              │
 │  Scratch Arena (handler-transient)               │
 │  Transfer Buffer Pool                            │
-│  Log Buffer                                      │
+│  Logging Subsystem                               │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -93,7 +93,7 @@ loop {
     4. Flush accumulated I/O submissions (one syscall per tick)
     5. Flush outbound cross-shard channels (one atomic store per channel)
     6. Advance timer wheel
-    7. Flush log buffer
+     7. Flush Logging Subsystem
 }
 ```
 

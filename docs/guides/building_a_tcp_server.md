@@ -311,7 +311,7 @@ main :: proc() {
         pool_slot_count           = 4096,             // message envelope pool
         timer_spoke_count         = 1024,
         timer_entry_count         = 1024,
-        log_ring_size             = 65536,
+         log_ring_size             = 65536, // Logging Subsystem buffer size (power of 2)
         default_ring_size         = 32,               // cross-shard channel size
         scratch_arena_size        = 65536,
         fd_table_slot_count       = 128,              // max open file descriptors per shard

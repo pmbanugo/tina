@@ -60,7 +60,7 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `ctx_log` | Overloaded: `ctx_log_raw(ctx, level, $tag, payload)` / `ctx_log_typed(ctx, level, $tag, &msg)` | void | Write a diagnostic log entry. Each Shard buffers log entries and flushes them to stderr once per scheduler tick. |
+| `ctx_log` | Overloaded: `ctx_log_raw(ctx, level, $tag, payload)` / `ctx_log_typed(ctx, level, $tag, &msg)` | void | Write a diagnostic log entry. Each Shard buffers log entries in the Logging Subsystem and flushes them to stderr once per scheduler tick. |
 
 **Log levels:**
 
@@ -102,7 +102,7 @@ Example: `[48231] INFO[Tag:40] Handle:10003A2 - Connection 5 closed after 1024 b
 **Behavior notes:**
 
 - Log formatting happens after all handlers have run, and then flushed to stderr.
-- If the log buffer is full, new entries are silently dropped. Size the buffer via `log_ring_size` on `SystemSpec` (default depends on your config; must be a power of 2).
+- If the Logging Subsystem buffer is full, new entries are silently dropped. Size the buffer via `log_ring_size` on `SystemSpec` (must be a power of 2).
 - Maximum payload per log entry is 96 bytes (same as message envelope payload). Longer strings are truncated.
 
 ---

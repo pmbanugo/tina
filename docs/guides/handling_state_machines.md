@@ -462,7 +462,7 @@ main :: proc() {
         pool_slot_count       = 4096,
         timer_spoke_count     = 1024,
         timer_entry_count     = 1024,
-        log_ring_size         = 65536,
+         log_ring_size         = 65536, // Logging Subsystem buffer size (power of 2)
         default_ring_size     = 16,
         scratch_arena_size    = 65536,
         fd_table_slot_count   = 16,
