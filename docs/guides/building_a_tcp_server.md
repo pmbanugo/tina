@@ -11,8 +11,8 @@ Client connects
        │
        ▼
 ┌──────────────┐   accept completes   ┌──────────────────┐
-│   Listener   │ ───────────────────▶ │ spawn Connection  │
-│  (1 per Shard)│                      │ (1 per client)    │
+│   Listener   │ ───────────────────▶ │ spawn Connection │
+│ (1 per Shard)│                      │ (1 per client)   │
 └──────────────┘                      └──────────────────┘
        │                                       │
        │ loop: accept next                     │ loop: recv → send → recv
