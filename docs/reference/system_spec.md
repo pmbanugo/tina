@@ -13,7 +13,7 @@ The root boot specification for the entire Tina process.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `app_version` | `u32` | `0` | Application version tag. Informational. |
-| `memory_init_mode` | `Memory_Init_Mode` | `.Production` | Memory initialization strategy. `.Development` zero-fills for debugging. |
+| `memory_init_mode` | `Memory_Init_Mode` | `.Production` | Memory initialization strategy. `.Development` lazy mode. No pinning, no NUMA policy, no pre-faulting. |
 | `quarantine_policy` | `Quarantine_Policy` | `.Quarantine` | What happens when a Shard exceeds its restart budget. `.Quarantine` isolates it; `.Abort` terminates the process. |
 | `init_timeout_ms` | `u32` | `0` | Timeout for Shard initialization phase (milliseconds). |
 | `shutdown_timeout_ms` | `u32` | `0` | Timeout for graceful shutdown (milliseconds). |
@@ -286,9 +286,80 @@ Checker_Fn :: #type proc(shards: []Shard, tick: u64) -> Check_Result
 
 ---
 
-## Validation
+## Enum Quick Reference
 
-`SystemSpec` is validated at boot by `validate_system_spec`. Errors are `SystemSpecError`:
+Scannable lookup for all configuration enums.
+
+| Enum | Value | Meaning |
+|------|-------|---------|
+| **`Supervision_Strategy`** | | |
+| | `.One_For_One` | Only the crashed child is restarted. |
+| | `.One_For_All` | All children are torn down and restarted. |
+| | `.Rest_For_One` | Crashed child and all children started after it are restarted. |
+| **`Restart_Type`** | | |
+| | `.permanent` | Always restarted, regardless of exit reason. |
+| | `.transient` | Restarted only on crash. Clean exit is not restarted. |
+| | `.temporary` | Never restarted. |
+| **`Memory_Init_Mode`** | | |
+| | `.Production` | No extra initialization. |
+| | `.Development` | Zero-fill all memory for debugging. |
+| **`Quarantine_Policy`** | | |
+| | `.Quarantine` | Isolate the failed Shard. Other Shards continue. |
+| | `.Abort` | Terminate the entire process. |
+| **`Handoff_Mode`** | | |
+| | `.Full` | Transfer both directions — parent loses all FD access. |
+| | `.Read_Only` | Child gets read, parent retains write. |
+| | `.Write_Only` | Child gets write, parent retains read. |
+| **`Ring_Override_Type`** | | |
+| | `.Pair` | Override a specific source → destination pair. |
+| | `.All_Inbound_To` | Override all channels inbound to a destination Shard. |
+| | `.All_Outbound_From` | Override all channels outbound from a source Shard. |
+
+---
+
+## Constraints & Validation
+
+`SystemSpec` is validated at boot by `validate_system_spec`. A constraint violation halts the process before any Shard thread is spawned.
+
+### Power-of-2 Requirements
+
+These fields must be powers of 2 (1, 2, 4, 8, 16, 32, ...):
+
+| Field | Minimum |
+|-------|---------|
+| `pool_slot_count` | — |
+| `log_ring_size` | — |
+| `timer_spoke_count` | — |
+| `default_ring_size` | 16 |
+| `Ring_Override.size` | 16 |
+
+### Capacity Limits
+
+| Field | Min | Max | Notes |
+|-------|-----|-----|-------|
+| `shard_count` | 1 | 255 | `len(shard_specs)` must equal `shard_count`. |
+| `types` (length) | 1 | 254 | Type IDs must be unique and <= 254. ID 255 is reserved. |
+| `TypeDescriptor.slot_count` | — | 1,048,575 | 20-bit slot index. |
+| `reactor_buffer_slot_count` | — | 4,094 | 12-bit token field. |
+| `timer_resolution_ns` | 1 | — | Must be > 0. |
+
+### Supervision Constraints
+
+- `restart_count_max` >= 1.
+- `window_duration_ticks` > 0.
+- Dynamic children (`child_count_dynamic_max > 0`) only valid with `.One_For_One` strategy.
+
+### Arena Constraints
+
+- `scratch_arena_size` >= the largest `TypeDescriptor.scratch_requirement_max` across all types.
+
+### Simulation Constraints (when `TINA_SIM=true`)
+
+- `ticks_max` > 0.
+- Fault `Ratio`: `numerator > 0` requires `denominator > 0`. `numerator <= denominator`.
+- Delay ranges: `min <= max`.
+
+### `SystemSpecError`
 
 ```odin
 SystemSpecError :: enum u8 {
@@ -301,17 +372,6 @@ SystemSpecError :: enum u8 {
     InvalidSupervisionIntensity,   // restart_count_max < 1 or window_duration_ticks == 0.
 }
 ```
-
-**Key constraints:**
-- `shard_count`: 1–255. `len(shard_specs)` must match.
-- `types`: 1–254 entries. IDs unique, <= 254. `slot_count` <= 1,048,575.
-- `pool_slot_count`, `log_ring_size`, `timer_spoke_count`, `default_ring_size`: must be powers of 2.
-- `default_ring_size` >= 16.
-- `reactor_buffer_slot_count` <= 4094.
-- `scratch_arena_size` >= max `scratch_requirement_max` across all types.
-- `timer_resolution_ns` > 0.
-- Dynamic children (`child_count_dynamic_max > 0`) only allowed with `.One_For_One` strategy.
-- Simulation: `ticks_max` > 0. Fault ratios must have valid numerator/denominator.
 
 ---
 

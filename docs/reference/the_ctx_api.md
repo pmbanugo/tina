@@ -8,10 +8,10 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 ## Messaging
 
-| Call | Signature | Returns | Description |
-|------|-----------|---------|-------------|
-| `ctx_send` | Overloaded: `ctx_send_raw(ctx, to, tag, payload)` / `ctx_send_typed(ctx, to, $tag, &msg)` | `Send_Result` | Send a message to a target Isolate. `tag` must be `>= USER_MESSAGE_TAG_BASE` (0x0040). Payload max: 96 bytes. |
-| `ctx_transfer_send` | `ctx_transfer_send(ctx, to, handle) -> Send_Result` | `Send_Result` | Send a `Transfer_Handle` reference to another Isolate. Uses system tag `TAG_TRANSFER` internally. |
+| Call | Signature | Returns | Errors | Description |
+|------|-----------|---------|--------|-------------|
+| `ctx_send` | Overloaded: `ctx_send_raw(ctx, to, tag, payload)` / `ctx_send_typed(ctx, to, $tag, &msg)` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a message to a target Isolate. `tag` must be `>= USER_MESSAGE_TAG_BASE` (0x0040). Payload max: 96 bytes. |
+| `ctx_transfer_send` | `ctx_transfer_send(ctx, to, handle) -> Send_Result` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a `Transfer_Handle` reference to another Isolate. Uses system tag `TAG_TRANSFER` internally. |
 
 **Tag constants:**
 
@@ -42,9 +42,9 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 ## Spawning
 
-| Call | Signature | Returns | Description |
-|------|-----------|---------|-------------|
-| `ctx_spawn` | `ctx_spawn(ctx, spec: Spawn_Spec) -> Spawn_Result` | `Handle` or `Spawn_Error` | Spawn a new Isolate and attach it to the specified supervision group. Requires `@(require_results)`. |
+| Call | Signature | Returns | Errors | Description |
+|------|-----------|---------|--------|-------------|
+| `ctx_spawn` | `ctx_spawn(ctx, spec: Spawn_Spec) -> Spawn_Result` | `Handle` or `Spawn_Error` | `.arena_full`, `.group_full`, `.type_not_allocated`, `.init_failed` | Spawn a new Isolate on the local Shard. Requires `@(require_results)`. |
 
 ---
 
@@ -60,7 +60,7 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `ctx_log` | Overloaded: `ctx_log_raw(ctx, level, $tag, payload)` / `ctx_log_typed(ctx, level, $tag, &msg)` | void | Write a diagnostic log entry. Logs are buffered per-Shard and flushed to stderr once per scheduler tick. |
+| `ctx_log` | Overloaded: `ctx_log_raw(ctx, level, $tag, payload)` / `ctx_log_typed(ctx, level, $tag, &msg)` | void | Write a diagnostic log entry. Each Shard buffers log entries and flushes them to stderr once per scheduler tick. |
 
 **Log levels:**
 
@@ -121,12 +121,12 @@ Example: `[48231] INFO[Tag:40] Handle:10003A2 - Connection 5 closed after 1024 b
 
 For payloads exceeding the 96-byte inline message limit.
 
-| Call | Signature | Returns | Description |
-|------|-----------|---------|-------------|
-| `ctx_transfer_alloc` | `ctx_transfer_alloc(ctx) -> Transfer_Alloc_Result` | `Transfer_Handle` or `Transfer_Alloc_Error` | Allocate a transfer buffer slot. |
-| `ctx_transfer_write` | Overloaded: `ctx_transfer_write_raw(ctx, handle, data)` / `ctx_transfer_write_typed(ctx, handle, &msg)` | `Transfer_Write_Error` | Write data into a transfer slot. |
-| `ctx_transfer_read` | `ctx_transfer_read(ctx, handle) -> Transfer_Read_Result` | `[]u8` or `Transfer_Read_Error` | Read from a transfer buffer. Auto-freed on handler return. **Call ONCE per invocation.** |
-| `ctx_transfer_send` | `ctx_transfer_send(ctx, to, handle) -> Send_Result` | `Send_Result` | Send a transfer handle reference to another Isolate. |
+| Call | Signature | Returns | Errors | Description |
+|------|-----------|---------|--------|-------------|
+| `ctx_transfer_alloc` | `ctx_transfer_alloc(ctx) -> Transfer_Alloc_Result` | `Transfer_Handle` or `Transfer_Alloc_Error` | `.Pool_Exhausted` | Allocate a transfer buffer slot. |
+| `ctx_transfer_write` | Overloaded: `ctx_transfer_write_raw(ctx, handle, data)` / `ctx_transfer_write_typed(ctx, handle, &msg)` | `Transfer_Write_Error` | `.Stale_Handle`, `.Bounds_Violation` | Write data into a transfer slot. |
+| `ctx_transfer_read` | `ctx_transfer_read(ctx, handle) -> Transfer_Read_Result` | `[]u8` or `Transfer_Read_Error` | `.Stale_Handle` | Read from a transfer buffer. The scheduler auto-frees the transfer slot when the receiver's handler returns. **Call ONCE per invocation.** |
+| `ctx_transfer_send` | `ctx_transfer_send(ctx, to, handle) -> Send_Result` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a transfer handle reference to another Isolate. |
 
 ---
 
@@ -134,15 +134,15 @@ For payloads exceeding the 96-byte inline message limit.
 
 These are non-batched, non-blocking control-plane operations executed during handler invocation.
 
-| Call | Signature | Returns | Description |
-|------|-----------|---------|-------------|
-| `ctx_socket` | `ctx_socket(ctx, domain: Socket_Domain, socket_type: Socket_Type, protocol: Socket_Protocol) -> (FD_Handle, Reactor_Socket_Error)` | FD handle + error | Create a socket and register it in the FD table. |
-| `ctx_bind` | `ctx_bind(ctx, fd: FD_Handle, address: Socket_Address) -> Backend_Error` | error | Bind socket to address. |
-| `ctx_listen` | `ctx_listen(ctx, fd: FD_Handle, backlog: u32) -> Backend_Error` | error | Start listening on a bound socket. |
-| `ctx_setsockopt` | Overloaded: `ctx_setsockopt_raw`, `ctx_setsockopt_bool`, `ctx_setsockopt_i32`, `ctx_setsockopt_linger` | `Backend_Error` | Set a socket option. |
-| `ctx_getsockopt` | `ctx_getsockopt(ctx, fd, level, option) -> (Socket_Option_Value, Backend_Error)` | value + error | Get a socket option value. |
-| `ctx_shutdown` | `ctx_shutdown(ctx, fd: FD_Handle, how: Shutdown_How) -> Backend_Error` | error | Shutdown a socket connection direction. |
-| `ctx_read_buffer` | `ctx_read_buffer(ctx, buffer_index: u16, size: u32) -> []u8` | `[]u8` | Read I/O completion data from the reactor buffer pool. Used after receiving an I/O completion message. |
+| Call | Signature | Returns | Errors | Description |
+|------|-----------|---------|--------|-------------|
+| `ctx_socket` | `ctx_socket(ctx, domain, socket_type, protocol) -> (FD_Handle, Reactor_Socket_Error)` | FD handle + error | `.Backend_Error`, `.FD_Table_Full` | Create a socket and register it in the FD table. |
+| `ctx_bind` | `ctx_bind(ctx, fd: FD_Handle, address: Socket_Address) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Bind socket to address. |
+| `ctx_listen` | `ctx_listen(ctx, fd: FD_Handle, backlog: u32) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Start listening on a bound socket. |
+| `ctx_setsockopt` | Overloaded: `ctx_setsockopt_raw`, `_bool`, `_i32`, `_linger` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Set a socket option. |
+| `ctx_getsockopt` | `ctx_getsockopt(ctx, fd, level, option) -> (Socket_Option_Value, Backend_Error)` | value + error | `.Queue_Full`, `.System_Error`, `.Not_Found` | Get a socket option value. |
+| `ctx_shutdown` | `ctx_shutdown(ctx, fd: FD_Handle, how: Shutdown_How) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Shutdown a socket connection direction. |
+| `ctx_read_buffer` | `ctx_read_buffer(ctx, buffer_index: u16, size: u32) -> []u8` | `[]u8` | — | Read I/O completion data from the reactor buffer pool. Valid for one handler call only. |
 
 ---
 
@@ -440,3 +440,69 @@ Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> 
 | Call | Signature | Description |
 |------|-----------|-------------|
 | `tina_start` | `tina_start(spec: ^SystemSpec)` | Validate spec, allocate all memory, build supervision trees, pin Shard threads to cores, and enter the run loop. Does not return under normal operation. |
+
+---
+
+## Quick Reference Dictionary
+
+### `Send_Result`
+
+| Value | Meaning |
+|-------|---------|
+| `.ok` | Message enqueued in the target's mailbox. |
+| `.mailbox_full` | Target mailbox or cross-shard channel is at capacity. Message not sent. |
+| `.pool_exhausted` | Shard message pool has no free slots. Message not sent. |
+| `.stale_handle` | Target Handle is dead — generation mismatch or quarantined Shard. |
+
+### `Spawn_Error`
+
+| Value | Meaning |
+|-------|---------|
+| `.arena_full` | Typed arena for this Isolate type has no free slots. Increase `slot_count`. |
+| `.group_full` | Supervision group reached `child_count_dynamic_max`. |
+| `.type_not_allocated` | `type_id` references a type with no allocated slots on this Shard. |
+| `.init_failed` | The spawned Isolate's `init_fn` returned `Effect_Crash`. |
+
+### `Restart_Type`
+
+| Value | Meaning |
+|-------|---------|
+| `.permanent` | Always restarted, regardless of exit reason. |
+| `.transient` | Restarted only on crash. Clean exit (`Effect_Done`) is not restarted. |
+| `.temporary` | Never restarted. One-shot tasks, connection handlers. |
+
+### `Handoff_Mode`
+
+| Value | Meaning |
+|-------|---------|
+| `.Full` | Transfer both read and write — parent loses all FD access. |
+| `.Read_Only` | Child gets read access, parent retains write. |
+| `.Write_Only` | Child gets write access, parent retains read. |
+
+### `Crash_Reason`
+
+| Value | Meaning |
+|-------|---------|
+| `.None` | Generic or user-triggered crash. |
+| `.Spawn_Failed` | A spawned child's `init_fn` failed. |
+| `.Unimplemented_Effect` | Handler returned an unhandled Effect variant. |
+| `.Init_Failed` | This Isolate's own initialization failed. |
+
+### `Backend_Error`
+
+| Value | Meaning |
+|-------|---------|
+| `.None` | Success. |
+| `.Queue_Full` | I/O submission queue is full. |
+| `.System_Error` | OS-level error (errno). |
+| `.Not_Found` | FD or resource not found in the FD table. |
+| `.Too_Late` | Operation cancelled or expired. |
+| `.Unsupported` | Operation not supported on this platform. |
+
+### `Reactor_Socket_Error`
+
+| Value | Meaning |
+|-------|---------|
+| `.None` | Success. |
+| `.Backend_Error` | OS-level socket creation failed. |
+| `.FD_Table_Full` | Shard's FD table has no free slots. Increase `fd_table_slot_count`. |

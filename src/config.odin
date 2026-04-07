@@ -31,8 +31,8 @@ TypeDescriptor :: struct {
 }
 
 Memory_Init_Mode :: enum u8 {
-	Production,
-	Development,
+	Production, // Pin to core, NUMA bind, HugePages, pre-fault.
+	Development, // Lazy commit (OS-default).
 }
 
 Quarantine_Policy :: enum u8 {
