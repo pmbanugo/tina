@@ -207,7 +207,7 @@ conn_handler :: proc(
 
 ## Pattern 3: The Dispatcher-Worker Pattern
 
-A Dispatcher spawns Workers, assigns jobs. Workers crash and restart with new Handles. The Dispatcher handles stale Handles gracefully.
+A Dispatcher spawns Workers, assigns jobs. Workers crash and restart with new Handles. The Dispatcher structurally tolerates stale Handles.
 
 ### The Problem
 
@@ -216,6 +216,8 @@ When a Worker crashes and the supervisor restarts it, the restarted Worker gets 
 ### The Solution: The Check-In Pattern
 
 After restart, each Worker sends its new Handle to the Dispatcher. The Dispatcher updates its table.
+
+> **Why doesn't Tina update the Handle automatically?** Handles encode physical routing information — Shard ID, type ID, slot index, and generation. When the supervisor restarts an Isolate, the new Isolate occupies a (possibly different) slot with a new generation. The old Handle is structurally dead. Automatic forwarding would require a global, lock-protected registry — violating the shared-nothing architecture. The Check-In pattern keeps Handle resolution O(1) and lock-free: one shift, one mask, one generation comparison. No registry. No indirection.
 
 ```odin
 // ---- Message tags ----

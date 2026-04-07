@@ -10,8 +10,6 @@ Three hard constraints shape every topology:
 
 Three patterns cover the design space.
 
----
-
 ## Pattern 1: Symmetric (SO_REUSEPORT)
 
 Every Shard runs its own Listener + Worker pool. Each Shard binds to the same port using `SO_REUSEPORT`. The kernel distributes incoming connections across Shards. No cross-shard messaging needed for connection handling.
@@ -120,8 +118,6 @@ tina.tina_start(&spec)
 ```
 
 **When to use:** Stateless services, protocol gateways, edge proxies. Each connection is self-contained — no need to route to a specific Shard.
-
----
 
 ## Pattern 2: Asymmetric (Network Shard + Compute Shards)
 
@@ -279,8 +275,6 @@ shard_specs := [4]tina.ShardSpec{
 
 **When to use:** Stateful services where work must be partitioned by key — user sessions, database shards, ordered processing per key. `key_to_shard` guarantees that the same key always lands on the same Shard.
 
----
-
 ## Pattern 3: The Coordinator Pattern (Cross-Shard Spawning)
 
 `ctx_spawn()` is Shard-local only. You cannot spawn an Isolate on another Shard directly. The Coordinator pattern solves this.
@@ -436,8 +430,6 @@ coordinator  := coordinator_handles[target_shard]
 return request_remote_spawn(coordinator, WORKER_TYPE, client_id, client_fd)
 ```
 
----
-
 ## Choosing Your Topology
 
 | Workload | Pattern | Why |
@@ -448,8 +440,6 @@ return request_remote_spawn(coordinator, WORKER_TYPE, client_id, client_fd)
 
 A hybrid topology combines both patterns. Each Shard runs its own Listener (symmetric), but routes stateful work to key-partitioned Compute Shards (asymmetric). The Listener accepts and does protocol parsing locally; the parsed request is forwarded to the correct Compute Shard via `key_to_shard`.
 
----
-
 ## Tradeoffs Accepted
 
 **SO_REUSEPORT depends on kernel support.** Linux 3.9+, macOS, FreeBSD. Not available on all platforms. If your target lacks `SO_REUSEPORT`, use the Asymmetric pattern with a single Listener Shard.
@@ -459,3 +449,5 @@ A hybrid topology combines both patterns. Each Shard runs its own Listener (symm
 **The Coordinator pattern adds one `.call` round-trip per remote spawn.** This is acceptable because spawns are rare relative to message processing. A spawn happens once per connection or session; messages flow thousands of times per second after that.
 
 **No runtime rebalancing.** If traffic shifts, redeploy with a new boot spec. The operator knows the workload shape. The boot spec (`SystemSpec` with `shard_specs`) defines the topology at startup. It is immutable after `tina_start()`.
+
+**Deterministic Routing over Work-Stealing.** `key_to_shard` implements a pure function: the same key always maps to the same Shard. This determinism is a hard requirement for simulation reproducibility. We reject work-stealing because it destroys memory locality and introduces non-deterministic migration, which renders simulation replay impossible. Tina chooses structural determinism over dynamic load balancing.

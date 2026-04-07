@@ -57,7 +57,7 @@ You can get a standard `mem.Allocator` from the scratch arena for general-purpos
 
 ### The rule
 
-**Do not** store a scratch allocation in the Isolate's struct. It will be a dangling reference on the next handler call. If you need data to survive, copy it into the struct or the working arena.
+Pointers to the scratch arena are strictly scoped to the current handler invocation. Storing a scratch pointer in your Isolate struct guarantees a dangling pointer on the next tick — the scheduler resets the scratch arena before every handler call and overwrites that memory. If you need data to survive, copy it into the struct or the working memory arena.
 
 ---
 

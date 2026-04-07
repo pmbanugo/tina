@@ -291,7 +291,7 @@ spec := tina.SystemSpec{
 }
 ```
 
-If your Isolates don't finish within this window, Phase 3 kicks in: emergency log flush, then `_exit(0)`. The kernel closes all sockets (sending RST), unmaps all memory, and terminates all threads.
+If your Isolates do not finish within this window, Phase 3 bypasses user-space cleanup and calls `_exit(0)`. This is structurally safe: the OS kernel reclaims all memory, releases io_uring state, and sends TCP RST for all open file descriptors. No user-space cleanup is needed because we rely on the kernel's most battle-tested cleanup path.
 
 ---
 

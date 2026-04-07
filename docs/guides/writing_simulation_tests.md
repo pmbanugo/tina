@@ -202,7 +202,7 @@ odin build my_sim_test.odin -file -out:sim_test -define:TINA_SIM=true
 
 ## Tips
 
-**Size pools small.** In simulation, use smaller pools and mailbox capacities than production. This stresses backpressure paths, pool exhaustion, and ring-full drops — paths that rarely activate under normal load but contain the nastiest bugs.
+**Starve the simulation.** Configure your `SystemSpec` with tiny message pools and mailbox capacities (e.g., `pool_slot_count = 1024`, `mailbox_capacity = 16`). This forces the system into constant backpressure, exercising the `.pool_exhausted` and `.mailbox_full` drop paths that rarely trigger in production — exposing hidden state-machine bugs in your retry and shed-load logic.
 
 **Start with low fault rates.** Begin with `Ratio{1, 1000}` and increase gradually. High crash rates can overwhelm the supervision system before your application logic even runs.
 
