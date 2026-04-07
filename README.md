@@ -1,6 +1,6 @@
 # Tina
 
-**A strictly bounded, thread-per-core concurrency framework for Odin.** It is designed For Massive Concurrency, Safety, and  Fault-tolerance
+**A strictly bounded, thread-per-core concurrency framework.** It is designed For massive concurrency, safety, and  fault-tolerance.
 > Write simple, synchronous-looking state machines. Get massive multi-core throughput, automatic fault isolation, and 100% deterministic simulation testing.
 
 [![Odin Version](https://img.shields.io/badge/Odin-2026-blue)](#)
@@ -31,7 +31,7 @@ echo_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.
     return tina.Effect_Io{operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = size_of(self.buffer)}}
 }
 
-// Handle I/O completions. Read → echo back → read again. If anything fails: let it crash.
+// Handle I/O completions synchronously. No callbacks, no hidden queues. If anything fails: let it crash.
 echo_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
     self := tina.self_as(EchoConnection, self_raw, ctx)
 
@@ -128,14 +128,34 @@ The echo example runs a two-shard TCP server. A chaos client crashes after a few
 
 ## Documentation
 
-| Document | What it covers |
+| Section | What it covers |
 |---|---|
+| **Concepts** | |
+| [`docs/concepts/isolates.md`](./docs/concepts/isolates.md) | Isolates, Effects & Messaging — the core mental model |
+| [`docs/concepts/thread_per_core.md`](./docs/concepts/thread_per_core.md) | Thread-per-core architecture, shared-nothing Shards, cross-shard messaging, budgeted batching |
+| [`docs/concepts/memory_arenas.md`](./docs/concepts/memory_arenas.md) | Grand Arena, three memory generations, typed arenas, hardware prefetcher alignment |
+| [`docs/concepts/supervision.md`](./docs/concepts/supervision.md) | Supervision & fault tolerance — "let it crash", restart strategies, quarantine |
+| [`docs/concepts/io_and_data_flow.md`](./docs/concepts/io_and_data_flow.md) | I/O model, reactor buffers, transfer buffers, the "one rule" |
+| [`docs/concepts/deterministic_simulation.md`](./docs/concepts/deterministic_simulation.md) | Simulation testing, PRNG tree, fault injection, structural checkers |
+| [`docs/concepts/backpressure_and_drops.md`](./docs/concepts/backpressure_and_drops.md) | Bounded mailboxes, drop-on-full semantics, control plane/data plane separation |
+| **Guides** | |
+| [`docs/guides/building_a_tcp_server.md`](./docs/guides/building_a_tcp_server.md) | Build a complete TCP echo server from scratch |
+| [`docs/guides/handling_state_machines.md`](./docs/guides/handling_state_machines.md) | Reactive handlers, lifecycle state machines, the dispatcher-worker pattern |
+| [`docs/guides/graceful_shutdown.md`](./docs/guides/graceful_shutdown.md) | TAG_SHUTDOWN handling, drain patterns, three-phase shutdown protocol |
+| [`docs/guides/working_with_memory.md`](./docs/guides/working_with_memory.md) | Scratch vs working arena, transfer buffers, the decision rule |
+| [`docs/guides/writing_simulation_tests.md`](./docs/guides/writing_simulation_tests.md) | Writing deterministic simulation tests — TestDrivers, checkers, fault config |
+| [`docs/guides/designing_shard_topologies.md`](./docs/guides/designing_shard_topologies.md) | Mapping applications to Shards — symmetric, asymmetric, the Coordinator pattern |
+| [`docs/guides/tuning_the_boot_spec.md`](./docs/guides/tuning_the_boot_spec.md) | Sizing every knob — pools, mailboxes, channels, buffers, timers, workload profiles |
+| **Reference** | |
+| [`docs/reference/the_ctx_api.md`](./docs/reference/the_ctx_api.md) | Complete `ctx` API — messaging, spawning, memory, I/O, timers, all types |
+| [`docs/reference/system_spec.md`](./docs/reference/system_spec.md) | SystemSpec, ShardSpec, TypeDescriptor, supervision, simulation config |
+| **Examples** | |
 | [`examples/`](./examples) | Runnable examples with detailed walkthroughs |
-| [`src/README_DST.md`](./src/README_DST.md) | Deterministic Simulation Testing — writing tests, fault injection, checkers, reproducing failures |
+| [`src/README_DST.md`](./src/README_DST.md) | Deterministic Simulation Testing — writing tests, fault injection, reproducing failures |
 
 ## Production Readiness & Status
 
-**Status: Stable.**
+**Status: Early but Functionally Stable.**
 
 Tina is in an early but functional state. The core architecture is implemented and working:
 
@@ -146,7 +166,7 @@ Tina is in an early but functional state. The core architecture is implemented a
 - ✅ Cross-shard, multi-core messaging
 - ✅ Two working examples demonstrating fault recovery under load
 - ✅ Deterministic simulation testing with fault injection, structural checkers, and seed-based replay
-- 🚧 Documentation beyond examples and design notes
+- ✅ Documentation: concept guides, how-to guides, and API reference
 
 Tested primarily on macOS (Apple Silicon). CI tests pass on Linux and Windows. If you find a bug, open an issue. If you want to discuss the design, open a GitHub Discussion.
 
@@ -160,8 +180,9 @@ Tina did not invent its ideas. It synthesizes them:
 | Thread-per-core, shared-nothing, reactor loop | Seastar by ScyllaDB |
 | Deterministic simulation testing, static allocation, Tiger Style | TigerBeetle & FoundationDB |
 | Ring buffer design, mechanical sympathy | Martin Thompson — LMAX Disruptor, Aeron |
-| Memory Lifetimes | Casey Muratori |
-| Pool allocators, intrusive free lists | Ginger Bill |
+| Memory Lifetimes | Casey Muratori & Bill Hall (gingerbill) |
+| Data-oriented design | Mike Acton (C++) & Andrew Kelly (Zig) |
+| Architecting large software projects | Eskil Steenberg (C developer) |
 
 ## Following the Build
 

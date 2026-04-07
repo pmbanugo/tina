@@ -5,7 +5,10 @@ adr-temp
 adr-temp2
 .DS_Store
 *.bin
+*.cast
 example_*.odin.txt
+tina_dispatch
+tina_echo
 
 # Prerequisites
 *.d
