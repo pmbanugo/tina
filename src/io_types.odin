@@ -38,7 +38,7 @@ fd_handle_generation :: #force_inline proc "contextless" (h: FD_Handle) -> u16 {
 // --- IO Completion Tags (§6.6.1 §5, §6.6.3 §7, PUBLIC_API_SURFACE §7.2) ---
 
 // IO completion tags use Message_Tag for unified tag switching.
-// IO_Completion_Tag is kept as a type alias for internal SOA metadata.
+// IO_Completion_Tag is kept as a type alias for internal Isolate metadata.
 @(private = "package")
 IO_Completion_Tag :: Message_Tag
 
@@ -141,7 +141,7 @@ Socket_Address :: union {
 	Socket_Address_Unix,
 }
 
-// Compact 28-byte peer address for SOA metadata (§6.6.3 §5.3).
+// Compact 28-byte peer address for Isolate metadata (§6.6.3 §5.3).
 // Covers inet4 and inet6. Unix peer addresses are not supported in SOA
 // (unix domain accept does not produce meaningful peer addresses).
 Peer_Address :: struct {

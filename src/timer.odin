@@ -65,7 +65,13 @@ ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag
 	shard := _ctx_extract_shard(ctx)
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
-		_shard_log(_ctx_extract_shard(ctx), ctx.self_handle, .ERROR, USER_LOG_TAG_BASE, transmute([]u8)string("Timer pool exhausted"))
+		_shard_log(
+			_ctx_extract_shard(ctx),
+			ctx.self_handle,
+			.ERROR,
+			USER_LOG_TAG_BASE,
+			transmute([]u8)string("Timer pool exhausted"),
+		)
 		return
 	}
 	// Convert nanoseconds to ticks
@@ -176,7 +182,7 @@ _advance_timers :: proc(
 			//   - SimulatedIO: operation completes on next tick_count advancement → stale path
 			//
 			// Explicit cancel was removed because it adds per-slot state
-			// (stored token) to the hot SOA metadata for a control-plane
+			// (stored token) to the hot Isolate metadata for a control-plane
 			// operation that the existing structural guarantee already handles.
 			// The only cost: the buffer stays allocated until the backend
 			// naturally completes the stale operation (bounded, typically

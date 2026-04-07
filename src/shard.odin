@@ -69,7 +69,7 @@ Control_Signal :: enum u8 {
 
 // --- Core Data Structures ---
 
-// SOA metadata
+// Isolate metadata
 Isolate_Metadata :: struct {
 	io_peer_address:       Peer_Address,
 	inbox_head:            u32,

@@ -41,11 +41,11 @@ Quarantine_Policy :: enum u8 {
 }
 
 Watchdog_Config :: struct {
-	check_interval_ms:      u32,
-	shard_restart_window_ms:u32,
-	shard_restart_max:      u16,
-	phase_2_threshold:      u8,
-	_padding:               u8,
+	check_interval_ms:       u32,
+	shard_restart_window_ms: u32,
+	shard_restart_max:       u16,
+	phase_2_threshold:       u8,
+	_padding:                u8,
 }
 
 Dio_Config :: struct {
@@ -439,14 +439,16 @@ when TINA_SIMULATION_MODE {
 		// A user writing Ratio{1, 0} likely intends 100% but would silently get 0%.
 		// Ratio{0, 0} is fine — it means "disabled" (numerator == 0 → always false).
 		f := sim.faults
-		_bad_ratio :: proc(r: Ratio) -> bool { return r.numerator > 0 && r.denominator == 0 }
+		_bad_ratio :: proc(r: Ratio) -> bool {return r.numerator > 0 && r.denominator == 0}
 		if _bad_ratio(f.io_error_rate) ||
 		   _bad_ratio(f.network_drop_rate) ||
 		   _bad_ratio(f.network_partition_rate) ||
 		   _bad_ratio(f.network_partition_heal_rate) ||
 		   _bad_ratio(f.isolate_crash_rate) ||
 		   _bad_ratio(f.init_failure_rate) {
-			fmt.eprintfln("[FATAL] Simulation fault ratio has non-zero numerator with zero denominator")
+			fmt.eprintfln(
+				"[FATAL] Simulation fault ratio has non-zero numerator with zero denominator",
+			)
 			return .ValueOutOfBounds
 		}
 
@@ -527,7 +529,7 @@ _validate_dio_config :: proc(spec: ^SystemSpec) -> SystemSpecError {
 // Revisit CONFIGURATION_VALIDATION.md later, perhaps combined with the memory management ADR
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
-	// 3 per type (Typed Arena, SOA Metadata, Working Memory)
+	// 3 per type (Typed Arena, Isolate Metadata, Working Memory)
 	// + 10 static framework regions
 	// + 1 for the SubRegion tracker array itself
 	// + 2 for the Slice Headers and Dispatch Cursors tracking
@@ -631,9 +633,7 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 		{id = 2, scratch_requirement_max = 4096},
 	}
 
-	children := [1]Child_Spec {
-		Static_Child_Spec{type_id = 1, restart_type = .permanent},
-	}
+	children := [1]Child_Spec{Static_Child_Spec{type_id = 1, restart_type = .permanent}}
 	root_group := Group_Spec {
 		strategy              = .One_For_One,
 		restart_count_max     = 3,
@@ -643,16 +643,16 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 	spec := SystemSpec {
-		shard_count        = 1,
-		types              = types[:],
-		shard_specs        = shard_specs[:],
-		scratch_arena_size = 2048, // Intentionally too small
-		pool_slot_count    = 1024,
-		log_ring_size      = 65536,
-		timer_spoke_count  = 4096,
-		timer_entry_count  = 64,
+		shard_count         = 1,
+		types               = types[:],
+		shard_specs         = shard_specs[:],
+		scratch_arena_size  = 2048, // Intentionally too small
+		pool_slot_count     = 1024,
+		log_ring_size       = 65536,
+		timer_spoke_count   = 4096,
+		timer_entry_count   = 64,
 		timer_resolution_ns = 1_000_000,
-		default_ring_size  = 16,
+		default_ring_size   = 16,
 	}
 
 	err := validate_system_spec(&spec)
@@ -684,13 +684,9 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 when TINA_SIMULATION_MODE {
 	@(test)
 	test_simulation_config_validation :: proc(t: ^testing.T) {
-		types := [1]TypeDescriptor {
-			{id = 0, scratch_requirement_max = 0},
-		}
+		types := [1]TypeDescriptor{{id = 0, scratch_requirement_max = 0}}
 
-		children := [1]Child_Spec {
-			Static_Child_Spec{type_id = 0, restart_type = .permanent},
-		}
+		children := [1]Child_Spec{Static_Child_Spec{type_id = 0, restart_type = .permanent}}
 		root_group := Group_Spec {
 			strategy              = .One_For_One,
 			restart_count_max     = 3,
@@ -701,8 +697,8 @@ when TINA_SIMULATION_MODE {
 
 		// Base valid simulation config
 		sim_config := SimulationConfig {
-			seed      = 42,
-			ticks_max = 1000,
+			seed             = 42,
+			ticks_max        = 1000,
 			builtin_checkers = CHECKER_FLAGS_ALL,
 		}
 
@@ -803,7 +799,7 @@ Check_Violation :: struct {
 	message: string,
 }
 
-Checker_Flags :: bit_set[Checker_Flag; u16]
+Checker_Flags :: bit_set[Checker_Flag;u16]
 
 Checker_Flag :: enum u8 {
 	Pool_Integrity,
