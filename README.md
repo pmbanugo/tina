@@ -6,6 +6,7 @@
 [![Odin Version](https://img.shields.io/badge/Odin-2026-blue)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](./LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-0-orange)](#)
+[![Follow @p_mbanugo](https://img.shields.io/twitter/follow/p_mbanugo?style=social)](https://twitter.com/p_mbanugo)
 
 ## A Simple TCP Echo Server
 
