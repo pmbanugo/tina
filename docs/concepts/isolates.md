@@ -77,17 +77,17 @@ Isolates are never referenced by pointer. They are referenced by **Handles** —
 
 ```
 Handle (u64):
-┌──────────┬────────────┬───────────────────────┐
-│ shard_id │  type_id   │  generation + slot     │
-│  (8 bit) │  (8 bit)   │  (48 bit)              │
-└──────────┴────────────┴───────────────────────┘
+┌──────────┬────────────┬─────────────┬──────────────┐
+│ shard_id │  type_id   │ slot_index  │  generation  │
+│  (8 bit) │  (8 bit)   │  (20 bit)   │   (28 bit)   │
+└──────────┴────────────┴─────────────┴──────────────┘
 ```
 
 The **generation** is the key to safety. When an Isolate is torn down, its arena slot's generation counter increments. Any Handle still referencing the old generation is now **stale** — sends to it return `.stale_handle` instead of delivering to whatever new Isolate now occupies that slot.
 
 This eliminates dangling pointers, use-after-free, and the ABA problem — structurally, without reference counting, garbage collection, or borrow checking. It's the same technique used in game engines (entity handles in ECS), Rust's `slotmap`, and generational arena allocators.
 
-**HANDLE_NONE** (`0xFFFFFFFFFFFFFFFF`) is the null sentinel. It always fails validation.
+**HANDLE_NONE** (`0`) is the null sentinel. It always fails validation.
 
 ## Messaging
 
@@ -101,7 +101,7 @@ Every message is a fixed-size **128-byte envelope**:
 |---|---|---|
 | `source` | 8 bytes | Sender's Handle |
 | `destination` | 8 bytes | Receiver's Handle |
-| `tag` | 4 bytes | Message type discriminant |
+| `tag` | 2 bytes | Message type discriminant |
 | `flags` | 2 bytes | Internal metadata (is_reply, is_call) |
 | `payload_size` | 2 bytes | Bytes of payload actually used |
 | `correlation` | 4 bytes | For `.call` request-response matching |

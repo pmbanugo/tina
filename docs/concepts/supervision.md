@@ -34,7 +34,7 @@ Level 3: Process Abort (External supervisor restarts the process)
 
 **Level 2** happens when a supervision group exceeds its restart budget (too many crashes in the time window). The Shard quarantines: all Isolates are torn down, all memory is reset, and the supervision tree is rebuilt from the boot spec. Other Shards continue serving. On POSIX, send `SIGUSR2` to revive quarantined Shards.
 
-**Level 3** is for unrecoverable failures: framework bugs, hardware faults, or a cascade that overwhelms Level 2. The watchdog (main thread) calls `abort()`. An external supervisor (systemd, Kubernetes) restarts the process.
+**Level 3** is for unrecoverable failures: framework bugs, hardware faults, or a cascade that overwhelms Level 2. The watchdog calls `_exit(0)`. The kernel reclaims all resources — memory, file descriptors, io_uring state, threads. An external supervisor (systemd, Kubernetes) optionally restarts the process.
 
 ## Supervision Groups
 

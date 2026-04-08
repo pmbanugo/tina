@@ -18,9 +18,10 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `USER_MESSAGE_TAG_BASE` | `0x0040` | Minimum tag value for user messages. |
+| `TAG_CALL_TIMEOUT` | `0x0001` | The scheduler delivers this when a `.call` timeout expires without a reply. |
 | `TAG_TIMER` | `0x0002` | Delivered when a registered timer fires. |
-| `TAG_TRANSFER` | `0x0004` | System tag for transfer buffer messages. |
 | `TAG_SHUTDOWN` | `0x0003` | Shard shutdown notification. |
+| `TAG_TRANSFER` | `0x0004` | System tag for transfer buffer messages. |
 | `TAG_SHARD_RESTARTED` | `0x0005` | Peer shard restarted notification. |
 | `TAG_SHARD_QUARANTINED` | `0x0006` | Peer shard quarantined notification. |
 

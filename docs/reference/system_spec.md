@@ -13,11 +13,11 @@ The root boot specification for the entire Tina process.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `app_version` | `u32` | `0` | Application version tag. Informational. |
-| `memory_init_mode` | `Memory_Init_Mode` | `.Production` | Memory initialization strategy. `.Development` lazy mode. No pinning, no NUMA policy, no pre-faulting. |
+| `memory_init_mode` | `Memory_Init_Mode` | `.Production` | Memory initialization strategy. `.Production`: pin to core, NUMA bind, HugePages, pre-fault. `.Development`: lazy commit (OS-default), no pinning, no NUMA policy, no pre-faulting. |
 | `quarantine_policy` | `Quarantine_Policy` | `.Quarantine` | What happens when a Shard exceeds its restart budget. `.Quarantine` isolates it; `.Abort` terminates the process. |
-| `init_timeout_ms` | `u32` | `0` | Timeout for Shard initialization phase (milliseconds). |
-| `shutdown_timeout_ms` | `u32` | `0` | Timeout for graceful shutdown (milliseconds). |
-| `safety_margin` | `f32` | `0` | Memory safety margin multiplier. |
+| `init_timeout_ms` | `u32` | `30000` | Timeout for Shard initialization phase (milliseconds). If 0, the framework applies 30,000ms. |
+| `shutdown_timeout_ms` | `u32` | `30000` | Timeout for graceful shutdown (milliseconds). If 0, the framework applies 30,000ms. |
+| `safety_margin` | `f32` | `0.9` | Memory safety margin multiplier. If 0 or negative, the framework applies 0.9 (90% of system RAM). |
 | `watchdog` | `Watchdog_Config` | — | Watchdog thread configuration. |
 | `dio` | `^Dio_Config` | `nil` | Direct I/O configuration. `nil` means DIO disabled. Currently reserved. |
 | `types` | `[]TypeDescriptor` | — | **Required.** Registered Isolate types. 1–254 entries. |
@@ -66,8 +66,8 @@ Defines the behavior, memory footprint, and lifecycle functions for a specific I
 | `soa_metadata_size` | `int` | — | Size of per-slot Isolate metadata. Use `size_of(tina.Isolate_Metadata)`. |
 | `working_memory_size` | `int` | `0` | Private working arena size per Isolate instance (bytes). |
 | `scratch_requirement_max` | `int` | `0` | Maximum scratch arena bytes this type needs. `SystemSpec.scratch_arena_size` must be >= this. |
-| `mailbox_capacity` | `u16` | `0` | Per-Isolate mailbox depth. |
-| `budget_weight` | `u16` | `0` | Scheduling weight. Higher = more messages processed per tick. Default: 1. |
+| `mailbox_capacity` | `u16` | `256` | Per-Isolate mailbox depth. If 0, the framework applies 256 at startup. |
+| `budget_weight` | `u16` | `1` | Scheduling weight. Higher = more messages processed per tick. If 0, the framework applies 1 at startup. |
 | `init_fn` | `Init_Fn` | — | `proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect`. Called once on spawn. |
 | `handler_fn` | `Handler_Fn` | — | `proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect`. Called on every message. |
 
@@ -130,22 +130,16 @@ Configuration for the watchdog thread that monitors Shard health.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `check_interval_ms` | `u32` | `0` | How often the watchdog checks Shard liveness (milliseconds). |
-| `shard_restart_window_ms` | `u32` | `0` | Time window for counting Shard restarts. |
-| `shard_restart_max` | `u16` | `0` | Maximum Shard restarts within the window before quarantine. |
-| `phase_2_threshold` | `u8` | `0` | Number of quarantined Shards before escalating to process-level action. |
+| `check_interval_ms` | `u32` | `500` | How often the watchdog checks Shard liveness (milliseconds). If 0, the framework applies 500ms. |
+| `shard_restart_window_ms` | `u32` | `30000` | Time window for counting Shard restarts (milliseconds). If 0, the framework applies 30,000ms. |
+| `shard_restart_max` | `u16` | `3` | Maximum Shard restarts within the window before quarantine. If 0, the framework applies 3. |
+| `phase_2_threshold` | `u8` | `2` | Consecutive stall intervals before the watchdog sends SIGUSR1 to the stalled Shard. If 0, the framework applies 2. |
 
 ---
 
 ## `Dio_Config`
 
-Direct I/O configuration. Currently reserved — pass `nil` in `SystemSpec.dio`.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `target_core` | `i32` | CPU core for the DIO thread. |
-| `submission_ring_size` | `u32` | Submission ring capacity. |
-| `completion_ring_size` | `u32` | Completion ring capacity. |
+Disk I/O configuration. Disk I/O (file system) is currently unimplemented so the system expects this value to be `nil` in `SystemSpec.dio`.
 
 ---
 
@@ -301,8 +295,8 @@ Scannable lookup for all configuration enums.
 | | `.transient` | Restarted only on crash. Clean exit is not restarted. |
 | | `.temporary` | Never restarted. |
 | **`Memory_Init_Mode`** | | |
-| | `.Production` | No extra initialization. |
-| | `.Development` | Zero-fill all memory for debugging. |
+| | `.Production` | Pin to core, NUMA bind, HugePages, pre-fault. |
+| | `.Development` | Lazy commit (OS-default). No pinning, no NUMA policy, no pre-faulting. |
 | **`Quarantine_Policy`** | | |
 | | `.Quarantine` | Isolate the failed Shard. Other Shards continue. |
 | | `.Abort` | Terminate the entire process. |
