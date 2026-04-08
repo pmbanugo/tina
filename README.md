@@ -181,7 +181,7 @@ Tina did not invent its ideas. It synthesizes them:
 | Thread-per-core, shared-nothing, reactor loop | Seastar by ScyllaDB |
 | Deterministic simulation testing, static allocation, Tiger Style | TigerBeetle & FoundationDB |
 | Ring buffer design, mechanical sympathy | Martin Thompson — LMAX Disruptor, Aeron |
-| Memory Lifetimes | Casey Muratori & Bill Hall (gingerbill) |
+| Memory Lifetimes | Casey Muratori |
 | Data-oriented design | Mike Acton (C++) & Andrew Kelly (Zig) |
 | Architecting large software projects | Eskil Steenberg (C developer) |
 
