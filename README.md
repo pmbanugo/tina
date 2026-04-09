@@ -141,6 +141,7 @@ The echo example runs a two-shard TCP server. A chaos client crashes after a few
 | [`docs/concepts/backpressure_and_drops.md`](./docs/concepts/backpressure_and_drops.md) | Bounded mailboxes, drop-on-full semantics, control plane/data plane separation |
 | **Guides** | |
 | [`docs/guides/building_a_tcp_server.md`](./docs/guides/building_a_tcp_server.md) | Build a complete TCP echo server from scratch |
+| [`docs/guides/odin_compilation.md`](./docs/guides/odin_compilation.md) | Odin compilation requirements & runtime assertions (TINA_ASSERTS) |
 | [`docs/guides/handling_state_machines.md`](./docs/guides/handling_state_machines.md) | Reactive handlers, lifecycle state machines, the dispatcher-worker pattern |
 | [`docs/guides/graceful_shutdown.md`](./docs/guides/graceful_shutdown.md) | TAG_SHUTDOWN handling, drain patterns, three-phase shutdown protocol |
 | [`docs/guides/working_with_memory.md`](./docs/guides/working_with_memory.md) | Scratch vs working arena, transfer buffers, the decision rule |
