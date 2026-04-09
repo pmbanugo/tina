@@ -185,6 +185,12 @@ Tina did not invent its ideas. It synthesizes them:
 | Data-oriented design | Mike Acton (C++) & Andrew Kelly (Zig) |
 | Architecting large software projects | Eskil Steenberg (C developer) |
 
+## Sponsorship & Support
+
+Tina is an independent, open-source engineering project. It is not backed by venture capital, which allows it to remain strictly focused and fiercely uncompromising on its architecture. 
+
+If you or your team is evaluating Tina for high-throughput infrastructure, or if you simply want to advance zero-allocation systems research and engineering, consider [becoming a sponsor on GitHub](https://github.com/sponsors/pmbanugo). Corporate sponsors receive priority issue triage and architectural advisory.
+
 ## Following the Build
 
 I'm writing about the engineering decisions behind Tina — the tradeoffs, the influences, and the ideas that didn't make it.
