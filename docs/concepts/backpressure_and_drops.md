@@ -84,14 +84,14 @@ Tina offers two message-sending mechanisms, each with different guarantees:
 
 **`ctx_send()` is UDP-like.** Best-effort delivery with immediate feedback. The message is either delivered to the target's mailbox (`.ok`) or it is not (`.mailbox_full`, `.pool_exhausted`, `.stale_handle`). There is no retry, no acknowledgment, no timeout. The sender knows the outcome immediately.
 
-**`Effect_Call` is RPC-like.** The sender parks itself and waits for a reply from the target, with a mandatory timeout. If the reply arrives, the sender wakes with the response. If the timeout expires, the sender wakes with a `TAG_CALL_TIMEOUT` message. This provides bounded-time request-response semantics — the sender never waits forever.
+**`Effect_Call` is RPC-like.** The sender returns and waits for a reply from the target, with a mandatory timeout. If the reply arrives, the sender wakes with the response. If the timeout expires, the sender wakes with a `TAG_CALL_TIMEOUT` message. This provides bounded-time request-response semantics — the sender never waits forever.
 
 ```odin
 // Fire-and-forget: sender does not wait
 _ = ctx_send(ctx, target, MY_TAG, payload)
 return Effect_Receive{}
 
-// Request-response: sender parks until reply or timeout
+// Request-response: sender waits until reply or timeout
 return Effect_Call{
     to      = target,
     message = request_message,

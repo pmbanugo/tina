@@ -22,7 +22,7 @@ The name **'Isolate'** explicitly defines its architectural guarantee — **faul
 
 Three artifacts per Isolate type:
 1. **The struct** — the Isolate's state. Lives in a typed arena. Should be 256–512 bytes for most cases, up to 4KB for protocol-heavy Isolates.
-2. **`init_fn`** — called once on spawn. Receives init args (up to 64 bytes), returns the initial parking Effect.
+2. **`init_fn`** — called once on spawn. Receives init args (up to 64 bytes), returns the initial Effect.
 3. **`handler_fn`** — called on every message/I/O completion. Returns an Effect telling the scheduler what to do next.
 
 ```odin
