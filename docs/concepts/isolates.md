@@ -1,22 +1,21 @@
 # Isolates, Effects & Messaging
 
-**An Isolate is a typed struct that lives in a dense arena, receives messages via a bounded mailbox, and communicates intent to the scheduler by returning an Effect value. Isolates share no memory, reference each other by generational Handle — never by pointer — and crash independently without affecting siblings.**
+**An Isolate is a unit of concurrent work that receives messages, acts on those messages, and communicates intent to the scheduler by returning an Effect. Isolates share no memory. They reference each other by generational Handle and crash independently without affecting other Isolates.**
 
 ## What Is an Isolate?
 
 An Isolate is the fundamental unit of execution, fault isolation, and identity in Tina. It is:
-- A **typed struct** residing in a dense, cache-friendly arena inside a Shard.
-- Referenced by a **generational Handle** (never a raw pointer).
-- Executed via **handler functions** called by the scheduler — the Isolate never "runs" on its own.
-- The unit of **fault containment**: if an Isolate crashes — panics or even segfaults — the Shard's trap boundary catches the fault, wipes the Isolate, and the supervisor restarts it. Other Isolates on the same Shard never notice.
+- A **typed struct** residing inside a Shard.
+- Referenced by a **generational Handle**.
+- Executed via **handler functions** called by the scheduler.
+- The unit of **fault containment**: if an Isolate crashes (panics or even segfaults), the Shard's trap boundary catches the fault, cleans up the Isolate, and the supervisor restarts it. Other Isolates on the same Shard never notice.
 
 What an Isolate is NOT:
 - Not a coroutine (no stack to save/restore).
-- Not a Hewitt Actor (no `become`, no location transparency, no theoretical baggage).
-- Not an ECS entity (no component composition, no runtime type changes).
+- Not a Hewitt Actor (no `become` or other theoretical features).
 - Not a goroutine (no shared heap, no work-stealing, no OS-managed scheduling).
 
-The name **'Isolate'** explicitly defines its architectural guarantee — **fault and memory isolation**. "An Isolate crashed", or "An Isolate was restarted" clearly communicates what happened. You can't do that in most of the other models.
+The name **'Isolate'** explicitly defines its architectural guarantee — **fault and memory isolation**. "An Isolate crashed", or "An Isolate was restarted" should communicate what happened. You can't do that in most of the other models 😉.
 
 ## Defining an Isolate Type
 
