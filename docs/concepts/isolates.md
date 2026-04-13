@@ -6,6 +6,7 @@
 
 An Isolate is the fundamental unit of execution, fault isolation, and identity in Tina. It is:
 - A **typed struct** residing inside a Shard.
+- A unit of composition. You can compose Isolates to build whatever architecture or topology you want.
 - Referenced by a **generational Handle**.
 - Executed via **handler functions** called by the scheduler.
 - The unit of **fault containment**: if an Isolate crashes (panics or even segfaults), the Shard's trap boundary catches the fault, cleans up the Isolate, and the supervisor restarts it. Other Isolates on the same Shard never notice.
