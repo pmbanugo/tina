@@ -714,10 +714,11 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	when !TINA_SIMULATION_MODE {
 		when ODIN_OS == .Windows {
 			spec.shard_count = 2
-			spec.shard_specs = [2]ShardSpec {
+			win_shards := [2]ShardSpec {
 				{shard_id = 0, root_group = root_group},
 				{shard_id = 1, root_group = root_group},
-			}[:]
+			}
+			spec.shard_specs = win_shards[:]
 			spec.fd_handoff_entry_count = 4
 			err = validate_system_spec(&spec)
 			testing.expect_value(t, err, SystemSpecError.UnsupportedPlatform)

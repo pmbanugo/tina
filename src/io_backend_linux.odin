@@ -625,7 +625,7 @@ when !TINA_SIMULATION_MODE {
 					linux.Fd(op.listen_fd),
 					&entry.sockaddr,
 					&entry.sockaddr_len,
-					/opt/homebrew/Cellar/odin/2026-03/libexec/core/sys/linux Socket_FD_Flags{},
+					linux.Socket_FD_Flags{},
 				)
 				if !ok {
 					entry.active = false
@@ -642,7 +642,7 @@ when !TINA_SIMULATION_MODE {
 				linux.Fd(op.listen_fd),
 				(^linux.Sock_Addr_Any)(nil),
 				nil,
-				/opt/homebrew/Cellar/odin/2026-03/libexec/core/sys/linux Socket_FD_Flags{},
+				linux.Socket_FD_Flags{},
 			)
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)

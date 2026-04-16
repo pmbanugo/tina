@@ -190,7 +190,7 @@ when !TINA_SIMULATION_MODE {
 				}
 				_win_push_sync_completion(backend, entry)
 
-				case Submission_Op_Accept:
+			case Submission_Op_Accept:
 				// Create the accept socket
 				client_sock := win.WSASocketW(
 					win.AF_INET,
@@ -240,7 +240,7 @@ when !TINA_SIMULATION_MODE {
 					continue
 				}
 
-				case Submission_Op_Connect:
+			case Submission_Op_Connect:
 				// ConnectEx requires the socket to be bound first
 				_win_bind_for_connect(op.socket_fd, op.address)
 
@@ -272,7 +272,7 @@ when !TINA_SIMULATION_MODE {
 					continue
 				}
 
-				case Submission_Op_Close:
+			case Submission_Op_Close:
 				// Close is synchronous — no overlapped needed
 				result: i32 = 0
 				if win.closesocket(win.SOCKET(uintptr(op.fd))) == win.SOCKET_ERROR {
