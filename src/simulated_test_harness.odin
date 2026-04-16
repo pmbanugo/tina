@@ -21,34 +21,6 @@ when TINA_SIMULATION_MODE {
 		return Effect_Receive{}
 	}
 
-	// Helper: build a minimal simulation with one noop isolate
-	@(private = "file")
-	_make_harness_test_spec :: proc(
-		sim_config: ^SimulationConfig,
-		types: []TypeDescriptor,
-		shard_specs: []ShardSpec,
-	) -> SystemSpec {
-		return SystemSpec {
-			shard_count               = 1,
-			types                     = types,
-			shard_specs               = shard_specs,
-			simulation                = sim_config,
-			pool_slot_count           = 256,
-			reactor_buffer_slot_count = 4,
-			reactor_buffer_slot_size  = 1024,
-			transfer_slot_count       = 4,
-			transfer_slot_size        = 1024,
-			timer_spoke_count         = 64,
-			timer_entry_count         = 64,
-			timer_resolution_ns       = 1_000_000,
-			fd_table_slot_count       = 16,
-			fd_entry_size             = size_of(FD_Entry),
-			log_ring_size             = 4096,
-			supervision_groups_max    = 4,
-			scratch_arena_size        = 8192,
-		}
-	}
-
 	@(test)
 	test_termination_reason_quiescent :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
@@ -67,12 +39,7 @@ when TINA_SIMULATION_MODE {
 		children := [1]Child_Spec {
 			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
 		}
-		root_group := Group_Spec {
-			strategy              = .One_For_One,
-			restart_count_max     = 3,
-			window_duration_ticks = 1000,
-			children              = children[:],
-		}
+		root_group := sim_test_make_root_group(children[:])
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		sim_config := SimulationConfig {
@@ -83,7 +50,7 @@ when TINA_SIMULATION_MODE {
 			checker_interval_ticks = 100,
 		}
 
-		spec := _make_harness_test_spec(&sim_config, types[:], shard_specs[:])
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
@@ -113,12 +80,7 @@ when TINA_SIMULATION_MODE {
 		children := [1]Child_Spec {
 			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
 		}
-		root_group := Group_Spec {
-			strategy              = .One_For_One,
-			restart_count_max     = 3,
-			window_duration_ticks = 1000,
-			children              = children[:],
-		}
+		root_group := sim_test_make_root_group(children[:])
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		sim_config := SimulationConfig {
@@ -127,7 +89,7 @@ when TINA_SIMULATION_MODE {
 			terminate_on_quiescent = false,
 		}
 
-		spec := _make_harness_test_spec(&sim_config, types[:], shard_specs[:])
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
@@ -157,12 +119,7 @@ when TINA_SIMULATION_MODE {
 		children := [1]Child_Spec {
 			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
 		}
-		root_group := Group_Spec {
-			strategy              = .One_For_One,
-			restart_count_max     = 3,
-			window_duration_ticks = 1000,
-			children              = children[:],
-		}
+		root_group := sim_test_make_root_group(children[:])
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		// User checker that fires a violation after round 3
@@ -184,7 +141,7 @@ when TINA_SIMULATION_MODE {
 			checker_interval_ticks = 1,
 		}
 
-		spec := _make_harness_test_spec(&sim_config, types[:], shard_specs[:])
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
@@ -214,12 +171,7 @@ when TINA_SIMULATION_MODE {
 		children := [1]Child_Spec {
 			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
 		}
-		root_group := Group_Spec {
-			strategy              = .One_For_One,
-			restart_count_max     = 3,
-			window_duration_ticks = 1000,
-			children              = children[:],
-		}
+		root_group := sim_test_make_root_group(children[:])
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		// User checker that always fires — should be caught by the final checker run
@@ -238,7 +190,7 @@ when TINA_SIMULATION_MODE {
 			checker_interval_ticks = 0, // No periodic checks — only final
 		}
 
-		spec := _make_harness_test_spec(&sim_config, types[:], shard_specs[:])
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
@@ -268,12 +220,7 @@ when TINA_SIMULATION_MODE {
 		children := [1]Child_Spec {
 			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
 		}
-		root_group := Group_Spec {
-			strategy              = .One_For_One,
-			restart_count_max     = 3,
-			window_duration_ticks = 1000,
-			children              = children[:],
-		}
+		root_group := sim_test_make_root_group(children[:])
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		// User checker that always passes
@@ -292,7 +239,7 @@ when TINA_SIMULATION_MODE {
 			checker_interval_ticks = 1,
 		}
 
-		spec := _make_harness_test_spec(&sim_config, types[:], shard_specs[:])
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)

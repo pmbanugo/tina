@@ -11,6 +11,9 @@ TAG_SHUTDOWN: Message_Tag : 0x0003
 TAG_TRANSFER: Message_Tag : 0x0004
 TAG_SHARD_RESTARTED: Message_Tag : 0x0005
 TAG_SHARD_QUARANTINED: Message_Tag : 0x0006
+TAG_FD_HANDOFF_OFFER: Message_Tag : 0x0007
+TAG_FD_HANDOFF_ACK: Message_Tag : 0x0008
+TAG_FD_HANDOFF_REJECT: Message_Tag : 0x0009
 // Application message tags can start from here (0x0040 - 0xFFFF)
 USER_MESSAGE_TAG_BASE: Message_Tag : 0x0040
 

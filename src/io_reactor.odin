@@ -17,6 +17,9 @@ Direction_Affinity :: enum u8 {
 	Any,
 }
 
+@(private = "package")
+FD_HANDOFF_TIMEOUT_TICKS :: u64(16)
+
 // ============================================================================
 // The Reactor
 // ============================================================================
@@ -172,13 +175,71 @@ reactor_control_shutdown :: proc(
 	return backend_control_shutdown(&reactor.backend, entry.os_fd, how)
 }
 
-reactor_internal_close_fd :: proc(reactor: ^Reactor, fd: FD_Handle) {
+reactor_internal_close_fd :: proc "contextless" (reactor: ^Reactor, fd: FD_Handle) {
 	os_fd, t_err := fd_table_resolve(&reactor.fd_table, fd)
 	if t_err == .None {
 		backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(fd))
 		backend_control_close(&reactor.backend, os_fd)
 		fd_table_free(&reactor.fd_table, fd)
 	}
+}
+
+@(private = "package")
+reactor_export_fd_handoff :: proc "contextless" (
+	reactor: ^Reactor,
+	fd: FD_Handle,
+	owner: Handle,
+) -> (
+	OS_FD,
+	Peer_Address,
+	FD_Handoff_Result,
+) {
+	entry, err := fd_table_lookup(&reactor.fd_table, fd)
+	if err != .None {
+		return OS_FD_INVALID, {}, .invalid_fd_state
+	}
+	if entry.read_owner != owner || entry.write_owner != owner {
+		return OS_FD_INVALID, {}, .not_owner
+	}
+	if !fd_table_is_fresh_accept(entry) || fd_table_is_close_on_completion(entry) {
+		return OS_FD_INVALID, {}, .invalid_fd_state
+	}
+
+	cleanup_fd := entry.os_fd
+	peer_address := entry.peer_address
+	backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(fd))
+	_ = fd_table_free(&reactor.fd_table, fd)
+
+	return cleanup_fd, peer_address, .ok
+}
+
+@(private = "package")
+reactor_adopt_fd_handoff :: proc "contextless" (
+	reactor: ^Reactor,
+	owner: Handle,
+	os_fd: OS_FD,
+	peer_address: Peer_Address,
+) -> (
+	FD_Handle,
+	FD_Handoff_Reject_Reason,
+) {
+	adopted_fd, dup_err := backend_control_dup(&reactor.backend, os_fd)
+	if dup_err == .Unsupported {
+		return FD_HANDLE_NONE, .Unsupported
+	}
+	if dup_err != .None {
+		return FD_HANDLE_NONE, .Adopt_Failed
+	}
+
+	fd_handle, fd_err := fd_table_alloc(&reactor.fd_table, adopted_fd, owner)
+	if fd_err != .None {
+		_ = backend_control_close(&reactor.backend, adopted_fd)
+		return FD_HANDLE_NONE, .Adopt_Failed
+	}
+
+	backend_register_fixed_fd(&reactor.backend, fd_handle_index(fd_handle), adopted_fd)
+	_ = fd_table_mark_fresh_accept(&reactor.fd_table, fd_handle, peer_address)
+	return fd_handle, .None
 }
 
 // =====================================================
@@ -268,6 +329,11 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 							&reactor.backend,
 							fd_handle_index(fd_handle),
 							e.client_fd,
+						)
+						_ = fd_table_mark_fresh_accept(
+							&reactor.fd_table,
+							fd_handle,
+							soa_meta[slot_index].io_peer_address,
 						)
 						soa_meta[slot_index].io_fd = fd_handle
 					} else {
@@ -533,6 +599,12 @@ reactor_submit_io :: proc(
 		}
 		backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(op.fd))
 		fd_table_free(&reactor.fd_table, op.fd)
+	}
+
+	if target_fd != FD_HANDLE_NONE &&
+	   submission_op_tag != u8(IO_TAG_ACCEPT_COMPLETE) &&
+	   submission_op_tag != u8(IO_TAG_CLOSE_COMPLETE) {
+		_ = fd_table_clear_fresh_accept(&reactor.fd_table, target_fd)
 	}
 
 	submission.token = submission_token_pack(

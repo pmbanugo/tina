@@ -82,6 +82,7 @@ Platform_Backend :: struct {
 //   _backend_control_setsockopt  proc
 //   _backend_control_getsockopt  proc
 //   _backend_control_shutdown    proc
+//   _backend_control_dup         proc
 
 backend_init :: proc(backend: ^Platform_Backend, config: Backend_Config) -> Backend_Error {
 	return _backend_init(backend, config)
@@ -186,18 +187,38 @@ backend_control_shutdown :: proc(
 	return _backend_control_shutdown(backend, fd, how)
 }
 
-backend_control_close :: proc(backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
+backend_control_close :: proc "contextless" (
+	backend: ^Platform_Backend,
+	fd: OS_FD,
+) -> Backend_Error {
 	return _backend_control_close(backend, fd)
+}
+
+backend_control_dup :: #force_inline proc "contextless" (
+	backend: ^Platform_Backend,
+	fd: OS_FD,
+) -> (
+	OS_FD,
+	Backend_Error,
+) {
+	return _backend_control_dup(backend, fd)
 }
 
 // --- Fixed File Hooks (§6.6.2 §8) ---
 // Called by reactor on FD table alloc/free to synchronize kernel fixed-file table (Linux only).
 // No-op on non-Linux backends.
 
-backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+backend_register_fixed_fd :: #force_inline proc "contextless" (
+	backend: ^Platform_Backend,
+	slot_index: u16,
+	fd: OS_FD,
+) {
 	_backend_register_fixed_fd(backend, slot_index, fd)
 }
 
-backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+backend_unregister_fixed_fd :: #force_inline proc "contextless" (
+	backend: ^Platform_Backend,
+	slot_index: u16,
+) {
 	_backend_unregister_fixed_fd(backend, slot_index)
 }

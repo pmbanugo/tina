@@ -55,44 +55,47 @@ transport_flush_outbound :: #force_inline proc "contextless" (shard: ^Shard) {
 
 @(private = "package")
 transport_route_envelope :: #force_inline proc "contextless" (
-	shard: ^Shard,
-	dest_shard: u8,
-	envelope: ^Message_Envelope,
+	source_shard: ^Shard,
+	destination_shard: u8,
+	msg_envelope: ^Message_Envelope,
 ) -> Send_Result {
 	when !TINA_SIMULATION_MODE {
-		if !shard_mask_contains(&shard.peer_alive_mask, dest_shard) {
-			shard.counters.quarantine_drops += 1
+		if !shard_mask_contains(&source_shard.peer_alive_mask, destination_shard) {
+			source_shard.counters.quarantine_drops += 1
 			return .stale_handle
 		}
 
-		ring := shard.outbound_rings[dest_shard]
+		ring := source_shard.outbound_rings[destination_shard]
 		if ring == nil {
-			shard.counters.stale_delivery_drops += 1
+			source_shard.counters.stale_delivery_drops += 1
 			return .stale_handle
 		}
-		if spsc_ring_enqueue(ring, envelope) == .Full {
-			shard.counters.ring_full_drops += 1
+		if spsc_ring_enqueue(ring, msg_envelope) == .Full {
+			source_shard.counters.ring_full_drops += 1
 			return .mailbox_full
 		}
 		return .ok
 	} else {
-		if !shard_mask_contains(&shard.peer_alive_mask, dest_shard) {
-			shard.counters.quarantine_drops += 1
+		if !shard_mask_contains(&source_shard.peer_alive_mask, destination_shard) {
+			source_shard.counters.quarantine_drops += 1
 			return .stale_handle
 		}
 		return sim_network_enqueue(
-			shard.sim_state.network,
-			shard,
-			dest_shard,
-			envelope^,
-			shard.current_tick,
-			shard.sim_state.fault_config,
+			source_shard.sim_state.network,
+			source_shard,
+			destination_shard,
+			msg_envelope^,
+			source_shard.current_tick,
+			source_shard.sim_state.fault_config,
 		)
 	}
 }
 
 @(private = "package")
-transport_broadcast_envelope :: #force_inline proc "contextless" (shard: ^Shard, env: ^Message_Envelope) {
+transport_broadcast_envelope :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	env: ^Message_Envelope,
+) {
 	when TINA_SIMULATION_MODE {
 		if shard.sim_state.network != nil {
 			for target_shard in u8(0) ..< shard.sim_state.network.shard_count {

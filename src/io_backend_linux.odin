@@ -539,12 +539,30 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_control_close :: proc(backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
+	_backend_control_close :: proc "contextless" (
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+	) -> Backend_Error {
 		err := linux.close(linux.Fd(fd))
 		if err != nil {
 			return .System_Error
 		}
 		return .None
+	}
+
+	@(private = "package")
+	_backend_control_dup :: proc "contextless" (
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+	) -> (
+		OS_FD,
+		Backend_Error,
+	) {
+		dup_fd, err := linux.fcntl_dupfd_cloexec(linux.Fd(fd), .DUPFD_CLOEXEC, 0)
+		if err != nil {
+			return OS_FD_INVALID, .System_Error
+		}
+		return OS_FD(dup_fd), .None
 	}
 
 	// ============================================================================
@@ -607,7 +625,7 @@ when !TINA_SIMULATION_MODE {
 					linux.Fd(op.listen_fd),
 					&entry.sockaddr,
 					&entry.sockaddr_len,
-					{},
+					/opt/homebrew/Cellar/odin/2026-03/libexec/core/sys/linux Socket_FD_Flags{},
 				)
 				if !ok {
 					entry.active = false
@@ -624,7 +642,7 @@ when !TINA_SIMULATION_MODE {
 				linux.Fd(op.listen_fd),
 				(^linux.Sock_Addr_Any)(nil),
 				nil,
-				{},
+				/opt/homebrew/Cellar/odin/2026-03/libexec/core/sys/linux Socket_FD_Flags{},
 			)
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
@@ -804,7 +822,11 @@ when !TINA_SIMULATION_MODE {
 	// Update a single slot in the kernel's fixed-file table.
 	// Called by reactor on fd_table_alloc (new FD enters a slot).
 	@(private = "package")
-	_backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+	_backend_register_fixed_fd :: proc "contextless" (
+		backend: ^Platform_Backend,
+		slot_index: u16,
+		fd: OS_FD,
+	) {
 		if !backend.files_registered do return
 
 		new_fd := linux.Fd(fd)
@@ -819,7 +841,10 @@ when !TINA_SIMULATION_MODE {
 	// Clear a single slot in the kernel's fixed-file table.
 	// Called by reactor on fd_table_free (FD leaves a slot).
 	@(private = "package")
-	_backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+	_backend_unregister_fixed_fd :: proc "contextless" (
+		backend: ^Platform_Backend,
+		slot_index: u16,
+	) {
 		if !backend.files_registered do return
 
 		empty_fd := linux.Fd(-1)
@@ -1020,6 +1045,34 @@ when !TINA_SIMULATION_MODE {
 	// ============================================================================
 	// Tests (Linux-only, real io_uring)
 	// ============================================================================
+
+	@(test)
+	test_linux_backend_control_dup_sets_cloexec_and_returns_distinct_fd :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			queue_size    = DEFAULT_BACKEND_QUEUE_SIZE,
+			fd_slot_count = 4,
+		}
+		backend_init_error := backend_init(&backend, config)
+		testing.expect_value(t, backend_init_error, Backend_Error.None)
+		defer backend_deinit(&backend)
+
+		fd, socket_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, socket_error, Backend_Error.None)
+
+		dup_fd, dup_error := backend_control_dup(&backend, fd)
+		testing.expect_value(t, dup_error, Backend_Error.None)
+		testing.expect(t, dup_fd != fd, "dup must return a distinct descriptor")
+
+		flags, flags_err := linux.fcntl_getfd(linux.Fd(dup_fd), .GETFD)
+		testing.expect_value(t, flags_err, linux.Errno(0))
+		testing.expect(t, flags != 0, "dup fd must have close-on-exec set")
+
+		close_error := backend_control_close(&backend, fd)
+		testing.expect_value(t, close_error, Backend_Error.None)
+		close_dup_error := backend_control_close(&backend, dup_fd)
+		testing.expect_value(t, close_dup_error, Backend_Error.None)
+	}
 
 	@(test)
 	test_linux_fixed_files_register_and_deinit :: proc(t: ^testing.T) {

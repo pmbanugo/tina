@@ -808,7 +808,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_control_close :: proc(backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
+	_backend_control_close :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
 		if win.closesocket(win.SOCKET(uintptr(fd))) == win.SOCKET_ERROR {
 			if !win.CloseHandle(win.HANDLE(uintptr(fd))) {
 				return .System_Error
@@ -818,13 +818,34 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+	_backend_control_dup :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> (
+		OS_FD,
+		Backend_Error,
+	) {
+		return OS_FD_INVALID, .Unsupported
+	}
+
+	@(private = "package")
+	_backend_register_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
 		// No-op: IOCP has no fixed-file table.
 	}
 
 	@(private = "package")
-	_backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+	_backend_unregister_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16) {
 		// No-op: IOCP has no fixed-file table.
+	}
+
+	@(test)
+	test_windows_backend_control_dup_unsupported :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {queue_size = DEFAULT_BACKEND_QUEUE_SIZE}
+		err := backend_init(&backend, config)
+		testing.expect_value(t, err, Backend_Error.None)
+		defer backend_deinit(&backend)
+
+		dup_fd, dup_err := backend_control_dup(&backend, OS_FD(42))
+		testing.expect_value(t, dup_fd, OS_FD_INVALID)
+		testing.expect_value(t, dup_err, Backend_Error.Unsupported)
 	}
 
 	// ============================================================================

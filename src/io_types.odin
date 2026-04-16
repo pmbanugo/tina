@@ -223,17 +223,116 @@ IoOp :: union {
 
 FD_Flag :: enum {
 	Close_On_Completion, // bit 0
+	Fresh_Accept, // newly accepted socket, eligible for v1 cross-shard handoff
 }
 
 FD_Flags :: bit_set[FD_Flag;u8]
 
 FD_Entry :: struct {
-	os_fd:       OS_FD,
-	read_owner:  Handle,
-	write_owner: Handle,
-	generation:  u16,
-	flags:       FD_Flags,
-	_padding:    [5]u8,
+	read_owner:   Handle,
+	write_owner:  Handle,
+	peer_address: Peer_Address,
+	os_fd:        OS_FD,
+	generation:   u16,
+	flags:        FD_Flags,
+	_padding:     [5]u8,
+}
+
+FD_Handoff_Result :: enum u8 {
+	ok,
+	not_remote_target,
+	not_owner,
+	invalid_fd_state,
+	unsupported,
+	handoff_table_full,
+	transport_full,
+	transport_unavailable,
+}
+
+FD_Handoff_Reject_Reason :: enum u8 {
+	None,
+	Invalid_Target,
+	Target_Busy,
+	Adopt_Failed,
+	Unsupported,
+}
+
+@(private = "package")
+FD_Handoff_State :: enum u8 {
+	Free,
+	In_Flight,
+}
+
+FD_HANDOFF_NONE_INDEX :: u16(0xFFFF)
+
+@(private = "package")
+FD_Handoff_Ref :: struct {
+	handoff_index: u16,
+	generation:    u16,
+	source_shard:  u8,
+	_padding:      [3]u8,
+}
+
+@(private = "package")
+FD_HANDOFF_REF_NONE :: FD_Handoff_Ref {
+	handoff_index = FD_HANDOFF_NONE_INDEX,
+}
+
+@(private = "package")
+FD_Handoff_Offer :: struct {
+	handoff:      FD_Handoff_Ref,
+	os_fd:        OS_FD,
+	peer_address: Peer_Address,
+}
+
+@(private = "package")
+FD_Handoff_Ack :: struct {
+	handoff: FD_Handoff_Ref,
+}
+
+@(private = "package")
+FD_Handoff_Reject :: struct {
+	handoff:  FD_Handoff_Ref,
+	reason:   FD_Handoff_Reject_Reason,
+	_padding: [7]u8,
+}
+
+@(private = "package")
+FD_Handoff_Entry :: struct {
+	target_handle:   Handle,
+	peer_address:    Peer_Address,
+	deadline_tick:   u64,
+	cleanup_fd:      OS_FD,
+	generation:      u16,
+	next_free_index: u16,
+	state:           FD_Handoff_State,
+	_padding:        [3]u8,
+}
+
+@(private = "package")
+FD_Handoff_Table :: struct {
+	entries:     []FD_Handoff_Entry,
+	free_head:   u16,
+	free_count:  u16,
+	entry_count: u16,
+	_padding:    u16,
+}
+
+#assert(size_of(FD_Handoff_Offer) <= MAX_PAYLOAD_SIZE)
+#assert(size_of(FD_Handoff_Ack) <= MAX_PAYLOAD_SIZE)
+#assert(size_of(FD_Handoff_Reject) <= MAX_PAYLOAD_SIZE)
+
+@(private = "package")
+fd_handoff_ref_make :: #force_inline proc "contextless" (
+	handoff_index: u16,
+	generation: u16,
+	source_shard: u8,
+) -> FD_Handoff_Ref {
+	return FD_Handoff_Ref {
+		handoff_index = handoff_index,
+		generation = generation,
+		source_shard = source_shard,
+	}
 }
 
 // --- Handoff Mode (§6.6.3 §5.4) ---

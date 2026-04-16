@@ -17,13 +17,17 @@ package tina
 import "core:c"
 import kq "core:sys/kqueue"
 import "core:sys/posix"
+import "core:testing"
 
 when !TINA_SIMULATION_MODE {
 
 	// Token-based correlation requires 64-bit udata in kqueue's kevent struct.
 	// On 32-bit platforms, the Submission_Token (u64) would be truncated during
 	// the rawptr round-trip, causing silent completion mis-routing.
-	#assert(size_of(uintptr) == 8, "POSIX kqueue backend requires 64-bit uintptr for token packing")
+	#assert(
+		size_of(uintptr) == 8,
+		"POSIX kqueue backend requires 64-bit uintptr for token packing",
+	)
 
 	MAX_POSIX_PENDING :: 1024
 
@@ -210,12 +214,7 @@ when !TINA_SIMULATION_MODE {
 
 		events_buf: [128]kq.KEvent
 
-		n, kerr := kq.kevent(
-			kq.KQ(backend.kq_fd),
-			nil,
-			events_buf[:],
-			time_spec_pointer,
-		)
+		n, kerr := kq.kevent(kq.KQ(backend.kq_fd), nil, events_buf[:], time_spec_pointer)
 		if kerr != nil {
 			if kerr == .EINTR {
 				return out, .None
@@ -572,7 +571,10 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_control_close :: proc(backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
+	_backend_control_close :: proc "contextless" (
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+	) -> Backend_Error {
 		// Sweep pending operations for this FD BEFORE closing it.
 		// On BSD/macOS, close() silently removes kevents. Without this sweep,
 		// pending operations on this FD would never produce a completion,
@@ -587,12 +589,34 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_register_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+	_backend_control_dup :: proc "contextless" (
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+	) -> (
+		OS_FD,
+		Backend_Error,
+	) {
+		dup_fd := posix.fcntl(posix.FD(fd), .DUPFD_CLOEXEC, 0)
+		if dup_fd < 0 {
+			return OS_FD_INVALID, .System_Error
+		}
+		return OS_FD(dup_fd), .None
+	}
+
+	@(private = "package")
+	_backend_register_fixed_fd :: proc "contextless" (
+		backend: ^Platform_Backend,
+		slot_index: u16,
+		fd: OS_FD,
+	) {
 		// No-op: kqueue has no fixed-file table.
 	}
 
 	@(private = "package")
-	_backend_unregister_fixed_fd :: proc(backend: ^Platform_Backend, slot_index: u16) {
+	_backend_unregister_fixed_fd :: proc "contextless" (
+		backend: ^Platform_Backend,
+		slot_index: u16,
+	) {
 		// No-op: kqueue has no fixed-file table.
 	}
 
@@ -874,7 +898,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_remove_pending :: proc(backend: ^Platform_Backend, index: u16) {
+	_remove_pending :: proc "contextless" (backend: ^Platform_Backend, index: u16) {
 		backend.pending_count -= 1
 		if index < backend.pending_count {
 			backend.pending[index] = backend.pending[backend.pending_count]
@@ -886,14 +910,14 @@ when !TINA_SIMULATION_MODE {
 	// stale-path reclamation can free their buffers. Called before close()
 	// because on kqueue, close() silently removes kevents without firing events.
 	@(private = "file")
-	_sweep_pending_for_fd :: proc(backend: ^Platform_Backend, fd: OS_FD) {
+	_sweep_pending_for_fd :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) {
 		i: u16 = 0
 		for i < backend.pending_count {
 			op_fd := _submission_op_fd(backend.pending[i].operation)
 			if op_fd == fd {
 				// Synthesize cancellation completion
 				if backend.completed_count < MAX_POSIX_COMPLETED {
-					backend.completed[backend.completed_count] = Raw_Completion{
+					backend.completed[backend.completed_count] = Raw_Completion {
 						token  = backend.pending[i].token,
 						result = -i32(posix.Errno.ECANCELED),
 						extra  = nil,
@@ -910,17 +934,26 @@ when !TINA_SIMULATION_MODE {
 
 	// Extract the OS_FD from a Submission_Operation for FD-based sweep matching.
 	@(private = "file")
-	_submission_op_fd :: proc(op: Submission_Operation) -> OS_FD {
+	_submission_op_fd :: proc "contextless" (op: Submission_Operation) -> OS_FD {
 		switch o in op {
-		case Submission_Op_Read:     return o.fd
-		case Submission_Op_Write:    return o.fd
-		case Submission_Op_Accept:   return o.listen_fd
-		case Submission_Op_Connect:  return o.socket_fd
-		case Submission_Op_Close:    return o.fd
-		case Submission_Op_Send:     return o.socket_fd
-		case Submission_Op_Recv:     return o.socket_fd
-		case Submission_Op_Sendto:   return o.socket_fd
-		case Submission_Op_Recvfrom: return o.socket_fd
+		case Submission_Op_Read:
+			return o.fd
+		case Submission_Op_Write:
+			return o.fd
+		case Submission_Op_Accept:
+			return o.listen_fd
+		case Submission_Op_Connect:
+			return o.socket_fd
+		case Submission_Op_Close:
+			return o.fd
+		case Submission_Op_Send:
+			return o.socket_fd
+		case Submission_Op_Recv:
+			return o.socket_fd
+		case Submission_Op_Sendto:
+			return o.socket_fd
+		case Submission_Op_Recvfrom:
+			return o.socket_fd
 		}
 		return OS_FD_INVALID
 	}
@@ -1010,4 +1043,30 @@ when !TINA_SIMULATION_MODE {
 		}
 	}
 
-} // when !TINA_SIM
+	@(test)
+	test_posix_backend_control_dup_sets_cloexec_and_returns_distinct_fd :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
+		}
+		backend_init_error := backend_init(&backend, config)
+		testing.expect_value(t, backend_init_error, Backend_Error.None)
+		defer backend_deinit(&backend)
+
+		fd, socket_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, socket_error, Backend_Error.None)
+
+		dup_fd, dup_error := backend_control_dup(&backend, fd)
+		testing.expect_value(t, dup_error, Backend_Error.None)
+		testing.expect(t, dup_fd != fd, "dup must return a distinct descriptor")
+
+		flags := posix.fcntl(posix.FD(dup_fd), .GETFD)
+		testing.expect(t, flags > 0, "dup fd must have close-on-exec set")
+
+		close_error := backend_control_close(&backend, fd)
+		testing.expect_value(t, close_error, Backend_Error.None)
+		close_dup_error := backend_control_close(&backend, dup_fd)
+		testing.expect_value(t, close_dup_error, Backend_Error.None)
+	}
+
+}

@@ -84,6 +84,77 @@ ctx_spawn :: #force_inline proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Re
 	return child_handle
 }
 
+@(require_results)
+ctx_fd_handoff :: #force_inline proc(
+	ctx: ^TinaContext,
+	to: Handle,
+	fd: FD_Handle,
+) -> FD_Handoff_Result {
+	shard := _ctx_extract_shard(ctx)
+
+	if to == HANDLE_NONE || extract_shard_id(to) == shard.id {
+		return .not_remote_target
+	}
+
+	when !TINA_SIMULATION_MODE {
+		when ODIN_OS == .Windows {
+			return .unsupported
+		}
+	}
+
+	cleanup_fd, peer_address, export_result := reactor_export_fd_handoff(
+		&shard.reactor,
+		fd,
+		ctx.self_handle,
+	)
+	if export_result != .ok {
+		return export_result
+	}
+
+	deadline_tick := shard.current_tick + FD_HANDOFF_TIMEOUT_TICKS
+	handoff_ref, ok := fd_handoff_table_alloc(
+		&shard.handoff_table,
+		to,
+		cleanup_fd,
+		peer_address,
+		deadline_tick,
+		shard.id,
+	)
+	if !ok {
+		_ = backend_control_close(&shard.reactor.backend, cleanup_fd)
+		shard.counters.handoff_exhaustions += 1
+		return .handoff_table_full
+	}
+
+	msg_envelope: Message_Envelope
+	msg_envelope.source = ctx.self_handle
+	msg_envelope.destination = to
+	msg_envelope.tag = TAG_FD_HANDOFF_OFFER
+	msg_envelope.payload_size = u16(size_of(FD_Handoff_Offer))
+	(cast(^FD_Handoff_Offer)&msg_envelope.payload[0])^ = FD_Handoff_Offer {
+		handoff      = handoff_ref,
+		os_fd        = cleanup_fd,
+		peer_address = peer_address,
+	}
+
+	route_result := _route_envelope_system(shard, to, &msg_envelope)
+	if route_result != .ok {
+		_ = _fd_handoff_close_entry(shard, handoff_ref)
+		switch route_result {
+		case .ok:
+			return .ok
+		case .mailbox_full:
+			return .transport_full
+		case .stale_handle:
+			return .transport_unavailable
+		case .pool_exhausted:
+			return .transport_full
+		}
+	}
+
+	return .ok
+}
+
 // =================================
 // Memory Management APIs (§6.9 §9)
 // =================================

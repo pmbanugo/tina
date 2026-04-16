@@ -92,6 +92,7 @@ SystemSpec :: struct {
 	reactor_buffer_slot_size:  int,
 	transfer_slot_count:       int,
 	transfer_slot_size:        int,
+	fd_handoff_entry_count:    int,
 	timer_spoke_count:         int,
 	timer_entry_count:         int,
 	fd_table_slot_count:       int,
@@ -115,6 +116,7 @@ SystemSpecError :: enum u8 {
 	InvalidTypeId,
 	InvalidSupervisionStrategy,
 	InvalidSupervisionIntensity,
+	UnsupportedPlatform,
 }
 
 Supervision_Strategy :: enum u8 {
@@ -262,6 +264,33 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 			spec.reactor_buffer_slot_count,
 		)
 		return .ValueOutOfBounds
+	}
+
+	if spec.fd_handoff_entry_count < 0 ||
+	   spec.fd_handoff_entry_count > int(FD_HANDOFF_NONE_INDEX) - 1 {
+		fmt.eprintfln(
+			"[FATAL] fd_handoff_entry_count (%v) must be 0-%v",
+			spec.fd_handoff_entry_count,
+			int(FD_HANDOFF_NONE_INDEX) - 1,
+		)
+		return .ValueOutOfBounds
+	}
+
+	when !TINA_SIMULATION_MODE {
+		when ODIN_OS == .Windows {
+			if spec.shard_count > 1 && spec.fd_handoff_entry_count > 0 {
+				fmt.eprintfln(
+					"[FATAL] cross-shard FD handoff is unsupported on Windows in this version",
+				)
+				return .UnsupportedPlatform
+			}
+		}
+	}
+
+	if spec.shard_count > 1 && spec.fd_handoff_entry_count == 0 {
+		fmt.eprintfln(
+			"[WARN] shard_count > 1 but fd_handoff_entry_count is 0 — cross-shard FD handoff is disabled",
+		)
 	}
 
 	return .None
@@ -530,22 +559,23 @@ _validate_dio_config :: proc(spec: ^SystemSpec) -> SystemSpecError {
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
 	// 3 per type (Typed Arena, Isolate Metadata, Working Memory)
-	// + 10 static framework regions
+	// + 11 static framework regions
 	// + 1 for the SubRegion tracker array itself
 	// + 2 for the Slice Headers and Dispatch Cursors tracking
-	return (types_count * 3) + 10 + 1 + 2
+	return (types_count * 3) + 11 + 1 + 2
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
 	// 2. Message Pool
 	// 3. Reactor Buffer Pool
 	// 4. Transfer Buffer Pool
 	// 5. Transfer Generations
-	// 6. Timer Wheel Spokes
-	// 7. Timer Wheel Entries
-	// 8. FD Table
-	// 9. Log Ring Buffer
-	// 10. Supervision Group Table
-	// 11. Scratch Arena
+	// 6. FD Handoff Table
+	// 7. Timer Wheel Spokes
+	// 8. Timer Wheel Entries
+	// 9. FD Table
+	// 10. Log Ring Buffer
+	// 11. Supervision Group Table
+	// 12. Scratch Arena
 }
 
 // Computes an upper-bound capacity aligned to a multiple of 8.
@@ -597,6 +627,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size
 	total += spec.transfer_slot_count * spec.transfer_slot_size
 	total += spec.transfer_slot_count * size_of(u16)
+	total += spec.fd_handoff_entry_count * size_of(FD_Handoff_Entry)
 	total += spec.timer_spoke_count * size_of(u32) // Spoke head array
 	total += spec.timer_entry_count * size_of(Timer_Entry) // Timer entry pool
 	total += spec.fd_table_slot_count * spec.fd_entry_size
@@ -679,6 +710,19 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, SystemSpecError.None)
 
 	spec.reactor_buffer_slot_count = 0 // Restore
+
+	when !TINA_SIMULATION_MODE {
+		when ODIN_OS == .Windows {
+			spec.shard_count = 2
+			spec.shard_specs = [2]ShardSpec {
+				{shard_id = 0, root_group = root_group},
+				{shard_id = 1, root_group = root_group},
+			}[:]
+			spec.fd_handoff_entry_count = 4
+			err = validate_system_spec(&spec)
+			testing.expect_value(t, err, SystemSpecError.UnsupportedPlatform)
+		}
+	}
 }
 
 when TINA_SIMULATION_MODE {
@@ -804,9 +848,18 @@ Checker_Flags :: bit_set[Checker_Flag;u16]
 Checker_Flag :: enum u8 {
 	Pool_Integrity,
 	Generation_Monotonic,
+	FD_Table_Integrity,
+	FD_Handoff_Integrity,
+	Sim_FD_Integrity,
 }
 
-CHECKER_FLAGS_ALL :: Checker_Flags{.Pool_Integrity, .Generation_Monotonic}
+CHECKER_FLAGS_ALL :: Checker_Flags {
+	.Pool_Integrity,
+	.Generation_Monotonic,
+	.FD_Table_Integrity,
+	.FD_Handoff_Integrity,
+	.Sim_FD_Integrity,
+}
 CHECKER_FLAGS_NONE :: Checker_Flags{}
 
 SimulationConfig :: struct {

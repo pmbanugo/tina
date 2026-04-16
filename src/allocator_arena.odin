@@ -153,7 +153,11 @@ hydrate_shard :: proc(
 	// 1. Allocate the tracking array FOR the arena, FROM the arena!
 	regions_max := compute_max_sub_regions(spec)
 	tracker_size := regions_max * size_of(SubRegion)
-	tracker_pointer := grand_arena_alloc_named(arena, "Arena_Regions_Tracker", tracker_size) or_return
+	tracker_pointer := grand_arena_alloc_named(
+		arena,
+		"Arena_Regions_Tracker",
+		tracker_size,
+	) or_return
 
 	arena.regions = (cast([^]SubRegion)tracker_pointer)[:regions_max]
 	arena.regions[0] = SubRegion{"Arena_Regions_Tracker", 0, tracker_size}
@@ -247,6 +251,10 @@ hydrate_shard :: proc(
 	for i in 0 ..< spec.transfer_slot_count {
 		shard.transfer_generations[i] = 1
 	}
+
+	alloc_data.current_name = "FD_Handoff_Table"
+	handoff_buffer := make([]FD_Handoff_Entry, spec.fd_handoff_entry_count, alloc)
+	fd_handoff_table_init(&shard.handoff_table, handoff_buffer)
 
 	alloc_data.current_name = "Timer_Wheel_Spokes"
 	spoke_buf := make([]u32, spec.timer_spoke_count, alloc)

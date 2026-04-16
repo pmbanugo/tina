@@ -46,6 +46,8 @@ when TINA_SIMULATION_MODE {
 
 		// Use the validated timer resolution from the spec (uniform across all shards)
 		sim.tick_resolution_ns = spec.timer_resolution_ns
+		_sim_fd_state_reset()
+		g_sim_fd_state.active_backend_count = 0
 
 		// SI-1: Initialize PRNG Tree
 		seed := spec.simulation.seed

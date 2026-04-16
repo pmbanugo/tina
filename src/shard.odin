@@ -104,6 +104,9 @@ Shard_Counters :: struct {
 	// Might require tracking a separate "io_wakes" counter to compare against.
 	transfer_exhaustions:      u64,
 	transfer_stale_reads:      u64,
+	handoff_exhaustions:       u64,
+	handoff_timeouts:          u64,
+	handoff_rejects:           u64,
 }
 
 Dynamic_Child_Spec :: struct {
@@ -156,6 +159,7 @@ Shard :: struct {
 	transfer_generations:   []u16,
 	metadata:               []#soa[]Isolate_Metadata,
 	supervision_groups:     []Supervision_Group,
+	handoff_table:          FD_Handoff_Table,
 
 	// --- Hot Embedded Structs (8-byte aligned) ---
 	log_ring:               Log_Ring_Buffer,
@@ -496,6 +500,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// Step 4: Flush I/O submissions
 	// ========================================================================
 	reactor_flush_submissions(&shard.reactor, shard)
+	_fd_handoff_timeout_scan(shard, now)
 
 	// ========================================================================
 	// Step 5: Flush outbound cross-shard rings
@@ -800,6 +805,159 @@ _dequeue :: proc "contextless" (
 	return head_index
 }
 
+@(private = "package")
+_fd_handoff_close_entry :: proc "contextless" (shard: ^Shard, ref: FD_Handoff_Ref) -> bool {
+	entry, ok := fd_handoff_table_lookup(&shard.handoff_table, ref)
+	if !ok {
+		return false
+	}
+
+	cleanup_fd := entry.cleanup_fd
+	_ = fd_handoff_table_free(&shard.handoff_table, ref)
+
+	if cleanup_fd != OS_FD_INVALID {
+		_ = backend_control_close(&shard.reactor.backend, cleanup_fd)
+	}
+	return true
+}
+
+@(private = "file")
+_fd_handoff_send_ack :: proc "contextless" (
+	shard: ^Shard,
+	destination: Handle,
+	source: Handle,
+	ref: FD_Handoff_Ref,
+) {
+	env: Message_Envelope
+	env.source = source
+	env.destination = destination
+	env.tag = TAG_FD_HANDOFF_ACK
+	env.payload_size = u16(size_of(FD_Handoff_Ack))
+	(cast(^FD_Handoff_Ack)&env.payload[0])^ = FD_Handoff_Ack {handoff = ref}
+	_ = _route_envelope_system(shard, destination, &env)
+}
+
+@(private = "file")
+_fd_handoff_send_reject :: proc "contextless" (
+	shard: ^Shard,
+	destination: Handle,
+	source: Handle,
+	ref: FD_Handoff_Ref,
+	reason: FD_Handoff_Reject_Reason,
+) {
+	env: Message_Envelope
+	env.source = source
+	env.destination = destination
+	env.tag = TAG_FD_HANDOFF_REJECT
+	env.payload_size = u16(size_of(FD_Handoff_Reject))
+	(cast(^FD_Handoff_Reject)&env.payload[0])^ = FD_Handoff_Reject {
+		handoff = ref,
+		reason = reason,
+	}
+	_ = _route_envelope_system(shard, destination, &env)
+}
+
+@(private = "file")
+_inject_fd_handoff_accept :: proc "contextless" (
+	shard: ^Shard,
+	target: Handle,
+	fd: FD_Handle,
+	peer_address: Peer_Address,
+) -> FD_Handoff_Reject_Reason {
+	type_id := extract_type_id(target)
+	if int(type_id) >= len(shard.metadata) {
+		return .Invalid_Target
+	}
+
+	soa_meta := shard.metadata[type_id]
+	slot := extract_slot(target)
+	if int(slot) >= len(soa_meta) {
+		return .Invalid_Target
+	}
+	if soa_meta[slot].generation != extract_generation(target) {
+		return .Invalid_Target
+	}
+	if soa_meta[slot].state == .Unallocated || soa_meta[slot].state == .Crashed {
+		return .Invalid_Target
+	}
+	if soa_meta[slot].state == .Waiting_For_Io || soa_meta[slot].io_completion_tag != IO_TAG_NONE {
+		return .Target_Busy
+	}
+
+	soa_meta[slot].io_completion_tag = IO_TAG_ACCEPT_COMPLETE
+	soa_meta[slot].io_result = 0
+	soa_meta[slot].io_fd = fd
+	soa_meta[slot].io_buffer_index = BUFFER_INDEX_NONE
+	soa_meta[slot].io_peer_address = peer_address
+	return .None
+}
+
+@(private = "file")
+_process_fd_handoff_offer :: proc "contextless" (shard: ^Shard, envelope: ^Message_Envelope) {
+	if envelope.payload_size < u16(size_of(FD_Handoff_Offer)) {
+		return
+	}
+
+	offer := (cast(^FD_Handoff_Offer)&envelope.payload[0])^
+	adopted_fd, adopt_reason := reactor_adopt_fd_handoff(
+		&shard.reactor,
+		envelope.destination,
+		offer.os_fd,
+		offer.peer_address,
+	)
+	if adopt_reason != .None {
+		_fd_handoff_send_reject(shard, envelope.source, envelope.destination, offer.handoff, adopt_reason)
+		return
+	}
+
+	inject_reason := _inject_fd_handoff_accept(
+		shard,
+		envelope.destination,
+		adopted_fd,
+		offer.peer_address,
+	)
+	if inject_reason != .None {
+		reactor_internal_close_fd(&shard.reactor, adopted_fd)
+		_fd_handoff_send_reject(shard, envelope.source, envelope.destination, offer.handoff, inject_reason)
+		return
+	}
+
+	_fd_handoff_send_ack(shard, envelope.source, envelope.destination, offer.handoff)
+}
+
+@(private = "file")
+_process_fd_handoff_ack :: proc "contextless" (shard: ^Shard, envelope: ^Message_Envelope) {
+	if envelope.payload_size < u16(size_of(FD_Handoff_Ack)) {
+		return
+	}
+	ack := (cast(^FD_Handoff_Ack)&envelope.payload[0])^
+	_ = _fd_handoff_close_entry(shard, ack.handoff)
+}
+
+@(private = "file")
+_process_fd_handoff_reject :: proc "contextless" (shard: ^Shard, envelope: ^Message_Envelope) {
+	if envelope.payload_size < u16(size_of(FD_Handoff_Reject)) {
+		return
+	}
+	reject := (cast(^FD_Handoff_Reject)&envelope.payload[0])^
+	if _fd_handoff_close_entry(shard, reject.handoff) {
+		shard.counters.handoff_rejects += 1
+	}
+}
+
+@(private = "file")
+_fd_handoff_timeout_scan :: proc(shard: ^Shard, now: u64) {
+	for handoff_index in 0 ..< int(shard.handoff_table.entry_count) {
+		entry := &shard.handoff_table.entries[handoff_index]
+		if entry.state != .In_Flight || entry.deadline_tick == 0 || now < entry.deadline_tick {
+			continue
+		}
+
+		shard.counters.handoff_timeouts += 1
+		entry.deadline_tick = 0
+	}
+}
+
 // --- Mass Teardown & Recovery ---
 
 @(private = "package")
@@ -846,6 +1004,16 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			fd_table_free(&shard.reactor.fd_table, fd_handle)
 		}
 	}
+	for handoff_index in 0 ..< int(shard.handoff_table.entry_count) {
+		entry := &shard.handoff_table.entries[handoff_index]
+		if entry.state != .In_Flight {
+			continue
+		}
+		if entry.cleanup_fd != OS_FD_INVALID {
+			_ = backend_control_close(&shard.reactor.backend, entry.cleanup_fd)
+		}
+	}
+	fd_handoff_table_init(&shard.handoff_table, shard.handoff_table.entries)
 	for type_desc in shard.type_descriptors {
 		type_id := type_desc.id
 		soa_meta := shard.metadata[type_id]
@@ -932,5 +1100,94 @@ _process_inbound_envelope :: #force_inline proc "contextless" (
 			shard_mask_exclude(&shard.peer_alive_mask, source_shard)
 			// NOTE: Same concern as above if-block. Pending calls will naturally time out.
 		}
-	} else do _ = _enqueue_user_msg(shard, envelope.destination, envelope)
+		return
+	}
+
+	switch envelope.tag {
+	case TAG_FD_HANDOFF_OFFER:
+		_process_fd_handoff_offer(shard, envelope)
+	case TAG_FD_HANDOFF_ACK:
+		_process_fd_handoff_ack(shard, envelope)
+	case TAG_FD_HANDOFF_REJECT:
+		_process_fd_handoff_reject(shard, envelope)
+	case:
+		_ = _enqueue_user_msg(shard, envelope.destination, envelope)
+	}
+}
+
+@(private = "file")
+_init_handoff_test_shard :: proc(
+	t: ^testing.T,
+	shard: ^Shard,
+	handoff_backing: []FD_Handoff_Entry,
+) {
+	shard.id = 0
+	fd_handoff_table_init(&shard.handoff_table, handoff_backing)
+	backend_config := Backend_Config {
+		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
+		sim_config = Simulation_IO_Config {},
+	}
+	err := backend_init(&shard.reactor.backend, backend_config)
+	testing.expect_value(t, err, Backend_Error.None)
+}
+
+@(private = "file")
+_alloc_handoff_test_entry :: proc(
+	t: ^testing.T,
+	shard: ^Shard,
+	target_handle: Handle,
+	deadline_tick: u64,
+) -> FD_Handoff_Ref {
+	cleanup_fd, sock_err := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
+	testing.expect_value(t, sock_err, Backend_Error.None)
+
+	ref, ok := fd_handoff_table_alloc(
+		&shard.handoff_table,
+		target_handle,
+		cleanup_fd,
+		Peer_Address{},
+		deadline_tick,
+		shard.id,
+	)
+	testing.expect(t, ok, "handoff entry should allocate")
+	return ref
+}
+
+@(test)
+test_fd_handoff_timeout_scan_counts_but_keeps_entry :: proc(t: ^testing.T) {
+	shard: Shard
+	handoff_backing: [2]FD_Handoff_Entry
+	_init_handoff_test_shard(t, &shard, handoff_backing[:])
+	defer backend_deinit(&shard.reactor.backend)
+
+	target_handle := make_handle(1, 1, 0, 1)
+	ref := _alloc_handoff_test_entry(t, &shard, target_handle, 5)
+
+	_fd_handoff_timeout_scan(&shard, 6)
+
+	entry, found := fd_handoff_table_lookup(&shard.handoff_table, ref)
+	testing.expect(t, found, "timed out entry must remain in-flight (FDs still live)")
+	testing.expect_value(t, entry.deadline_tick, u64(0))
+	testing.expect_value(t, shard.counters.handoff_timeouts, u64(1))
+
+	_fd_handoff_timeout_scan(&shard, 100)
+	testing.expect_value(t, shard.counters.handoff_timeouts, u64(1))
+}
+
+@(test)
+test_shard_mass_teardown_reclaims_in_flight_handoff_entries :: proc(t: ^testing.T) {
+	shard: Shard
+	handoff_backing: [2]FD_Handoff_Entry
+	_init_handoff_test_shard(t, &shard, handoff_backing[:])
+	defer backend_deinit(&shard.reactor.backend)
+
+	target_handle := make_handle(1, 1, 0, 1)
+	ref := _alloc_handoff_test_entry(t, &shard, target_handle, 100)
+
+	shard_mass_teardown(&shard)
+
+	_, found := fd_handoff_table_lookup(&shard.handoff_table, ref)
+	testing.expect(t, !found, "mass teardown should reclaim in-flight handoff entries")
+	testing.expect_value(t, shard.handoff_table.free_count, shard.handoff_table.entry_count)
+	testing.expect_value(t, shard.counters.handoff_timeouts, u64(0))
 }

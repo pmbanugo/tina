@@ -47,6 +47,7 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 		entry.generation = 1
 		entry.read_owner = HANDLE_NONE
 		entry.write_owner = HANDLE_NONE
+		entry.peer_address = {}
 		entry.flags = {}
 		table.free_head = u16(i)
 	}
@@ -54,7 +55,7 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 
 // Allocate an FD table slot for a new OS file descriptor.
 // Returns the FD_Handle with generation for stale-reference detection.
-fd_table_alloc :: proc(
+fd_table_alloc :: proc "contextless" (
 	table: ^FD_Table,
 	os_fd: OS_FD,
 	owner: Handle,
@@ -77,6 +78,7 @@ fd_table_alloc :: proc(
 	entry.os_fd = os_fd
 	entry.read_owner = owner
 	entry.write_owner = owner
+	entry.peer_address = {}
 	entry.flags = {}
 	// generation already set from previous free or init
 
@@ -85,7 +87,7 @@ fd_table_alloc :: proc(
 
 // Look up an FD entry by handle with generation check.
 // Returns nil and error if the handle is stale or invalid.
-fd_table_lookup :: proc(table: ^FD_Table, handle: FD_Handle) -> (^FD_Entry, FD_Table_Error) {
+fd_table_lookup :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> (^FD_Entry, FD_Table_Error) {
 	if handle == FD_HANDLE_NONE {
 		return nil, .Invalid_Index
 	}
@@ -104,7 +106,7 @@ fd_table_lookup :: proc(table: ^FD_Table, handle: FD_Handle) -> (^FD_Entry, FD_T
 }
 
 // Resolve an FD_Handle to the underlying OS_FD with generation check.
-fd_table_resolve :: #force_inline proc(
+fd_table_resolve :: #force_inline proc "contextless" (
 	table: ^FD_Table,
 	handle: FD_Handle,
 ) -> (
@@ -120,7 +122,7 @@ fd_table_resolve :: #force_inline proc(
 
 // Validate that `owner` has the correct direction affinity for the given operation.
 // recv/recvfrom/read/accept check read_owner; send/sendto/write/connect/close check write_owner.
-fd_table_validate_read_affinity :: #force_inline proc(
+fd_table_validate_read_affinity :: #force_inline proc "contextless" (
 	entry: ^FD_Entry,
 	owner: Handle,
 ) -> FD_Table_Error {
@@ -130,7 +132,7 @@ fd_table_validate_read_affinity :: #force_inline proc(
 	return .None
 }
 
-fd_table_validate_write_affinity :: #force_inline proc(
+fd_table_validate_write_affinity :: #force_inline proc "contextless" (
 	entry: ^FD_Entry,
 	owner: Handle,
 ) -> FD_Table_Error {
@@ -141,7 +143,7 @@ fd_table_validate_write_affinity :: #force_inline proc(
 }
 
 // Transfer FD ownership according to handoff mode (§6.6.3 §5.4).
-fd_table_handoff :: proc(
+fd_table_handoff :: proc "contextless" (
 	table: ^FD_Table,
 	handle: FD_Handle,
 	new_owner: Handle,
@@ -167,7 +169,7 @@ fd_table_handoff :: proc(
 
 // Free an FD table slot. Bumps generation for stale-reference detection.
 // Does NOT close the OS FD — caller must handle that.
-fd_table_free :: proc(table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
+fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
 	if handle == FD_HANDLE_NONE {
 		return .Invalid_Index
 	}
@@ -187,6 +189,7 @@ fd_table_free :: proc(table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
 	entry.os_fd = _fd_table_encode_next(table.free_head)
 	entry.read_owner = HANDLE_NONE
 	entry.write_owner = HANDLE_NONE
+	entry.peer_address = {}
 	entry.flags = {}
 
 	table.free_head = index
@@ -197,7 +200,7 @@ fd_table_free :: proc(table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
 
 // Mark an FD for close-on-completion (§6.6.1 §3).
 // Used during teardown_isolate when I/O is in-flight on the FD.
-fd_table_mark_close_on_completion :: proc(table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
+fd_table_mark_close_on_completion :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
 	entry, err := fd_table_lookup(table, handle)
 	if err != .None {
 		return err
@@ -207,8 +210,36 @@ fd_table_mark_close_on_completion :: proc(table: ^FD_Table, handle: FD_Handle) -
 }
 
 // Check if an FD is marked for close-on-completion.
-fd_table_is_close_on_completion :: #force_inline proc(entry: ^FD_Entry) -> bool {
+fd_table_is_close_on_completion :: #force_inline proc "contextless" (entry: ^FD_Entry) -> bool {
 	return .Close_On_Completion in entry.flags
+}
+
+fd_table_mark_fresh_accept :: #force_inline proc "contextless" (
+	table: ^FD_Table,
+	handle: FD_Handle,
+	peer_address: Peer_Address,
+) -> FD_Table_Error {
+	entry, err := fd_table_lookup(table, handle)
+	if err != .None {
+		return err
+	}
+	entry.peer_address = peer_address
+	entry.flags += {.Fresh_Accept}
+	return .None
+}
+
+fd_table_clear_fresh_accept :: #force_inline proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
+	entry, err := fd_table_lookup(table, handle)
+	if err != .None {
+		return err
+	}
+	entry.flags -= {.Fresh_Accept}
+	entry.peer_address = {}
+	return .None
+}
+
+fd_table_is_fresh_accept :: #force_inline proc "contextless" (entry: ^FD_Entry) -> bool {
+	return .Fresh_Accept in entry.flags
 }
 
 // Find all FDs owned by a given Isolate (for teardown).
@@ -233,12 +264,12 @@ fd_table_for_each_owned :: proc(
 // Repurpose the OS_FD field (i32 or uintptr) to store next-free u16 index.
 
 @(private = "file")
-_fd_table_encode_next :: #force_inline proc(next: u16) -> OS_FD {
+_fd_table_encode_next :: #force_inline proc "contextless" (next: u16) -> OS_FD {
 	return OS_FD(next)
 }
 
 @(private = "file")
-_fd_table_decode_next :: #force_inline proc(encoded: OS_FD) -> u16 {
+_fd_table_decode_next :: #force_inline proc "contextless" (encoded: OS_FD) -> u16 {
 	return u16(encoded)
 }
 
