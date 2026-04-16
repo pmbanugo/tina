@@ -145,12 +145,12 @@ Socket_Address :: union {
 // Covers inet4 and inet6. Unix peer addresses are not supported in SOA
 // (unix domain accept does not produce meaningful peer addresses).
 Peer_Address :: struct {
-	address_data: [16]u8, // IPv4 uses first 4 bytes, IPv6 uses all 16
 	flow_info:    u32, // IPv6 flow info (0 for IPv4)
 	scope_id:     u32, // IPv6 scope ID (0 for IPv4)
 	port:         u16, // network port
 	family:       Socket_Domain, // discriminant
 	_padding:     [1]u8,
+	address_data: [16]u8, // IPv4 uses first 4 bytes, IPv6 uses all 16
 }
 #assert(size_of(Peer_Address) == 28)
 
