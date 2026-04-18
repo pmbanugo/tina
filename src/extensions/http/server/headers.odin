@@ -31,6 +31,17 @@ Known_Header_Mask :: distinct bit_set[Known_Header; u8]
 FNV1A_OFFSET_BASIS :: u32(2166136261)
 FNV1A_PRIME        :: u32(16777619)
 
+// Fold ASCII uppercase A..Z to lowercase a..z. All other bytes pass through
+// unchanged — critical for symbols like '^' (0x5E) and '_' (0x5F) that naive
+// `| 0x20` would corrupt. Pure ALU, zero memory loads, compiler-unrollable.
+// See Parser Notes §1 for rationale.
+fold_ascii_upper :: #force_inline proc "contextless" (character: u8) -> u8 {
+	if character >= 'A' && character <= 'Z' {
+		return character | 0x20
+	}
+	return character
+}
+
 // Computes a case-insensitive FNV-1a hash directly from the slice.
 // Precondition: name_bytes must already be validated as valid HTTP token characters (CHARS_HTTP_TOKEN).
 // Only ASCII letters A..Z are folded to lowercase; all other bytes are preserved.
@@ -38,14 +49,7 @@ compute_header_hash :: #force_inline proc "contextless" (name_bytes: []u8) -> u3
 	hash_value: u32 = FNV1A_OFFSET_BASIS
 
 	for character in name_bytes {
-		// Fold only ASCII uppercase letters to lowercase.
-		// 'A' (0x41) .. 'Z' (0x5A) -> 'a' (0x61) .. 'z' (0x7A)
-		folded := character
-		if character >= 'A' && character <= 'Z' {
-			folded = character | 0x20
-		}
-
-		hash_value = (hash_value ~ u32(folded)) * FNV1A_PRIME
+		hash_value = (hash_value ~ u32(fold_ascii_upper(character))) * FNV1A_PRIME
 	}
 
 	return hash_value
@@ -67,14 +71,7 @@ validate_and_hash_header_name :: proc "contextless" (name_bytes: []u8) -> (hash:
 		if !is_token_byte(character) {
 			return 0, false
 		}
-
-		// Fold A..Z to lowercase for case-insensitive hashing.
-		folded := character
-		if character >= 'A' && character <= 'Z' {
-			folded = character | 0x20
-		}
-
-		hash_value = (hash_value ~ u32(folded)) * FNV1A_PRIME
+		hash_value = (hash_value ~ u32(fold_ascii_upper(character))) * FNV1A_PRIME
 	}
 
 	return hash_value, true
