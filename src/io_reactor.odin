@@ -119,7 +119,12 @@ reactor_control_bind :: proc(
 	return backend_control_bind(&reactor.backend, entry.os_fd, address)
 }
 
-reactor_control_listen :: proc(reactor: ^Reactor, fd: FD_Handle, owner: Handle, backlog: u32) -> Backend_Error {
+reactor_control_listen :: proc(
+	reactor: ^Reactor,
+	fd: FD_Handle,
+	owner: Handle,
+	backlog: u32,
+) -> Backend_Error {
 	entry, err := _resolve_fd(reactor, fd, owner, .Any)
 	if err != IO_ERR_NONE do return .Not_Found
 	return backend_control_listen(&reactor.backend, entry.os_fd, backlog)
@@ -348,7 +353,9 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		} else if op_tag == u8(IO_TAG_RECVFROM_COMPLETE) {
 			#partial switch e in completion.extra {
 			case Completion_Extra_Recvfrom:
-				soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(e.peer_address)
+				soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(
+					e.peer_address,
+				)
 			}
 		}
 
@@ -446,7 +453,6 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_READ_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
 		if alloc_error != .None do return IO_ERR_RESOURCE_EXHAUSTED
@@ -464,7 +470,6 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_WRITE_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		alloc_index, alloc_error := _alloc_and_copy_in(
 			reactor,
@@ -489,7 +494,6 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_ACCEPT_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.listen_fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.listen_fd)
 		submission.operation = Submission_Op_Accept {
 			listen_fd = entry.os_fd,
 		}
@@ -499,9 +503,8 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_CONNECT_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.fd)
 		submission.operation = Submission_Op_Connect {
-			socket_fd = entry.os_fd,
+			fd_socket = entry.os_fd,
 			address   = op.address,
 		}
 
@@ -510,7 +513,6 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_SEND_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		alloc_index, alloc_error := _alloc_and_copy_in(
 			reactor,
@@ -524,7 +526,7 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Send {
-			socket_fd = entry.os_fd,
+			fd_socket = entry.os_fd,
 			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.payload_size,
 		}
@@ -534,14 +536,13 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_RECV_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
 		if alloc_error != .None do return IO_ERR_RESOURCE_EXHAUSTED
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Recv {
-			socket_fd = entry.os_fd,
+			fd_socket = entry.os_fd,
 			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.buffer_size_max,
 		}
@@ -551,7 +552,6 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_SENDTO_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		alloc_index, alloc_error := _alloc_and_copy_in(
 			reactor,
@@ -565,7 +565,7 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Sendto {
-			socket_fd = entry.os_fd,
+			fd_socket = entry.os_fd,
 			address   = op.address,
 			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.payload_size,
@@ -576,14 +576,13 @@ reactor_submit_io :: proc(
 		submission_op_tag = u8(IO_TAG_RECVFROM_COMPLETE)
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
-		submission.fixed_file_index = fd_handle_index(op.fd)
 
 		alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
 		if alloc_error != .None do return IO_ERR_RESOURCE_EXHAUSTED
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Recvfrom {
-			socket_fd = entry.os_fd,
+			fd_socket = entry.os_fd,
 			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.buffer_size_max,
 		}
@@ -599,6 +598,29 @@ reactor_submit_io :: proc(
 		}
 		backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(op.fd))
 		fd_table_free(&reactor.fd_table, op.fd)
+
+	case IoOp_Sendfile:
+		target_fd = op.fd_socket
+		submission_op_tag = u8(IO_TAG_SENDFILE_COMPLETE)
+
+		file_entry, file_err := _resolve_fd(reactor, op.fd_file, owner, .Read)
+		if file_err != IO_ERR_NONE do return file_err
+
+		socket_entry, socket_err := _resolve_fd(reactor, op.fd_socket, owner, .Write)
+		if socket_err != IO_ERR_NONE do return socket_err
+
+		submission.operation = Submission_Op_Sendfile {
+			fd_file       = file_entry.os_fd,
+			fd_socket     = socket_entry.os_fd,
+			source_offset = op.source_offset,
+			size          = op.size,
+		}
+	}
+
+	// Hoist fixed-file assignment: all ops except Close use their target_fd's index.
+	// Close must stay FIXED_FILE_INDEX_NONE because io_uring close uses raw FDs.
+	if target_fd != FD_HANDLE_NONE {
+		submission.fixed_file_index = fd_handle_index(target_fd)
 	}
 
 	if target_fd != FD_HANDLE_NONE &&
@@ -647,6 +669,8 @@ _io_op_to_completion_tag :: #force_inline proc(op: IoOp) -> Message_Tag {
 		return IO_TAG_RECVFROM_COMPLETE
 	case IoOp_Close:
 		return IO_TAG_CLOSE_COMPLETE
+	case IoOp_Sendfile:
+		return IO_TAG_SENDFILE_COMPLETE
 	}
 	return IO_TAG_NONE
 }
@@ -738,7 +762,7 @@ test_reactor_control_socket_and_shutdown :: proc(t: ^testing.T) {
 
 	reactor := new(Reactor)
 	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 1)
-	defer { reactor_deinit(reactor); free(reactor) }
+	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner_handle := make_handle(0, 1, 0, 1)
 
@@ -790,7 +814,7 @@ test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
 
 	reactor := new(Reactor)
 	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
-	defer { reactor_deinit(reactor); free(reactor) }
+	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner := make_handle(0, 1, 0, 1)
 
@@ -835,7 +859,7 @@ test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
 
 	reactor := new(Reactor)
 	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
-	defer { reactor_deinit(reactor); free(reactor) }
+	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner := make_handle(0, 1, 0, 1)
 
@@ -868,7 +892,7 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 
 	reactor := new(Reactor)
 	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
-	defer { reactor_deinit(reactor); free(reactor) }
+	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner := make_handle(0, 1, 0, 1)
 
@@ -941,81 +965,95 @@ emergency_print_stalled_io_snapshot :: proc "contextless" (shard: ^Shard) {
 }
 
 when TINA_SIMULATION_MODE {
-    // The equivalent is named test_io_sequence_stale_completion_reclamation
-    // which is in the simulation test file, and runs only in simulation mode
-    // Once I make the Simulation IO emulate the kqueue/IOCP/uring semantics,
-    // I should remove one of them or merge the concepts.
-    @(test)
-    test_reactor_real_os_stale_completion_reclamation :: proc(t: ^testing.T) {
-    	// 1. Setup Backing Memory and Reactor
-    	config := Backend_Config{queue_size = 32}
-    	//when TINA_SIMULATION_MODE {
-    	//	config.sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, seed = t.seed}
-    	//}
+	// The equivalent is named test_io_sequence_stale_completion_reclamation
+	// which is in the simulation test file, and runs only in simulation mode
+	// Once I make the Simulation IO emulate the kqueue/IOCP/uring semantics,
+	// I should remove one of them or merge the concepts.
+	@(test)
+	test_reactor_real_os_stale_completion_reclamation :: proc(t: ^testing.T) {
+		// 1. Setup Backing Memory and Reactor
+		config := Backend_Config {
+			queue_size = 32,
+		}
+		//when TINA_SIMULATION_MODE {
+		//	config.sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, seed = t.seed}
+		//}
 
-    	fd_backing: [8]FD_Entry
-    	buffer_backing: [4096]u8
+		fd_backing: [8]FD_Entry
+		buffer_backing: [4096]u8
 
-    	reactor := new(Reactor)
-    	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
-    	defer { reactor_deinit(reactor); free(reactor) }
+		reactor := new(Reactor)
+		reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+		defer {reactor_deinit(reactor); free(reactor)}
 
-    	// 2. Setup Mock Shard Metadata
-    	shard := new(Shard)
-    	defer free(shard)
-    	shard.metadata = make([]#soa[]Isolate_Metadata, 1)
-    	defer delete(shard.metadata)
-    	shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
-    	defer delete(shard.metadata[0])
+		// 2. Setup Mock Shard Metadata
+		shard := new(Shard)
+		defer free(shard)
+		shard.metadata = make([]#soa[]Isolate_Metadata, 1)
+		defer delete(shard.metadata)
+		shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
+		defer delete(shard.metadata[0])
 
-    	meta := &shard.metadata[0][0]
-    	meta.generation = 1
-    	meta.io_sequence = 1
-    	meta.state = .Runnable
+		meta := &shard.metadata[0][0]
+		meta.generation = 1
+		meta.io_sequence = 1
+		meta.state = .Runnable
 
-    	owner := make_handle(0, 0, 0, 1)
+		owner := make_handle(0, 0, 0, 1)
 
-    	// 3. Anchor the I/O: Create a UDP socket. It will block forever on Recv.
-    	fd, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .DGRAM, .UDP)
-    	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
+		// 3. Anchor the I/O: Create a UDP socket. It will block forever on Recv.
+		fd, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .DGRAM, .UDP)
+		testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
 
-    	bind_addr := Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 0}
-    	reactor_control_bind(reactor, fd, owner, bind_addr)
+		bind_addr := Socket_Address_Inet4 {
+			address = {127, 0, 0, 1},
+			port    = 0,
+		}
+		reactor_control_bind(reactor, fd, owner, bind_addr)
 
-    	// 4. Submit Recv
-    	io_err := reactor_submit_io(reactor, shard, owner, IoOp_Recv{fd = fd, buffer_size_max = 512})
-    	testing.expect_value(t, io_err, IO_ERR_NONE)
+		// 4. Submit Recv
+		io_err := reactor_submit_io(
+			reactor,
+			shard,
+			owner,
+			IoOp_Recv{fd = fd, buffer_size_max = 512},
+		)
+		testing.expect_value(t, io_err, IO_ERR_NONE)
 
-    	// Buffer should be allocated
-    	testing.expect_value(t, reactor.buffer_pool.free_count, 3)
+		// Buffer should be allocated
+		testing.expect_value(t, reactor.buffer_pool.free_count, 3)
 
-    	// Push to the OS kernel / Simulator
-    	reactor_flush_submissions(reactor, shard)
+		// Push to the OS kernel / Simulator
+		reactor_flush_submissions(reactor, shard)
 
-    	// 5. Simulate the Timer Wake (The ADR Structural Guarantee)
-    	meta.io_sequence += 1
-    	meta.state = .Runnable
+		// 5. Simulate the Timer Wake (The ADR Structural Guarantee)
+		meta.io_sequence += 1
+		meta.state = .Runnable
 
-    	// 6. Simulate Isolate closing the socket as a timeout response.
-    	// This triggers the kqueue sweep, the io_uring cancel, or the IOCP abort.
-    	reactor_internal_close_fd(reactor, fd)
+		// 6. Simulate Isolate closing the socket as a timeout response.
+		// This triggers the kqueue sweep, the io_uring cancel, or the IOCP abort.
+		reactor_internal_close_fd(reactor, fd)
 
-    	// 7. Collect Completions
-    	// Because kernel cancellation is asynchronous (especially on io_uring/IOCP),
-    	// we must poll a few times. The kqueue sweep is synchronous, but this loop
-    	// should safely handles all platforms.
-    	recovered := false
-    	for i in 0 ..< 50 {
-    		reactor_collect_completions(reactor, shard, 10_000_000) // 10ms wait
-    		if reactor.buffer_pool.free_count == 4 {
-    			recovered = true
-    			break
-    		}
-    	}
+		// 7. Collect Completions
+		// Because kernel cancellation is asynchronous (especially on io_uring/IOCP),
+		// we must poll a few times. The kqueue sweep is synchronous, but this loop
+		// should safely handles all platforms.
+		recovered := false
+		for i in 0 ..< 50 {
+			reactor_collect_completions(reactor, shard, 10_000_000) // 10ms wait
+			if reactor.buffer_pool.free_count == 4 {
+				recovered = true
+				break
+			}
+		}
 
-    	// 8. The Critical Assertions
-    	testing.expect(t, recovered, "Reactor buffer leaked! The OS completion was lost or never generated.")
-    	testing.expect_value(t, reactor.buffer_pool.free_count, 4)
-    	testing.expect_value(t, shard.counters.io_stale_completions, 1)
-    }
+		// 8. The Critical Assertions
+		testing.expect(
+			t,
+			recovered,
+			"Reactor buffer leaked! The OS completion was lost or never generated.",
+		)
+		testing.expect_value(t, reactor.buffer_pool.free_count, 4)
+		testing.expect_value(t, shard.counters.io_stale_completions, 1)
+	}
 }

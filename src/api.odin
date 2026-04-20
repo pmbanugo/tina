@@ -4,6 +4,7 @@ import "core:mem"
 
 MAX_INIT_ARGS_SIZE :: 64 //Fixed-Size Payload/Args for init_fn
 MAX_ISOLATES_PER_TYPE :: 1_048_575 // 20-bit slot index
+SENDFILE_ALL_BYTES: u32 : max(u32)
 
 Supervision_Group_Id :: distinct u16
 SUPERVISION_GROUP_ID_NONE :: Supervision_Group_Id(0xFFFF)
@@ -223,6 +224,20 @@ io_write :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8, off
 			payload_offset = payload_offset_of(self, buffer),
 			payload_size   = u32(len(buffer)),
 			offset         = offset,
+		},
+	}
+}
+
+// Builds an Effect that transfers file data directly to a socket via kernel zero-copy (sendfile).
+// No Isolate memory is involved — data flows from the file's page cache to the socket.
+// The caller manages offset progression: next offset = source_offset + completion.result.
+io_sendfile :: #force_inline proc "contextless" (fd_socket: FD_Handle, fd_file: FD_Handle, source_offset: u64, size: u32) -> Effect {
+	return Effect_Io {
+		operation = IoOp_Sendfile {
+			fd_file       = fd_file,
+			fd_socket     = fd_socket,
+			source_offset = source_offset,
+			size          = size,
 		},
 	}
 }

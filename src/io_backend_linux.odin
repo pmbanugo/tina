@@ -25,6 +25,7 @@ when !TINA_SIMULATION_MODE {
 
 	MAX_LINUX_UNQUEUED :: 256
 	MAX_LINUX_PENDING_ADDRS :: 64
+	MAX_LINUX_SENDFILE_ENTRIES :: 16
 
 	// Persistent storage for io_uring operations that need stable pointers
 	// (accept, connect, sendto, recvfrom). Allocated on submit, freed on CQE.
@@ -37,6 +38,35 @@ when !TINA_SIMULATION_MODE {
 		active:       bool,
 	}
 
+	// io_uring splice state machine for zero-copy file→socket transfer.
+	// Two-phase: (1) file→pipe via IORING_OP_SPLICE, (2) pipe→socket via IORING_OP_SPLICE.
+	// One dedicated pipe pair per entry, pre-created at init.
+	// Internal SQEs use high-bit-tagged user_data (filtered from user completions).
+	Sendfile_Phase :: enum u8 {
+		File_To_Pipe,
+		Pipe_To_Socket,
+	}
+
+	Sendfile_Entry :: struct {
+		token:             Submission_Token,
+		fd_file:           OS_FD,
+		fd_socket:         OS_FD,
+		socket_fixed_index: u16,
+		pipe_read_fd:      linux.Fd,
+		pipe_write_fd:     linux.Fd,
+		source_offset:     u64,
+		size_remaining:    u32,
+		bytes_in_pipe:     u32,
+		bytes_sent_total:  u32,
+		phase:             Sendfile_Phase,
+		active:            bool,
+	}
+
+	// Internal user_data encoding for sendfile splice SQEs.
+	// High bit set = internal (filtered by CQE loop). Bits 0..3 = entry index. Bit 4 = phase.
+	SENDFILE_UD_FLAG :: u64(0x8000_0000_0000_0002) // high bit + bit 1 to distinguish from wake/cancel
+	SENDFILE_UD_PHASE_BIT :: u64(1 << 4)
+
 	_Platform_State :: struct {
 		ring:               uring.Ring,
 		wake_fd:            OS_FD,
@@ -47,6 +77,7 @@ when !TINA_SIMULATION_MODE {
 		files_registered:   bool,
 		fixed_fd_count:     u16,
 		addr_entries:       [MAX_LINUX_PENDING_ADDRS]Pending_Addr_Entry,
+		sendfile_entries:   [MAX_LINUX_SENDFILE_ENTRIES]Sendfile_Entry,
 	}
 
 	// Internal user_data for wake eventfd reads. High bit marks it as internal (filtered from user completions).
@@ -82,6 +113,26 @@ when !TINA_SIMULATION_MODE {
 
 		for i in 0 ..< MAX_LINUX_PENDING_ADDRS {
 			backend.addr_entries[i].active = false
+		}
+
+		// Pre-create pipe pairs for sendfile splice state machine.
+		// Each entry gets a dedicated pipe so concurrent sendfile ops never mix data.
+		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
+			backend.sendfile_entries[i].active = false
+			pipes: [2]linux.Fd
+			pipe_err := linux.pipe2(&pipes, {.CLOEXEC, .NONBLOCK})
+			if pipe_err != nil {
+				// Clean up already-created pipes and fail init
+				for j in 0 ..< i {
+					linux.close(backend.sendfile_entries[j].pipe_read_fd)
+					linux.close(backend.sendfile_entries[j].pipe_write_fd)
+				}
+				linux.close(linux.Fd(backend.wake_fd))
+				uring.destroy(&backend.ring)
+				return .System_Error
+			}
+			backend.sendfile_entries[i].pipe_read_fd = pipes[0]
+			backend.sendfile_entries[i].pipe_write_fd = pipes[1]
 		}
 
 		_linux_arm_wake(backend)
@@ -130,6 +181,11 @@ when !TINA_SIMULATION_MODE {
 		if backend.buffers_registered {
 			linux.io_uring_register(backend.ring.fd, .UNREGISTER_BUFFERS, nil, 0)
 			backend.buffers_registered = false
+		}
+		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
+			linux.close(backend.sendfile_entries[i].pipe_read_fd)
+			linux.close(backend.sendfile_entries[i].pipe_write_fd)
+			backend.sendfile_entries[i].active = false
 		}
 		linux.close(linux.Fd(backend.wake_fd))
 		uring.destroy(&backend.ring)
@@ -214,11 +270,14 @@ when !TINA_SIMULATION_MODE {
 		for i in 0 ..< completed {
 			cqe := &cqes[i]
 
-			// Filter internal CQEs: cancel results (high bit set) and wake reads
+			// Filter internal CQEs: cancel results (high bit set), wake reads, and sendfile splices
 			if cqe.user_data & (1 << 63) != 0 {
 				if cqe.user_data == LINUX_WAKE_UD {
-					// Re-arm the wake read
 					_linux_arm_wake(backend)
+				} else if (cqe.user_data & SENDFILE_UD_FLAG) == SENDFILE_UD_FLAG {
+					// Internal sendfile splice CQE — advance the state machine.
+					// May produce a user-visible completion pushed to the output slice.
+					_linux_handle_sendfile_cqe(backend, cqe, completions, &count, u32(len(completions)))
 				}
 				continue
 			}
@@ -270,8 +329,31 @@ when !TINA_SIMULATION_MODE {
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
 		// Use a distinct cancel user_data (token with high bit flipped)
 		cancel_ud := u64(token) ~ (1 << 63)
-		_, ok := uring.async_cancel(&backend.ring, u64(token), cancel_ud)
-		if !ok {
+
+		cancelled_any := false
+		is_sendfile := false
+
+		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
+			if backend.sendfile_entries[i].active && backend.sendfile_entries[i].token == token {
+				is_sendfile = true
+
+				ud_fp := _linux_sendfile_ud(u64(i), .File_To_Pipe)
+				ud_ps := _linux_sendfile_ud(u64(i), .Pipe_To_Socket)
+
+				_, ok1 := uring.async_cancel(&backend.ring, ud_fp, cancel_ud)
+				_, ok2 := uring.async_cancel(&backend.ring, ud_ps, cancel_ud)
+
+				cancelled_any = cancelled_any || ok1 || ok2
+				break
+			}
+		}
+
+		if !is_sendfile {
+			_, ok := uring.async_cancel(&backend.ring, u64(token), cancel_ud)
+			cancelled_any = cancelled_any || ok
+		}
+
+		if !cancelled_any {
 			return .Queue_Full
 		}
 
@@ -656,7 +738,7 @@ when !TINA_SIMULATION_MODE {
 				sqe, ok := uring.connect(
 					&backend.ring,
 					ud,
-					linux.Fd(op.socket_fd),
+					linux.Fd(op.fd_socket),
 					&entry.sockaddr,
 				)
 				if !ok {
@@ -677,7 +759,7 @@ when !TINA_SIMULATION_MODE {
 			sqe, ok := uring.send(
 				&backend.ring,
 				ud,
-				linux.Fd(op.socket_fd),
+				linux.Fd(op.fd_socket),
 				op.buffer[:op.size],
 				{.NOSIGNAL},
 			)
@@ -690,7 +772,7 @@ when !TINA_SIMULATION_MODE {
 			sqe, ok := uring.recv(
 				&backend.ring,
 				ud,
-				linux.Fd(op.socket_fd),
+				linux.Fd(op.fd_socket),
 				op.buffer[:op.size],
 				{.NOSIGNAL},
 			)
@@ -717,7 +799,7 @@ when !TINA_SIMULATION_MODE {
 			sqe, ok := uring.sendmsg(
 				&backend.ring,
 				ud,
-				linux.Fd(op.socket_fd),
+				linux.Fd(op.fd_socket),
 				&entry.msghdr,
 				{.NOSIGNAL},
 			)
@@ -747,7 +829,7 @@ when !TINA_SIMULATION_MODE {
 			sqe, ok := uring.recvmsg(
 				&backend.ring,
 				ud,
-				linux.Fd(op.socket_fd),
+				linux.Fd(op.fd_socket),
 				&entry.msghdr,
 				{.NOSIGNAL},
 			)
@@ -758,9 +840,230 @@ when !TINA_SIMULATION_MODE {
 				_linux_apply_fixed_file(sqe, ffi)
 			}
 			return ok
+
+		case Submission_Op_Sendfile:
+			entry := _linux_alloc_sendfile_entry(backend)
+			if entry == nil {
+				return false
+			}
+			entry.token = submission.token
+			entry.fd_file = op.fd_file
+			entry.fd_socket = op.fd_socket
+			entry.socket_fixed_index = submission.fixed_file_index
+			entry.source_offset = op.source_offset
+			entry.size_remaining = op.size
+			entry.bytes_in_pipe = 0
+			entry.bytes_sent_total = 0
+			entry.phase = .File_To_Pipe
+			entry.active = true
+
+			return _linux_submit_splice_file_to_pipe(backend, entry)
 		}
 
 		return false
+	}
+
+	// ============================================================================
+	// Sendfile Splice State Machine
+	// ============================================================================
+
+	@(private = "file")
+	_linux_alloc_sendfile_entry :: proc(backend: ^Platform_Backend) -> ^Sendfile_Entry {
+		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
+			if !backend.sendfile_entries[i].active {
+				return &backend.sendfile_entries[i]
+			}
+		}
+		return nil
+	}
+
+	@(private = "file")
+	_linux_sendfile_entry_index :: proc(backend: ^Platform_Backend, entry: ^Sendfile_Entry) -> u64 {
+		base := uintptr(&backend.sendfile_entries[0])
+		return u64(uintptr(entry) - base) / u64(size_of(Sendfile_Entry))
+	}
+
+	// Encode internal user_data for a sendfile splice SQE.
+	// High bit set = internal. Bit 1 = sendfile marker. Bits 8..11 = entry index. Bit 4 = phase.
+	@(private = "file")
+	_linux_sendfile_ud :: proc(entry_index: u64, phase: Sendfile_Phase) -> u64 {
+		ud := SENDFILE_UD_FLAG | (entry_index << 8)
+		if phase == .Pipe_To_Socket {
+			ud |= SENDFILE_UD_PHASE_BIT
+		}
+		return ud
+	}
+
+	// Decode entry index and phase from internal user_data.
+	@(private = "file")
+	_linux_sendfile_ud_decode :: proc(ud: u64) -> (entry_index: u16, phase: Sendfile_Phase) {
+		entry_index = u16((ud >> 8) & 0xF)
+		phase = .Pipe_To_Socket if (ud & SENDFILE_UD_PHASE_BIT) != 0 else .File_To_Pipe
+		return
+	}
+
+	// Phase 1: splice file → pipe. Reads from file at source_offset into the pipe write end.
+	@(private = "file")
+	_linux_submit_splice_file_to_pipe :: proc(backend: ^Platform_Backend, entry: ^Sendfile_Entry) -> bool {
+		idx := _linux_sendfile_entry_index(backend, entry)
+		ud := _linux_sendfile_ud(idx, .File_To_Pipe)
+		chunk := min(entry.size_remaining, 1024 * 1024) // 1MB max per splice to keep granularity
+
+		_, ok := uring.splice(
+			&backend.ring,
+			ud,
+			linux.Fd(entry.fd_file),       // fd_in = file
+			i64(entry.source_offset),       // off_in = file offset
+			entry.pipe_write_fd,            // fd_out = pipe write end
+			-1,                             // off_out = -1 (NULL, pipe has no offset)
+			chunk,
+			{.NONBLOCK, .MORE},
+		)
+		return ok
+	}
+
+	// Phase 2: splice pipe → socket. Drains pipe contents into the destination socket.
+	@(private = "file")
+	_linux_submit_splice_pipe_to_socket :: proc(backend: ^Platform_Backend, entry: ^Sendfile_Entry) -> bool {
+		idx := _linux_sendfile_entry_index(backend, entry)
+		ud := _linux_sendfile_ud(idx, .Pipe_To_Socket)
+
+		use_fixed := backend.files_registered && entry.socket_fixed_index != FIXED_FILE_INDEX_NONE
+		splice_flags: linux.IO_Uring_Splice_Flags = {.NONBLOCK}
+		if entry.size_remaining > 0 {
+			splice_flags += {.MORE} // hint: more data coming after this
+		}
+
+		sqe, ok := uring.splice(
+			&backend.ring,
+			ud,
+			entry.pipe_read_fd,            // fd_in = pipe read end
+			-1,                            // off_in = -1 (NULL, pipe has no offset)
+			linux.Fd(entry.fd_socket),     // fd_out = socket
+			-1,                            // off_out = -1 (NULL for sockets)
+			entry.bytes_in_pipe,
+			splice_flags,
+		)
+		if ok && use_fixed {
+			_linux_apply_fixed_file(sqe, entry.socket_fixed_index)
+		}
+		return ok
+	}
+
+	// Handle a CQE from an internal sendfile splice SQE.
+	// Advances the state machine and may produce a user-visible completion.
+	@(private = "file")
+	_linux_handle_sendfile_cqe :: proc(
+		backend: ^Platform_Backend,
+		cqe: ^linux.IO_Uring_CQE,
+		completions: []Raw_Completion,
+		count: ^u32,
+		output_max: u32,
+	) {
+		entry_index, phase := _linux_sendfile_ud_decode(cqe.user_data)
+		if int(entry_index) >= MAX_LINUX_SENDFILE_ENTRIES {
+			return
+		}
+		entry := &backend.sendfile_entries[entry_index]
+		if !entry.active {
+			return
+		}
+
+		// Error on any splice phase → complete with error (only if no bytes already sent to socket)
+		if cqe.res < 0 {
+			result: i32
+			if entry.bytes_sent_total > 0 {
+				// Partial progress already made — report bytes sent so far
+				result = i32(entry.bytes_sent_total)
+			} else {
+				result = cqe.res
+			}
+
+			if entry.bytes_in_pipe > 0 {
+				linux.close(entry.pipe_read_fd)
+				linux.close(entry.pipe_write_fd)
+				pipes: [2]linux.Fd
+				linux.pipe2(&pipes, {.CLOEXEC, .NONBLOCK})
+				entry.pipe_read_fd = pipes[0]
+				entry.pipe_write_fd = pipes[1]
+				entry.bytes_in_pipe = 0
+			}
+
+			_linux_complete_sendfile(entry, completions, count, output_max, result)
+			return
+		}
+
+		bytes := u32(cqe.res)
+
+		switch phase {
+		case .File_To_Pipe:
+			if bytes == 0 {
+				// EOF — file shorter than expected at this offset
+				if entry.bytes_in_pipe > 0 {
+					// Drain remaining pipe contents to socket first
+					entry.phase = .Pipe_To_Socket
+					if !_linux_submit_splice_pipe_to_socket(backend, entry) {
+						_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+					}
+				} else {
+					_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+				}
+				return
+			}
+
+			entry.source_offset += u64(bytes)
+			entry.size_remaining -= bytes
+			entry.bytes_in_pipe += bytes
+
+			// Now drain pipe → socket
+			entry.phase = .Pipe_To_Socket
+			if !_linux_submit_splice_pipe_to_socket(backend, entry) {
+				_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+			}
+
+		case .Pipe_To_Socket:
+			entry.bytes_in_pipe -= bytes
+			entry.bytes_sent_total += bytes
+
+			if entry.bytes_in_pipe > 0 {
+				// Pipe not fully drained — keep draining before advancing
+				if !_linux_submit_splice_pipe_to_socket(backend, entry) {
+					_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+				}
+				return
+			}
+
+			// Pipe fully drained. More file data to transfer?
+			if entry.size_remaining > 0 {
+				entry.phase = .File_To_Pipe
+				if !_linux_submit_splice_file_to_pipe(backend, entry) {
+					_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+				}
+			} else {
+				// All done — emit user completion
+				_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+			}
+		}
+	}
+
+	// Emit the final user-visible completion for a sendfile operation and release the entry.
+	@(private = "file")
+	_linux_complete_sendfile :: proc(
+		entry: ^Sendfile_Entry,
+		completions: []Raw_Completion,
+		count: ^u32,
+		output_max: u32,
+		result: i32,
+	) {
+		if count^ < output_max {
+			completions[count^] = Raw_Completion {
+				token  = entry.token,
+				result = result,
+				extra  = nil,
+			}
+			count^ += 1
+		}
+		entry.active = false
 	}
 
 	// Register the reactor's pre-allocated buffer pool with io_uring.
@@ -1130,7 +1433,7 @@ when !TINA_SIMULATION_MODE {
 			{
 				token = token,
 				fixed_file_index = 0,
-				operation = Submission_Op_Recv{socket_fd = fd, buffer = &buf[0], size = 64},
+				operation = Submission_Op_Recv{fd_socket = fd, buffer = &buf[0], size = 64},
 			},
 		}
 		sub_err := backend_submit(&backend, submissions[:])

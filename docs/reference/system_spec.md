@@ -29,6 +29,7 @@ The root boot specification for the entire Tina process.
 | `reactor_buffer_slot_size` | `int` | `0` | Bytes per reactor buffer slot. |
 | `transfer_slot_count` | `int` | `0` | Transfer buffer pool slot count. |
 | `transfer_slot_size` | `int` | `0` | Bytes per transfer buffer slot. |
+| `fd_handoff_entry_count` | `int` | `0` | Capacity of the per-Shard FD Handoff Table for cross-shard socket handoff. Must be > 0 for multi-shard handoff. Windows rejects > 0 when `shard_count > 1`. |
 | `timer_spoke_count` | `int` | — | **Required.** Timer wheel spoke count. Must be a power of 2. |
 | `timer_entry_count` | `int` | — | **Required.** Timer entry pool size. |
 | `fd_table_slot_count` | `int` | `0` | FD table capacity per Shard. |
@@ -364,6 +365,7 @@ SystemSpecError :: enum u8 {
     InvalidTypeId,                 // Child_Spec references unregistered type.
     InvalidSupervisionStrategy,    // Invalid strategy/dynamic combination.
     InvalidSupervisionIntensity,   // restart_count_max < 1 or window_duration_ticks == 0.
+    UnsupportedPlatform,           // Feature not supported on this platform (e.g. cross-shard FD handoff on Windows).
 }
 ```
 

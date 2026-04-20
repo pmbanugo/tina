@@ -38,6 +38,7 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 | `IO_TAG_SENDTO_COMPLETE` | `0x0016` |
 | `IO_TAG_RECVFROM_COMPLETE` | `0x0017` |
 | `IO_TAG_CLOSE_COMPLETE` | `0x0018` |
+| `IO_TAG_SENDFILE_COMPLETE` | `0x0019` |
 
 ---
 
@@ -185,6 +186,7 @@ Not `ctx_`-prefixed but part of the public API.
 | `io_send` | `io_send(self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Effect` | `Effect_Io` | Build a send Effect. `buffer` must live inside the Isolate struct. |
 | `io_write` | `io_write(self: ^$Isolate, fd: FD_Handle, buffer: []u8, offset: u64) -> Effect` | `Effect_Io` | Build a write Effect at a byte offset. |
 | `io_sendto` | `io_sendto(self: ^$Isolate, fd: FD_Handle, buffer: []u8, address: Socket_Address) -> Effect` | `Effect_Io` | Build a sendto Effect (UDP). |
+| `io_sendfile` | `io_sendfile(fd_socket: FD_Handle, fd_file: FD_Handle, source_offset: u64, size: u32) -> Effect` | `Effect_Io` | Build a zero-copy sendfile Effect. No Isolate memory involved — data flows from file page cache to socket. Use `SENDFILE_ALL_BYTES` for `size` to send the entire file from `source_offset`. |
 | `payload_offset_of` | `payload_offset_of(self: ^$Isolate, buffer: []u8) -> u16` | `u16` | Compute byte offset of a buffer within an Isolate's stable memory. Debug-validated. |
 
 ### Address Construction
@@ -245,6 +247,7 @@ IoOp :: union {
     IoOp_Sendto,    // {fd, address, payload_offset, payload_size}
     IoOp_Recvfrom,  // {fd, buffer_size_max}
     IoOp_Close,     // {fd}
+    IoOp_Sendfile,  // {fd_file, fd_socket, source_offset, size}
 }
 ```
 
@@ -428,6 +431,7 @@ Handoff_Mode :: enum u8 {
 | `FD_HANDLE_NONE` | `FD_Handle(0)` | Sentinel for "no FD". |
 | `SUPERVISION_GROUP_ID_NONE` | `0xFFFF` | Sentinel for "no group". |
 | `SUPERVISION_GROUP_ID_ROOT` | `0` | Root group ID. |
+| `SENDFILE_ALL_BYTES` | `max(u32)` | Pass as `size` to `io_sendfile` to send the entire file from `source_offset`. |
 
 ### Function Type Signatures
 

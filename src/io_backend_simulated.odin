@@ -46,7 +46,9 @@ when TINA_SIMULATION_MODE {
 		delay_ticks:    u64,
 		descriptor_index: u16,
 		object_index:   u16,
-		_padding:       [4]u8,
+		object_index_second: u16,
+		has_second_pin:      bool,
+		_padding:       [1]u8,
 	}
 
 	Sim_FD_State :: struct {
@@ -117,6 +119,24 @@ when TINA_SIMULATION_MODE {
 				return .System_Error
 			}
 
+			// Sendfile needs a second pin for the fd_file
+			object_index_second: u16 = SIM_OBJECT_NONE_INDEX
+			has_second_pin := false
+			if sf, ok := sub.operation.(Submission_Op_Sendfile); ok {
+				file_desc_index, file_ok := _sim_lookup_descriptor_index(backend, sf.fd_file)
+				if !file_ok {
+					_sim_unpin_object(backend, object_index)
+					return .System_Error
+				}
+				file_object_index := g_sim_fd_state.descriptors[file_desc_index].object_index
+				if !_sim_pin_object(backend, file_object_index) {
+					_sim_unpin_object(backend, object_index)
+					return .System_Error
+				}
+				object_index_second = file_object_index
+				has_second_pin = true
+			}
+
 			// Compute delay from hash seeded by (seed, tick_count, token) for determinism
 			// invariant to batch size and iteration order
 			delay: u64
@@ -131,12 +151,14 @@ when TINA_SIMULATION_MODE {
 			}
 
 			backend.pending[backend.pending_count] = Simulated_Operation {
-				token            = sub.token,
-				operation        = sub.operation,
-				submitted_tick   = backend.tick_count,
-				delay_ticks      = delay,
-				descriptor_index = descriptor_index,
-				object_index     = object_index,
+				token               = sub.token,
+				operation            = sub.operation,
+				submitted_tick       = backend.tick_count,
+				delay_ticks          = delay,
+				descriptor_index     = descriptor_index,
+				object_index         = object_index,
+				object_index_second  = object_index_second,
+				has_second_pin       = has_second_pin,
 			}
 			backend.pending_count += 1
 		}
@@ -198,6 +220,9 @@ when TINA_SIMULATION_MODE {
 				}
 
 				_sim_unpin_object(backend, op.object_index)
+				if op.has_second_pin {
+					_sim_unpin_object(backend, op.object_index_second)
+				}
 
 				completed_count += 1
 
@@ -244,6 +269,9 @@ when TINA_SIMULATION_MODE {
 		for i: u16 = 0; i < backend.pending_count; i += 1 {
 			if backend.pending[i].token == token {
 				_sim_unpin_object(backend, backend.pending[i].object_index)
+				if backend.pending[i].has_second_pin {
+					_sim_unpin_object(backend, backend.pending[i].object_index_second)
+				}
 				backend.pending_count -= 1
 				if i < backend.pending_count {
 					backend.pending[i] = backend.pending[backend.pending_count]
@@ -560,12 +588,13 @@ when TINA_SIMULATION_MODE {
 		case Submission_Op_Read:     return o.fd
 		case Submission_Op_Write:    return o.fd
 		case Submission_Op_Accept:   return o.listen_fd
-		case Submission_Op_Connect:  return o.socket_fd
+		case Submission_Op_Connect:  return o.fd_socket
 		case Submission_Op_Close:    return o.fd
-		case Submission_Op_Send:     return o.socket_fd
-		case Submission_Op_Recv:     return o.socket_fd
-		case Submission_Op_Sendto:   return o.socket_fd
-		case Submission_Op_Recvfrom: return o.socket_fd
+		case Submission_Op_Send:     return o.fd_socket
+		case Submission_Op_Recv:     return o.fd_socket
+		case Submission_Op_Sendto:   return o.fd_socket
+		case Submission_Op_Recvfrom: return o.fd_socket
+		case Submission_Op_Sendfile: return o.fd_socket
 		}
 		return OS_FD_INVALID
 	}
@@ -632,6 +661,9 @@ when TINA_SIMULATION_MODE {
 			completion.extra = Completion_Extra_Recvfrom {
 				peer_address = Socket_Address_Inet4{address = {10, 0, 0, 1}, port = 5000},
 			}
+		case Submission_Op_Sendfile:
+			sf := op.operation.(Submission_Op_Sendfile)
+			completion.result = i32(min(sf.size, 65536))
 		case:
 			completion.result = 0
 		}
@@ -711,7 +743,7 @@ when TINA_SIMULATION_MODE {
 			{
 				token = token,
 				operation = Submission_Op_Connect {
-					socket_fd = fd,
+					fd_socket = fd,
 					address = Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 8080},
 				},
 			},
@@ -746,7 +778,7 @@ when TINA_SIMULATION_MODE {
 
 		token := submission_token_pack(1, 5, 0, 0, BUFFER_INDEX_NONE, 1)
 		submissions := [1]Submission {
-			{token = token, operation = Submission_Op_Recv{socket_fd = fd, size = 4096}},
+			{token = token, operation = Submission_Op_Recv{fd_socket = fd, size = 4096}},
 		}
 		backend_submit(&backend, submissions[:])
 		testing.expect_value(t, backend.pending_count, 1)
@@ -807,7 +839,7 @@ when TINA_SIMULATION_MODE {
 			for i in 0 ..< 4 {
 				submissions[i] = Submission {
 					token = submission_token_pack(0, u32(i), 0, 0, BUFFER_INDEX_NONE, 7),
-					operation = Submission_Op_Recv{socket_fd = fds[i], size = 1024},
+					operation = Submission_Op_Recv{fd_socket = fds[i], size = 1024},
 				}
 			}
 			backend_submit(&backend, submissions[:])
@@ -862,7 +894,7 @@ when TINA_SIMULATION_MODE {
 
 		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE))
 		submissions := [1]Submission {
-			{token = token, operation = Submission_Op_Recv{socket_fd = fd, size = 1024}},
+			{token = token, operation = Submission_Op_Recv{fd_socket = fd, size = 1024}},
 		}
 		backend_submit(&backend, submissions[:])
 
@@ -949,7 +981,7 @@ when TINA_SIMULATION_MODE {
 
 		token := submission_token_pack(2, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE))
 		submissions := [1]Submission {
-			{token = token, operation = Submission_Op_Recv{socket_fd = fd, size = 256}},
+			{token = token, operation = Submission_Op_Recv{fd_socket = fd, size = 256}},
 		}
 		sub_err := backend_submit(&backend, submissions[:])
 		testing.expect_value(t, sub_err, Backend_Error.None)

@@ -52,6 +52,7 @@ IO_TAG_RECV_COMPLETE: Message_Tag : 0x0015
 IO_TAG_SENDTO_COMPLETE: Message_Tag : 0x0016
 IO_TAG_RECVFROM_COMPLETE: Message_Tag : 0x0017
 IO_TAG_CLOSE_COMPLETE: Message_Tag : 0x0018
+IO_TAG_SENDFILE_COMPLETE: Message_Tag : 0x0019
 
 // --- Socket Types (§6.6.3 §4, §9, §10) ---
 
@@ -205,6 +206,13 @@ IoOp_Close :: struct {
 	fd: FD_Handle,
 }
 
+IoOp_Sendfile :: struct {
+	fd_file:       FD_Handle,
+	fd_socket:     FD_Handle,
+	source_offset: u64,
+	size:          u32,
+}
+
 IoOp :: union {
 	IoOp_Read,
 	IoOp_Write,
@@ -215,6 +223,7 @@ IoOp :: union {
 	IoOp_Sendto,
 	IoOp_Recvfrom,
 	IoOp_Close,
+	IoOp_Sendfile,
 }
 
 // --- FD Table Entry (§6.6.3 §6) ---
@@ -422,7 +431,7 @@ Submission_Op_Accept :: struct {
 }
 
 Submission_Op_Connect :: struct {
-	socket_fd: OS_FD,
+	fd_socket: OS_FD,
 	address:   Socket_Address,
 }
 
@@ -431,28 +440,35 @@ Submission_Op_Close :: struct {
 }
 
 Submission_Op_Send :: struct {
-	socket_fd: OS_FD,
+	fd_socket: OS_FD,
 	buffer:    [^]u8,
 	size:      u32,
 }
 
 Submission_Op_Recv :: struct {
-	socket_fd: OS_FD,
+	fd_socket: OS_FD,
 	buffer:    [^]u8,
 	size:      u32,
 }
 
 Submission_Op_Sendto :: struct {
-	socket_fd: OS_FD,
+	fd_socket: OS_FD,
 	address:   Socket_Address,
 	buffer:    [^]u8,
 	size:      u32,
 }
 
 Submission_Op_Recvfrom :: struct {
-	socket_fd: OS_FD,
+	fd_socket: OS_FD,
 	buffer:    [^]u8,
 	size:      u32,
+}
+
+Submission_Op_Sendfile :: struct {
+	fd_file:       OS_FD,
+	fd_socket:     OS_FD,
+	source_offset: u64,
+	size:          u32,
 }
 
 Submission_Operation :: union {
@@ -465,6 +481,7 @@ Submission_Operation :: union {
 	Submission_Op_Recv,
 	Submission_Op_Sendto,
 	Submission_Op_Recvfrom,
+	Submission_Op_Sendfile,
 }
 
 Submission :: struct {
@@ -649,6 +666,7 @@ test_io_completion_tag_distinct :: proc(t: ^testing.T) {
 		IO_TAG_RECV_COMPLETE,
 		IO_TAG_SENDTO_COMPLETE,
 		IO_TAG_RECVFROM_COMPLETE,
+		IO_TAG_SENDFILE_COMPLETE,
 	}
 	for i in 0 ..< len(tags) {
 		for j in (i + 1) ..< len(tags) {

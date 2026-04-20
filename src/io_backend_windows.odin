@@ -30,6 +30,19 @@ when !TINA_SIMULATION_MODE {
 	// TODO: Consider exposing via Backend_Config if workloads require larger bursts.
 	MAX_WIN_COMPLETED :: 640
 
+	// TransmitFile (sendfile) — not in core:sys/windows, define locally.
+	WSAID_TRANSMITFILE :: win.GUID{0xb5367df0, 0xcbac, 0x11cf, {0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92}}
+
+	LPFN_TRANSMITFILE :: #type proc "stdcall" (
+		hSocket: win.SOCKET,
+		hFile: win.HANDLE,
+		nNumberOfBytesToWrite: win.DWORD,
+		nNumberOfBytesPerSend: win.DWORD,
+		lpOverlapped: ^win.OVERLAPPED,
+		lpTransmitBuffers: rawptr,
+		dwReserved: win.DWORD,
+	) -> win.BOOL
+
 	// Accept and Recvfrom need persistent kernel-writable buffers that survive
 	// until CQE harvest. These are mutually exclusive per entry, so we overlap
 	// them to reduce per-entry footprint (~96 bytes saved × 512 entries ≈ 48KB).
@@ -70,6 +83,7 @@ when !TINA_SIMULATION_MODE {
 		completed_read:  u16,
 		accept_ex:       win.LPFN_ACCEPTEX,
 		connect_ex:      win.LPFN_CONNECTEX,
+		transmit_file:   LPFN_TRANSMITFILE,
 	}
 
 	// ============================================================================
@@ -105,6 +119,7 @@ when !TINA_SIMULATION_MODE {
 		if dummy != win.INVALID_SOCKET {
 			_win_load_socket_fn(dummy, win.WSAID_ACCEPTEX, &backend.accept_ex)
 			_win_load_socket_fn(dummy, win.WSAID_CONNECTEX, &backend.connect_ex)
+			_win_load_socket_fn(dummy, WSAID_TRANSMITFILE, &backend.transmit_file)
 			win.closesocket(dummy)
 		}
 
@@ -242,13 +257,13 @@ when !TINA_SIMULATION_MODE {
 
 			case Submission_Op_Connect:
 				// ConnectEx requires the socket to be bound first
-				_win_bind_for_connect(op.socket_fd, op.address)
+				_win_bind_for_connect(op.fd_socket, op.address)
 
 				sockaddr, socklen := _win_socket_address_to_sockaddr(op.address)
 				ok := win.TRUE
 				if backend.connect_ex != nil {
 					ok = backend.connect_ex(
-						win.SOCKET(uintptr(op.socket_fd)),
+						win.SOCKET(uintptr(op.fd_socket)),
 						&sockaddr,
 						socklen,
 						nil,
@@ -290,7 +305,7 @@ when !TINA_SIMULATION_MODE {
 					buf = (^win.CHAR)(op.buffer),
 				}
 				rc := win.WSASend(
-					win.SOCKET(uintptr(op.socket_fd)),
+					win.SOCKET(uintptr(op.fd_socket)),
 					&wsa_buf,
 					1,
 					nil,
@@ -316,7 +331,7 @@ when !TINA_SIMULATION_MODE {
 				}
 				flags: win.DWORD = 0
 				rc := win.WSARecv(
-					win.SOCKET(uintptr(op.socket_fd)),
+					win.SOCKET(uintptr(op.fd_socket)),
 					&wsa_buf,
 					1,
 					nil,
@@ -342,7 +357,7 @@ when !TINA_SIMULATION_MODE {
 					buf = (^win.CHAR)(op.buffer),
 				}
 				rc := win.WSASendTo(
-					win.SOCKET(uintptr(op.socket_fd)),
+					win.SOCKET(uintptr(op.fd_socket)),
 					&wsa_buf,
 					1,
 					nil,
@@ -372,7 +387,7 @@ when !TINA_SIMULATION_MODE {
 				entry.op_data.recvfrom.peer_address = {}
 				entry.op_data.recvfrom.peer_address_len = win.INT(size_of(win.SOCKADDR_STORAGE_LH))
 				rc := win.WSARecvFrom(
-					win.SOCKET(uintptr(op.socket_fd)),
+					win.SOCKET(uintptr(op.fd_socket)),
 					&wsa_buf,
 					1,
 					nil,
@@ -402,6 +417,47 @@ when !TINA_SIMULATION_MODE {
 					},
 				)
 				entry.active = false
+
+			case Submission_Op_Sendfile:
+				if op.size == 0 {
+					_win_push_completion(backend, sub.token, 0, nil)
+					entry.active = false
+					continue
+				}
+
+				nbytes_to_send := op.size
+				if op.size == SENDFILE_ALL_BYTES {
+					nbytes_to_send = 0
+				}
+
+				entry.overlapped.Offset = win.DWORD(op.source_offset & 0xFFFFFFFF)
+				entry.overlapped.OffsetHigh = win.DWORD(op.source_offset >> 32)
+
+				if backend.transmit_file == nil {
+					_win_push_error_completion(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED))
+					entry.active = false
+					continue
+				}
+
+				ok := backend.transmit_file(
+					win.SOCKET(uintptr(op.fd_socket)),
+					win.HANDLE(uintptr(op.fd_file)),
+					win.DWORD(nbytes_to_send),
+					0,
+					&entry.overlapped,
+					nil,
+					0,
+				)
+				if ok == win.FALSE {
+					err := win.GetLastError()
+					if err == win.ERROR_IO_PENDING {
+						continue
+					}
+					_win_push_error_completion(backend, sub.token, i32(err))
+					entry.active = false
+					continue
+				}
+				_win_push_sync_completion(backend, entry)
 			}
 		}
 
@@ -539,7 +595,7 @@ when !TINA_SIMULATION_MODE {
 					// Enable full socket API on ConnectEx-completed socket
 					win.setsockopt(
 						win.SOCKET(uintptr(
-							entry.operation.(Submission_Op_Connect).socket_fd,
+							entry.operation.(Submission_Op_Connect).fd_socket,
 						)),
 						win.SOL_SOCKET,
 						win.SO_UPDATE_CONNECT_CONTEXT,
@@ -566,6 +622,7 @@ when !TINA_SIMULATION_MODE {
 				case Submission_Op_Send:
 				case Submission_Op_Recv:
 				case Submission_Op_Sendto:
+				case Submission_Op_Sendfile:
 				}
 			}
 
@@ -887,17 +944,19 @@ when !TINA_SIMULATION_MODE {
 		case Submission_Op_Accept:
 			return win.HANDLE(uintptr(op.listen_fd))
 		case Submission_Op_Connect:
-			return win.HANDLE(uintptr(op.socket_fd))
+			return win.HANDLE(uintptr(op.fd_socket))
 		case Submission_Op_Close:
 			return win.HANDLE(uintptr(op.fd))
 		case Submission_Op_Send:
-			return win.HANDLE(uintptr(op.socket_fd))
+			return win.HANDLE(uintptr(op.fd_socket))
 		case Submission_Op_Recv:
-			return win.HANDLE(uintptr(op.socket_fd))
+			return win.HANDLE(uintptr(op.fd_socket))
 		case Submission_Op_Sendto:
-			return win.HANDLE(uintptr(op.socket_fd))
+			return win.HANDLE(uintptr(op.fd_socket))
 		case Submission_Op_Recvfrom:
-			return win.HANDLE(uintptr(op.socket_fd))
+			return win.HANDLE(uintptr(op.fd_socket))
+		case Submission_Op_Sendfile:
+			return win.HANDLE(uintptr(op.fd_socket))
 		}
 		return win.INVALID_HANDLE_VALUE
 	}
@@ -1170,7 +1229,7 @@ when !TINA_SIMULATION_MODE {
 		connect_submissions := [1]Submission {
 			{
 				token = connect_token,
-				operation = Submission_Op_Connect{socket_fd = client_fd, address = connect_address},
+				operation = Submission_Op_Connect{fd_socket = client_fd, address = connect_address},
 			},
 		}
 		backend_submit(backend, connect_submissions[:])
@@ -1245,7 +1304,7 @@ when !TINA_SIMULATION_MODE {
 		submissions := [1]Submission {
 			{
 				token = token,
-				operation = Submission_Op_Connect{socket_fd = client_fd, address = connect_address},
+				operation = Submission_Op_Connect{fd_socket = client_fd, address = connect_address},
 			},
 		}
 		backend_submit(backend, submissions[:])
@@ -1312,7 +1371,7 @@ when !TINA_SIMULATION_MODE {
 			{
 				token = connect_token,
 				operation = Submission_Op_Connect{
-					socket_fd = client_fd,
+					fd_socket = client_fd,
 					address = connect_address,
 				},
 			},
@@ -1349,7 +1408,7 @@ when !TINA_SIMULATION_MODE {
 			{
 				token = send_token,
 				operation = Submission_Op_Send{
-					socket_fd = client_fd,
+					fd_socket = client_fd,
 					buffer = &send_data[0],
 					size = 4,
 				},
@@ -1364,7 +1423,7 @@ when !TINA_SIMULATION_MODE {
 			{
 				token = recv_token,
 				operation = Submission_Op_Recv{
-					socket_fd = server_fd,
+					fd_socket = server_fd,
 					buffer = &recv_buf[0],
 					size = 64,
 				},

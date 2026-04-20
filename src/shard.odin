@@ -1155,36 +1155,38 @@ _alloc_handoff_test_entry :: proc(
 
 @(test)
 test_fd_handoff_timeout_scan_counts_but_keeps_entry :: proc(t: ^testing.T) {
-	shard: Shard
+	shard := new(Shard)
+	defer free(shard)
 	handoff_backing: [2]FD_Handoff_Entry
-	_init_handoff_test_shard(t, &shard, handoff_backing[:])
+	_init_handoff_test_shard(t, shard, handoff_backing[:])
 	defer backend_deinit(&shard.reactor.backend)
 
 	target_handle := make_handle(1, 1, 0, 1)
-	ref := _alloc_handoff_test_entry(t, &shard, target_handle, 5)
+	ref := _alloc_handoff_test_entry(t, shard, target_handle, 5)
 
-	_fd_handoff_timeout_scan(&shard, 6)
+	_fd_handoff_timeout_scan(shard, 6)
 
 	entry, found := fd_handoff_table_lookup(&shard.handoff_table, ref)
 	testing.expect(t, found, "timed out entry must remain in-flight (FDs still live)")
 	testing.expect_value(t, entry.deadline_tick, u64(0))
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(1))
 
-	_fd_handoff_timeout_scan(&shard, 100)
+	_fd_handoff_timeout_scan(shard, 100)
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(1))
 }
 
 @(test)
 test_shard_mass_teardown_reclaims_in_flight_handoff_entries :: proc(t: ^testing.T) {
-	shard: Shard
+	shard := new(Shard)
+	defer free(shard)
 	handoff_backing: [2]FD_Handoff_Entry
-	_init_handoff_test_shard(t, &shard, handoff_backing[:])
+	_init_handoff_test_shard(t, shard, handoff_backing[:])
 	defer backend_deinit(&shard.reactor.backend)
 
 	target_handle := make_handle(1, 1, 0, 1)
-	ref := _alloc_handoff_test_entry(t, &shard, target_handle, 100)
+	ref := _alloc_handoff_test_entry(t, shard, target_handle, 100)
 
-	shard_mass_teardown(&shard)
+	shard_mass_teardown(shard)
 
 	_, found := fd_handoff_table_lookup(&shard.handoff_table, ref)
 	testing.expect(t, !found, "mass teardown should reclaim in-flight handoff entries")

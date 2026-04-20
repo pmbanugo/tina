@@ -55,15 +55,34 @@ when !TINA_SIMULATION_MODE {
 		_HAS_SO_NOSIGPIPE :: false
 	}
 
+	when ODIN_OS == .Darwin {
+		foreign import _libc "system:System.framework"
+		@(private = "file")
+		foreign _libc {
+			@(link_name = "sendfile")
+			_darwin_sendfile :: proc(fd: posix.FD, s: posix.FD, offset: posix.off_t, len: ^posix.off_t, hdtr: rawptr, flags: c.int) -> c.int ---
+		}
+	} else when ODIN_OS == .FreeBSD {
+		foreign import _libc "system:c"
+		@(private = "file")
+		foreign _libc {
+			@(link_name = "sendfile")
+			_freebsd_sendfile :: proc(fd: posix.FD, s: posix.FD, offset: posix.off_t, nbytes: c.size_t, hdtr: rawptr, sbytes: ^posix.off_t, flags: c.int) -> c.int ---
+		}
+	}
+
 	Pending_Posix_Op_Flag :: enum u8 {
 		Connect_In_Progress,
 	}
 	Pending_Posix_Op_Flags :: bit_set[Pending_Posix_Op_Flag;u8]
 
 	Pending_Posix_Op :: struct {
-		token:     Submission_Token,
-		operation: Submission_Operation,
-		flags:     Pending_Posix_Op_Flags,
+		token:         Submission_Token,
+		operation:     Submission_Operation,
+		subject_fd:    OS_FD,
+		kqueue_ident:  uintptr,
+		kqueue_filter: kq.Filter,
+		flags:         Pending_Posix_Op_Flags,
 	}
 
 	_Platform_State :: struct {
@@ -140,14 +159,18 @@ when !TINA_SIMULATION_MODE {
 				if _is_connect_op(&sub.operation) {
 					pending_flags = {.Connect_In_Progress}
 				}
+				subject_fd, kq_ident, kq_filter := _submission_op_metadata(sub.operation)
 				backend.pending[backend.pending_count] = Pending_Posix_Op {
-					token     = sub.token,
-					operation = sub.operation,
-					flags     = pending_flags,
+					token         = sub.token,
+					operation     = sub.operation,
+					subject_fd    = subject_fd,
+					kqueue_ident  = kq_ident,
+					kqueue_filter = kq_filter,
+					flags         = pending_flags,
 				}
 				backend.pending_count += 1
 
-				reg_err := _register_kqueue(backend, &sub)
+				reg_err := _register_kqueue(backend, &backend.pending[backend.pending_count - 1])
 				if reg_err != .None {
 					// Registration failed — remove from pending and complete as error.
 					// Cannot fail the batch: earlier submissions may have already
@@ -265,7 +288,7 @@ when !TINA_SIMULATION_MODE {
 				}
 				socket_error: posix.Errno
 				socket_error_size := posix.socklen_t(size_of(socket_error))
-				connect_fd := pop.operation.(Submission_Op_Connect).socket_fd
+				connect_fd := pop.operation.(Submission_Op_Connect).fd_socket
 				getsockopt_result := posix.getsockopt(
 					posix.FD(connect_fd),
 					posix.SOL_SOCKET,
@@ -307,8 +330,8 @@ when !TINA_SIMULATION_MODE {
 				)
 				_remove_pending(backend, u16(pending_index))
 			} else {
-				// Still not ready — re-register ONESHOT.
-				rearm_error := _register_kqueue(backend, &sub)
+			// Still not ready — re-register ONESHOT.
+				rearm_error := _register_kqueue(backend, pop)
 				if rearm_error != .None {
 					// Re-registration failed — complete as error to avoid stranding
 					// this operation in pending forever with no kqueue wakeup.
@@ -738,7 +761,7 @@ when !TINA_SIMULATION_MODE {
 
 		case Submission_Op_Connect:
 			sa, sa_len := _socket_address_to_sockaddr(op.address)
-			if posix.connect(posix.FD(op.socket_fd), (^posix.sockaddr)(&sa), sa_len) != .OK {
+			if posix.connect(posix.FD(op.fd_socket), (^posix.sockaddr)(&sa), sa_len) != .OK {
 				errno := posix.errno()
 				if errno == .EINPROGRESS || errno == .EWOULDBLOCK {
 					return result, false
@@ -758,7 +781,7 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Send:
-			n := posix.send(posix.FD(op.socket_fd), rawptr(op.buffer), uint(op.size), {.NOSIGNAL})
+			n := posix.send(posix.FD(op.fd_socket), rawptr(op.buffer), uint(op.size), {.NOSIGNAL})
 			if n < 0 {
 				errno := posix.errno()
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
@@ -771,7 +794,7 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Recv:
-			n := posix.recv(posix.FD(op.socket_fd), rawptr(op.buffer), uint(op.size), {})
+			n := posix.recv(posix.FD(op.fd_socket), rawptr(op.buffer), uint(op.size), {})
 			if n < 0 {
 				errno := posix.errno()
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
@@ -786,7 +809,7 @@ when !TINA_SIMULATION_MODE {
 		case Submission_Op_Sendto:
 			sa, sa_len := _socket_address_to_sockaddr(op.address)
 			n := posix.sendto(
-				posix.FD(op.socket_fd),
+				posix.FD(op.fd_socket),
 				rawptr(op.buffer),
 				uint(op.size),
 				{.NOSIGNAL},
@@ -808,7 +831,7 @@ when !TINA_SIMULATION_MODE {
 			peer_addr: posix.sockaddr_storage
 			addr_len := posix.socklen_t(size_of(peer_addr))
 			n := posix.recvfrom(
-				posix.FD(op.socket_fd),
+				posix.FD(op.fd_socket),
 				rawptr(op.buffer),
 				uint(op.size),
 				{},
@@ -829,6 +852,74 @@ when !TINA_SIMULATION_MODE {
 			}
 			return result, true
 
+		case Submission_Op_Sendfile:
+			if op.size == 0 {
+				result.result = 0
+				return result, true
+			}
+			nbytes_to_send := op.size
+			if op.size == SENDFILE_ALL_BYTES {
+				nbytes_to_send = 0
+			}
+
+			when ODIN_OS == .Darwin {
+				len_val := posix.off_t(nbytes_to_send)
+				rc := _darwin_sendfile(
+					posix.FD(op.fd_file),
+					posix.FD(op.fd_socket),
+					posix.off_t(op.source_offset),
+					&len_val,
+					nil,
+					0,
+				)
+				if rc == 0 {
+					result.result = i32(len_val)
+					return result, true
+				}
+				errno := posix.errno()
+				// Partial progress takes priority — report bytes sent even on fatal errors.
+				if len_val > 0 {
+					result.result = i32(len_val)
+					return result, true
+				}
+				if errno == .EAGAIN || errno == .EWOULDBLOCK {
+					return result, false
+				}
+				result.result = -i32(errno)
+				return result, true
+			} else when ODIN_OS == .FreeBSD {
+				sbytes: posix.off_t
+				rc := _freebsd_sendfile(
+					posix.FD(op.fd_file),
+					posix.FD(op.fd_socket),
+					posix.off_t(op.source_offset),
+					c.size_t(nbytes_to_send),
+					nil,
+					&sbytes,
+					0,
+				)
+				if rc == 0 {
+					result.result = i32(sbytes)
+					return result, true
+				}
+				errno := posix.errno()
+
+				if sbytes > 0 {
+					result.result = i32(sbytes)
+					return result, true
+				}
+
+				if errno == .EAGAIN || errno == .EWOULDBLOCK {
+					return result, false
+				}
+
+				result.result = -i32(errno)
+				return result, true
+			} else {
+				result.result = -i32(posix.Errno.EOPNOTSUPP)
+				return result, true
+			}
+
 		case:
 			result.result = 0
 			return result, true
@@ -836,47 +927,46 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_register_kqueue :: proc(backend: ^Platform_Backend, sub: ^Submission) -> Backend_Error {
-		filter: kq.Filter
-		ident: uintptr
-
-		switch op in sub.operation {
+	_submission_op_metadata :: proc "contextless" (op: Submission_Operation) -> (subject_fd: OS_FD, ident: uintptr, filter: kq.Filter) {
+		switch o in op {
 		case Submission_Op_Read:
-			filter = .Read
-			ident = uintptr(op.fd)
+			return o.fd, uintptr(o.fd), .Read
 		case Submission_Op_Recv:
-			filter = .Read
-			ident = uintptr(op.socket_fd)
+			return o.fd_socket, uintptr(o.fd_socket), .Read
 		case Submission_Op_Recvfrom:
-			filter = .Read
-			ident = uintptr(op.socket_fd)
+			return o.fd_socket, uintptr(o.fd_socket), .Read
 		case Submission_Op_Accept:
-			filter = .Read
-			ident = uintptr(op.listen_fd)
+			return o.listen_fd, uintptr(o.listen_fd), .Read
 		case Submission_Op_Write:
-			filter = .Write
-			ident = uintptr(op.fd)
+			return o.fd, uintptr(o.fd), .Write
 		case Submission_Op_Send:
-			filter = .Write
-			ident = uintptr(op.socket_fd)
+			return o.fd_socket, uintptr(o.fd_socket), .Write
 		case Submission_Op_Sendto:
-			filter = .Write
-			ident = uintptr(op.socket_fd)
+			return o.fd_socket, uintptr(o.fd_socket), .Write
 		case Submission_Op_Connect:
-			filter = .Write
-			ident = uintptr(op.socket_fd)
+			return o.fd_socket, uintptr(o.fd_socket), .Write
+		case Submission_Op_Sendfile:
+			return o.fd_socket, uintptr(o.fd_socket), .Write
 		case Submission_Op_Close:
-			return .None
+			return o.fd, 0, .Read
 		case:
-			return .Unsupported
+			return OS_FD_INVALID, 0, .Read
+		}
+	}
+
+	@(private = "file")
+	_register_kqueue :: proc(backend: ^Platform_Backend, pending: ^Pending_Posix_Op) -> Backend_Error {
+		// Close operations don't need kqueue registration.
+		if _, is_close := pending.operation.(Submission_Op_Close); is_close {
+			return .None
 		}
 
 		ev := [1]kq.KEvent {
 			{
-				ident = ident,
-				filter = filter,
+				ident = pending.kqueue_ident,
+				filter = pending.kqueue_filter,
 				flags = {.Add, .Enable, .One_Shot},
-				udata = rawptr(uintptr(u64(sub.token))),
+				udata = rawptr(uintptr(u64(pending.token))),
 			},
 		}
 		time_spec: posix.timespec
@@ -913,8 +1003,7 @@ when !TINA_SIMULATION_MODE {
 	_sweep_pending_for_fd :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) {
 		i: u16 = 0
 		for i < backend.pending_count {
-			op_fd := _submission_op_fd(backend.pending[i].operation)
-			if op_fd == fd {
+			if backend.pending[i].subject_fd == fd {
 				// Synthesize cancellation completion
 				if backend.completed_count < MAX_POSIX_COMPLETED {
 					backend.completed[backend.completed_count] = Raw_Completion {
@@ -930,32 +1019,6 @@ when !TINA_SIMULATION_MODE {
 				i += 1
 			}
 		}
-	}
-
-	// Extract the OS_FD from a Submission_Operation for FD-based sweep matching.
-	@(private = "file")
-	_submission_op_fd :: proc "contextless" (op: Submission_Operation) -> OS_FD {
-		switch o in op {
-		case Submission_Op_Read:
-			return o.fd
-		case Submission_Op_Write:
-			return o.fd
-		case Submission_Op_Accept:
-			return o.listen_fd
-		case Submission_Op_Connect:
-			return o.socket_fd
-		case Submission_Op_Close:
-			return o.fd
-		case Submission_Op_Send:
-			return o.socket_fd
-		case Submission_Op_Recv:
-			return o.socket_fd
-		case Submission_Op_Sendto:
-			return o.socket_fd
-		case Submission_Op_Recvfrom:
-			return o.socket_fd
-		}
-		return OS_FD_INVALID
 	}
 
 	@(private = "file")
