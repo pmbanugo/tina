@@ -144,12 +144,13 @@ validate_token_bytes :: proc "contextless" (bytes_array: []u8) -> bool {
 
 // Parses a base-10 Content-Length value.
 // Precondition: digit_bytes must contain ONLY validated '0'..'9' characters.
-// Returns (parsed_size, true) on success, (0, false) on overflow.
+// Returns (parsed_size, true) on success, (0, false) on empty input or conservative range reject.
 parse_decimal_size :: proc "contextless" (digit_bytes: []u8) -> (u64, bool) {
 	if len(digit_bytes) == 0 do return 0, false
 
-	// u64 max is 20 digits. Any input with 20+ digits requires per-digit 
-	// overflow checking. Inputs with <= 19 digits are mathematically safe from wrap.
+	// Conservative fast guard: u64 max is 20 digits (18,446,744,073,709,551,615).
+	// Every 19-digit decimal value fits in u64, so rejecting all 20+ digit inputs
+	// keeps the hot loop below branchless with no per-digit overflow check.
 	if len(digit_bytes) > 19 do return 0, false
 
 	parsed_size: u64 = 0
