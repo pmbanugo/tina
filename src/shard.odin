@@ -174,7 +174,7 @@ Shard :: struct {
 	next_correlation_id:    u32,
 	current_msg_slot:       u32,
 	current_slot_index:     u32,
-	id:                     u8,
+	id:                     Shard_Id,
 	current_type_id:        u16,
 	peer_alive_mask:        Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
 	control_signal:         Control_Signal, // Atomic, mutually exclusive signals from watchdog
@@ -1083,7 +1083,7 @@ shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
 @(private = "package")
 _process_inbound_envelope :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	source_shard: u8,
+	source_shard: Shard_Id,
 	envelope: ^Message_Envelope,
 ) {
 	// System Broadcast Intercept

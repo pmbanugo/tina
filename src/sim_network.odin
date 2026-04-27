@@ -105,7 +105,7 @@ when TINA_SIMULATION_MODE {
 	sim_network_enqueue :: #force_inline proc "contextless" (
 		net: ^SimulatedNetwork,
 		source_shard: ^Shard,
-		target: u8,
+		target: Shard_Id,
 		envelope: Message_Envelope,
 		current_tick: u64,
 		fault_config: ^FaultConfig,
@@ -143,7 +143,7 @@ when TINA_SIMULATION_MODE {
 	sim_network_drain :: #force_inline proc "contextless" (
 		net: ^SimulatedNetwork,
 		target_shard: ^Shard,
-		source: u8,
+		source: Shard_Id,
 		current_tick: u64,
 	) {
 		target := target_shard.id

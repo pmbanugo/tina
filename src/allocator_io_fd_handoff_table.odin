@@ -25,7 +25,7 @@ fd_handoff_table_alloc :: proc "contextless" (
 	cleanup_fd: OS_FD,
 	peer_address: Peer_Address,
 	deadline_tick: u64,
-	source_shard: u8,
+	source_shard: Shard_Id,
 ) -> (
 	FD_Handoff_Ref,
 	bool,

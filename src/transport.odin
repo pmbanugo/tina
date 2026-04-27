@@ -18,7 +18,7 @@ transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now:
 				available := spsc_ring_available_to_read(ring)
 				for i in 0 ..< available {
 					envelope := spsc_ring_get_read_ptr(ring, i)
-					_process_inbound_envelope(shard, u8(source_shard), envelope)
+					_process_inbound_envelope(shard, Shard_Id(source_shard), envelope)
 				}
 
 				if available > 0 {
@@ -31,9 +31,9 @@ transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now:
 			// Drain sources in ascending shard order. This keeps delivery order
 			// stable and matches the fixed ordered-drain discipline expected by
 			// the simulation ADR.
-			for source in u8(0) ..< shard.sim_state.network.shard_count {
-				if source != shard.id {
-					sim_network_drain(shard.sim_state.network, shard, source, now)
+			for source in 0 ..< shard.sim_state.network.shard_count {
+				if Shard_Id(source) != shard.id {
+					sim_network_drain(shard.sim_state.network, shard, Shard_Id(source), now)
 				}
 			}
 		}
@@ -56,7 +56,7 @@ transport_flush_outbound :: #force_inline proc "contextless" (shard: ^Shard) {
 @(private = "package")
 transport_route_envelope :: #force_inline proc "contextless" (
 	source_shard: ^Shard,
-	destination_shard: u8,
+	destination_shard: Shard_Id,
 	msg_envelope: ^Message_Envelope,
 ) -> Send_Result {
 	when !TINA_SIMULATION_MODE {
@@ -98,12 +98,12 @@ transport_broadcast_envelope :: #force_inline proc "contextless" (
 ) {
 	when TINA_SIMULATION_MODE {
 		if shard.sim_state.network != nil {
-			for target_shard in u8(0) ..< shard.sim_state.network.shard_count {
-				if target_shard != shard.id {
+		for target_shard in 0 ..< shard.sim_state.network.shard_count {
+				if Shard_Id(target_shard) != shard.id {
 					_ = sim_network_enqueue(
 						shard.sim_state.network,
 						shard,
-						target_shard,
+						Shard_Id(target_shard),
 						env^,
 						shard.current_tick,
 						shard.sim_state.fault_config,

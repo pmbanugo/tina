@@ -25,7 +25,7 @@ Shard_Config :: struct #align (CACHE_LINE_SIZE) {
 	watchdog_state:    u8,
 	os_thread_handle:  rawptr,
 	total_memory_size: int,
-	shard_id:          u8,
+	shard_id:          Shard_Id,
 	target_core:       u8,
 	shard_restart_count:         u16,
 	_padding:                    [4]u8,
@@ -104,7 +104,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 		}
 		config.barrier = barrier
 		config.total_memory_size = shard_memory_size
-		config.shard_id = i
+		config.shard_id = Shard_Id(i)
 		config.target_core = u8(i) // Mapped directly to shard_id by default
 	}
 

@@ -369,7 +369,7 @@ ctx_type_config :: #force_inline proc(ctx: ^TinaContext) -> ^TypeDescriptor {
 	return &shard.type_descriptors[type_id]
 }
 
-ctx_shard_id :: #force_inline proc(ctx: ^TinaContext) -> u8 {
+ctx_shard_id :: #force_inline proc(ctx: ^TinaContext) -> Shard_Id {
 	shard := _ctx_extract_shard(ctx)
 	return shard.id
 }

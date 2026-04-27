@@ -82,7 +82,7 @@ when TINA_SIMULATION_MODE {
 
 		for i in 0 ..< spec.shard_count {
 			shard := &sim.shards[i]
-			shard.id = u8(i)
+			shard.id = Shard_Id(i)
 			shard.sim_state.network = &sim.network
 			shard.sim_state.fault_config = &spec.simulation.faults
 			shard.sim_state.crash_prng = &sim.prng_tree.shard_crash[i]

@@ -300,6 +300,6 @@ make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8
 // or handle a specific piece of data.
 // If your keys are not uniformly distributed (e.g., memory addresses),
 // perhaps hash them before passing them here.
-key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u8) -> u8 {
-	return u8(key % u64(shard_count))
+key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u8) -> Shard_Id {
+	return Shard_Id(key % u64(shard_count))
 }

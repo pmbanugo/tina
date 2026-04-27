@@ -278,7 +278,7 @@ FD_HANDOFF_NONE_INDEX :: u16(0xFFFF)
 FD_Handoff_Ref :: struct {
 	handoff_index: u16,
 	generation:    u16,
-	source_shard:  u8,
+	source_shard:  Shard_Id,
 	_padding:      [3]u8,
 }
 
@@ -335,7 +335,7 @@ FD_Handoff_Table :: struct {
 fd_handoff_ref_make :: #force_inline proc "contextless" (
 	handoff_index: u16,
 	generation: u16,
-	source_shard: u8,
+	source_shard: Shard_Id,
 ) -> FD_Handoff_Ref {
 	return FD_Handoff_Ref {
 		handoff_index = handoff_index,

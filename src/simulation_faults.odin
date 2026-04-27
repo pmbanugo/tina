@@ -18,9 +18,9 @@ when TINA_SIMULATION_MODE {
 		if heal_rate.numerator > 0 {
 			for source in 0 ..< engine.shard_count {
 				for id in 0 ..< engine.shard_count {
-					if shard_mask_contains(&engine.network.partition_matrix[source], id) {
+					if shard_mask_contains(&engine.network.partition_matrix[source], Shard_Id(id)) {
 						if ratio_chance(heal_rate, engine.partition_prng) {
-							shard_mask_exclude(&engine.network.partition_matrix[source], id)
+							shard_mask_exclude(&engine.network.partition_matrix[source], Shard_Id(id))
 						}
 					}
 				}
@@ -34,8 +34,8 @@ when TINA_SIMULATION_MODE {
 				victim := u8(prng_uint_less_than(engine.partition_prng, u32(engine.shard_count)))
 				for other in 0 ..< engine.shard_count {
 					if other != victim {
-						shard_mask_include(&engine.network.partition_matrix[victim], other)
-						shard_mask_include(&engine.network.partition_matrix[other], victim)
+						shard_mask_include(&engine.network.partition_matrix[victim], Shard_Id(other))
+						shard_mask_include(&engine.network.partition_matrix[other], Shard_Id(victim))
 					}
 				}
 			}
