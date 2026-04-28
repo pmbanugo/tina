@@ -208,22 +208,27 @@ payload_offset_of :: #force_inline proc(self: ^$Isolate, buffer: []u8) -> u16 {
 io_send :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Effect {
 	return Effect_Io {
 		operation = IoOp_Send {
-			fd             = fd,
+			fd = fd,
 			payload_offset = payload_offset_of(self, buffer),
-			payload_size   = u32(len(buffer)),
+			payload_size = u32(len(buffer)),
 		},
 	}
 }
 
 // Builds an Effect that writes data from an Isolate's buffer to a file descriptor at a byte offset.
 // Computes payload_offset automatically from the buffer slice.
-io_write :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8, offset: u64) -> Effect {
+io_write :: #force_inline proc(
+	self: ^$Isolate,
+	fd: FD_Handle,
+	buffer: []u8,
+	offset: u64,
+) -> Effect {
 	return Effect_Io {
 		operation = IoOp_Write {
-			fd             = fd,
+			fd = fd,
 			payload_offset = payload_offset_of(self, buffer),
-			payload_size   = u32(len(buffer)),
-			offset         = offset,
+			payload_size = u32(len(buffer)),
+			offset = offset,
 		},
 	}
 }
@@ -231,26 +236,36 @@ io_write :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8, off
 // Builds an Effect that transfers file data directly to a socket via kernel zero-copy (sendfile).
 // No Isolate memory is involved — data flows from the file's page cache to the socket.
 // The caller manages offset progression: next offset = source_offset + completion.result.
-io_sendfile :: #force_inline proc "contextless" (fd_socket: FD_Handle, fd_file: FD_Handle, source_offset: u64, size: u32) -> Effect {
+io_sendfile :: #force_inline proc "contextless" (
+	fd_socket: FD_Handle,
+	fd_file: FD_Handle,
+	source_offset: u64,
+	size: u32,
+) -> Effect {
 	return Effect_Io {
 		operation = IoOp_Sendfile {
-			fd_file       = fd_file,
-			fd_socket     = fd_socket,
+			fd_file = fd_file,
+			fd_socket = fd_socket,
 			source_offset = source_offset,
-			size          = size,
+			size = size,
 		},
 	}
 }
 
 // Builds an Effect that sends data from an Isolate's buffer to a specific network address (UDP).
 // Computes payload_offset automatically from the buffer slice.
-io_sendto :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8, address: Socket_Address) -> Effect {
+io_sendto :: #force_inline proc(
+	self: ^$Isolate,
+	fd: FD_Handle,
+	buffer: []u8,
+	address: Socket_Address,
+) -> Effect {
 	return Effect_Io {
 		operation = IoOp_Sendto {
-			fd             = fd,
-			address        = address,
+			fd = fd,
+			address = address,
 			payload_offset = payload_offset_of(self, buffer),
-			payload_size   = u32(len(buffer)),
+			payload_size = u32(len(buffer)),
 		},
 	}
 }
@@ -261,7 +276,12 @@ ipv4 :: #force_inline proc "contextless" (a, b, c, d: u8, port: u16) -> Socket_A
 }
 
 // Constructs an IPv6 socket address.
-ipv6 :: #force_inline proc "contextless" (addr: [16]u8, port: u16, flow: u32 = 0, scope: u32 = 0) -> Socket_Address {
+ipv6 :: #force_inline proc "contextless" (
+	addr: [16]u8,
+	port: u16,
+	flow: u32 = 0,
+	scope: u32 = 0,
+) -> Socket_Address {
 	return Socket_Address_Inet6{address = addr, port = port, flow = flow, scope = scope}
 }
 
@@ -293,13 +313,30 @@ make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8
 	return buf, u8(size_of(T))
 }
 
+// SplitMix64 finalizer to guarantee bit-avalanche.
+mix_bits_to_32 :: #force_inline proc "contextless" (key: u64) -> u32 {
+	hash_value := key
+	hash_value = (hash_value ~ (hash_value >> 30)) * 0xbf58476d1ce4e5b9
+	hash_value = (hash_value ~ (hash_value >> 27)) * 0x94d049bb133111eb
+	hash_value = hash_value ~ (hash_value >> 31)
+
+	// We only need 32 bits of entropy for fastrange against a u8 divisor.
+	// The highest bits have the best avalanche properties.
+	return u32(hash_value >> 32)
+}
+
 // Consistent key-based partitioning utility
-// Uses simple modulo to map a logical key (e.g., session_id, user_id)
-// to a Shard ID.
+// Safely maps any u64 key (e.g., session_id, user_id) to a Shard_Id.
 // Use this when you need to decide which Shard should spawn a new Isolate
 // or handle a specific piece of data.
-// If your keys are not uniformly distributed (e.g., memory addresses),
-// perhaps hash them before passing them here.
+// TODO: consider a second option/kind that doesn't need Bijection Mixer,
+// if keys are already well distributed random u64
 key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u8) -> Shard_Id {
-	return Shard_Id(key % u64(shard_count))
+	// Bijection Mixer: Guarantee uniform distribution regardless of input shape.
+	hash_value_32 := mix_bits_to_32(key)
+
+	// Mapping: fastrange. (hash * N) >> 32
+	shard_index := u8((u64(hash_value_32) * u64(shard_count)) >> 32)
+
+	return Shard_Id(shard_index)
 }
