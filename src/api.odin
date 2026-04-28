@@ -313,6 +313,11 @@ make_spawn_args :: #force_inline proc(args: ^$T) -> (buf: [MAX_INIT_ARGS_SIZE]u8
 	return buf, u8(size_of(T))
 }
 
+// A distinct type representing a value that already has high entropy
+// in its highest bits. You MUST explicitly cast to this type to
+// bypass the SplitMix64 safety net for key_to_shard().
+Hashed_Key_32 :: distinct u32
+
 // SplitMix64 finalizer to guarantee bit-avalanche.
 mix_bits_to_32 :: #force_inline proc "contextless" (key: u64) -> u32 {
 	hash_value := key
@@ -329,9 +334,7 @@ mix_bits_to_32 :: #force_inline proc "contextless" (key: u64) -> u32 {
 // Safely maps any u64 key (e.g., session_id, user_id) to a Shard_Id.
 // Use this when you need to decide which Shard should spawn a new Isolate
 // or handle a specific piece of data.
-// TODO: consider a second option/kind that doesn't need Bijection Mixer,
-// if keys are already well distributed random u64
-key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u8) -> Shard_Id {
+from_key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u8) -> Shard_Id {
 	// Bijection Mixer: Guarantee uniform distribution regardless of input shape.
 	hash_value_32 := mix_bits_to_32(key)
 
@@ -339,4 +342,22 @@ key_to_shard :: #force_inline proc "contextless" (key: u64, shard_count: u8) -> 
 	shard_index := u8((u64(hash_value_32) * u64(shard_count)) >> 32)
 
 	return Shard_Id(shard_index)
+}
+
+// Consistent key-based partitioning utility
+// Accepts a Hashed_Key_32 & skips the Bijection Mixer entirely
+// and just applies the fastrange mapping.
+from_hash_to_shard :: #force_inline proc "contextless" (
+	hash: Hashed_Key_32,
+	shard_count: u8,
+) -> Shard_Id {
+	// Fastrange map directly
+	shard_index := u8((u64(hash) * u64(shard_count)) >> 32)
+	return Shard_Id(shard_index)
+}
+
+// Consistent key-based partitioning utility
+key_to_shard :: proc {
+	from_key_to_shard,
+	from_hash_to_shard,
 }
