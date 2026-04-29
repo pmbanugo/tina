@@ -2,11 +2,6 @@ package http_server
 
 import "core:testing"
 
-// ─── HTTP Methods ───────────────────────────────────────────────────────────
-//
-// Enum values map 1:1 to RFC 9110 method tokens. The ordering is chosen so
-// GET (the common case) occupies value 0 for branch-friendly default comparison.
-
 Method :: enum u8 {
 	GET,
 	POST,
@@ -18,44 +13,8 @@ Method :: enum u8 {
 	TRACE,
 }
 
-// Branchless method matching via `request_method in route_method_mask`.
-// A single bitwise AND replaces a chain of equality comparisons.
-Method_Mask :: distinct bit_set[Method; u8]
-
-// ─── Route Index ────────────────────────────────────────────────────────────
-//
-// Dense index into Compiled_Router.descriptors[]. 0xFF is the sentinel for "no route".
-
-Route_Index :: distinct u8
-
-ROUTE_INDEX_NONE :: Route_Index(0xFF)
-
-// ─── Route Step ─────────────────────────────────────────────────────────────
-//
-// Small instruction returned by route handlers telling the library what
-// phase to enter next. The connection state machine interprets this after
-// each handler invocation.
-
-Route_Step :: union {
-	Step_Flush,
-	Step_Read_Body,
-	Step_Close,
-}
-
-// Send the current egress buffer contents.
-// final=true means the response is complete after this flush.
-// final=false means the handler expects a Send_Ready callback when the
-// buffer drains.
-Step_Flush :: struct {
-	final: bool,
-}
-
-// Begin or continue reading request body. Body limit is set per-route
-// in Route_Descriptor.body_limit, not per-call.
-Step_Read_Body :: struct {}
-
-// Close the connection after the current safe point.
-Step_Close :: struct {}
+// Used for method matching via `request_method in route_method_mask`.
+Method_Mask :: distinct bit_set[Method;u8]
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -101,36 +60,4 @@ test_method_mask_set_operations :: proc(t: ^testing.T) {
 	testing.expect(t, .GET in intersection, "GET in intersection")
 	testing.expect(t, .HEAD not_in intersection, "HEAD not in intersection")
 	testing.expect(t, .POST not_in intersection, "POST not in intersection")
-}
-
-@(test)
-test_route_index_sentinel :: proc(t: ^testing.T) {
-	testing.expect_value(t, u8(ROUTE_INDEX_NONE), 0xFF)
-
-	// A valid route index must be less than the sentinel.
-	valid_index := Route_Index(0)
-	testing.expect(t, valid_index != ROUTE_INDEX_NONE, "valid index should differ from sentinel")
-}
-
-@(test)
-test_route_step_variant_discrimination :: proc(t: ^testing.T) {
-	// Step_Flush
-	step_flush: Route_Step = Step_Flush{final = true}
-	flush, is_flush := step_flush.(Step_Flush)
-	testing.expect(t, is_flush, "should be Step_Flush")
-	testing.expect(t, flush.final, "final should be true")
-
-	// Step_Read_Body
-	step_read: Route_Step = Step_Read_Body{}
-	_, is_read := step_read.(Step_Read_Body)
-	testing.expect(t, is_read, "should be Step_Read_Body")
-
-	// Step_Close
-	step_close: Route_Step = Step_Close{}
-	_, is_close := step_close.(Step_Close)
-	testing.expect(t, is_close, "should be Step_Close")
-
-	// nil union — the zero value
-	step_nil: Route_Step
-	testing.expect(t, step_nil == nil, "zero Route_Step should be nil")
 }
