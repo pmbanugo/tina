@@ -1,6 +1,6 @@
 # The `ctx` API Reference
 
-Complete public API surface available to Isolate `init_fn` and `handler_fn` callbacks. All functions operate on a `^TinaContext` passed by the scheduler.
+Complete public API surface available to Isolate `init_handler` and `handler_fn` callbacks. All functions operate on a `^TinaContext` passed by the scheduler.
 
 Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
@@ -208,7 +208,7 @@ Not `ctx_`-prefixed but part of the public API.
 
 ### `Effect`
 
-Tagged union returned by `init_fn` and `handler_fn`. Tells the scheduler what to do next.
+Tagged union returned by `init_handler` and `handler_fn`. Tells the scheduler what to do next.
 
 ```odin
 Effect :: union {
@@ -278,7 +278,7 @@ Spawn_Error :: enum u8 {
     arena_full,          // No memory for the Isolate's slot.
     group_full,          // Supervision group at dynamic child capacity.
     type_not_allocated,  // Type ID has no allocated slots on this Shard.
-    init_failed,         // init_fn returned an error Effect.
+    init_failed,         // init_handler returned an error Effect.
 }
 ```
 
@@ -300,7 +300,7 @@ Spawn_Spec :: struct {
 
 ### `TinaContext`
 
-The primary API gateway. Passed to `init_fn` and `handler_fn`.
+The primary API gateway. Passed to `init_handler` and `handler_fn`.
 
 **User-visible fields:**
 
@@ -424,7 +424,7 @@ Handoff_Mode :: enum u8 {
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `MAX_INIT_ARGS_SIZE` | `64` | Max bytes for `init_fn` args / `Spawn_Spec.args_payload`. |
+| `MAX_INIT_ARGS_SIZE` | `64` | Max bytes for `init_handler` args / `Spawn_Spec.args_payload`. |
 | `MAX_PAYLOAD_SIZE` | `96` | Max inline message payload bytes. |
 | `MAX_ISOLATES_PER_TYPE` | `1_048_575` | 20-bit slot index limit. |
 | `HANDLE_NONE` | `Handle(0)` | Sentinel for "no handle". |
@@ -436,7 +436,7 @@ Handoff_Mode :: enum u8 {
 ### Function Type Signatures
 
 ```odin
-Init_Fn    :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
+Init_Handler    :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
 ```
 
@@ -466,7 +466,7 @@ Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> 
 | `.arena_full` | Typed arena for this Isolate type has no free slots. Increase `slot_count`. |
 | `.group_full` | Supervision group reached `child_count_dynamic_max`. |
 | `.type_not_allocated` | `type_id` references a type with no allocated slots on this Shard. |
-| `.init_failed` | The spawned Isolate's `init_fn` returned `Effect_Crash`. |
+| `.init_failed` | The spawned Isolate's `init_handler` returned `Effect_Crash`. |
 
 ### `Restart_Type`
 
@@ -489,7 +489,7 @@ Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> 
 | Value | Meaning |
 |-------|---------|
 | `.None` | Generic or user-triggered crash. |
-| `.Spawn_Failed` | A spawned child's `init_fn` failed. |
+| `.Spawn_Failed` | A spawned child's `init_handler` failed. |
 | `.Unimplemented_Effect` | Handler returned an unhandled Effect variant. |
 | `.Init_Failed` | This Isolate's own initialization failed. |
 

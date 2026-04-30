@@ -56,7 +56,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Coordinator),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = coordinator_init,
+				init_handler = coordinator_init,
 				handler_fn = coordinator_handler,
 			},
 			{
@@ -64,7 +64,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PingIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = ping_init,
+				init_handler = ping_init,
 				handler_fn = ping_handler,
 			},
 			{
@@ -72,7 +72,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PongIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = pong_init,
+				init_handler = pong_init,
 				handler_fn = pong_handler,
 			},
 			{
@@ -80,7 +80,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Supervisor),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = supervisor_init,
+				init_handler = supervisor_init,
 				handler_fn = supervisor_handler,
 			},
 			{
@@ -88,7 +88,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Exiter),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = exiter_init,
+				init_handler = exiter_init,
 				handler_fn = exiter_handler,
 			},
 			{
@@ -96,7 +96,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Bystander),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = bystander_init,
+				init_handler = bystander_init,
 				handler_fn = bystander_handler,
 			},
 		}
@@ -180,7 +180,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Coordinator),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = coordinator_init,
+				init_handler = coordinator_init,
 				handler_fn = coordinator_handler,
 			},
 			{
@@ -188,7 +188,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PingIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = ping_init,
+				init_handler = ping_init,
 				handler_fn = ping_handler,
 			},
 			{
@@ -196,7 +196,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PongIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = pong_init,
+				init_handler = pong_init,
 				handler_fn = pong_handler,
 			},
 			{
@@ -204,7 +204,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Supervisor),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = supervisor_init,
+				init_handler = supervisor_init,
 				handler_fn = supervisor_handler,
 			},
 			{
@@ -212,7 +212,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Exiter),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = exiter_init,
+				init_handler = exiter_init,
 				handler_fn = exiter_handler,
 			},
 			{
@@ -220,7 +220,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 2,
 				stride = size_of(Bystander),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = bystander_init,
+				init_handler = bystander_init,
 				handler_fn = bystander_handler,
 			},
 		}
@@ -328,10 +328,10 @@ when TINA_SIMULATION_MODE {
 		spec := SystemSpec {
 			quarantine_policy = .Quarantine,
 			watchdog = Watchdog_Config {
-				check_interval_ms       = 100,
+				check_interval_ms = 100,
 				shard_restart_window_ms = 1_000,
-				shard_restart_max       = 2,
-				phase_2_threshold       = 2,
+				shard_restart_max = 2,
+				phase_2_threshold = 2,
 			},
 		}
 

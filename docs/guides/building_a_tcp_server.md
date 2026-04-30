@@ -32,7 +32,7 @@ ServerListener :: struct {
 }
 ```
 
-### Listener init_fn
+### Listener init_handler
 
 All socket setup happens here — in one shot, no multi-step init.
 
@@ -146,7 +146,7 @@ ServerConnection :: struct {
 }
 ```
 
-### Connection init_fn
+### Connection init_handler
 
 Called once when the Isolate is spawned. Sets up the socket and parks waiting for data.
 
@@ -262,7 +262,7 @@ main :: proc() {
             slot_count       = 1,                            // only one listener per shard
             stride           = size_of(ServerListener),      // bytes per Isolate instance
             soa_metadata_size = size_of(tina.Isolate_Metadata),
-            init_fn          = listener_init,                // called on spawn
+            init_handler          = listener_init,                // called on spawn
             handler_fn       = listener_handler,             // called on every message
             mailbox_capacity = 16,                           // max queued messages
         },
@@ -271,7 +271,7 @@ main :: proc() {
             slot_count       = 64,                           // up to 64 concurrent connections
             stride           = size_of(ServerConnection),
             soa_metadata_size = size_of(tina.Isolate_Metadata),
-            init_fn          = conn_init,
+            init_handler          = conn_init,
             handler_fn       = conn_handler,
             mailbox_capacity = 16,
         },

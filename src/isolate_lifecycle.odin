@@ -105,7 +105,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		mem.arena_init(&child_ctx.working_arena, working_slice)
 	}
 
-	// 4. Execute init_fn
+	// 4. Execute init_handler
 	local_spec := spec
 
 	when TINA_SIMULATION_MODE {
@@ -120,11 +120,11 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		}
 	}
 
-	// Set up the implicit context for the user init_fn
+	// Set up the implicit context for the user init_handler
 	context.allocator = mem.arena_allocator(&child_ctx.scratch_arena)
 	context.temp_allocator = mem.arena_allocator(&child_ctx.scratch_arena)
 
-	effect := shard.type_descriptors[type_id].init_fn(
+	effect := shard.type_descriptors[type_id].init_handler(
 		isolate_pointer,
 		local_spec.args_payload[:local_spec.args_size],
 		&child_ctx,

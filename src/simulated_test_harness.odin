@@ -31,7 +31,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(HarnessNoopIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = harness_noop_init,
+				init_handler = harness_noop_init,
 				handler_fn = harness_noop_handler,
 			},
 		}
@@ -72,7 +72,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(HarnessNoopIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = harness_noop_init,
+				init_handler = harness_noop_init,
 				handler_fn = harness_noop_handler,
 			},
 		}
@@ -111,7 +111,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(HarnessNoopIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = harness_noop_init,
+				init_handler = harness_noop_init,
 				handler_fn = harness_noop_handler,
 			},
 		}
@@ -150,7 +150,11 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		testing.expect_value(t, sim.termination_reason, Termination_Reason.Checker_Violation)
-		testing.expect(t, sim.final_round <= 3, "Should stop at or before round 3 due to checker violation")
+		testing.expect(
+			t,
+			sim.final_round <= 3,
+			"Should stop at or before round 3 due to checker violation",
+		)
 	}
 
 	@(test)
@@ -163,7 +167,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(HarnessNoopIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = harness_noop_init,
+				init_handler = harness_noop_init,
 				handler_fn = harness_noop_handler,
 			},
 		}
@@ -212,7 +216,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(HarnessNoopIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = harness_noop_init,
+				init_handler = harness_noop_init,
 				handler_fn = harness_noop_handler,
 			},
 		}

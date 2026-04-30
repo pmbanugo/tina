@@ -2,7 +2,7 @@ package tina
 
 import "core:mem"
 
-MAX_INIT_ARGS_SIZE :: 64 //Fixed-Size Payload/Args for init_fn
+MAX_INIT_ARGS_SIZE :: 64 //Fixed-Size Payload/Args for init_handler
 MAX_ISOLATES_PER_TYPE :: 1_048_575 // 20-bit slot index
 SENDFILE_ALL_BYTES: u32 : max(u32)
 
@@ -122,7 +122,7 @@ Context_Flag :: enum u8 {
 Context_Flags :: distinct bit_set[Context_Flag;u8]
 
 // The primary API gateway for Isolates during execution.
-// Passed into `init_fn` and `handler_fn` to provide access to messaging, spawning, and memory.
+// Passed into `init_handler` and `handler_fn` to provide access to messaging, spawning, and memory.
 TinaContext :: struct {
 	// Opaque pointer to internal Shard state to prevents user mutation.
 	_shard:                 rawptr,

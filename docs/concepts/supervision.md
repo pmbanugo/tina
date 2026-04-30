@@ -14,7 +14,7 @@ Tina implements this philosophy with three structural guarantees:
 
 1. **Fault isolation.** An Isolate crash does not corrupt other Isolates or the Shard. The Shard's trap boundary catches panics AND segfaults (via `sigaltstack` + `siglongjmp`).
 2. **Deterministic cleanup.** When an Isolate crashes, teardown is immediate: its mailbox is drained (messages returned to the pool), its working arena is reclaimed, pending I/O and transfer buffers are freed, and its arena slot's generation counter increments (invalidating all outstanding Handles).
-3. **Automatic restart.** The supervision system restarts the Isolate from its `init_fn` with the same boot args. The restarted Isolate gets a fresh struct, a fresh Handle, and no memory of its past life.
+3. **Automatic restart.** The supervision system restarts the Isolate from its `init_handler` with the same boot args. The restarted Isolate gets a fresh struct, a fresh Handle, and no memory of its past life.
 
 ## The Three-Level Recovery Hierarchy
 
@@ -98,7 +98,7 @@ This is a critical design property: supervision operates as **direct function ca
 When an Isolate crashes:
 1. The scheduler calls the teardown sequence (drain mailbox, free resources, increment generation).
 2. The scheduler calls the supervision group's restart logic directly.
-3. The restarted Isolate's `init_fn` runs.
+3. The restarted Isolate's `init_handler` runs.
 
 No message envelope is allocated. No mailbox slot is consumed. No pool capacity is needed. This means supervision works even when the message pool is completely exhausted — the control plane operates independently of the data plane.
 
@@ -128,7 +128,7 @@ Guard pages between Grand Arenas prevent a wild pointer in one Shard from silent
 
 **No framework-enforced shutdown ordering.** During graceful shutdown, each Isolate handles `TAG_SHUTDOWN` independently. Natural ordering emerges from the dependency structure (listeners stop first, connections drain, infrastructure outlives workers). Framework-enforced supervision tree walk is deferred to post-v1. The global shutdown timeout provides the safety net.
 
-**Supervision restarts use the same init args.** A restarted Isolate receives the same `args_payload` that was in its `Spawn_Spec`. If the original args are stale (e.g., they referenced a dead Handle), the `init_fn` must handle this — typically by using the check-in pattern (send a message with the new Handle to a coordinator).
+**Supervision restarts use the same init args.** A restarted Isolate receives the same `args_payload` that was in its `Spawn_Spec`. If the original args are stale (e.g., they referenced a dead Handle), the `init_handler` must handle this — typically by using the check-in pattern (send a message with the new Handle to a coordinator).
 
 **Quarantine is Shard-wide, not per-group.** When escalation reaches the root group, the entire Shard quarantines. There is no "quarantine one group, keep the rest running" mode. This is conservative but simple — a cascade of failures within a Shard suggests systemic corruption, not a single misbehaving group.
 

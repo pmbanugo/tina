@@ -14,7 +14,7 @@ TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
 // but needs verify invariant/structural correctness holds in a non-simulated environment
 TINA_DEBUG_ASSERTS :: #config(TINA_ASSERTS, false)
 
-Init_Fn :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
+Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
@@ -27,7 +27,7 @@ TypeDescriptor :: struct {
 	scratch_requirement_max: int,
 	mailbox_capacity:        u16, // Mailbox capacity (default: 256). TODO: rename to mailbox_capacity?
 	budget_weight:           u16, // (default: 1)
-	init_fn:                 Init_Fn,
+	init_handler:            Init_Handler,
 	handler_fn:              Handler_Fn,
 }
 
@@ -914,7 +914,9 @@ compute_ring_sizes :: proc(
 	for o in overrides {
 		switch o.type {
 		case .Pair:
-			if o.source < Shard_Id(shard_count) && o.destination < Shard_Id(shard_count) && o.source != o.destination {
+			if o.source < Shard_Id(shard_count) &&
+			   o.destination < Shard_Id(shard_count) &&
+			   o.source != o.destination {
 				sizes[o.source][o.destination] = o.size
 			}
 		case .All_Inbound_To:

@@ -16,7 +16,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(HarnessNoopIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = harness_noop_init,
+				init_handler = harness_noop_init,
 				handler_fn = harness_noop_handler,
 			},
 		}
@@ -25,13 +25,13 @@ when TINA_SIMULATION_MODE {
 			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
 		}
 		root_group := sim_test_make_root_group(children[:])
-		shard_specs := [1]ShardSpec {{shard_id = 0, root_group = root_group}}
+		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		sim_config := SimulationConfig {
-			seed = t.seed,
-			ticks_max = 8,
+			seed                   = t.seed,
+			ticks_max              = 8,
 			terminate_on_quiescent = true,
-			builtin_checkers = checker_flags,
+			builtin_checkers       = checker_flags,
 			checker_interval_ticks = 1,
 		}
 
@@ -39,7 +39,7 @@ when TINA_SIMULATION_MODE {
 			&sim_config,
 			types[:],
 			shard_specs[:],
-			Sim_Test_Spec_Options {fd_handoff_entry_count = fd_handoff_entry_count},
+			Sim_Test_Spec_Options{fd_handoff_entry_count = fd_handoff_entry_count},
 		)
 
 		sim: Simulator
@@ -66,7 +66,11 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(t, lookup_err, FD_Table_Error.None)
 		entry.os_fd = OS_FD_INVALID
 
-		testing.expect(t, simulator_run_checkers(&sim, 0), "fd table checker should detect invalid active os fd")
+		testing.expect(
+			t,
+			simulator_run_checkers(&sim, 0),
+			"fd table checker should detect invalid active os fd",
+		)
 	}
 
 	@(test)
@@ -77,7 +81,12 @@ when TINA_SIMULATION_MODE {
 		shard := &sim.shards[0]
 		target_handle := make_handle(0, u16(HARNESS_NOOP_TYPE_ID), 0, 1)
 
-		cleanup_fd, sock_err := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
+		cleanup_fd, sock_err := backend_control_socket(
+			&shard.reactor.backend,
+			.AF_INET,
+			.STREAM,
+			.TCP,
+		)
 		testing.expect_value(t, sock_err, Backend_Error.None)
 
 		ref, ok := fd_handoff_table_alloc(
@@ -94,7 +103,11 @@ when TINA_SIMULATION_MODE {
 		testing.expect(t, found, "handoff entry should resolve")
 		entry.cleanup_fd = OS_FD_INVALID
 
-		testing.expect(t, simulator_run_checkers(&sim, 0), "handoff checker should detect invalid cleanup fd")
+		testing.expect(
+			t,
+			simulator_run_checkers(&sim, 0),
+			"handoff checker should detect invalid cleanup fd",
+		)
 	}
 
 	@(test)
@@ -111,6 +124,10 @@ when TINA_SIMULATION_MODE {
 		testing.expect(t, ok, "simulated descriptor should resolve")
 		g_sim_fd_state.objects[desc.object_index].ref_count += 1
 
-		testing.expect(t, simulator_run_checkers(&sim, 0), "sim fd checker should detect object ref mismatch")
+		testing.expect(
+			t,
+			simulator_run_checkers(&sim, 0),
+			"sim fd checker should detect object ref mismatch",
+		)
 	}
 }

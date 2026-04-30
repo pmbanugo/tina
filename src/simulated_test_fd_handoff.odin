@@ -9,10 +9,10 @@ when TINA_SIMULATION_MODE {
 	FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID: u8 : 1
 
 	FDHandoffListener :: struct {
-		listen_fd:       FD_Handle,
-		target_handle:   Handle,
-		handoff_result:  FD_Handoff_Result,
-		hand_offered:    bool,
+		listen_fd:      FD_Handle,
+		target_handle:  Handle,
+		handoff_result: FD_Handoff_Result,
+		hand_offered:   bool,
 	}
 
 	FDHandoffDispatcher :: struct {
@@ -46,7 +46,11 @@ when TINA_SIMULATION_MODE {
 		return Effect_Io{operation = IoOp_Accept{listen_fd = fd}}
 	}
 
-	fd_handoff_listener_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	fd_handoff_listener_handler :: proc(
+		self: rawptr,
+		message: ^Message,
+		ctx: ^TinaContext,
+	) -> Effect {
 		iso := cast(^FDHandoffListener)self
 		if message != nil && message.tag == IO_TAG_ACCEPT_COMPLETE {
 			iso.handoff_result = ctx_fd_handoff(ctx, iso.target_handle, message.io.fd)
@@ -60,7 +64,11 @@ when TINA_SIMULATION_MODE {
 		return Effect_Receive{}
 	}
 
-	fd_handoff_dispatcher_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	fd_handoff_dispatcher_handler :: proc(
+		self: rawptr,
+		message: ^Message,
+		ctx: ^TinaContext,
+	) -> Effect {
 		iso := cast(^FDHandoffDispatcher)self
 		if message != nil && message.tag == IO_TAG_ACCEPT_COMPLETE {
 			iso.received_accept = true
@@ -70,7 +78,11 @@ when TINA_SIMULATION_MODE {
 		return Effect_Receive{}
 	}
 
-	fd_handoff_busy_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	fd_handoff_busy_dispatcher_init :: proc(
+		self: rawptr,
+		args: []u8,
+		ctx: ^TinaContext,
+	) -> Effect {
 		iso := cast(^FDHandoffBusyDispatcher)self
 		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
 		if err != .None {
@@ -80,7 +92,11 @@ when TINA_SIMULATION_MODE {
 		return Effect_Io{operation = IoOp_Recv{fd = fd, buffer_size_max = 64}}
 	}
 
-	fd_handoff_busy_dispatcher_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	fd_handoff_busy_dispatcher_handler :: proc(
+		self: rawptr,
+		message: ^Message,
+		ctx: ^TinaContext,
+	) -> Effect {
 		return Effect_Receive{}
 	}
 
@@ -89,7 +105,9 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		target_handle := make_handle(1, u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0, 1)
-		listener_args_size, listener_args_payload := sim_test_pack_init_args(bytes_of(&target_handle))
+		listener_args_size, listener_args_payload := sim_test_pack_init_args(
+			bytes_of(&target_handle),
+		)
 
 		types := [2]TypeDescriptor {
 			{
@@ -97,7 +115,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffListener),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_listener_init,
+				init_handler = fd_handoff_listener_init,
 				handler_fn = fd_handoff_listener_handler,
 				mailbox_capacity = 8,
 				budget_weight = 1,
@@ -107,7 +125,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffDispatcher),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_dispatcher_init,
+				init_handler = fd_handoff_dispatcher_init,
 				handler_fn = fd_handoff_dispatcher_handler,
 				mailbox_capacity = 1,
 				budget_weight = 1,
@@ -123,7 +141,7 @@ when TINA_SIMULATION_MODE {
 			},
 		}
 		shard_1_children := [1]Child_Spec {
-			Static_Child_Spec {type_id = FD_HANDOFF_DISPATCHER_TYPE_ID, restart_type = .permanent},
+			Static_Child_Spec{type_id = FD_HANDOFF_DISPATCHER_TYPE_ID, restart_type = .permanent},
 		}
 		root_group_0 := sim_test_make_root_group(shard_0_children[:])
 		root_group_1 := sim_test_make_root_group(shard_1_children[:])
@@ -133,10 +151,10 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim_config := SimulationConfig {
-			seed = t.seed,
-			ticks_max = 64,
+			seed                   = t.seed,
+			ticks_max              = 64,
 			terminate_on_quiescent = true,
-			builtin_checkers = CHECKER_FLAGS_ALL,
+			builtin_checkers       = CHECKER_FLAGS_ALL,
 			checker_interval_ticks = 8,
 		}
 
@@ -161,13 +179,29 @@ when TINA_SIMULATION_MODE {
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {0, 0}
 		simulator_run(&sim)
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(&sim.shards[0], u16(FD_HANDOFF_LISTENER_TYPE_ID), 0)
-		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(&sim.shards[1], u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0)
+		listener := cast(^FDHandoffListener)_get_isolate_ptr(
+			&sim.shards[0],
+			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			0,
+		)
+		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
+			&sim.shards[1],
+			u16(FD_HANDOFF_DISPATCHER_TYPE_ID),
+			0,
+		)
 
 		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
 		testing.expect(t, listener.hand_offered, "listener should successfully initiate handoff")
-		testing.expect(t, dispatcher.received_accept, "dispatcher should receive injected accept completion")
-		testing.expect(t, dispatcher.client_fd != FD_HANDLE_NONE, "dispatcher should receive adopted FD")
+		testing.expect(
+			t,
+			dispatcher.received_accept,
+			"dispatcher should receive injected accept completion",
+		)
+		testing.expect(
+			t,
+			dispatcher.client_fd != FD_HANDLE_NONE,
+			"dispatcher should receive adopted FD",
+		)
 		testing.expect_value(t, dispatcher.peer_port, u16(9999))
 		testing.expect_value(
 			t,
@@ -181,7 +215,9 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		target_handle := make_handle(1, u16(FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID), 0, 1)
-		listener_args_size, listener_args_payload := sim_test_pack_init_args(bytes_of(&target_handle))
+		listener_args_size, listener_args_payload := sim_test_pack_init_args(
+			bytes_of(&target_handle),
+		)
 
 		types := [2]TypeDescriptor {
 			{
@@ -189,7 +225,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffListener),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_listener_init,
+				init_handler = fd_handoff_listener_init,
 				handler_fn = fd_handoff_listener_handler,
 				mailbox_capacity = 8,
 				budget_weight = 1,
@@ -199,7 +235,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffBusyDispatcher),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_busy_dispatcher_init,
+				init_handler = fd_handoff_busy_dispatcher_init,
 				handler_fn = fd_handoff_busy_dispatcher_handler,
 				mailbox_capacity = 1,
 				budget_weight = 1,
@@ -215,7 +251,10 @@ when TINA_SIMULATION_MODE {
 			},
 		}
 		shard_1_children := [1]Child_Spec {
-			Static_Child_Spec {type_id = FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID, restart_type = .permanent},
+			Static_Child_Spec {
+				type_id = FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID,
+				restart_type = .permanent,
+			},
 		}
 		root_group_0 := sim_test_make_root_group(shard_0_children[:])
 		root_group_1 := sim_test_make_root_group(shard_1_children[:])
@@ -225,10 +264,10 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim_config := SimulationConfig {
-			seed = t.seed,
-			ticks_max = 8,
+			seed                   = t.seed,
+			ticks_max              = 8,
 			terminate_on_quiescent = false,
-			builtin_checkers = CHECKER_FLAGS_ALL,
+			builtin_checkers       = CHECKER_FLAGS_ALL,
 			checker_interval_ticks = 8,
 		}
 
@@ -253,7 +292,11 @@ when TINA_SIMULATION_MODE {
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {64, 64}
 		simulator_run(&sim)
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(&sim.shards[0], u16(FD_HANDOFF_LISTENER_TYPE_ID), 0)
+		listener := cast(^FDHandoffListener)_get_isolate_ptr(
+			&sim.shards[0],
+			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			0,
+		)
 		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
 		testing.expect_value(t, sim.shards[0].counters.handoff_rejects, u64(1))
 		testing.expect_value(
@@ -274,7 +317,9 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		target_handle := make_handle(1, u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0, 1)
-		listener_args_size, listener_args_payload := sim_test_pack_init_args(bytes_of(&target_handle))
+		listener_args_size, listener_args_payload := sim_test_pack_init_args(
+			bytes_of(&target_handle),
+		)
 
 		types := [2]TypeDescriptor {
 			{
@@ -282,7 +327,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffListener),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_listener_init,
+				init_handler = fd_handoff_listener_init,
 				handler_fn = fd_handoff_listener_handler,
 				mailbox_capacity = 8,
 				budget_weight = 1,
@@ -292,7 +337,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffDispatcher),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_dispatcher_init,
+				init_handler = fd_handoff_dispatcher_init,
 				handler_fn = fd_handoff_dispatcher_handler,
 				mailbox_capacity = 1,
 				budget_weight = 1,
@@ -308,7 +353,7 @@ when TINA_SIMULATION_MODE {
 			},
 		}
 		shard_1_children := [1]Child_Spec {
-			Static_Child_Spec {type_id = FD_HANDOFF_DISPATCHER_TYPE_ID, restart_type = .permanent},
+			Static_Child_Spec{type_id = FD_HANDOFF_DISPATCHER_TYPE_ID, restart_type = .permanent},
 		}
 		root_group_0 := sim_test_make_root_group(shard_0_children[:])
 		root_group_1 := sim_test_make_root_group(shard_1_children[:])
@@ -318,10 +363,10 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim_config := SimulationConfig {
-			seed = t.seed,
-			ticks_max = 64,
+			seed                   = t.seed,
+			ticks_max              = 64,
 			terminate_on_quiescent = true,
-			builtin_checkers = CHECKER_FLAGS_ALL,
+			builtin_checkers       = CHECKER_FLAGS_ALL,
 			checker_interval_ticks = 8,
 		}
 
@@ -357,15 +402,31 @@ when TINA_SIMULATION_MODE {
 			scheduler_tick(&sim.shards[1])
 		}
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(&sim.shards[0], u16(FD_HANDOFF_LISTENER_TYPE_ID), 0)
-		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(&sim.shards[1], u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0)
+		listener := cast(^FDHandoffListener)_get_isolate_ptr(
+			&sim.shards[0],
+			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			0,
+		)
+		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
+			&sim.shards[1],
+			u16(FD_HANDOFF_DISPATCHER_TYPE_ID),
+			0,
+		)
 
 		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
 		// The critical assertion: even though the source observed a timeout,
 		// the destination must still successfully adopt the socket from the
 		// delayed OFFER. If this fails, the offered FD was closed prematurely.
-		testing.expect(t, dispatcher.received_accept, "late OFFER must still be adoptable after source timeout")
-		testing.expect(t, dispatcher.client_fd != FD_HANDLE_NONE, "dispatcher should receive adopted FD")
+		testing.expect(
+			t,
+			dispatcher.received_accept,
+			"late OFFER must still be adoptable after source timeout",
+		)
+		testing.expect(
+			t,
+			dispatcher.client_fd != FD_HANDLE_NONE,
+			"dispatcher should receive adopted FD",
+		)
 		testing.expect_value(t, dispatcher.peer_port, u16(9999))
 		testing.expect_value(t, sim.shards[0].counters.handoff_timeouts, u64(1))
 		testing.expect_value(
@@ -380,7 +441,9 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		target_handle := make_handle(1, u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0, 1)
-		listener_args_size, listener_args_payload := sim_test_pack_init_args(bytes_of(&target_handle))
+		listener_args_size, listener_args_payload := sim_test_pack_init_args(
+			bytes_of(&target_handle),
+		)
 
 		types := [2]TypeDescriptor {
 			{
@@ -388,7 +451,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffListener),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_listener_init,
+				init_handler = fd_handoff_listener_init,
 				handler_fn = fd_handoff_listener_handler,
 				mailbox_capacity = 8,
 				budget_weight = 1,
@@ -398,7 +461,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(FDHandoffDispatcher),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = fd_handoff_dispatcher_init,
+				init_handler = fd_handoff_dispatcher_init,
 				handler_fn = fd_handoff_dispatcher_handler,
 				mailbox_capacity = 1,
 				budget_weight = 1,
@@ -414,7 +477,7 @@ when TINA_SIMULATION_MODE {
 			},
 		}
 		shard_1_children := [1]Child_Spec {
-			Static_Child_Spec {type_id = FD_HANDOFF_DISPATCHER_TYPE_ID, restart_type = .permanent},
+			Static_Child_Spec{type_id = FD_HANDOFF_DISPATCHER_TYPE_ID, restart_type = .permanent},
 		}
 		root_group_0 := sim_test_make_root_group(shard_0_children[:])
 		root_group_1 := sim_test_make_root_group(shard_1_children[:])
@@ -424,10 +487,10 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim_config := SimulationConfig {
-			seed = t.seed,
-			ticks_max = 64,
+			seed                   = t.seed,
+			ticks_max              = 64,
 			terminate_on_quiescent = true,
-			builtin_checkers = CHECKER_FLAGS_ALL,
+			builtin_checkers       = CHECKER_FLAGS_ALL,
 			checker_interval_ticks = 8,
 		}
 
@@ -461,11 +524,23 @@ when TINA_SIMULATION_MODE {
 			scheduler_tick(&sim.shards[1])
 		}
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(&sim.shards[0], u16(FD_HANDOFF_LISTENER_TYPE_ID), 0)
-		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(&sim.shards[1], u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0)
+		listener := cast(^FDHandoffListener)_get_isolate_ptr(
+			&sim.shards[0],
+			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			0,
+		)
+		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
+			&sim.shards[1],
+			u16(FD_HANDOFF_DISPATCHER_TYPE_ID),
+			0,
+		)
 
 		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
-		testing.expect(t, dispatcher.received_accept, "dispatcher should still receive adopted socket before timeout")
+		testing.expect(
+			t,
+			dispatcher.received_accept,
+			"dispatcher should still receive adopted socket before timeout",
+		)
 		testing.expect_value(t, sim.shards[0].counters.handoff_timeouts, u64(1))
 		testing.expect_value(t, sim.shards[0].counters.handoff_rejects, u64(0))
 		testing.expect_value(

@@ -153,7 +153,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Coordinator),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = coordinator_init,
+				init_handler = coordinator_init,
 				handler_fn = coordinator_handler,
 			},
 			{
@@ -161,7 +161,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PingIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = ping_init,
+				init_handler = ping_init,
 				handler_fn = ping_handler,
 			},
 			{
@@ -169,7 +169,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PongIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = pong_init,
+				init_handler = pong_init,
 				handler_fn = pong_handler,
 			},
 		}

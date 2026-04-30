@@ -4,14 +4,14 @@ import "core:testing"
 
 when TINA_SIMULATION_MODE {
 	Ping_Pong_Run_Result :: struct {
-		ping_state:             Isolate_State,
-		pong_state:             Isolate_State,
-		ping_count:             u32,
-		io_stale_completions:   u64,
-		ring_full_drops:        u64,
-		quarantine_drops:       u64,
-		termination_reason:     Termination_Reason,
-		final_round:            u64,
+		ping_state:           Isolate_State,
+		pong_state:           Isolate_State,
+		ping_count:           u32,
+		io_stale_completions: u64,
+		ring_full_drops:      u64,
+		quarantine_drops:     u64,
+		termination_reason:   Termination_Reason,
+		final_round:          u64,
 	}
 
 	run_ping_pong_simulation_once :: proc(seed: u64) -> Ping_Pong_Run_Result {
@@ -21,7 +21,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(Coordinator),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = coordinator_init,
+				init_handler = coordinator_init,
 				handler_fn = coordinator_handler,
 			},
 			{
@@ -29,7 +29,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PingIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = ping_init,
+				init_handler = ping_init,
 				handler_fn = ping_handler,
 			},
 			{
@@ -37,7 +37,7 @@ when TINA_SIMULATION_MODE {
 				slot_count = 1,
 				stride = size_of(PongIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn = pong_init,
+				init_handler = pong_init,
 				handler_fn = pong_handler,
 			},
 		}
@@ -96,14 +96,14 @@ when TINA_SIMULATION_MODE {
 		ping_memory := cast(^PingIsolate)ping_pointer
 
 		return Ping_Pong_Run_Result {
-			ping_state           = shard.metadata[PING_TYPE_ID].state[0],
-			pong_state           = shard.metadata[PONG_TYPE_ID].state[0],
-			ping_count           = ping_memory.count,
+			ping_state = shard.metadata[PING_TYPE_ID].state[0],
+			pong_state = shard.metadata[PONG_TYPE_ID].state[0],
+			ping_count = ping_memory.count,
 			io_stale_completions = shard.counters.io_stale_completions,
-			ring_full_drops      = shard.counters.ring_full_drops,
-			quarantine_drops     = shard.counters.quarantine_drops,
-			termination_reason   = sim.termination_reason,
-			final_round          = sim.final_round,
+			ring_full_drops = shard.counters.ring_full_drops,
+			quarantine_drops = shard.counters.quarantine_drops,
+			termination_reason = sim.termination_reason,
+			final_round = sim.final_round,
 		}
 	}
 
@@ -138,7 +138,7 @@ when TINA_SIMULATION_MODE {
 					slot_count = 1,
 					stride = size_of(Coordinator),
 					soa_metadata_size = size_of(Isolate_Metadata),
-					init_fn = coordinator_init,
+					init_handler = coordinator_init,
 					handler_fn = coordinator_handler,
 				},
 				{
@@ -146,7 +146,7 @@ when TINA_SIMULATION_MODE {
 					slot_count = 1,
 					stride = size_of(PingIsolate),
 					soa_metadata_size = size_of(Isolate_Metadata),
-					init_fn = ping_init,
+					init_handler = ping_init,
 					handler_fn = ping_handler,
 				},
 				{
@@ -154,7 +154,7 @@ when TINA_SIMULATION_MODE {
 					slot_count = 1,
 					stride = size_of(PongIsolate),
 					soa_metadata_size = size_of(Isolate_Metadata),
-					init_fn = pong_init,
+					init_handler = pong_init,
 					handler_fn = pong_handler,
 				},
 			}
@@ -174,10 +174,10 @@ when TINA_SIMULATION_MODE {
 			shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 			sim_config := SimulationConfig {
-				seed                   = seed,
-				ticks_max              = 10_000,
+				seed = seed,
+				ticks_max = 10_000,
 				terminate_on_quiescent = true,
-				builtin_checkers       = CHECKER_FLAGS_ALL,
+				builtin_checkers = CHECKER_FLAGS_ALL,
 				checker_interval_ticks = 100,
 				faults = FaultConfig {
 					isolate_crash_rate = Ratio{1, 10}, // 10% crash rate per handler
@@ -216,14 +216,14 @@ when TINA_SIMULATION_MODE {
 			ping_memory := cast(^PingIsolate)ping_pointer
 
 			return Ping_Pong_Run_Result {
-				ping_state           = shard.metadata[PING_TYPE_ID].state[0],
-				pong_state           = shard.metadata[PONG_TYPE_ID].state[0],
-				ping_count           = ping_memory.count,
+				ping_state = shard.metadata[PING_TYPE_ID].state[0],
+				pong_state = shard.metadata[PONG_TYPE_ID].state[0],
+				ping_count = ping_memory.count,
 				io_stale_completions = shard.counters.io_stale_completions,
-				ring_full_drops      = shard.counters.ring_full_drops,
-				quarantine_drops     = shard.counters.quarantine_drops,
-				termination_reason   = sim.termination_reason,
-				final_round          = sim.final_round,
+				ring_full_drops = shard.counters.ring_full_drops,
+				quarantine_drops = shard.counters.quarantine_drops,
+				termination_reason = sim.termination_reason,
+				final_round = sim.final_round,
 			}
 		}
 
@@ -241,6 +241,10 @@ when TINA_SIMULATION_MODE {
 			r1a.final_round != r2.final_round ||
 			r1a.termination_reason != r2.termination_reason
 
-		testing.expect(t, differs, "Different seeds with fault injection should produce observably different runs")
+		testing.expect(
+			t,
+			differs,
+			"Different seeds with fault injection should produce observably different runs",
+		)
 	}
 }

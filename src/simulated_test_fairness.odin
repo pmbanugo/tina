@@ -63,7 +63,7 @@ when TINA_SIMULATION_MODE {
 				slot_count        = 1,
 				stride            = 0, // Zero-sized, purely behavioral
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn           = starvation_coord_init,
+				init_handler      = starvation_coord_init,
 				handler_fn        = starvation_coord_handler,
 			},
 			{
@@ -71,7 +71,7 @@ when TINA_SIMULATION_MODE {
 				slot_count        = 300,
 				stride            = size_of(StarvationWorker),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn           = starvation_worker_init,
+				init_handler      = starvation_worker_init,
 				handler_fn        = starvation_worker_handler,
 				budget_weight     = 1, // Quota = 1 * 256 = 256 dispatches per tick
 			},

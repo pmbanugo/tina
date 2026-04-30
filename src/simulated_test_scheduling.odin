@@ -33,12 +33,12 @@ when TINA_SIMULATION_MODE {
 
 		types := [1]TypeDescriptor {
 			{
-				id                = SCHED_NOOP_TYPE_ID,
-				slot_count        = 1,
-				stride            = size_of(SchedNoopIsolate),
+				id = SCHED_NOOP_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(SchedNoopIsolate),
 				soa_metadata_size = size_of(Isolate_Metadata),
-				init_fn           = sched_noop_init,
-				handler_fn        = sched_noop_handler,
+				init_handler = sched_noop_init,
+				handler_fn = sched_noop_handler,
 			},
 		}
 

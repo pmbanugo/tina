@@ -37,7 +37,7 @@ test_my_scenario :: proc(t: ^testing.T) {
             id = 0, slot_count = 10,
             stride = size_of(MyIsolate),
             soa_metadata_size = size_of(Isolate_Metadata),
-            init_fn = my_init, handler_fn = my_handler,
+            init_handler = my_init, handler_fn = my_handler,
         },
     }
 

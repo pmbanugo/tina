@@ -403,7 +403,7 @@ dispatcher_handler :: proc(
 Tick 1:  Dispatcher sends Job #3 to Worker #0 (Handle = 0xAA)
 Tick 2:  Worker #0 crashes on Job #3 → Effect_Crash
 Tick 3:  Supervisor restarts Worker #0 → new Handle = 0xBB
-Tick 3:  Worker #0's init_fn sends TAG_WORKER_READY{id=0, handle=0xBB}
+Tick 3:  Worker #0's init_handler sends TAG_WORKER_READY{id=0, handle=0xBB}
 Tick 4:  Dispatcher sends Job #6 to Worker #0 (Handle = 0xAA) → .stale_handle!
          Dispatcher clears workers[0] = HANDLE_NONE
 Tick 5:  Dispatcher receives TAG_WORKER_READY → workers[0] = 0xBB
@@ -422,7 +422,7 @@ main :: proc() {
             slot_count       = 1,                          // one dispatcher
             stride           = size_of(DispatcherIsolate),
             soa_metadata_size = size_of(tina.Isolate_Metadata),
-            init_fn          = dispatcher_init,
+            init_handler          = dispatcher_init,
             handler_fn       = dispatcher_handler,
             mailbox_capacity = 64,                         // needs room for check-ins + done msgs
         },
@@ -431,7 +431,7 @@ main :: proc() {
             slot_count       = 10,                         // up to 10 workers
             stride           = size_of(WorkerIsolate),
             soa_metadata_size = size_of(tina.Isolate_Metadata),
-            init_fn          = worker_init,
+            init_handler          = worker_init,
             handler_fn       = worker_handler,
             mailbox_capacity = 16,
         },

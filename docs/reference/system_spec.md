@@ -69,7 +69,7 @@ Defines the behavior, memory footprint, and lifecycle functions for a specific I
 | `scratch_requirement_max` | `int` | `0` | Maximum scratch arena bytes this type needs. `SystemSpec.scratch_arena_size` must be >= this. |
 | `mailbox_capacity` | `u16` | `256` | Per-Isolate mailbox depth. If 0, the framework applies 256 at startup. |
 | `budget_weight` | `u16` | `1` | Scheduling weight. Higher = more messages processed per tick. If 0, the framework applies 1 at startup. |
-| `init_fn` | `Init_Fn` | — | `proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect`. Called once on spawn. |
+| `init_handler` | `Init_Handler` | — | `proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect`. Called once on spawn. |
 | `handler_fn` | `Handler_Fn` | — | `proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect`. Called on every message. |
 
 ---
@@ -175,7 +175,7 @@ Fault injection rates and delays. Only meaningful when `TINA_SIM=true`. All `Rat
 | `network_partition_rate` | `Ratio` | Probability of network partition onset. |
 | `network_partition_heal_rate` | `Ratio` | Probability of healing a partition. |
 | `isolate_crash_rate` | `Ratio` | Probability of random Isolate crash. |
-| `init_failure_rate` | `Ratio` | Probability of `init_fn` failure. |
+| `init_failure_rate` | `Ratio` | Probability of `init_handler` failure. |
 
 **Validation rules:**
 - `numerator > 0` requires `denominator > 0`.
@@ -396,7 +396,7 @@ main :: proc() {
         slot_count     = 1,
         stride         = size_of(MyIsolate),
         soa_metadata_size = size_of(tina.Isolate_Metadata),
-        init_fn        = my_init,
+        init_handler        = my_init,
         handler_fn     = my_handler,
         mailbox_capacity = 16,
     }}
