@@ -7,7 +7,7 @@ import "core:testing"
 // ============================================================================
 //
 // Fixed-size table mapping FD_Handle (generational index) to OS file descriptors.
-// Direction-partitioned ownership: each entry tracks read_owner and write_owner
+// Direction-partitioned ownership: each entry tracks reader_isolate and writer_isolate
 // separately, enabling full-duplex split affinity (§6.6.3 §17).
 //
 // Managed via an intrusive LIFO free list with u16 indices.
@@ -45,8 +45,8 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 		entry^ = FD_Entry{}
 		entry.os_fd = _fd_table_encode_next(table.free_head)
 		entry.generation = 1
-		entry.read_owner = HANDLE_NONE
-		entry.write_owner = HANDLE_NONE
+		entry.reader_isolate = HANDLE_NONE
+		entry.writer_isolate = HANDLE_NONE
 		entry.peer_address = {}
 		entry.flags = {}
 		table.free_head = u16(i)
@@ -76,8 +76,8 @@ fd_table_alloc :: proc "contextless" (
 
 	// Initialize the entry
 	entry.os_fd = os_fd
-	entry.read_owner = owner
-	entry.write_owner = owner
+	entry.reader_isolate = owner
+	entry.writer_isolate = owner
 	entry.peer_address = {}
 	entry.flags = {}
 	// generation already set from previous free or init
@@ -87,7 +87,13 @@ fd_table_alloc :: proc "contextless" (
 
 // Look up an FD entry by handle with generation check.
 // Returns nil and error if the handle is stale or invalid.
-fd_table_lookup :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> (^FD_Entry, FD_Table_Error) {
+fd_table_lookup :: proc "contextless" (
+	table: ^FD_Table,
+	handle: FD_Handle,
+) -> (
+	^FD_Entry,
+	FD_Table_Error,
+) {
 	if handle == FD_HANDLE_NONE {
 		return nil, .Invalid_Index
 	}
@@ -121,12 +127,12 @@ fd_table_resolve :: #force_inline proc "contextless" (
 }
 
 // Validate that `owner` has the correct direction affinity for the given operation.
-// recv/recvfrom/read/accept check read_owner; send/sendto/write/connect/close check write_owner.
+// recv/recvfrom/read/accept check reader_isolate; send/sendto/write/connect/close check writer_isolate.
 fd_table_validate_read_affinity :: #force_inline proc "contextless" (
 	entry: ^FD_Entry,
 	owner: Handle,
 ) -> FD_Table_Error {
-	if entry.read_owner != owner {
+	if entry.reader_isolate != owner {
 		return .Affinity_Violation
 	}
 	return .None
@@ -136,7 +142,7 @@ fd_table_validate_write_affinity :: #force_inline proc "contextless" (
 	entry: ^FD_Entry,
 	owner: Handle,
 ) -> FD_Table_Error {
-	if entry.write_owner != owner {
+	if entry.writer_isolate != owner {
 		return .Affinity_Violation
 	}
 	return .None
@@ -156,12 +162,12 @@ fd_table_handoff :: proc "contextless" (
 
 	switch mode {
 	case .Full:
-		entry.read_owner = new_owner
-		entry.write_owner = new_owner
+		entry.reader_isolate = new_owner
+		entry.writer_isolate = new_owner
 	case .Read_Only:
-		entry.read_owner = new_owner
+		entry.reader_isolate = new_owner
 	case .Write_Only:
-		entry.write_owner = new_owner
+		entry.writer_isolate = new_owner
 	}
 
 	return .None
@@ -187,8 +193,8 @@ fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_
 	// Bump generation to invalidate all outstanding FD_Handles
 	entry.generation += 1
 	entry.os_fd = _fd_table_encode_next(table.free_head)
-	entry.read_owner = HANDLE_NONE
-	entry.write_owner = HANDLE_NONE
+	entry.reader_isolate = HANDLE_NONE
+	entry.writer_isolate = HANDLE_NONE
 	entry.peer_address = {}
 	entry.flags = {}
 
@@ -200,7 +206,10 @@ fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_
 
 // Mark an FD for close-on-completion (§6.6.1 §3).
 // Used during teardown_isolate when I/O is in-flight on the FD.
-fd_table_mark_close_on_completion :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
+fd_table_mark_close_on_completion :: proc "contextless" (
+	table: ^FD_Table,
+	handle: FD_Handle,
+) -> FD_Table_Error {
 	entry, err := fd_table_lookup(table, handle)
 	if err != .None {
 		return err
@@ -228,7 +237,10 @@ fd_table_mark_fresh_accept :: #force_inline proc "contextless" (
 	return .None
 }
 
-fd_table_clear_fresh_accept :: #force_inline proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_Table_Error {
+fd_table_clear_fresh_accept :: #force_inline proc "contextless" (
+	table: ^FD_Table,
+	handle: FD_Handle,
+) -> FD_Table_Error {
 	entry, err := fd_table_lookup(table, handle)
 	if err != .None {
 		return err
@@ -251,7 +263,7 @@ fd_table_for_each_owned :: proc(
 ) {
 	for i in 0 ..< table.slot_count {
 		entry := &table.entries[i]
-		if entry.read_owner == owner || entry.write_owner == owner {
+		if entry.reader_isolate == owner || entry.writer_isolate == owner {
 			h := fd_handle_make(i, entry.generation)
 			if !visitor(h, entry) {
 				return

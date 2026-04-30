@@ -43,10 +43,10 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 			}
 			can_transfer := true
 			if spec.handoff_mode == .Full || spec.handoff_mode == .Read_Only {
-				if entry.read_owner != spawner_handle do can_transfer = false
+				if entry.reader_isolate != spawner_handle do can_transfer = false
 			}
 			if spec.handoff_mode == .Full || spec.handoff_mode == .Write_Only {
-				if entry.write_owner != spawner_handle do can_transfer = false
+				if entry.writer_isolate != spawner_handle do can_transfer = false
 			}
 
 			if can_transfer {
@@ -196,10 +196,10 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]
-		if entry.read_owner == HANDLE_NONE && entry.write_owner == HANDLE_NONE {
+		if entry.reader_isolate == HANDLE_NONE && entry.writer_isolate == HANDLE_NONE {
 			continue
 		}
-		if entry.read_owner == handle_to_match || entry.write_owner == handle_to_match {
+		if entry.reader_isolate == handle_to_match || entry.writer_isolate == handle_to_match {
 			fd_h := fd_handle_make(u16(i), entry.generation)
 
 			if is_waiting_for_io && fd_h == in_flight_fd {

@@ -227,7 +227,7 @@ IoOp :: union {
 }
 
 // --- FD Table Entry (§6.6.3 §6) ---
-// Direction-partitioned ownership: read_owner and write_owner tracked separately.
+// Direction-partitioned ownership: reader_isolate and writer_isolate tracked separately.
 // For single-owner FDs (common case), both point to the same Isolate.
 
 FD_Flag :: enum {
@@ -238,13 +238,13 @@ FD_Flag :: enum {
 FD_Flags :: bit_set[FD_Flag;u8]
 
 FD_Entry :: struct {
-	read_owner:   Handle,
-	write_owner:  Handle,
-	peer_address: Peer_Address,
-	os_fd:        OS_FD,
-	generation:   u16,
-	flags:        FD_Flags,
-	_padding:     [5]u8,
+	reader_isolate: Handle,
+	writer_isolate: Handle,
+	peer_address:   Peer_Address,
+	os_fd:          OS_FD,
+	generation:     u16,
+	flags:          FD_Flags,
+	_padding:       [5]u8,
 }
 
 FD_Handoff_Result :: enum u8 {

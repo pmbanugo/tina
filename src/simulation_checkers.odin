@@ -85,7 +85,8 @@ when TINA_SIMULATION_MODE {
 
 				for slot in 0 ..< int(fd_table.slot_count) {
 					entry := &fd_table.entries[slot]
-					active := entry.read_owner != HANDLE_NONE || entry.write_owner != HANDLE_NONE
+					active :=
+						entry.reader_isolate != HANDLE_NONE || entry.writer_isolate != HANDLE_NONE
 					if active {
 						if entry.generation == 0 {
 							fmt.eprintfln(
@@ -124,7 +125,8 @@ when TINA_SIMULATION_MODE {
 					entry := &table.entries[handoff_index]
 					if entry.state == .In_Flight {
 						in_flight_count += 1
-						if entry.generation == 0 || entry.target_handle == HANDLE_NONE ||
+						if entry.generation == 0 ||
+						   entry.target_handle == HANDLE_NONE ||
 						   entry.cleanup_fd == OS_FD_INVALID ||
 						   entry.deadline_tick == 0 {
 							fmt.eprintfln(
@@ -158,11 +160,12 @@ when TINA_SIMULATION_MODE {
 					if !desc.active {
 						continue
 					}
-					if desc.fd_number == OS_FD_INVALID || desc.object_index >= MAX_SIMULATED_OBJECTS {
+					if desc.fd_number == OS_FD_INVALID ||
+					   desc.object_index >= MAX_SIMULATED_OBJECTS {
 						fmt.eprintfln(
 							"[CHECKER] Shard %d: invalid simulated descriptor state at index %d",
 							i,
-						descriptor_index,
+							descriptor_index,
 						)
 						return true
 					}

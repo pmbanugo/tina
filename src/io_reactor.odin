@@ -203,7 +203,7 @@ reactor_export_fd_handoff :: proc "contextless" (
 	if err != .None {
 		return OS_FD_INVALID, {}, .invalid_fd_state
 	}
-	if entry.read_owner != owner || entry.write_owner != owner {
+	if entry.reader_isolate != owner || entry.writer_isolate != owner {
 		return OS_FD_INVALID, {}, .not_owner
 	}
 	if !fd_table_is_fresh_accept(entry) || fd_table_is_close_on_completion(entry) {

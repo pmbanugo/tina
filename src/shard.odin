@@ -833,7 +833,9 @@ _fd_handoff_send_ack :: proc "contextless" (
 	env.destination = destination
 	env.tag = TAG_FD_HANDOFF_ACK
 	env.payload_size = u16(size_of(FD_Handoff_Ack))
-	(cast(^FD_Handoff_Ack)&env.payload[0])^ = FD_Handoff_Ack {handoff = ref}
+	(cast(^FD_Handoff_Ack)&env.payload[0])^ = FD_Handoff_Ack {
+		handoff = ref,
+	}
 	_ = _route_envelope_system(shard, destination, &env)
 }
 
@@ -852,7 +854,7 @@ _fd_handoff_send_reject :: proc "contextless" (
 	env.payload_size = u16(size_of(FD_Handoff_Reject))
 	(cast(^FD_Handoff_Reject)&env.payload[0])^ = FD_Handoff_Reject {
 		handoff = ref,
-		reason = reason,
+		reason  = reason,
 	}
 	_ = _route_envelope_system(shard, destination, &env)
 }
@@ -906,7 +908,13 @@ _process_fd_handoff_offer :: proc "contextless" (shard: ^Shard, envelope: ^Messa
 		offer.peer_address,
 	)
 	if adopt_reason != .None {
-		_fd_handoff_send_reject(shard, envelope.source, envelope.destination, offer.handoff, adopt_reason)
+		_fd_handoff_send_reject(
+			shard,
+			envelope.source,
+			envelope.destination,
+			offer.handoff,
+			adopt_reason,
+		)
 		return
 	}
 
@@ -918,7 +926,13 @@ _process_fd_handoff_offer :: proc "contextless" (shard: ^Shard, envelope: ^Messa
 	)
 	if inject_reason != .None {
 		reactor_internal_close_fd(&shard.reactor, adopted_fd)
-		_fd_handoff_send_reject(shard, envelope.source, envelope.destination, offer.handoff, inject_reason)
+		_fd_handoff_send_reject(
+			shard,
+			envelope.source,
+			envelope.destination,
+			offer.handoff,
+			inject_reason,
+		)
 		return
 	}
 
@@ -998,7 +1012,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]
 
-		if entry.read_owner != HANDLE_NONE || entry.write_owner != HANDLE_NONE {
+		if entry.reader_isolate != HANDLE_NONE || entry.writer_isolate != HANDLE_NONE {
 			backend_control_close(&shard.reactor.backend, entry.os_fd)
 			fd_handle := fd_handle_make(u16(i), entry.generation)
 			fd_table_free(&shard.reactor.fd_table, fd_handle)
@@ -1125,7 +1139,7 @@ _init_handoff_test_shard :: proc(
 	fd_handoff_table_init(&shard.handoff_table, handoff_backing)
 	backend_config := Backend_Config {
 		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
-		sim_config = Simulation_IO_Config {},
+		sim_config = Simulation_IO_Config{},
 	}
 	err := backend_init(&shard.reactor.backend, backend_config)
 	testing.expect_value(t, err, Backend_Error.None)
