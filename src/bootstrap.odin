@@ -12,8 +12,18 @@ import "core:time"
 
 MAX_SHARDS :: 256
 
+// Shared control-plane state scanned by the watchdog and mutated by the shard thread.
+Shard_Runtime_State :: struct #align (CACHE_LINE_SIZE) {
+	shard_pointer:            ^Shard,
+	os_thread_handle:         rawptr,
+	restart_window_start_ns:  u64,
+	watchdog_state:           u8,
+	restart_count:            u16,
+	_padding:                 [5]u8,
+}
+
 // Passed to each Shard thread upon creation.
-Shard_Config :: struct #align (CACHE_LINE_SIZE) {
+Shard_Config :: struct {
 	// Massive inline arrays (256 * 8 = 2048 bytes each)
 	outbound_rings:    [MAX_SHARDS]^SPSC_Ring,
 	inbound_rings:     [MAX_SHARDS]^SPSC_Ring,
@@ -21,15 +31,10 @@ Shard_Config :: struct #align (CACHE_LINE_SIZE) {
 	system_spec:       ^SystemSpec,
 	shard_spec:        ^ShardSpec,
 	barrier:           ^sync.Barrier,
-	shard_pointer:     ^Shard,
-	watchdog_state:    u8,
-	os_thread_handle:  rawptr,
+	runtime_state:     ^Shard_Runtime_State,
 	total_memory_size: int,
 	shard_id:          Shard_Id,
 	target_core:       u8,
-	shard_restart_count:         u16,
-	_padding:                    [4]u8,
-	shard_restart_window_ns:       u64,
 }
 
 // #assert(size_of(Shard_Config) == 4160, "Shard_Config alignment/size drifted.")
@@ -81,6 +86,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 	// 5. Initialize coordination structures
 	shard_configs := make([]Shard_Config, spec.shard_count)
+	shard_runtime_states := make([]Shard_Runtime_State, spec.shard_count)
 
 	barrier := new(sync.Barrier)
 	sync.barrier_init(barrier, int(spec.shard_count)) // Main thread does NOT wait on this
@@ -103,6 +109,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 			config.shard_spec = &spec.shard_specs[i]
 		}
 		config.barrier = barrier
+		config.runtime_state = &shard_runtime_states[i]
 		config.total_memory_size = shard_memory_size
 		config.shard_id = Shard_Id(i)
 		config.target_core = u8(i) // Mapped directly to shard_id by default
@@ -198,7 +205,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 		all_running := true
 		for index in 0 ..< spec.shard_count {
 			state := cast(Shard_State)sync.atomic_load_explicit(
-				&shard_configs[index].watchdog_state,
+				&shard_runtime_states[index].watchdog_state,
 				.Relaxed,
 			)
 			if state != .Running {
@@ -212,7 +219,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 		if time.stopwatch_duration(stopwatch) > timeout_duration {
 			for index in 0 ..< spec.shard_count {
 				state := cast(Shard_State)sync.atomic_load_explicit(
-					&shard_configs[index].watchdog_state,
+					&shard_runtime_states[index].watchdog_state,
 					.Relaxed,
 				)
 				if state == .Init {
@@ -234,7 +241,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	set_process_phase(.Running)
 
 	// 10. Enter Watchdog loop (sigtimedwait / kqueue)
-	watchdog_loop(shard_configs, spec)
+	watchdog_loop(shard_runtime_states, spec)
 
 	// Await graceful termination
 	for t in threads {

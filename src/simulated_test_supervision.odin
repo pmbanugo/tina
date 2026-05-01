@@ -335,25 +335,23 @@ when TINA_SIMULATION_MODE {
 			},
 		}
 
-		config := Shard_Config {
-			system_spec = &spec,
-		}
+		runtime_state: Shard_Runtime_State
 
-		exceeded := _check_and_record_shard_restart(&config, 100)
+		exceeded := _check_and_record_shard_restart(&runtime_state, &spec, 100)
 		testing.expect_value(t, exceeded, false)
-		testing.expect_value(t, config.shard_restart_count, u16(1))
+		testing.expect_value(t, runtime_state.restart_count, u16(1))
 
-		exceeded = _check_and_record_shard_restart(&config, 500_000_000)
+		exceeded = _check_and_record_shard_restart(&runtime_state, &spec, 500_000_000)
 		testing.expect_value(t, exceeded, false)
-		testing.expect_value(t, config.shard_restart_count, u16(2))
+		testing.expect_value(t, runtime_state.restart_count, u16(2))
 
-		exceeded = _check_and_record_shard_restart(&config, 900_000_000)
+		exceeded = _check_and_record_shard_restart(&runtime_state, &spec, 900_000_000)
 		testing.expect_value(t, exceeded, true)
-		testing.expect_value(t, config.shard_restart_count, u16(3))
+		testing.expect_value(t, runtime_state.restart_count, u16(3))
 
-		exceeded = _check_and_record_shard_restart(&config, 1_500_000_000)
+		exceeded = _check_and_record_shard_restart(&runtime_state, &spec, 1_500_000_000)
 		testing.expect_value(t, exceeded, false)
-		testing.expect_value(t, config.shard_restart_count, u16(1))
-		testing.expect_value(t, config.shard_restart_window_ns, u64(1_500_000_000))
+		testing.expect_value(t, runtime_state.restart_count, u16(1))
+		testing.expect_value(t, runtime_state.restart_window_start_ns, u64(1_500_000_000))
 	}
 }

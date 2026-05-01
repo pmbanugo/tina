@@ -7,22 +7,26 @@ import "core:thread"
 import "core:time"
 
 @(private = "package")
-_check_and_record_shard_restart :: proc(config: ^Shard_Config, wall_now_ns: u64) -> bool {
-	window_duration_ns := u64(config.system_spec.watchdog.shard_restart_window_ms) * 1_000_000
+_check_and_record_shard_restart :: proc(
+	runtime_state: ^Shard_Runtime_State,
+	spec: ^SystemSpec,
+	wall_now_ns: u64,
+) -> bool {
+	window_duration_ns := u64(spec.watchdog.shard_restart_window_ms) * 1_000_000
 	if window_duration_ns == 0 do window_duration_ns = 30 * u64(time.Second)
 
-	restart_count_max := config.system_spec.watchdog.shard_restart_max
+	restart_count_max := spec.watchdog.shard_restart_max
 	if restart_count_max == 0 do restart_count_max = 3
 
-	if config.shard_restart_window_ns == 0 ||
-	   wall_now_ns - config.shard_restart_window_ns >= window_duration_ns {
-		config.shard_restart_window_ns = wall_now_ns
-		config.shard_restart_count = 1
+	if runtime_state.restart_window_start_ns == 0 ||
+	   wall_now_ns - runtime_state.restart_window_start_ns >= window_duration_ns {
+		runtime_state.restart_window_start_ns = wall_now_ns
+		runtime_state.restart_count = 1
 		return false
 	}
 
-	config.shard_restart_count += 1
-	return config.shard_restart_count > restart_count_max
+	runtime_state.restart_count += 1
+	return runtime_state.restart_count > restart_count_max
 }
 
 // Custom assertion handler that routes Odin software panics into Tina's Trap Boundary.
@@ -56,11 +60,12 @@ tina_assertion_failure_proc :: proc(
 // The entry point for every Shard OS thread.
 shard_thread_entry :: proc(t: ^thread.Thread) {
 	config := cast(^Shard_Config)t.data
+	runtime_state := config.runtime_state
 	name_bufffer: [32]u8
 	name_string := fmt.bprintf(name_bufffer[:], "tina-shard-%d", config.shard_id)
 	os_set_current_thread_name(name_string)
 
-	config.os_thread_handle = os_get_current_thread_handle()
+	runtime_state.os_thread_handle = os_get_current_thread_handle()
 
 	// Hook Odin's software panics into the Tina Trap Boundary
 	context.assertion_failure_proc = tina_assertion_failure_proc
@@ -68,10 +73,10 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	shard := new(Shard)
 	defer free(shard)
 
-	config.shard_pointer = shard
+	runtime_state.shard_pointer = shard
 	g_current_shard_pointer = shard
 	shard.id = config.shard_id
-	shard.shared_state = &config.watchdog_state
+	shard.shared_state = &runtime_state.watchdog_state
 
 	os_pin_thread_to_core(i32(config.target_core))
 
@@ -120,7 +125,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 			// 1. Evaluate Shard Restart Intensity using watchdog-owned policy.
 			wall_now_ns := os_monotonic_time_ns()
-			if _check_and_record_shard_restart(config, wall_now_ns) {
+			if _check_and_record_shard_restart(runtime_state, config.system_spec, wall_now_ns) {
 				if config.system_spec.quarantine_policy == .Abort {
 					fmt.eprintfln(
 						"[FATAL] Shard %d exceeded restart limits. Policy: Abort. Force Killing Process.",
@@ -133,7 +138,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 						shard.id,
 					)
 					sync.atomic_store_explicit(
-						&config.watchdog_state,
+						&runtime_state.watchdog_state,
 						u8(Shard_State.Quarantined),
 						.Release,
 					)
@@ -160,17 +165,17 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		}
 
 		// 3. The Dormant Sleep Loop (Fixes Silent Escapes)
-		state := cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed)
+		state := cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
 		if state == .Quarantined {
 			// Poll interval derived from watchdog cadence — never faster than the watchdog can act.
 			poll_ms := config.system_spec.watchdog.check_interval_ms
 			if poll_ms == 0 do poll_ms = 500
 			poll_interval := time.Duration(poll_ms) * time.Millisecond
 
-			for cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed) == .Quarantined {
+			for cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed) == .Quarantined {
 				phase := get_process_phase()
 				if phase == .Shutting_Down || phase == .Terminated {
-					sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Terminated), .Release)
+					sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(Shard_State.Terminated), .Release)
 					return // Safely exit thread to unblock watchdog join
 				}
 				when !TINA_SIMULATION_MODE {
@@ -179,8 +184,8 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			}
 
 			// Recovered from quarantine! Reset limits and force a clean rebuild.
-			config.shard_restart_count = 0
-			config.shard_restart_window_ns = os_monotonic_time_ns()
+			runtime_state.restart_count = 0
+			runtime_state.restart_window_start_ns = os_monotonic_time_ns()
 			shard_mass_teardown(shard)
 		}
 
@@ -202,12 +207,12 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		}
 
 		// Safe transition to Running (Never blindly overwrite a Quarantined state)
-		sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Running), .Release)
+		sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(Shard_State.Running), .Release)
 
 		// S16. Enter scheduler loop
 		for {
 			current_state := cast(Shard_State)sync.atomic_load_explicit(
-				&config.watchdog_state,
+				&runtime_state.watchdog_state,
 				.Relaxed,
 			)
 			if current_state == .Shutting_Down && !shard_has_live_isolates(shard) do break
@@ -216,7 +221,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			scheduler_tick(shard)
 		}
 
-		if cast(Shard_State)sync.atomic_load_explicit(&config.watchdog_state, .Relaxed) != .Running do break
+		if cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed) != .Running do break
 	}
 
 	when TINA_DEBUG_ASSERTS {
@@ -232,5 +237,5 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	}
 
 	log_flush(shard)
-	sync.atomic_store_explicit(&config.watchdog_state, u8(Shard_State.Terminated), .Release)
+	sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(Shard_State.Terminated), .Release)
 }

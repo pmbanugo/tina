@@ -17,7 +17,7 @@ Watchdog_Tracker :: struct {
 	stall_count:         [MAX_SHARDS]u8,
 }
 
-watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
+watchdog_loop :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) {
 	interval_ms := spec.watchdog.check_interval_ms
 	if interval_ms == 0 do interval_ms = 500
 
@@ -40,18 +40,19 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 		switch event {
 		case .Shutdown:
 			_write_stderr(transmute([]u8)string("\n[WATCHDOG] Initiating Graceful Shutdown...\n"))
-			_execute_graceful_shutdown(configs, spec)
+			_execute_graceful_shutdown(runtime_states, spec)
 			return
 
 		case .Recover_Quarantine:
 			_write_stderr(transmute([]u8)string("[WATCHDOG] Recovering quarantined Shards.\n"))
 			for i in 0 ..< spec.shard_count {
-				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
+				runtime_state := &runtime_states[i]
+				state := cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
 				if state == .Quarantined {
 					tracker.stall_count[i] = 0
-					configs[i].shard_restart_count = 0
-					configs[i].shard_restart_window_ns = os_monotonic_time_ns()
-					sync.atomic_store_explicit(&configs[i].watchdog_state, u8(Shard_State.Running), .Release)
+					runtime_state.restart_count = 0
+					runtime_state.restart_window_start_ns = os_monotonic_time_ns()
+					sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(Shard_State.Running), .Release)
 					buf: [64]u8
 					position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
 					position = _sig_append_u64(buf[:], position, u64(i))
@@ -66,10 +67,11 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 		case .None:
 			// Timeout (EAGAIN) — No OS signal received. Do periodic heartbeat work.
 			for i in 0 ..< spec.shard_count {
-				state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
+				runtime_state := &runtime_states[i]
+				state := cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
 				if state != .Running do continue
 
-				shard := configs[i].shard_pointer
+				shard := runtime_state.shard_pointer
 				if shard == nil do continue
 
 				current_heartbeat := sync.atomic_load_explicit(&shard.heartbeat_tick, .Relaxed)
@@ -97,7 +99,7 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 						position = _sig_append_u64(buf[:], position, u64(i))
 						position = _sig_append_str(buf[:], position, " hard-stalled. Phase 2 (Forced SIGUSR1) dispatched.\n")
 						_write_stderr(buf[:position])
-						os_signal_thread(configs[i].os_thread_handle, posix.Signal.SIGUSR1)
+						os_signal_thread(runtime_state.os_thread_handle, posix.Signal.SIGUSR1)
 						tracker.stall_count[i] = 0
 					}
 				} else {
@@ -111,14 +113,15 @@ watchdog_loop :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 }
 
 @(private = "file")
-_execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
+_execute_graceful_shutdown :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) {
 	set_process_phase(.Shutting_Down)
 
 	// Notify all running shards via control signal
 	for i in 0 ..< spec.shard_count {
-		state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
+		runtime_state := &runtime_states[i]
+		state := cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
 		if state == .Running {
-			shard := configs[i].shard_pointer
+			shard := runtime_state.shard_pointer
 			if shard != nil {
 				sync.atomic_store_explicit(
 					cast(^u8)&shard.control_signal,
@@ -147,13 +150,13 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 		event := os_poll_watchdog_events(100)
 		if event == .Shutdown {
 			_write_stderr(transmute([]u8)string("[FATAL] Second signal received. Executing Phase 3 Force-Kill.\n"))
-			_execute_phase3_force_kill(configs, spec)
+			_execute_phase3_force_kill(runtime_states, spec)
 		}
 
 		// Check if all shards have cleanly terminated
 		all_terminated := true
 		for i in 0 ..< spec.shard_count {
-			state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
+			state := cast(Shard_State)sync.atomic_load_explicit(&runtime_states[i].watchdog_state, .Relaxed)
 			if state != .Terminated && state != .Quarantined {
 				all_terminated = false
 				break
@@ -167,10 +170,11 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 
 		// Heartbeat monitoring during drain (§5.2 — watchdog remains active)
 		for i in 0 ..< spec.shard_count {
-			state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
+			runtime_state := &runtime_states[i]
+			state := cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
 			if state != .Shutting_Down do continue
 
-			shard := configs[i].shard_pointer
+			shard := runtime_state.shard_pointer
 			if shard == nil do continue
 
 			current_heartbeat := sync.atomic_load_explicit(&shard.heartbeat_tick, .Relaxed)
@@ -184,7 +188,7 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 						position = _sig_append_str(buf[:], position, " stalled during shutdown drain. Sending SIGUSR1.\n")
 						_write_stderr(buf[:position])
 					}
-					os_signal_thread(configs[i].os_thread_handle, posix.Signal.SIGUSR1)
+					os_signal_thread(runtime_state.os_thread_handle, posix.Signal.SIGUSR1)
 					tracker.stall_count[i] = 0
 				}
 			} else {
@@ -201,17 +205,17 @@ _execute_graceful_shutdown :: proc(configs: []Shard_Config, spec: ^SystemSpec) {
 			position = _sig_append_u64(buf[:], position, u64(timeout_ms))
 			position = _sig_append_str(buf[:], position, " ms). Executing Phase 3 Force-Kill.\n")
 			_write_stderr(buf[:position])
-			_execute_phase3_force_kill(configs, spec)
+			_execute_phase3_force_kill(runtime_states, spec)
 		}
 	}
 }
 
 @(private = "file")
-_execute_phase3_force_kill :: proc(configs: []Shard_Config, spec: ^SystemSpec) -> ! {
+_execute_phase3_force_kill :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) -> ! {
 	// Step 1: Log diagnostic
 	alive_count := 0
 	for i in 0 ..< spec.shard_count {
-		state := cast(Shard_State)sync.atomic_load_explicit(&configs[i].watchdog_state, .Relaxed)
+		state := cast(Shard_State)sync.atomic_load_explicit(&runtime_states[i].watchdog_state, .Relaxed)
 		if state != .Terminated && state != .Quarantined {
 			alive_count += 1
 		}
@@ -226,7 +230,7 @@ _execute_phase3_force_kill :: proc(configs: []Shard_Config, spec: ^SystemSpec) -
 
 	// Step 2: Emergency log flush for all shards (best-effort, accepts data race)
 	for i in 0 ..< spec.shard_count {
-		shard := configs[i].shard_pointer
+		shard := runtime_states[i].shard_pointer
 		if shard != nil {
 			when ODIN_OS == .Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD || ODIN_OS == .Windows {
 				emergency_log_flush_snapshot(shard)
