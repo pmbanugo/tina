@@ -47,12 +47,12 @@ watchdog_loop :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) 
 			_write_stderr(transmute([]u8)string("[WATCHDOG] Recovering quarantined Shards.\n"))
 			for i in 0 ..< spec.shard_count {
 				runtime_state := &runtime_states[i]
-				state := runtime_state_get(runtime_state)
+				state := load_watchdog_state(runtime_state)
 				if state == .Quarantined {
 					tracker.stall_count[i] = 0
 					runtime_state.restart_count = 0
 					runtime_state.restart_window_start_ns = os_monotonic_time_ns()
-					runtime_state_set(runtime_state, .Running)
+					store_watchdog_state(runtime_state, .Running)
 					buf: [64]u8
 					position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
 					position = _sig_append_u64(buf[:], position, u64(i))
@@ -68,7 +68,7 @@ watchdog_loop :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) 
 			// Timeout (EAGAIN) — No OS signal received. Do periodic heartbeat work.
 			for i in 0 ..< spec.shard_count {
 				runtime_state := &runtime_states[i]
-				state := runtime_state_get(runtime_state)
+				state := load_watchdog_state(runtime_state)
 				if state != .Running do continue
 
 				shard := runtime_state.shard_pointer
@@ -81,7 +81,7 @@ watchdog_loop :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) 
 
 					if tracker.stall_count[i] == 1 {
 						// Phase 1: Cooperative Escalation
-						shard_control_signal_set(shard, .Kill)
+						store_shard_control_signal(shard, .Kill)
 						buf: [96]u8
 						position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
 						position = _sig_append_u64(buf[:], position, u64(i))
@@ -110,16 +110,16 @@ watchdog_loop :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) 
 
 @(private = "file")
 _execute_graceful_shutdown :: proc(runtime_states: []Shard_Runtime_State, spec: ^SystemSpec) {
-	set_process_phase(.Shutting_Down)
+	store_process_phase(.Shutting_Down)
 
 	// Notify all running shards via control signal
 	for i in 0 ..< spec.shard_count {
 		runtime_state := &runtime_states[i]
-		state := runtime_state_get(runtime_state)
+		state := load_watchdog_state(runtime_state)
 		if state == .Running {
 			shard := runtime_state.shard_pointer
 			if shard != nil {
-				shard_control_signal_set(shard, .Shutdown)
+				store_shard_control_signal(shard, .Shutdown)
 			}
 		}
 	}
@@ -148,7 +148,7 @@ _execute_graceful_shutdown :: proc(runtime_states: []Shard_Runtime_State, spec: 
 		// Check if all shards have cleanly terminated
 		all_terminated := true
 		for i in 0 ..< spec.shard_count {
-			state := runtime_state_get(&runtime_states[i])
+			state := load_watchdog_state(&runtime_states[i])
 			if state != .Terminated && state != .Quarantined {
 				all_terminated = false
 				break
@@ -163,7 +163,7 @@ _execute_graceful_shutdown :: proc(runtime_states: []Shard_Runtime_State, spec: 
 		// Heartbeat monitoring during drain (§5.2 — watchdog remains active)
 		for i in 0 ..< spec.shard_count {
 			runtime_state := &runtime_states[i]
-			state := runtime_state_get(runtime_state)
+			state := load_watchdog_state(runtime_state)
 			if state != .Shutting_Down do continue
 
 			shard := runtime_state.shard_pointer
@@ -207,7 +207,7 @@ _execute_phase3_force_kill :: proc(runtime_states: []Shard_Runtime_State, spec: 
 	// Step 1: Log diagnostic
 	alive_count := 0
 	for i in 0 ..< spec.shard_count {
-		state := runtime_state_get(&runtime_states[i])
+		state := load_watchdog_state(&runtime_states[i])
 		if state != .Terminated && state != .Quarantined {
 			alive_count += 1
 		}

@@ -137,7 +137,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 						"[QUARANTINE] Shard %d exceeded restart limits. Quarantining.",
 						shard.id,
 					)
-					runtime_state_set(runtime_state, .Quarantined)
+					store_watchdog_state(runtime_state, .Quarantined)
 
 					// Single Writer Principle: Shard broadcasts its own quarantine state
 					env: Message_Envelope
@@ -161,17 +161,17 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		}
 
 		// 3. The Dormant Sleep Loop (Fixes Silent Escapes)
-		state := runtime_state_get(runtime_state)
+		state := load_watchdog_state(runtime_state)
 		if state == .Quarantined {
 			// Poll interval derived from watchdog cadence — never faster than the watchdog can act.
 			poll_ms := config.system_spec.watchdog.check_interval_ms
 			if poll_ms == 0 do poll_ms = 500
 			poll_interval := time.Duration(poll_ms) * time.Millisecond
 
-			for runtime_state_get(runtime_state) == .Quarantined {
-				phase := get_process_phase()
+			for load_watchdog_state(runtime_state) == .Quarantined {
+				phase := load_process_phase()
 				if phase == .Shutting_Down || phase == .Terminated {
-					runtime_state_set(runtime_state, .Terminated)
+					store_watchdog_state(runtime_state, .Terminated)
 					return // Safely exit thread to unblock watchdog join
 				}
 				when !TINA_SIMULATION_MODE {
@@ -203,18 +203,18 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		}
 
 		// Safe transition to Running (Never blindly overwrite a Quarantined state)
-		runtime_state_set(runtime_state, .Running)
+		store_watchdog_state(runtime_state, .Running)
 
 		// S16. Enter scheduler loop
 		for {
-			current_state := runtime_state_get(runtime_state)
+			current_state := load_watchdog_state(runtime_state)
 			if current_state == .Shutting_Down && !shard_has_live_isolates(shard) do break
 			if current_state != .Running && current_state != .Shutting_Down do break
 
 			scheduler_tick(shard)
 		}
 
-		if runtime_state_get(runtime_state) != .Running do break
+		if load_watchdog_state(runtime_state) != .Running do break
 	}
 
 	when TINA_DEBUG_ASSERTS {
@@ -230,5 +230,5 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	}
 
 	log_flush(shard)
-	runtime_state_set(runtime_state, .Terminated)
+	store_watchdog_state(runtime_state, .Terminated)
 }

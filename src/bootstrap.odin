@@ -45,7 +45,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	// ========================================================================
 	// PHASE: BOOTSTRAP (single-threaded)
 	// ========================================================================
-	set_process_phase(.Bootstrap)
+	store_process_phase(.Bootstrap)
 	os_set_current_thread_name("tina-watchdog")
 
 	// 1. Parse boot spec and validate
@@ -65,9 +65,9 @@ tina_start :: proc(spec: ^SystemSpec) {
 				os.exit(1)
 			}
 
-			set_process_phase(.Running)
+			store_process_phase(.Running)
 			simulator_run(simulator)
-			set_process_phase(.Terminated)
+			store_process_phase(.Terminated)
 			return // End process cleanly, bypassing production setup
 		}
 	}
@@ -181,7 +181,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	// ========================================================================
 	// PHASE: SHARD_INIT (multi-threaded, pre-scheduler)
 	// ========================================================================
-	set_process_phase(.Shard_Init)
+	store_process_phase(.Shard_Init)
 
 	// 6. Spawn Shard threads
 	threads := make([]^thread.Thread, spec.shard_count)
@@ -204,7 +204,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	init_loop: for {
 		all_running := true
 		for index in 0 ..< spec.shard_count {
-			state := runtime_state_get(&shard_runtime_states[index])
+			state := load_watchdog_state(&shard_runtime_states[index])
 			if state != .Running {
 				all_running = false
 				break
@@ -215,7 +215,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 		if time.stopwatch_duration(stopwatch) > timeout_duration {
 			for index in 0 ..< spec.shard_count {
-				state := runtime_state_get(&shard_runtime_states[index])
+				state := load_watchdog_state(&shard_runtime_states[index])
 				if state == .Init {
 					fmt.eprintfln(
 						"[FATAL] Shard %d failed to initialize within %v",
@@ -232,7 +232,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	// ========================================================================
 	// PHASE: RUNNING
 	// ========================================================================
-	set_process_phase(.Running)
+	store_process_phase(.Running)
 
 	// 10. Enter Watchdog loop (sigtimedwait / kqueue)
 	watchdog_loop(shard_runtime_states, spec)
@@ -243,6 +243,6 @@ tina_start :: proc(spec: ^SystemSpec) {
 		thread.destroy(t)
 	}
 
-	set_process_phase(.Terminated)
+	store_process_phase(.Terminated)
 	fmt.printfln("[SYSTEM] Process Terminated Cleanly.")
 }

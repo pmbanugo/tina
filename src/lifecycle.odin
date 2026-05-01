@@ -15,12 +15,18 @@ Process_Phase :: enum u8 {
 g_process_phase: Process_Phase = .Bootstrap
 
 @(private = "package")
-runtime_state_get :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
+load_watchdog_state :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
 	return cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
 }
 
 @(private = "package")
-runtime_state_set :: #force_inline proc "contextless" (
+store_watchdog_state :: proc {
+	_store_watchdog_state_runtime,
+	_store_watchdog_state_shard,
+}
+
+@(private = "package")
+_store_watchdog_state_runtime :: #force_inline proc "contextless" (
 	runtime_state: ^Shard_Runtime_State,
 	state: Shard_State,
 ) {
@@ -28,12 +34,12 @@ runtime_state_set :: #force_inline proc "contextless" (
 }
 
 @(private = "package")
-shard_control_signal_get :: #force_inline proc "contextless" (shard: ^Shard) -> Control_Signal {
+load_shard_control_signal :: #force_inline proc "contextless" (shard: ^Shard) -> Control_Signal {
 	return cast(Control_Signal)sync.atomic_load_explicit(cast(^u8)&shard.control_signal, .Relaxed)
 }
 
 @(private = "package")
-shard_control_signal_set :: #force_inline proc "contextless" (
+store_shard_control_signal :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	signal: Control_Signal,
 ) {
@@ -41,16 +47,16 @@ shard_control_signal_set :: #force_inline proc "contextless" (
 }
 
 @(private = "package")
-shard_runtime_state_set :: #force_inline proc "contextless" (shard: ^Shard, state: Shard_State) {
+_store_watchdog_state_shard :: #force_inline proc "contextless" (shard: ^Shard, state: Shard_State) {
 	sync.atomic_store_explicit(shard.watchdog_state_pointer, u8(state), .Release)
 }
 
 // Atomically read the current process phase.
-get_process_phase :: #force_inline proc "contextless" () -> Process_Phase {
+load_process_phase :: #force_inline proc "contextless" () -> Process_Phase {
 	return cast(Process_Phase)sync.atomic_load_explicit(cast(^u8)&g_process_phase, .Relaxed)
 }
 
 // Atomically set the process phase. (Called primarily by the watchdog/main thread).
-set_process_phase :: #force_inline proc "contextless" (phase: Process_Phase) {
+store_process_phase :: #force_inline proc "contextless" (phase: Process_Phase) {
 	sync.atomic_store_explicit(cast(^u8)&g_process_phase, u8(phase), .Relaxed)
 }
