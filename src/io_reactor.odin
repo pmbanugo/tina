@@ -460,7 +460,6 @@ reactor_submit_io :: proc(
 
 		submission.operation = Submission_Op_Read {
 			fd     = entry.os_fd,
-			buffer = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size   = op.buffer_size_max,
 			offset = op.offset,
 		}
@@ -484,7 +483,6 @@ reactor_submit_io :: proc(
 
 		submission.operation = Submission_Op_Write {
 			fd     = entry.os_fd,
-			buffer = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size   = op.payload_size,
 			offset = op.offset,
 		}
@@ -527,7 +525,6 @@ reactor_submit_io :: proc(
 
 		submission.operation = Submission_Op_Send {
 			fd_socket = entry.os_fd,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.payload_size,
 		}
 
@@ -543,7 +540,6 @@ reactor_submit_io :: proc(
 
 		submission.operation = Submission_Op_Recv {
 			fd_socket = entry.os_fd,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.buffer_size_max,
 		}
 
@@ -567,7 +563,6 @@ reactor_submit_io :: proc(
 		submission.operation = Submission_Op_Sendto {
 			fd_socket = entry.os_fd,
 			address   = op.address,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.payload_size,
 		}
 
@@ -583,7 +578,6 @@ reactor_submit_io :: proc(
 
 		submission.operation = Submission_Op_Recvfrom {
 			fd_socket = entry.os_fd,
-			buffer    = reactor_buffer_pool_slot_ptr(&reactor.buffer_pool, buffer_index),
 			size      = op.buffer_size_max,
 		}
 

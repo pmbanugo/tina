@@ -69,6 +69,10 @@ when !TINA_SIMULATION_MODE {
 
 	_Platform_State :: struct {
 		ring:               uring.Ring,
+		buffer_base:        [^]u8,
+		buffer_slot_size:   u32,
+		buffer_slot_count:  u16,
+		_padding:           u16,
 		wake_fd:            OS_FD,
 		wake_buffer:        u64,
 		unqueued:           [MAX_LINUX_UNQUEUED]Submission,
@@ -108,6 +112,9 @@ when !TINA_SIMULATION_MODE {
 			return .System_Error
 		}
 		backend.wake_fd = OS_FD(wakefd)
+		backend.buffer_base = config.buffer_base
+		backend.buffer_slot_size = config.buffer_slot_size
+		backend.buffer_slot_count = config.buffer_slot_count
 		backend.unqueued_count = 0
 		backend.buffers_registered = false
 
@@ -661,17 +668,31 @@ when !TINA_SIMULATION_MODE {
 		switch op in submission.operation {
 		case Submission_Op_Read:
 			buffer_index := submission_token_buffer_index(submission.token)
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				submission.token,
+			)
 
 			// When the buffer belongs to the registered pool, use READ_FIXED to
 			// bypass the kernel's per-operation get_user_pages cost (§6.6.2 §8).
 			if backend.buffers_registered && buffer_index != BUFFER_INDEX_NONE {
-				return _linux_submit_read_fixed(backend, ud, op, buffer_index, use_fixed, ffi)
+				return _linux_submit_read_fixed(
+					backend,
+					ud,
+					op,
+					buffer_pointer,
+					buffer_index,
+					use_fixed,
+					ffi,
+				)
 			}
 			sqe, ok := uring.read(
 				&backend.ring,
 				ud,
 				linux.Fd(op.fd),
-				op.buffer[:op.size],
+				buffer_pointer[:op.size],
 				u64(op.offset),
 			)
 			if ok && use_fixed {
@@ -681,15 +702,29 @@ when !TINA_SIMULATION_MODE {
 
 		case Submission_Op_Write:
 			buffer_index := submission_token_buffer_index(submission.token)
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				submission.token,
+			)
 
 			if backend.buffers_registered && buffer_index != BUFFER_INDEX_NONE {
-				return _linux_submit_write_fixed(backend, ud, op, buffer_index, use_fixed, ffi)
+				return _linux_submit_write_fixed(
+					backend,
+					ud,
+					op,
+					buffer_pointer,
+					buffer_index,
+					use_fixed,
+					ffi,
+				)
 			}
 			sqe, ok := uring.write(
 				&backend.ring,
 				ud,
 				linux.Fd(op.fd),
-				op.buffer[:op.size],
+				buffer_pointer[:op.size],
 				u64(op.offset),
 			)
 			if ok && use_fixed {
@@ -756,11 +791,17 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Send:
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				submission.token,
+			)
 			sqe, ok := uring.send(
 				&backend.ring,
 				ud,
 				linux.Fd(op.fd_socket),
-				op.buffer[:op.size],
+				buffer_pointer[:op.size],
 				{.NOSIGNAL},
 			)
 			if ok && use_fixed {
@@ -769,11 +810,17 @@ when !TINA_SIMULATION_MODE {
 			return ok
 
 		case Submission_Op_Recv:
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				submission.token,
+			)
 			sqe, ok := uring.recv(
 				&backend.ring,
 				ud,
 				linux.Fd(op.fd_socket),
-				op.buffer[:op.size],
+				buffer_pointer[:op.size],
 				{.NOSIGNAL},
 			)
 			if ok && use_fixed {
@@ -786,9 +833,15 @@ when !TINA_SIMULATION_MODE {
 			if entry == nil {
 				return false
 			}
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				submission.token,
+			)
 			entry.sockaddr = _linux_socket_address_to_sockaddr(op.address)
 			entry.iovec = linux.IO_Vec {
-				base = op.buffer,
+				base = buffer_pointer,
 				len  = uint(op.size),
 			}
 			entry.msghdr = linux.Msg_Hdr {
@@ -816,9 +869,15 @@ when !TINA_SIMULATION_MODE {
 			if entry == nil {
 				return false
 			}
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				submission.token,
+			)
 			entry.sockaddr_len = size_of(entry.sockaddr)
 			entry.iovec = linux.IO_Vec {
-				base = op.buffer,
+				base = buffer_pointer,
 				len  = uint(op.size),
 			}
 			entry.msghdr = linux.Msg_Hdr {
@@ -1176,6 +1235,7 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		user_data: u64,
 		op: Submission_Op_Read,
+		buffer_pointer: [^]u8,
 		buffer_index: u16,
 		use_fixed_file: bool,
 		fixed_file_index: u16,
@@ -1183,7 +1243,7 @@ when !TINA_SIMULATION_MODE {
 		sqe := uring.get_sqe(&backend.ring) or_return
 		sqe.opcode = .READ_FIXED
 		sqe.fd = linux.Fd(op.fd)
-		sqe.addr = u64(uintptr(op.buffer))
+		sqe.addr = u64(uintptr(buffer_pointer))
 		sqe.len = op.size
 		sqe.off = op.offset
 		sqe.user_data = user_data
@@ -1200,6 +1260,7 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		user_data: u64,
 		op: Submission_Op_Write,
+		buffer_pointer: [^]u8,
 		buffer_index: u16,
 		use_fixed_file: bool,
 		fixed_file_index: u16,
@@ -1207,7 +1268,7 @@ when !TINA_SIMULATION_MODE {
 		sqe := uring.get_sqe(&backend.ring) or_return
 		sqe.opcode = .WRITE_FIXED
 		sqe.fd = linux.Fd(op.fd)
-		sqe.addr = u64(uintptr(op.buffer))
+		sqe.addr = u64(uintptr(buffer_pointer))
 		sqe.len = op.size
 		sqe.off = op.offset
 		sqe.user_data = user_data
@@ -1412,9 +1473,13 @@ when !TINA_SIMULATION_MODE {
 	@(test)
 	test_linux_fixed_file_update_round_trip :: proc(t: ^testing.T) {
 		backend: Platform_Backend
+		buffer_backing: [64]u8
 		config := Backend_Config {
-			queue_size    = DEFAULT_BACKEND_QUEUE_SIZE,
-			fd_slot_count = 4,
+			queue_size       = DEFAULT_BACKEND_QUEUE_SIZE,
+			buffer_base      = &buffer_backing[0],
+			buffer_slot_size = 64,
+			buffer_slot_count = 1,
+			fd_slot_count    = 4,
 		}
 		backend_init(&backend, config)
 		defer backend_deinit(&backend)
@@ -1427,13 +1492,12 @@ when !TINA_SIMULATION_MODE {
 		_backend_register_fixed_fd(&backend, 0, fd)
 
 		// Submit a recv using IOSQE_FIXED_FILE on slot 0
-		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE))
-		buf: [64]u8
+		token := submission_token_pack(0, 0, 0, 0, 0, u8(IO_TAG_RECV_COMPLETE))
 		submissions := [1]Submission {
 			{
 				token = token,
 				fixed_file_index = 0,
-				operation = Submission_Op_Recv{fd_socket = fd, buffer = &buf[0], size = 64},
+				operation = Submission_Op_Recv{fd_socket = fd, size = 64},
 			},
 		}
 		sub_err := backend_submit(&backend, submissions[:])

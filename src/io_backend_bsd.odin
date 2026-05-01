@@ -86,6 +86,10 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	_Platform_State :: struct {
+		buffer_base:      [^]u8,
+		buffer_slot_size: u32,
+		buffer_slot_count: u16,
+		_padding:         u16,
 		kq_fd:           OS_FD,
 		pending:         [MAX_POSIX_PENDING]Pending_Posix_Op,
 		pending_count:   u16,
@@ -106,6 +110,9 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		backend.kq_fd = OS_FD(kq_fd)
+		backend.buffer_base = config.buffer_base
+		backend.buffer_slot_size = config.buffer_slot_size
+		backend.buffer_slot_count = config.buffer_slot_count
 		backend.pending_count = 0
 		backend.completed_count = 0
 		backend.completed_read = 0
@@ -149,7 +156,7 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		for &sub in submissions {
-			result, immediate := _try_syscall(&sub)
+			result, immediate := _try_syscall(backend, &sub)
 
 			if immediate {
 				backend.completed[backend.completed_count] = result
@@ -313,7 +320,7 @@ when !TINA_SIMULATION_MODE {
 				token     = pop.token,
 				operation = pop.operation,
 			}
-			result, immediate := _try_syscall(&sub)
+			result, immediate := _try_syscall(backend, &sub)
 
 			if immediate {
 				_posix_deliver_completion(backend, completions, &out, output_max, result)
@@ -692,7 +699,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_try_syscall :: proc(sub: ^Submission) -> (Raw_Completion, bool) {
+	_try_syscall :: proc(backend: ^Platform_Backend, sub: ^Submission) -> (Raw_Completion, bool) {
 		result := Raw_Completion {
 			token = sub.token,
 			extra = nil,
@@ -700,9 +707,15 @@ when !TINA_SIMULATION_MODE {
 
 		switch op in sub.operation {
 		case Submission_Op_Read:
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				sub.token,
+			)
 			n := posix.pread(
 				posix.FD(op.fd),
-				([^]byte)(op.buffer),
+				([^]byte)(buffer_pointer),
 				uint(op.size),
 				posix.off_t(op.offset),
 			)
@@ -718,9 +731,15 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Write:
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				sub.token,
+			)
 			n := posix.pwrite(
 				posix.FD(op.fd),
-				([^]byte)(op.buffer),
+				([^]byte)(buffer_pointer),
 				uint(op.size),
 				posix.off_t(op.offset),
 			)
@@ -781,7 +800,13 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Send:
-			n := posix.send(posix.FD(op.fd_socket), rawptr(op.buffer), uint(op.size), {.NOSIGNAL})
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				sub.token,
+			)
+			n := posix.send(posix.FD(op.fd_socket), rawptr(buffer_pointer), uint(op.size), {.NOSIGNAL})
 			if n < 0 {
 				errno := posix.errno()
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
@@ -794,7 +819,13 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Recv:
-			n := posix.recv(posix.FD(op.fd_socket), rawptr(op.buffer), uint(op.size), {})
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				sub.token,
+			)
+			n := posix.recv(posix.FD(op.fd_socket), rawptr(buffer_pointer), uint(op.size), {})
 			if n < 0 {
 				errno := posix.errno()
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
@@ -807,10 +838,16 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Sendto:
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				sub.token,
+			)
 			sa, sa_len := _socket_address_to_sockaddr(op.address)
 			n := posix.sendto(
 				posix.FD(op.fd_socket),
-				rawptr(op.buffer),
+				rawptr(buffer_pointer),
 				uint(op.size),
 				{.NOSIGNAL},
 				(^posix.sockaddr)(&sa),
@@ -828,11 +865,17 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Recvfrom:
+			buffer_pointer := submission_buffer_ptr(
+				backend.buffer_base,
+				backend.buffer_slot_size,
+				backend.buffer_slot_count,
+				sub.token,
+			)
 			peer_addr: posix.sockaddr_storage
 			addr_len := posix.socklen_t(size_of(peer_addr))
 			n := posix.recvfrom(
 				posix.FD(op.fd_socket),
-				rawptr(op.buffer),
+				rawptr(buffer_pointer),
 				uint(op.size),
 				{},
 				(^posix.sockaddr)(&peer_addr),

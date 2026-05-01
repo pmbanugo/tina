@@ -76,6 +76,10 @@ when !TINA_SIMULATION_MODE {
 	#assert(size_of(Win_Accept_Data) >= WIN_ACCEPTEX_MIN_BUF + size_of(OS_FD), "AcceptEx buffer too small for dual sockaddr_in6 + 16 padding")
 
 	_Platform_State :: struct {
+		buffer_base:      [^]u8,
+		buffer_slot_size: u32,
+		buffer_slot_count: u16,
+		_padding:         u16,
 		iocp:            win.HANDLE,
 		entries:         [MAX_WIN_OVERLAPPED]Win_Overlapped_Entry,
 		completed:       [MAX_WIN_COMPLETED]Raw_Completion,
@@ -100,6 +104,9 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		backend.iocp = iocp
+		backend.buffer_base = config.buffer_base
+		backend.buffer_slot_size = config.buffer_slot_size
+		backend.buffer_slot_count = config.buffer_slot_count
 		backend.completed_count = 0
 		backend.completed_read = 0
 
@@ -163,11 +170,17 @@ when !TINA_SIMULATION_MODE {
 
 			switch op in sub.operation {
 			case Submission_Op_Read:
+				buffer_pointer := submission_buffer_ptr(
+					backend.buffer_base,
+					backend.buffer_slot_size,
+					backend.buffer_slot_count,
+					sub.token,
+				)
 				entry.overlapped.Offset = win.DWORD(u64(op.offset) & 0xFFFFFFFF)
 				entry.overlapped.OffsetHigh = win.DWORD(u64(op.offset) >> 32)
 				ok := win.ReadFile(
 					win.HANDLE(uintptr(op.fd)),
-					op.buffer,
+					buffer_pointer,
 					win.DWORD(op.size),
 					nil,
 					&entry.overlapped,
@@ -185,11 +198,17 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Write:
+				buffer_pointer := submission_buffer_ptr(
+					backend.buffer_base,
+					backend.buffer_slot_size,
+					backend.buffer_slot_count,
+					sub.token,
+				)
 				entry.overlapped.Offset = win.DWORD(u64(op.offset) & 0xFFFFFFFF)
 				entry.overlapped.OffsetHigh = win.DWORD(u64(op.offset) >> 32)
 				ok := win.WriteFile(
 					win.HANDLE(uintptr(op.fd)),
-					op.buffer,
+					buffer_pointer,
 					win.DWORD(op.size),
 					nil,
 					&entry.overlapped,
@@ -300,9 +319,15 @@ when !TINA_SIMULATION_MODE {
 				entry.active = false
 
 			case Submission_Op_Send:
+				buffer_pointer := submission_buffer_ptr(
+					backend.buffer_base,
+					backend.buffer_slot_size,
+					backend.buffer_slot_count,
+					sub.token,
+				)
 				wsa_buf := win.WSABUF {
 					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(op.buffer),
+					buf = (^win.CHAR)(buffer_pointer),
 				}
 				rc := win.WSASend(
 					win.SOCKET(uintptr(op.fd_socket)),
@@ -325,9 +350,15 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Recv:
+				buffer_pointer := submission_buffer_ptr(
+					backend.buffer_base,
+					backend.buffer_slot_size,
+					backend.buffer_slot_count,
+					sub.token,
+				)
 				wsa_buf := win.WSABUF {
 					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(op.buffer),
+					buf = (^win.CHAR)(buffer_pointer),
 				}
 				flags: win.DWORD = 0
 				rc := win.WSARecv(
@@ -351,10 +382,16 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Sendto:
+				buffer_pointer := submission_buffer_ptr(
+					backend.buffer_base,
+					backend.buffer_slot_size,
+					backend.buffer_slot_count,
+					sub.token,
+				)
 				sockaddr, socklen := _win_socket_address_to_sockaddr(op.address)
 				wsa_buf := win.WSABUF {
 					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(op.buffer),
+					buf = (^win.CHAR)(buffer_pointer),
 				}
 				rc := win.WSASendTo(
 					win.SOCKET(uintptr(op.fd_socket)),
@@ -379,9 +416,15 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Recvfrom:
+				buffer_pointer := submission_buffer_ptr(
+					backend.buffer_base,
+					backend.buffer_slot_size,
+					backend.buffer_slot_count,
+					sub.token,
+				)
 				wsa_buf := win.WSABUF {
 					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(op.buffer),
+					buf = (^win.CHAR)(buffer_pointer),
 				}
 				flags: win.DWORD = 0
 				entry.op_data.recvfrom.peer_address = {}
@@ -1336,7 +1379,13 @@ when !TINA_SIMULATION_MODE {
 	@(test)
 	test_windows_send_recv_round_trip :: proc(t: ^testing.T) {
 		backend := new(Platform_Backend)
-		config := Backend_Config{queue_size = DEFAULT_BACKEND_QUEUE_SIZE}
+		buffer_backing: [64 * 2]u8
+		config := Backend_Config {
+			queue_size        = DEFAULT_BACKEND_QUEUE_SIZE,
+			buffer_base       = &buffer_backing[0],
+			buffer_slot_size  = 64,
+			buffer_slot_count = 2,
+		}
 		backend_init(backend, config)
 		defer { backend_deinit(backend); free(backend) }
 
@@ -1401,31 +1450,29 @@ when !TINA_SIMULATION_MODE {
 
 		// Send from client, recv on server
 		send_data := [4]u8{0xDE, 0xAD, 0xBE, 0xEF}
+		copy(buffer_backing[0:4], send_data[:])
 		send_token := submission_token_pack(
-			0, 2, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_SEND_COMPLETE),
+			0, 2, 0, 0, 0, u8(IO_TAG_SEND_COMPLETE),
 		)
 		send_sub := [1]Submission {
 			{
 				token = send_token,
 				operation = Submission_Op_Send{
 					fd_socket = client_fd,
-					buffer = &send_data[0],
-					size = 4,
+					size      = 4,
 				},
 			},
 		}
 
-		recv_buf: [64]u8
 		recv_token := submission_token_pack(
-			0, 3, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE),
+			0, 3, 0, 0, 1, u8(IO_TAG_RECV_COMPLETE),
 		)
 		recv_sub := [1]Submission {
 			{
 				token = recv_token,
 				operation = Submission_Op_Recv{
 					fd_socket = server_fd,
-					buffer = &recv_buf[0],
-					size = 64,
+					size      = 64,
 				},
 			},
 		}
@@ -1454,10 +1501,10 @@ when !TINA_SIMULATION_MODE {
 		testing.expect(t, send_done, "send should complete")
 		testing.expect(t, recv_done, "recv should complete")
 		testing.expect_value(t, recv_byte_count, 4)
-		testing.expect_value(t, recv_buf[0], 0xDE)
-		testing.expect_value(t, recv_buf[1], 0xAD)
-		testing.expect_value(t, recv_buf[2], 0xBE)
-		testing.expect_value(t, recv_buf[3], 0xEF)
+		testing.expect_value(t, buffer_backing[64], 0xDE)
+		testing.expect_value(t, buffer_backing[65], 0xAD)
+		testing.expect_value(t, buffer_backing[66], 0xBE)
+		testing.expect_value(t, buffer_backing[67], 0xEF)
 
 		backend_control_close(backend, server_fd)
 		backend_control_close(backend, client_fd)

@@ -120,6 +120,21 @@ backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> B
 	return _backend_cancel(backend, token)
 }
 
+@(private = "package")
+submission_buffer_ptr :: #force_inline proc(
+	buffer_base: [^]u8,
+	buffer_slot_size: u32,
+	buffer_slot_count: u16,
+	token: Submission_Token,
+) -> [^]u8 {
+	buffer_index := u16((u64(token) >> 44) & 0x0FFF)
+	assert(buffer_base != nil, "buffer_base must be set for buffered submissions")
+	assert(buffer_index != BUFFER_INDEX_NONE, "buffered submission token must carry a buffer index")
+	assert(buffer_index < buffer_slot_count, "submission buffer index out of bounds")
+	buffer_offset := u64(buffer_index) * u64(buffer_slot_size)
+	return cast([^]u8)(uintptr(buffer_base) + uintptr(buffer_offset))
+}
+
 // Interrupt a blocking backend_collect from another thread.
 backend_wake :: proc(backend: ^Platform_Backend) {
 	_backend_wake(backend)

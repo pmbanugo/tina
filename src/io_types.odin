@@ -414,14 +414,12 @@ submission_token_operation_tag :: #force_inline proc(t: Submission_Token) -> u8 
 
 Submission_Op_Read :: struct {
 	fd:     OS_FD,
-	buffer: [^]u8,
 	size:   u32,
 	offset: u64,
 }
 
 Submission_Op_Write :: struct {
 	fd:     OS_FD,
-	buffer: [^]u8,
 	size:   u32,
 	offset: u64,
 }
@@ -441,26 +439,22 @@ Submission_Op_Close :: struct {
 
 Submission_Op_Send :: struct {
 	fd_socket: OS_FD,
-	buffer:    [^]u8,
 	size:      u32,
 }
 
 Submission_Op_Recv :: struct {
 	fd_socket: OS_FD,
-	buffer:    [^]u8,
 	size:      u32,
 }
 
 Submission_Op_Sendto :: struct {
 	fd_socket: OS_FD,
 	address:   Socket_Address,
-	buffer:    [^]u8,
 	size:      u32,
 }
 
 Submission_Op_Recvfrom :: struct {
 	fd_socket: OS_FD,
-	buffer:    [^]u8,
 	size:      u32,
 }
 
