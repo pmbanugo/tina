@@ -2,7 +2,7 @@ package http_server
 
 import "core:testing"
 
-// Headers with semantic meaning to the parser — tracked exactly during parse
+// Headers with semantic meaning to the parser — tracked during parse
 @(private = "package")
 Known_Header :: enum u8 {
 	Host,
@@ -22,6 +22,9 @@ Known_Header_Mask :: distinct bit_set[Known_Header;u8]
 // Used for arbitrary header lookup via Header_View.hash and the bloom filter.
 
 @(private = "package")
+FNV_Hash_1a :: distinct u32
+
+@(private = "package")
 FNV1A_OFFSET_BASIS :: u32(2166136261)
 
 @(private = "package")
@@ -37,17 +40,18 @@ fold_ascii_upper :: #force_inline proc "contextless" (character: u8) -> u8 {
 }
 
 // Computes a case-insensitive FNV-1a hash directly from the slice.
-// Precondition: name_bytes must already be validated as valid HTTP token characters (CHARS_HTTP_TOKEN).
-// Only ASCII letters A..Z are folded to lowercase; all other bytes are preserved.
+// Precondition: name_bytes must already be validated as valid
+// HTTP token characters (CHARS_HTTP_TOKEN). Only ASCII letters A..Z
+// are folded to lowercase; all other bytes are preserved.
 @(private = "package")
-compute_header_hash :: #force_inline proc "contextless" (name_bytes: []u8) -> u32 {
+compute_header_hash :: #force_inline proc "contextless" (name_bytes: []u8) -> FNV_Hash_1a {
 	hash_value: u32 = FNV1A_OFFSET_BASIS
 
 	for character in name_bytes {
 		hash_value = (hash_value ~ u32(fold_ascii_upper(character))) * FNV1A_PRIME
 	}
 
-	return hash_value
+	return FNV_Hash_1a(hash_value)
 }
 
 // Combined validation + hashing in a single pass over header name bytes.
@@ -60,7 +64,7 @@ compute_header_hash :: #force_inline proc "contextless" (name_bytes: []u8) -> u3
 validate_and_hash_header_name :: proc "contextless" (
 	name_bytes: []u8,
 ) -> (
-	hash: u32,
+	hash: FNV_Hash_1a,
 	valid: bool,
 ) {
 	if len(name_bytes) == 0 do return 0, false
@@ -75,7 +79,7 @@ validate_and_hash_header_name :: proc "contextless" (
 		hash_value = (hash_value ~ u32(fold_ascii_upper(character))) * FNV1A_PRIME
 	}
 
-	return hash_value, true
+	return FNV_Hash_1a(hash_value), true
 }
 
 
@@ -83,15 +87,16 @@ validate_and_hash_header_name :: proc "contextless" (
 
 // Sets 2 bits in a 64-bit bloom filter derived from the hash.
 @(private = "package")
-bloom_set :: #force_inline proc "contextless" (bloom: ^u64, hash: u32) {
-	bit_a := hash & 0x3F // low 6 bits  -> bit position 0..63
-	bit_b := (hash >> 6) & 0x3F // next 6 bits -> bit position 0..63
+bloom_set :: #force_inline proc "contextless" (bloom: ^u64, hash: FNV_Hash_1a) {
+	h := u32(hash)
+	bit_a := h & 0x3F // low 6 bits  -> bit position 0..63
+	bit_b := (h >> 6) & 0x3F // next 6 bits -> bit position 0..63
 	bloom^ |= (1 << bit_a) | (1 << bit_b)
 }
 
-// Tests whether the bloom filter may contain a header with the given hash.
+// Check if  the bloom filter may contain a header with the given hash.
 @(private = "package")
-bloom_may_contain :: #force_inline proc "contextless" (bloom: u64, hash: u32) -> bool {
+bloom_may_contain :: #force_inline proc "contextless" (bloom: u64, hash: FNV_Hash_1a) -> bool {
 	bit_a := hash & 0x3F
 	bit_b := (hash >> 6) & 0x3F
 	mask := u64(1 << bit_a) | u64(1 << bit_b)
@@ -325,7 +330,7 @@ test_bloom_no_false_negatives :: proc(t: ^testing.T) {
 
 	// Insert several distinct header hashes.
 	headers := [?]string{"host", "content-length", "connection", "accept", "user-agent"}
-	hashes: [5]u32
+	hashes: [5]FNV_Hash_1a
 
 	for header, index in headers {
 		hashes[index] = compute_header_hash(transmute([]u8)header)

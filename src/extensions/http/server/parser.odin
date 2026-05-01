@@ -3,13 +3,6 @@ package http_server
 import "core:bytes"
 import "core:testing"
 
-// ─── Parser State Machine ───────────────────────────────────────────────────
-//
-// The parser is an incremental state machine that processes bytes from the
-// reactor buffer or working-memory ingress carry (split-packet).
-// Parse_Phase drives the outer loop; Parser_Flags track semantic state
-// extracted during header parsing.
-
 @(private = "package")
 Parse_Phase :: enum u8 {
 	Request_Line,
@@ -24,7 +17,7 @@ Parse_Phase :: enum u8 {
 }
 
 @(private = "package")
-Parser_Flag :: enum u16 {
+Parser_Flag :: enum u8 {
 	Has_Content_Length,
 	Has_Transfer_Encoding,
 	Chunked_Request,
@@ -51,13 +44,9 @@ Parser_Flags :: distinct bit_set[Parser_Flag;u16]
 //   'A' (65) → table[1] bit 1
 //   'a' (97) → table[1] bit 33
 //
-// This enables branchless validation:
-//   (table[c >> 6] & (1 << (c & 63))) != 0
-//
 // Important:
 //   These tables are derived from RFC rules.
 //   Use verify_all_tables() in debug builds to ensure correctness.
-
 @(private = "package")
 Table_256 :: distinct [4]u64
 
@@ -65,7 +54,7 @@ Table_256 :: distinct [4]u64
 // These represent exact 256-bit sets mathematically derived from HTTP RFCs.
 //
 // Char tables are intentionally `@(private = "file", rodata)` per the ADR
-// allowance for file-local lookup tables (HTTP_LIBRARY_DESIGN.md §2)
+// allowance (HTTP_LIBRARY_DESIGN.md §2)
 // Validation reaches them via package-private `is_*_byte` accessors below.
 
 @(private = "file", rodata)
@@ -108,7 +97,7 @@ CHARS_DIGIT_DECIMAL := Table_256 {
 	0x0000000000000000,
 }
 
-// ─── Inline Validation Helpers ──────────────────────────────────────────────
+// ─── Validation Helpers ──────────────────────────────────────────────
 //
 // They map the u8 to the exact bit in the 256-bit set.
 
@@ -214,6 +203,517 @@ find_newline_offset :: proc "contextless" (
 	}
 
 	return newline_offset, false
+}
+
+
+// Mutable per-request parser cursor. Lives inside HTTP_Connection_State and is
+// reset between requests on a keep-alive connection.
+@(private = "package")
+Parser_State :: struct {
+	body_size_remaining:  u64, // Content-Length remaining; tracked from header parse onward
+	chunk_size_remaining: u64, // bytes left inside the current chunk's data section
+	chunk_size_parsed:    u64, // partial hex value while accumulating a chunk size line
+	header_size:          u32, // total header bytes consumed (incl. CRLFs); bounded by Limits.header_size_max
+	request_line_size:    u16, // size of the request line (incl. trailing CRLF)
+	header_count:         u8, // number of headers parsed so far
+	flags:                Parser_Flags,
+	phase:                Parse_Phase,
+}
+
+// Initializes the parser to its pre-request baseline.
+// Called by the connection state machine on accept and
+// after each completed request frame on a keep-alive connection.
+@(private = "package")
+parser_state_reset :: #force_inline proc "contextless" (state: ^Parser_State) {
+	state^ = Parser_State{}
+}
+
+// Result returned to the connection state machine after each parse_step call.
+// Error variants encode the wire-protocol HTTP status code that the library
+// must respond with (then close the connection). The error → status mapping is
+// the source of truth — see HTTP_LIBRARY_REQUEST_PARSING.md §4.
+@(private = "package")
+Parse_Status :: enum u8 {
+	// `Continue` is an internal sentinel emitted by per-line helpers to signal
+	// that forward progress was made and the parse loop should keep going. It
+	// is filtered out by parse_step and never escapes the parser boundary.
+	Continue,
+	Need_More, // not enough buffered bytes to make progress; preserve state and resume
+	Headers_Done, // request line + all headers parsed and validated
+	Error_Bad_Request, // 400 — malformed request, smuggling guard tripped
+	Error_Expectation, // 417 — Expect header carries something other than 100-continue
+	Error_Header_Too_Large, // 431 — request line OR cumulative headers exceeded the limit
+	Error_Not_Implemented, // 501 — unsupported transfer-coding (e.g. anything other than `chunked`)
+	Error_Version, // 505 — version other than HTTP/1.1
+}
+
+
+// ─── Comparison Helpers ──────────────────────────────────────────────
+
+// Case-sensitive byte slice vs. literal string equality.
+@(private = "package")
+equal_bytes :: #force_inline proc "contextless" (lhs: []u8, rhs: string) -> bool {
+	if len(lhs) != len(rhs) do return false
+	rhs_bytes := transmute([]u8)rhs
+	for index in 0 ..< len(lhs) {
+		if lhs[index] != rhs_bytes[index] do return false
+	}
+	return true
+}
+
+// ASCII case-insensitive equality (folds A..Z only — see Parser Notes §1).
+// The right-hand literal is treated as the canonical form; both sides are
+// folded so callers may pass arbitrary case in either argument.
+@(private = "package")
+equal_bytes_ci :: #force_inline proc "contextless" (lhs: []u8, rhs: string) -> bool {
+	if len(lhs) != len(rhs) do return false
+	rhs_bytes := transmute([]u8)rhs
+	for index in 0 ..< len(lhs) {
+		if fold_ascii_upper(lhs[index]) != fold_ascii_upper(rhs_bytes[index]) do return false
+	}
+	return true
+}
+
+// Length-dispatched compare against the closed set of methods exposed by
+// `Method`. Method names are case-sensitive per RFC 9110 §9. Unknown but
+// otherwise valid token methods are reported with `known = false` so the
+// router can return 405 / 501 in a later phase.
+@(private = "package")
+classify_method :: #force_inline proc "contextless" (
+	method_bytes: []u8,
+) -> (
+	method: Method,
+	known: bool,
+) {
+	switch len(method_bytes) {
+	case 3:
+		if equal_bytes(method_bytes, "GET") do return .GET, true
+		if equal_bytes(method_bytes, "PUT") do return .PUT, true
+	case 4:
+		if equal_bytes(method_bytes, "POST") do return .POST, true
+		if equal_bytes(method_bytes, "HEAD") do return .HEAD, true
+	case 5:
+		if equal_bytes(method_bytes, "PATCH") do return .PATCH, true
+		if equal_bytes(method_bytes, "TRACE") do return .TRACE, true
+	case 6:
+		if equal_bytes(method_bytes, "DELETE") do return .DELETE, true
+	case 7:
+		if equal_bytes(method_bytes, "OPTIONS") do return .OPTIONS, true
+	}
+	return .GET, false
+}
+
+// Length-dispatched case-insensitive match against the closed `Known_Header`
+// set. Only headers with semantic meaning to the parser/router are tracked
+// here; arbitrary headers are stored in the bloom filter for negative lookup
+// and confirmed later by `length + ci-compare` on the raw slice.
+@(private = "package")
+classify_known_header :: #force_inline proc "contextless" (
+	name_bytes: []u8,
+) -> (
+	header: Known_Header,
+	known: bool,
+) {
+	switch len(name_bytes) {
+	case 4:
+		if equal_bytes_ci(name_bytes, "Host") do return .Host, true
+	case 6:
+		if equal_bytes_ci(name_bytes, "Expect") do return .Expect, true
+	case 7:
+		if equal_bytes_ci(name_bytes, "Upgrade") do return .Upgrade, true
+	case 10:
+		if equal_bytes_ci(name_bytes, "Connection") do return .Connection, true
+	case 14:
+		if equal_bytes_ci(name_bytes, "Content-Length") do return .Content_Length, true
+	case 17:
+		if equal_bytes_ci(name_bytes, "Transfer-Encoding") do return .Transfer_Encoding, true
+	}
+	return .Host, false
+}
+
+// `Connection: close, keep-alive, upgrade` is a comma-separated token list
+// with optional surrounding whitespace. Per RFC 9110 §7.6.1 we walk tokens,
+// case-insensitively matching the small set we care about.
+@(private = "package")
+parse_connection_tokens :: #force_inline proc "contextless" (
+	state: ^Parser_State,
+	value_bytes: []u8,
+) {
+	cursor := 0
+	for cursor < len(value_bytes) {
+		// Skip leading OWS and commas.
+		for cursor < len(value_bytes) {
+			byte_value := value_bytes[cursor]
+			if byte_value != ' ' && byte_value != '\t' && byte_value != ',' do break
+			cursor += 1
+		}
+		if cursor >= len(value_bytes) do break
+
+		token_start := cursor
+		for cursor < len(value_bytes) {
+			byte_value := value_bytes[cursor]
+			if byte_value == ',' || byte_value == ' ' || byte_value == '\t' do break
+			cursor += 1
+		}
+		token := value_bytes[token_start:cursor]
+
+		switch {
+		case equal_bytes_ci(token, "close"):
+			state.flags += {.Connection_Close}
+		case equal_bytes_ci(token, "upgrade"):
+			state.flags += {.Upgrade_Request}
+		case equal_bytes_ci(token, "keep-alive"):
+			state.flags += {.Keep_Alive_Allowed}
+		}
+	}
+}
+
+// Strict RFC 9112 §3 request-line: METHOD SP request-target SP HTTP-version CRLF.
+// Exactly one SP between parts, no HTAB, no leading blank lines. v1 supports
+// origin-form (`/path?query`) and asterisk-form (`*` for OPTIONS only).
+// On success the parser advances `parsed_offset` past the CRLF and the caller
+// transitions to the Headers phase.
+@(private = "package")
+parse_request_line :: #force_inline proc "contextless" (
+	state: ^Parser_State,
+	request: ^Request_State,
+	buffer: []u8,
+	parsed_offset: ^u32,
+	limits: ^Limits,
+) -> Parse_Status {
+	frame_offset := parsed_offset^
+	if u32(len(buffer)) <= frame_offset {
+		return .Need_More
+	}
+
+	view := buffer[frame_offset:]
+
+	// Reject leading blank lines (RFC 9112 §2.2 RECOMMENDS ignore; we strictly
+	// reject to harden against parser-desync smuggling vectors).
+	if view[0] == '\r' || view[0] == '\n' {
+		return .Error_Bad_Request
+	}
+
+	cr_offset, limit_exceeded := find_newline_offset(view, 0, u32(limits.request_line_size_max))
+	if limit_exceeded {
+		// A request line that exceeds the configured cap is treated as a
+		// malformed request rather than 414 — request-target overrun is
+		// indistinguishable from missing CRLF at the parser boundary.
+		return .Error_Bad_Request
+	}
+	if cr_offset < 0 {
+		return .Need_More
+	}
+	if cr_offset + 1 >= len(view) {
+		return .Need_More // saw '\r', waiting for '\n'
+	}
+	if view[cr_offset + 1] != '\n' {
+		return .Error_Bad_Request // bare CR without LF — smuggling vector
+	}
+
+	line := view[:cr_offset]
+
+	// Reject HTAB anywhere in the request line — only SP is permitted.
+	for byte_value in line {
+		if byte_value == '\t' do return .Error_Bad_Request
+	}
+
+	first_space := index_byte_in(line, ' ')
+	if first_space < 0 do return .Error_Bad_Request
+	method_bytes := line[:first_space]
+
+	rest_after_method := line[first_space + 1:]
+	second_space := index_byte_in(rest_after_method, ' ')
+	if second_space < 0 do return .Error_Bad_Request
+	target_bytes := rest_after_method[:second_space]
+	version_bytes := rest_after_method[second_space + 1:]
+
+	if !validate_token_bytes(method_bytes) do return .Error_Bad_Request
+
+	// Version must be exactly "HTTP/1.1". Anything else (HTTP/1.0, HTTP/2.0,
+	// junk) is a 505 — the connection is unusable for the requested version.
+	if !equal_bytes(version_bytes, "HTTP/1.1") do return .Error_Version
+
+	if len(target_bytes) == 0 do return .Error_Bad_Request
+	for byte_value in target_bytes {
+		if !is_uri_byte(byte_value) do return .Error_Bad_Request
+	}
+
+	// Method classification — accept any token but flag unknown for the router.
+	method, method_known := classify_method(method_bytes)
+	request.method = method
+	if !method_known do request.status_flags += {.Unknown_Method}
+	if method == .HEAD do state.flags += {.Head_Method}
+
+	target_offset_in_frame := frame_offset + u32(first_space) + 1
+
+	is_asterisk := len(target_bytes) == 1 && target_bytes[0] == '*'
+	if is_asterisk {
+		// asterisk-form is only valid for OPTIONS. Any other method gets
+		// 400 + close (DR-10). Path/query are degenerate; record `*` as both.
+		if method != .OPTIONS do return .Error_Bad_Request
+		request.status_flags += {.Options_Asterisk}
+		request.target_offset = target_offset_in_frame
+		request.target_size = 1
+		request.path_offset = target_offset_in_frame
+		request.path_size = 1
+		request.query_offset = 0
+		request.query_size = 0
+	} else if target_bytes[0] != '/' {
+		// absolute-form (`http://...`) and authority-form (CONNECT) rejected.
+		return .Error_Bad_Request
+	} else {
+		request.target_offset = target_offset_in_frame
+		request.target_size = u16(len(target_bytes))
+
+		query_marker := index_byte_in(target_bytes, '?')
+		if query_marker < 0 {
+			request.path_offset = target_offset_in_frame
+			request.path_size = u16(len(target_bytes))
+			request.query_offset = 0
+			request.query_size = 0
+		} else {
+			request.path_offset = target_offset_in_frame
+			request.path_size = u16(query_marker)
+			request.query_offset = target_offset_in_frame + u32(query_marker) + 1
+			request.query_size = u16(len(target_bytes) - query_marker - 1)
+		}
+	}
+
+	line_total := u32(cr_offset) + 2 // bytes consumed including CRLF
+	state.request_line_size = u16(line_total)
+	parsed_offset^ = frame_offset + line_total
+
+	return .Continue
+}
+
+// Parses one `Field-Name: field-value CRLF` line at `parsed_offset`. The empty
+// CRLF terminator is recognized as `.Headers_Done` and consumed. Smuggling
+// guardrails (duplicate Host, dual Content-Length, CL+TE coexistence,
+// non-`chunked` transfer-codings, bad Expect) all surface as wire-status
+// errors here, not later.
+@(private = "package")
+parse_one_header :: proc "contextless" (
+	state: ^Parser_State,
+	request: ^Request_State,
+	headers: []Header_View,
+	buffer: []u8,
+	parsed_offset: ^u32,
+	limits: ^Limits,
+) -> Parse_Status {
+	frame_offset := parsed_offset^
+	if u32(len(buffer)) <= frame_offset {
+		return .Need_More
+	}
+
+	view := buffer[frame_offset:]
+
+	// Empty line ⇒ end of header section.
+	if len(view) >= 2 && view[0] == '\r' && view[1] == '\n' {
+		parsed_offset^ = frame_offset + 2
+		return .Headers_Done
+	}
+	if len(view) == 1 && view[0] == '\r' {
+		return .Need_More // need to see the '\n' to know whether headers end here
+	}
+
+	// Header lines must begin with a token byte. obs-fold (a continuation
+	// line beginning with SP/HTAB) is unconditionally rejected per RFC 9112
+	// §5.2 to neutralize smuggling via line-folding ambiguity.
+	if view[0] == ' ' || view[0] == '\t' do return .Error_Bad_Request
+
+	remaining_budget := limits.header_size_max - state.header_size
+	cr_offset, limit_exceeded := find_newline_offset(view, 0, remaining_budget)
+	if limit_exceeded do return .Error_Header_Too_Large
+	if cr_offset < 0 do return .Need_More
+	if cr_offset + 1 >= len(view) do return .Need_More
+	if view[cr_offset + 1] != '\n' do return .Error_Bad_Request
+	if cr_offset == 0 do return .Error_Bad_Request // protocol-impossible: empty is handled above
+
+	line := view[:cr_offset]
+
+	// Bound header_count before we touch any storage.
+	if int(state.header_count) >= int(limits.header_count_max) ||
+	   int(state.header_count) >= len(headers) {
+		return .Error_Header_Too_Large
+	}
+
+	colon_index := index_byte_in(line, ':')
+	if colon_index <= 0 do return .Error_Bad_Request
+
+	name_bytes := line[:colon_index]
+
+	// validate_and_hash_header_name catches:
+	//   - empty names
+	//   - any byte outside CHARS_HTTP_TOKEN (CTL, SP, HTAB, delimiters, high
+	//     bytes) — including the "whitespace before colon" smuggling vector.
+	hash, name_valid := validate_and_hash_header_name(name_bytes)
+	if !name_valid do return .Error_Bad_Request
+
+	// Trim OWS surrounding the value (RFC 9110 §5.5).
+	value_start := colon_index + 1
+	for value_start < len(line) && (line[value_start] == ' ' || line[value_start] == '\t') {
+		value_start += 1
+	}
+	value_end := len(line)
+	for value_end > value_start && (line[value_end - 1] == ' ' || line[value_end - 1] == '\t') {
+		value_end -= 1
+	}
+	value_bytes := line[value_start:value_end]
+
+	for byte_value in value_bytes {
+		if !is_header_value_byte(byte_value) do return .Error_Bad_Request
+	}
+
+	// Frame-relative offsets — preserved verbatim if the bytes are later
+	// promoted from reactor buffer to Working Memory (DR-3, I3).
+	headers[state.header_count] = Header_View {
+		name_offset  = frame_offset,
+		value_offset = frame_offset + u32(value_start),
+		hash         = hash,
+		name_size    = u16(len(name_bytes)),
+		value_size   = u16(len(value_bytes)),
+	}
+
+	known_header, is_known := classify_known_header(name_bytes)
+	if is_known {
+		switch known_header {
+		case .Host:
+			if .Host in request.known_headers do return .Error_Bad_Request
+		case .Content_Length:
+			if .Has_Content_Length in state.flags do return .Error_Bad_Request
+			if .Has_Transfer_Encoding in state.flags do return .Error_Bad_Request
+			content_length, parsed_ok := parse_decimal_size(value_bytes)
+			if !parsed_ok do return .Error_Bad_Request
+			state.body_size_remaining = content_length
+			state.flags += {.Has_Content_Length}
+		case .Transfer_Encoding:
+			if .Has_Transfer_Encoding in state.flags do return .Error_Bad_Request
+			if .Has_Content_Length in state.flags do return .Error_Bad_Request
+			// v1 accepts only the single token `chunked`. Any list (e.g.
+			// "gzip, chunked") or unknown coding is 501 + close.
+			if !equal_bytes_ci(value_bytes, "chunked") do return .Error_Not_Implemented
+			state.flags += {.Has_Transfer_Encoding, .Chunked_Request}
+		case .Connection:
+			parse_connection_tokens(state, value_bytes)
+		case .Expect:
+			if !equal_bytes_ci(value_bytes, "100-continue") do return .Error_Expectation
+			state.flags += {.Expect_100}
+		case .Upgrade:
+			state.flags += {.Upgrade_Request}
+		}
+		request.known_headers += {known_header}
+	} else {
+		// Bloom is populated for arbitrary headers only; known headers go
+		// through the exact `Known_Header_Mask` check, which has zero false
+		// positives.
+		bloom_set(&request.header_bloom, hash)
+	}
+
+	line_total := u32(cr_offset) + 2
+	state.header_size += line_total
+	state.header_count += 1
+	request.header_count = state.header_count
+	parsed_offset^ = frame_offset + line_total
+
+	return .Continue
+}
+
+// Called once header parsing completes. Sets `state.phase` to the appropriate
+// body-mode entry phase. Body parsing itself is owned by `body.odin`
+// and reads `state.body_size_remaining` / `Chunked_Request` to drive its loop.
+@(private = "package")
+determine_body_framing :: #force_inline proc "contextless" (state: ^Parser_State) {
+	if .Chunked_Request in state.flags {
+		state.phase = .Chunk_Size
+		return
+	}
+	if .Has_Content_Length in state.flags && state.body_size_remaining > 0 {
+		state.phase = .Body_Fixed
+		return
+	}
+	state.phase = .Complete
+}
+
+
+// ─── Top-Level Parse Step ──────────────────────────────────────────────────
+//
+// Drives the parser to forward progress on the supplied buffer slice. The
+// caller (Connection state machine) accumulates ingress bytes in a contiguous
+// region (reactor buffer or Working Memory split-packet carry) and calls
+// parse_step whenever new bytes arrive. parse_step returns:
+//
+//   - `Need_More`     — more bytes required; parser state preserved.
+//   - `Headers_Done`  — request line + headers fully parsed; body framing set.
+//   - `Error_*`       — protocol violation; caller serializes the matching
+//                       HTTP status response and closes the connection.
+//
+// `parsed_offset` is updated in place to point at the first unconsumed byte.
+
+@(private = "package")
+parse_step :: #force_inline proc "contextless" (
+	state: ^Parser_State,
+	request: ^Request_State,
+	headers: []Header_View,
+	buffer: []u8,
+	parsed_offset: ^u32,
+	limits: ^Limits,
+) -> Parse_Status {
+	for {
+		switch state.phase {
+		case .Request_Line:
+			result := parse_request_line(state, request, buffer, parsed_offset, limits)
+			#partial switch result {
+			case .Continue:
+				state.phase = .Headers
+			case .Need_More:
+				return .Need_More
+			case:
+				state.phase = .Error
+				return result
+			}
+
+		case .Headers:
+			result := parse_one_header(state, request, headers, buffer, parsed_offset, limits)
+			#partial switch result {
+			case .Continue:
+			// Loop and parse the next header line.
+			case .Need_More:
+				return .Need_More
+			case .Headers_Done:
+				// Mandatory-header validation gate: HTTP/1.1 requires Host.
+				// (Duplicate Host was already caught inline by parse_one_header.)
+				if .Host not_in request.known_headers {
+					state.phase = .Error
+					return .Error_Bad_Request
+				}
+				determine_body_framing(state)
+				return .Headers_Done
+			case:
+				state.phase = .Error
+				return result
+			}
+
+		case .Body_Fixed, .Chunk_Size, .Chunk_Data, .Chunk_Data_CRLF, .Trailers, .Complete:
+			// Body phases are owned by body.odin (Phase 3). For Phase 2,
+			// returning Need_More keeps parse_step idempotent if a caller
+			// re-enters after Headers_Done without owning body parsing.
+			return .Need_More
+
+		case .Error:
+			return .Error_Bad_Request
+		}
+	}
+}
+
+
+// ─── Local Helpers ─────────────────────────────────────────────────────────
+
+// Forwarded `bytes.index_byte` — kept thin and inlinable so the hot parser
+// loops do not pay a function-call overhead for each delimiter scan.
+@(private = "file")
+index_byte_in :: #force_inline proc "contextless" (slice: []u8, target: u8) -> int {
+	return bytes.index_byte(slice, target)
 }
 
 
@@ -557,4 +1057,625 @@ test_find_newline_exact_boundaries :: proc(t: ^testing.T) {
 		"Must exceed limit when \\r is pushed beyond the maximum size",
 	)
 	testing.expect_value(t, offset_past, -1)
+}
+
+
+// ─── Helper Procs for Parser State-Machine Tests ───────────────────────────
+
+@(private = "file")
+Parse_Harness :: struct {
+	state:         Parser_State,
+	request:       Request_State,
+	headers:       [64]Header_View,
+	parsed_offset: u32,
+	limits:        Limits,
+}
+
+@(private = "file")
+parse_harness_make :: proc() -> Parse_Harness {
+	harness := Parse_Harness {
+		limits = DEFAULT_LIMITS,
+	}
+	request_state_reset(&harness.request)
+	parser_state_reset(&harness.state)
+	return harness
+}
+
+// Drives the parser to terminal status (Headers_Done or any Error_*) by
+// repeatedly calling parse_step on the same buffer. Returns the final status.
+@(private = "file")
+parse_harness_run :: proc(harness: ^Parse_Harness, buffer: []u8) -> Parse_Status {
+	return parse_step(
+		&harness.state,
+		&harness.request,
+		harness.headers[:],
+		buffer,
+		&harness.parsed_offset,
+		&harness.limits,
+	)
+}
+
+// Feeds the buffer to the parser one byte at a time.
+// Returns the terminal status that the parser produces.
+@(private = "file")
+parse_harness_run_byte_by_byte :: proc(
+	harness: ^Parse_Harness,
+	buffer: []u8,
+) -> (
+	terminal_status: Parse_Status,
+	terminal_index: int,
+) {
+	for index := 1; index <= len(buffer); index += 1 {
+		status := parse_step(
+			&harness.state,
+			&harness.request,
+			harness.headers[:],
+			buffer[:index],
+			&harness.parsed_offset,
+			&harness.limits,
+		)
+		if status != .Need_More {
+			return status, index
+		}
+	}
+	return .Need_More, len(buffer)
+}
+
+
+// ─── Happy-Path Parser Tests ───────────────────────────────────────────────
+
+@(test)
+test_parse_step_simple_get :: proc(t: ^testing.T) {
+	request_bytes := transmute([]u8)string("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect_value(t, harness.request.method, Method.GET)
+	testing.expect_value(t, harness.request.path_offset, 4)
+	testing.expect_value(t, harness.request.path_size, 1)
+	testing.expect_value(t, harness.request.query_size, 0)
+	testing.expect_value(t, harness.request.header_count, 1)
+	testing.expect(t, .Host in harness.request.known_headers, "Host should be classified")
+	testing.expect_value(t, harness.parsed_offset, u32(len(request_bytes)))
+	testing.expect_value(t, harness.state.phase, Parse_Phase.Complete)
+}
+
+@(test)
+test_parse_step_path_query_split :: proc(t: ^testing.T) {
+	// Query begins after the first '?'. The '?' itself is not part of either side.
+	request_bytes := transmute([]u8)string(
+		"GET /api/users?name=jane&age=30 HTTP/1.1\r\nHost: api.local\r\n\r\n",
+	)
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect_value(t, harness.request.path_offset, 4)
+	testing.expect_value(t, harness.request.path_size, 10) // "/api/users"
+	testing.expect_value(t, harness.request.query_offset, 15)
+	testing.expect_value(t, harness.request.query_size, 16) // "name=jane&age=30"
+
+	path := request_bytes[harness.request.path_offset:][:harness.request.path_size]
+	query := request_bytes[harness.request.query_offset:][:harness.request.query_size]
+	testing.expect(t, equal_bytes(path, "/api/users"), "path should be /api/users")
+	testing.expect(t, equal_bytes(query, "name=jane&age=30"), "query should match")
+}
+
+@(test)
+test_parse_step_post_with_content_length :: proc(t: ^testing.T) {
+	request_bytes := transmute([]u8)string(
+		"POST /upload HTTP/1.1\r\nHost: u.local\r\nContent-Length: 1024\r\n\r\n",
+	)
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect_value(t, harness.request.method, Method.POST)
+	testing.expect(t, .Has_Content_Length in harness.state.flags, "CL flag set")
+	testing.expect_value(t, harness.state.body_size_remaining, 1024)
+	testing.expect_value(t, harness.state.phase, Parse_Phase.Body_Fixed)
+}
+
+@(test)
+test_parse_step_chunked_request :: proc(t: ^testing.T) {
+	request_bytes := transmute([]u8)string(
+		"POST /upload HTTP/1.1\r\nHost: u.local\r\nTransfer-Encoding: chunked\r\n\r\n",
+	)
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect(t, .Chunked_Request in harness.state.flags, "Chunked flag set")
+	testing.expect(t, .Has_Transfer_Encoding in harness.state.flags, "TE flag set")
+	testing.expect_value(t, harness.state.phase, Parse_Phase.Chunk_Size)
+}
+
+@(test)
+test_parse_step_options_asterisk :: proc(t: ^testing.T) {
+	request_bytes := transmute([]u8)string("OPTIONS * HTTP/1.1\r\nHost: srv.local\r\n\r\n")
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect_value(t, harness.request.method, Method.OPTIONS)
+	testing.expect(
+		t,
+		.Options_Asterisk in harness.request.status_flags,
+		"asterisk flag should be set",
+	)
+	testing.expect_value(t, harness.request.target_size, 1)
+}
+
+@(test)
+test_parse_step_unknown_method_flagged :: proc(t: ^testing.T) {
+	// "FOO" is a valid HTTP token but is not in the known method set.
+	// The parser must accept the request but flag it for the router.
+	request_bytes := transmute([]u8)string("FOO / HTTP/1.1\r\nHost: x\r\n\r\n")
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect(
+		t,
+		.Unknown_Method in harness.request.status_flags,
+		"Unknown_Method flag must be set for non-standard methods",
+	)
+}
+
+@(test)
+test_parse_step_known_headers_skip_bloom :: proc(t: ^testing.T) {
+	// Known headers must NOT pollute the bloom filter — they're tracked exactly
+	// via Known_Header_Mask. Only arbitrary headers populate the bloom.
+	request_bytes := transmute([]u8)string(
+		"GET / HTTP/1.1\r\nHost: x\r\nX-Trace: abc\r\nUser-Agent: test\r\n\r\n",
+	)
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect(t, harness.request.header_bloom != 0, "bloom should reflect arbitrary headers")
+
+	// The bloom must NOT contain Host (Host is exact-tracked).
+	host_hash := compute_header_hash(transmute([]u8)string("host"))
+	x_trace_hash := compute_header_hash(transmute([]u8)string("x-trace"))
+	user_agent_hash := compute_header_hash(transmute([]u8)string("user-agent"))
+
+	// Hash space is small (64 bits) so we can only assert positives reliably.
+	// Negatives can be coincidental — assert positives only.
+	testing.expect(
+		t,
+		bloom_may_contain(harness.request.header_bloom, x_trace_hash),
+		"bloom must contain X-Trace",
+	)
+	testing.expect(
+		t,
+		bloom_may_contain(harness.request.header_bloom, user_agent_hash),
+		"bloom must contain User-Agent",
+	)
+	_ = host_hash // suppress unused; bloom may incidentally cover it via collision
+}
+
+@(test)
+test_parse_step_connection_close_token :: proc(t: ^testing.T) {
+	request_bytes := transmute([]u8)string(
+		"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n",
+	)
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+	testing.expect(t, .Connection_Close in harness.state.flags, "close token recognized")
+	testing.expect(t, .Keep_Alive_Allowed in harness.state.flags, "keep-alive token recognized")
+}
+
+
+// ─── Fragmentation (Incremental Feed) Tests ────────────────────────────────
+
+@(test)
+test_parse_step_fragmentation_matches_atomic :: proc(t: ^testing.T) {
+	// The parser MUST be deterministic regardless of how the bytes arrive.
+	// Feeding the request 1 byte at a time must produce a final state that is
+	// identical (modulo internal counters) to feeding the entire buffer at once.
+	request_bytes := transmute([]u8)string(
+		"GET /api/users?id=42 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: tina-test\r\nAccept: */*\r\nContent-Length: 0\r\n\r\n",
+	)
+
+	atomic_harness := parse_harness_make()
+	atomic_status := parse_harness_run(&atomic_harness, request_bytes)
+	testing.expect_value(t, atomic_status, Parse_Status.Headers_Done)
+
+	streaming_harness := parse_harness_make()
+	streaming_status, terminal_index := parse_harness_run_byte_by_byte(
+		&streaming_harness,
+		request_bytes,
+	)
+
+	testing.expect_value(t, streaming_status, Parse_Status.Headers_Done)
+	testing.expect_value(t, terminal_index, len(request_bytes))
+
+	// Field-level equality between atomic and streaming runs.
+	testing.expect_value(t, streaming_harness.request.method, atomic_harness.request.method)
+	testing.expect_value(
+		t,
+		streaming_harness.request.path_offset,
+		atomic_harness.request.path_offset,
+	)
+	testing.expect_value(t, streaming_harness.request.path_size, atomic_harness.request.path_size)
+	testing.expect_value(
+		t,
+		streaming_harness.request.query_offset,
+		atomic_harness.request.query_offset,
+	)
+	testing.expect_value(
+		t,
+		streaming_harness.request.query_size,
+		atomic_harness.request.query_size,
+	)
+	testing.expect_value(
+		t,
+		streaming_harness.request.header_count,
+		atomic_harness.request.header_count,
+	)
+	testing.expect_value(
+		t,
+		streaming_harness.request.known_headers,
+		atomic_harness.request.known_headers,
+	)
+	testing.expect_value(
+		t,
+		streaming_harness.request.header_bloom,
+		atomic_harness.request.header_bloom,
+	)
+	testing.expect_value(t, streaming_harness.state.flags, atomic_harness.state.flags)
+	testing.expect_value(t, streaming_harness.state.phase, atomic_harness.state.phase)
+	testing.expect_value(t, streaming_harness.state.header_size, atomic_harness.state.header_size)
+	testing.expect_value(t, streaming_harness.parsed_offset, atomic_harness.parsed_offset)
+
+	// Header_View entries must match byte-for-byte.
+	for i in 0 ..< int(atomic_harness.request.header_count) {
+		testing.expect_value(t, streaming_harness.headers[i], atomic_harness.headers[i])
+	}
+}
+
+@(test)
+test_parse_step_fragmentation_split_at_crlf_boundary :: proc(t: ^testing.T) {
+	// The CR/LF boundary (\r without \n yet) is the canonical "single byte more"
+	// case. Verify the parser asks for more bytes rather than declaring success.
+	request_bytes := transmute([]u8)string("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	harness := parse_harness_make()
+
+	// Feed everything except the final '\n'.
+	short_view := request_bytes[:len(request_bytes) - 1]
+	short_status := parse_harness_run(&harness, short_view)
+	testing.expect_value(t, short_status, Parse_Status.Need_More)
+
+	// Now feed the whole buffer including the final '\n'.
+	final_status := parse_harness_run(&harness, request_bytes)
+	testing.expect_value(t, final_status, Parse_Status.Headers_Done)
+}
+
+
+// ─── Smuggling Guardrail Tests ─────────────────────────────────────────────
+
+// A small DSL for declaring "feed this byte slice → expect this terminal status".
+@(private = "file")
+Smuggling_Case :: struct {
+	name:    string,
+	wire:    string,
+	expects: Parse_Status,
+}
+
+@(test)
+test_parse_step_smuggling_400_bad_request :: proc(t: ^testing.T) {
+	cases := [?]Smuggling_Case {
+		{"space in method", " ET / HTTP/1.1\r\nHost: x\r\n\r\n", .Error_Bad_Request},
+		{"tab in request line", "GET\t/\tHTTP/1.1\r\nHost: x\r\n\r\n", .Error_Bad_Request},
+		{"leading blank line", "\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", .Error_Bad_Request},
+		{"missing host header", "GET / HTTP/1.1\r\n\r\n", .Error_Bad_Request},
+		{"duplicate host", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", .Error_Bad_Request},
+		{
+			"duplicate content-length",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"content-length and transfer-encoding both",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"transfer-encoding then content-length",
+			"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"duplicate transfer-encoding",
+			"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"obs-fold continuation line",
+			"GET / HTTP/1.1\r\nHost: x\r\nX-Trace: abc\r\n  more\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"absolute-form request target",
+			"GET http://example.com/ HTTP/1.1\r\nHost: x\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"asterisk target with non-OPTIONS method",
+			"GET * HTTP/1.1\r\nHost: x\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"null byte in header value",
+			"GET / HTTP/1.1\r\nHost: x\r\nX-T: bad\x00val\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"obs-text high byte in header value",
+			"GET / HTTP/1.1\r\nHost: x\r\nX-T: caf\xc3\xa9\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"colon-prefixed header (empty name)",
+			"GET / HTTP/1.1\r\nHost: x\r\n: empty-name\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"whitespace before colon",
+			"GET / HTTP/1.1\r\nHost: x\r\nBad Header: v\r\n\r\n",
+			.Error_Bad_Request,
+		},
+	}
+
+	for tc in cases {
+		harness := parse_harness_make()
+		status := parse_harness_run(&harness, transmute([]u8)tc.wire)
+		testing.expectf(
+			t,
+			status == tc.expects,
+			"%q: expected %v but got %v",
+			tc.name,
+			tc.expects,
+			status,
+		)
+	}
+}
+
+@(test)
+test_parse_step_smuggling_417_expectation :: proc(t: ^testing.T) {
+	request_bytes := transmute([]u8)string(
+		"POST / HTTP/1.1\r\nHost: x\r\nExpect: lol-not-100\r\n\r\n",
+	)
+	harness := parse_harness_make()
+	status := parse_harness_run(&harness, request_bytes)
+	testing.expect_value(t, status, Parse_Status.Error_Expectation)
+}
+
+@(test)
+test_parse_step_smuggling_501_unsupported_te :: proc(t: ^testing.T) {
+	cases := [?]Smuggling_Case {
+		{
+			"gzip-only TE",
+			"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
+			.Error_Not_Implemented,
+		},
+		{
+			"gzip+chunked list rejected (v1)",
+			"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+			.Error_Not_Implemented,
+		},
+		{
+			"unknown coding",
+			"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
+			.Error_Not_Implemented,
+		},
+	}
+	for tc in cases {
+		harness := parse_harness_make()
+		status := parse_harness_run(&harness, transmute([]u8)tc.wire)
+		testing.expectf(
+			t,
+			status == tc.expects,
+			"%q: expected %v but got %v",
+			tc.name,
+			tc.expects,
+			status,
+		)
+	}
+}
+
+@(test)
+test_parse_step_smuggling_505_bad_version :: proc(t: ^testing.T) {
+	cases := [?]Smuggling_Case {
+		{"HTTP/1.0", "GET / HTTP/1.0\r\nHost: x\r\n\r\n", .Error_Version},
+		{"HTTP/2.0", "GET / HTTP/2.0\r\nHost: x\r\n\r\n", .Error_Version},
+		{"junk version", "GET / HTTP/9.9\r\nHost: x\r\n\r\n", .Error_Version},
+		{"missing slash", "GET / HTTP1.1\r\nHost: x\r\n\r\n", .Error_Version},
+	}
+	for tc in cases {
+		harness := parse_harness_make()
+		status := parse_harness_run(&harness, transmute([]u8)tc.wire)
+		testing.expectf(
+			t,
+			status == tc.expects,
+			"%q: expected %v but got %v",
+			tc.name,
+			tc.expects,
+			status,
+		)
+	}
+}
+
+@(test)
+test_parse_step_smuggling_431_header_too_large :: proc(t: ^testing.T) {
+	// Construct headers that exceed `header_size_max` while remaining
+	// individually well-formed. Use a tightened limit for a fast test.
+	harness := parse_harness_make()
+	harness.limits.header_size_max = 64
+
+	// Build a single oversize header value.
+	buf: [256]u8
+	build_index := 0
+	prefix := transmute([]u8)string("GET / HTTP/1.1\r\nHost: x\r\nX-Big: ")
+	copy(buf[build_index:], prefix)
+	build_index += len(prefix)
+	for i in 0 ..< 200 {
+		buf[build_index] = 'a'
+		build_index += 1
+	}
+	tail := transmute([]u8)string("\r\n\r\n")
+	copy(buf[build_index:], tail)
+	build_index += len(tail)
+
+	status := parse_harness_run(&harness, buf[:build_index])
+	testing.expect_value(t, status, Parse_Status.Error_Header_Too_Large)
+}
+
+@(test)
+test_parse_step_smuggling_request_line_too_long :: proc(t: ^testing.T) {
+	harness := parse_harness_make()
+	harness.limits.request_line_size_max = 32
+
+	// Path long enough to overrun request_line_size_max with no CR in budget.
+	buf: [128]u8
+	build_index := 0
+	prefix := transmute([]u8)string("GET /")
+	copy(buf[:], prefix)
+	build_index += len(prefix)
+	for i in 0 ..< 100 {
+		buf[build_index] = 'a'
+		build_index += 1
+	}
+	tail := transmute([]u8)string(" HTTP/1.1\r\nHost: x\r\n\r\n")
+	copy(buf[build_index:], tail)
+	build_index += len(tail)
+
+	status := parse_harness_run(&harness, buf[:build_index])
+	testing.expect_value(t, status, Parse_Status.Error_Bad_Request)
+}
+
+@(test)
+test_parse_step_smuggling_too_many_headers :: proc(t: ^testing.T) {
+	// Cap header_count_max well below what we feed.
+	harness := parse_harness_make()
+	harness.limits.header_count_max = 3
+
+	request_bytes := transmute([]u8)string(
+		"GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n",
+	)
+	status := parse_harness_run(&harness, request_bytes)
+	testing.expect_value(t, status, Parse_Status.Error_Header_Too_Large)
+}
+
+
+// ─── Frame-Relative Offset Sanity ──────────────────────────────────────────
+
+@(test)
+test_parse_step_offsets_are_frame_relative :: proc(t: ^testing.T) {
+	// Resolve every Header_View / path / query offset against the original
+	// buffer and assert byte-for-byte equality with the expected text.
+	request_bytes := transmute([]u8)string(
+		"POST /foo?bar=baz HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+	)
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+
+	path := request_bytes[harness.request.path_offset:][:harness.request.path_size]
+	testing.expect(t, equal_bytes(path, "/foo"), "path offset/size resolves to /foo")
+
+	query := request_bytes[harness.request.query_offset:][:harness.request.query_size]
+	testing.expect(t, equal_bytes(query, "bar=baz"), "query resolves to bar=baz")
+
+	// Header 0: Host
+	host_view := harness.headers[0]
+	host_name := request_bytes[host_view.name_offset:][:host_view.name_size]
+	host_value := request_bytes[host_view.value_offset:][:host_view.value_size]
+	testing.expect(t, equal_bytes(host_name, "Host"), "header[0] name is Host")
+	testing.expect(t, equal_bytes(host_value, "example.com"), "header[0] value is example.com")
+
+	// Header 1: Content-Length
+	cl_view := harness.headers[1]
+	cl_name := request_bytes[cl_view.name_offset:][:cl_view.name_size]
+	cl_value := request_bytes[cl_view.value_offset:][:cl_view.value_size]
+	testing.expect(t, equal_bytes(cl_name, "Content-Length"), "header[1] name is Content-Length")
+	testing.expect(t, equal_bytes(cl_value, "0"), "header[1] value is 0")
+}
+
+@(test)
+test_parse_step_value_ows_trimmed :: proc(t: ^testing.T) {
+	// OWS surrounding the value must be trimmed in the stored Header_View.
+	request_bytes := transmute([]u8)string("GET / HTTP/1.1\r\nHost:    spaced.example   \r\n\r\n")
+	harness := parse_harness_make()
+
+	status := parse_harness_run(&harness, request_bytes)
+	testing.expect_value(t, status, Parse_Status.Headers_Done)
+
+	host_view := harness.headers[0]
+	host_value := request_bytes[host_view.value_offset:][:host_view.value_size]
+	testing.expect(
+		t,
+		equal_bytes(host_value, "spaced.example"),
+		"OWS around value must be trimmed",
+	)
+}
+
+
+// ─── classify_method / classify_known_header Tests ─────────────────────────
+
+@(test)
+test_classify_method_known :: proc(t: ^testing.T) {
+	method, known := classify_method(transmute([]u8)string("GET"))
+	testing.expect(t, known && method == .GET)
+
+	method, known = classify_method(transmute([]u8)string("OPTIONS"))
+	testing.expect(t, known && method == .OPTIONS)
+
+	method, known = classify_method(transmute([]u8)string("TRACE"))
+	testing.expect(t, known && method == .TRACE)
+}
+
+@(test)
+test_classify_method_unknown :: proc(t: ^testing.T) {
+	_, known := classify_method(transmute([]u8)string("FOO"))
+	testing.expect(t, !known, "FOO should not be a known method")
+
+	_, known = classify_method(transmute([]u8)string("get"))
+	testing.expect(t, !known, "lowercase should not match (HTTP methods are case-sensitive)")
+}
+
+@(test)
+test_classify_known_header :: proc(t: ^testing.T) {
+	header, ok := classify_known_header(transmute([]u8)string("Host"))
+	testing.expect(t, ok && header == .Host)
+
+	header, ok = classify_known_header(transmute([]u8)string("content-length"))
+	testing.expect(t, ok && header == .Content_Length)
+
+	header, ok = classify_known_header(transmute([]u8)string("TRANSFER-ENCODING"))
+	testing.expect(t, ok && header == .Transfer_Encoding)
+
+	_, ok = classify_known_header(transmute([]u8)string("X-Custom"))
+	testing.expect(t, !ok, "X-Custom is not a known header")
+}
+
+@(test)
+test_equal_bytes_ci :: proc(t: ^testing.T) {
+	testing.expect(t, equal_bytes_ci(transmute([]u8)string("HOST"), "host"))
+	testing.expect(t, equal_bytes_ci(transmute([]u8)string("Host"), "HOST"))
+	testing.expect(t, !equal_bytes_ci(transmute([]u8)string("Hosts"), "host"))
+	testing.expect(t, !equal_bytes_ci(transmute([]u8)string("Hxst"), "host"))
 }
