@@ -266,10 +266,10 @@ when !TINA_SIMULATION_MODE {
 				token := Submission_Token(u64(uintptr(event.udata)))
 				pending_index := _find_pending(backend, token)
 				if pending_index >= 0 {
-					_posix_deliver_completion(
+					out = _posix_deliver_completion(
 						backend,
 						completions,
-						&out,
+						out,
 						output_max,
 						Raw_Completion{token = token, result = -i32(posix.Errno(event.data))},
 					)
@@ -310,7 +310,7 @@ when !TINA_SIMULATION_MODE {
 				} else {
 					conn_result.result = 0
 				}
-				_posix_deliver_completion(backend, completions, &out, output_max, conn_result)
+				out = _posix_deliver_completion(backend, completions, out, output_max, conn_result)
 				_remove_pending(backend, u16(pending_index))
 				continue
 			}
@@ -323,15 +323,15 @@ when !TINA_SIMULATION_MODE {
 			result, immediate := _try_syscall(backend, &sub)
 
 			if immediate {
-				_posix_deliver_completion(backend, completions, &out, output_max, result)
+				out = _posix_deliver_completion(backend, completions, out, output_max, result)
 				_remove_pending(backend, u16(pending_index))
 			} else if event_has_eof {
 				// Peer closed but syscall returned EWOULDBLOCK — complete as EOF.
 				// Re-registering would be pointless: no further data will arrive.
-				_posix_deliver_completion(
+				out = _posix_deliver_completion(
 					backend,
 					completions,
-					&out,
+					out,
 					output_max,
 					Raw_Completion{token = pop.token, result = 0},
 				)
@@ -342,10 +342,10 @@ when !TINA_SIMULATION_MODE {
 				if rearm_error != .None {
 					// Re-registration failed — complete as error to avoid stranding
 					// this operation in pending forever with no kqueue wakeup.
-					_posix_deliver_completion(
+					out = _posix_deliver_completion(
 						backend,
 						completions,
-						&out,
+						out,
 						output_max,
 						Raw_Completion{token = pop.token, result = -i32(posix.Errno.EIO)},
 					)
@@ -660,17 +660,18 @@ when !TINA_SIMULATION_MODE {
 	_posix_deliver_completion :: proc(
 		backend: ^Platform_Backend,
 		completions: []Raw_Completion,
-		out: ^u32,
+		out_count: u32,
 		output_max: u32,
 		raw: Raw_Completion,
-	) {
-		if out^ < output_max {
-			completions[out^] = raw
-			out^ += 1
+	) -> u32 {
+		if out_count < output_max {
+			completions[out_count] = raw
+			return out_count + 1
 		} else if backend.completed_count < MAX_POSIX_COMPLETED {
 			backend.completed[backend.completed_count] = raw
 			backend.completed_count += 1
 		}
+		return out_count
 	}
 
 	// Configure an accepted client socket: non-blocking, close-on-exec, SIGPIPE suppression.

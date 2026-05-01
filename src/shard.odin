@@ -396,15 +396,16 @@ scheduler_tick :: proc(shard: ^Shard) {
 					message_pointer = &message
 					flags[slot] -= {.Shutdown_Pending}
 				} else if inbox_counts[slot] > 0 {
-					shard.current_msg_slot = _dequeue(
+					dequeue_result := _dequeue(
 						shard,
 						u16(type_id),
 						slot,
-						&message,
-						&correlation,
-						&envelope_flags,
 					)
+					shard.current_msg_slot = dequeue_result.pool_index
 					if shard.current_msg_slot != POOL_NONE_INDEX {
+						message = dequeue_result.message
+						correlation = dequeue_result.correlation
+						envelope_flags = dequeue_result.flags
 						message_pointer = &message
 					}
 				}
@@ -775,34 +776,44 @@ _enqueue_internal :: #force_inline proc "contextless" (
 }
 
 @(private = "package")
+Dequeue_Result :: struct {
+	pool_index:   u32,
+	correlation:  u32,
+	message:      Message,
+	flags:        Envelope_Flags,
+}
+
+@(private = "package")
 _dequeue :: proc "contextless" (
 	shard: ^Shard,
 	type_id: u16,
 	slot: u32,
-	out_message: ^Message,
-	out_correlation: ^u32,
-	out_flags: ^Envelope_Flags,
-) -> u32 {
+) -> Dequeue_Result {
+	result := Dequeue_Result {
+		pool_index = POOL_NONE_INDEX,
+	}
+
 	soa_meta := shard.metadata[type_id]
 	head_index := soa_meta[slot].inbox_head
-	if head_index == POOL_NONE_INDEX {return POOL_NONE_INDEX}
+	if head_index == POOL_NONE_INDEX {return result}
 
 	envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, head_index)
 
-	out_message.tag = envelope.tag
-	out_message.user.source = envelope.source
-	out_message.user.payload_size = envelope.payload_size
-	copy(out_message.user.payload[:], envelope.payload[:])
+	result.pool_index = head_index
+	result.message.tag = envelope.tag
+	result.message.user.source = envelope.source
+	result.message.user.payload_size = envelope.payload_size
+	copy(result.message.user.payload[:], envelope.payload[:])
 
-	out_correlation^ = envelope.correlation
-	out_flags^ = envelope.flags
+	result.correlation = envelope.correlation
+	result.flags = envelope.flags
 
 	next_index := envelope.next_in_mailbox
 	soa_meta[slot].inbox_head = next_index
 	if next_index == POOL_NONE_INDEX {soa_meta[slot].inbox_tail = POOL_NONE_INDEX}
 	soa_meta[slot].inbox_count -= 1
 
-	return head_index
+	return result
 }
 
 @(private = "package")

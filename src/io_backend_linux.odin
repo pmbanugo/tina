@@ -284,7 +284,7 @@ when !TINA_SIMULATION_MODE {
 				} else if (cqe.user_data & SENDFILE_UD_FLAG) == SENDFILE_UD_FLAG {
 					// Internal sendfile splice CQE — advance the state machine.
 					// May produce a user-visible completion pushed to the output slice.
-					_linux_handle_sendfile_cqe(backend, cqe, completions, &count, u32(len(completions)))
+					count = _linux_handle_sendfile_cqe(backend, cqe, completions, count, u32(len(completions)))
 				}
 				continue
 			}
@@ -1016,16 +1016,16 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		cqe: ^linux.IO_Uring_CQE,
 		completions: []Raw_Completion,
-		count: ^u32,
+		count: u32,
 		output_max: u32,
-	) {
+	) -> u32 {
 		entry_index, phase := _linux_sendfile_ud_decode(cqe.user_data)
 		if int(entry_index) >= MAX_LINUX_SENDFILE_ENTRIES {
-			return
+			return count
 		}
 		entry := &backend.sendfile_entries[entry_index]
 		if !entry.active {
-			return
+			return count
 		}
 
 		// Error on any splice phase → complete with error (only if no bytes already sent to socket)
@@ -1048,8 +1048,7 @@ when !TINA_SIMULATION_MODE {
 				entry.bytes_in_pipe = 0
 			}
 
-			_linux_complete_sendfile(entry, completions, count, output_max, result)
-			return
+			return _linux_complete_sendfile(entry, completions, count, output_max, result)
 		}
 
 		bytes := u32(cqe.res)
@@ -1062,12 +1061,24 @@ when !TINA_SIMULATION_MODE {
 					// Drain remaining pipe contents to socket first
 					entry.phase = .Pipe_To_Socket
 					if !_linux_submit_splice_pipe_to_socket(backend, entry) {
-						_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+						return _linux_complete_sendfile(
+							entry,
+							completions,
+							count,
+							output_max,
+							i32(entry.bytes_sent_total),
+						)
 					}
 				} else {
-					_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+					return _linux_complete_sendfile(
+						entry,
+						completions,
+						count,
+						output_max,
+						i32(entry.bytes_sent_total),
+					)
 				}
-				return
+				return count
 			}
 
 			entry.source_offset += u64(bytes)
@@ -1077,7 +1088,13 @@ when !TINA_SIMULATION_MODE {
 			// Now drain pipe → socket
 			entry.phase = .Pipe_To_Socket
 			if !_linux_submit_splice_pipe_to_socket(backend, entry) {
-				_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+				return _linux_complete_sendfile(
+					entry,
+					completions,
+					count,
+					output_max,
+					i32(entry.bytes_sent_total),
+				)
 			}
 
 		case .Pipe_To_Socket:
@@ -1087,22 +1104,41 @@ when !TINA_SIMULATION_MODE {
 			if entry.bytes_in_pipe > 0 {
 				// Pipe not fully drained — keep draining before advancing
 				if !_linux_submit_splice_pipe_to_socket(backend, entry) {
-					_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+					return _linux_complete_sendfile(
+						entry,
+						completions,
+						count,
+						output_max,
+						i32(entry.bytes_sent_total),
+					)
 				}
-				return
+				return count
 			}
 
 			// Pipe fully drained. More file data to transfer?
 			if entry.size_remaining > 0 {
 				entry.phase = .File_To_Pipe
 				if !_linux_submit_splice_file_to_pipe(backend, entry) {
-					_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+					return _linux_complete_sendfile(
+						entry,
+						completions,
+						count,
+						output_max,
+						i32(entry.bytes_sent_total),
+					)
 				}
 			} else {
 				// All done — emit user completion
-				_linux_complete_sendfile(entry, completions, count, output_max, i32(entry.bytes_sent_total))
+				return _linux_complete_sendfile(
+					entry,
+					completions,
+					count,
+					output_max,
+					i32(entry.bytes_sent_total),
+				)
 			}
 		}
+		return count
 	}
 
 	// Emit the final user-visible completion for a sendfile operation and release the entry.
@@ -1110,19 +1146,21 @@ when !TINA_SIMULATION_MODE {
 	_linux_complete_sendfile :: proc(
 		entry: ^Sendfile_Entry,
 		completions: []Raw_Completion,
-		count: ^u32,
+		count: u32,
 		output_max: u32,
 		result: i32,
-	) {
-		if count^ < output_max {
-			completions[count^] = Raw_Completion {
+	) -> u32 {
+		count_next := count
+		if count_next < output_max {
+			completions[count_next] = Raw_Completion {
 				token  = entry.token,
 				result = result,
 				extra  = nil,
 			}
-			count^ += 1
+			count_next += 1
 		}
 		entry.active = false
+		return count_next
 	}
 
 	// Register the reactor's pre-allocated buffer pool with io_uring.
