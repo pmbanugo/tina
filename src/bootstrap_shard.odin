@@ -76,7 +76,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	runtime_state.shard_pointer = shard
 	g_current_shard_pointer = shard
 	shard.id = config.shard_id
-	shard.shared_state = &runtime_state.watchdog_state
+	shard.watchdog_state_pointer = &runtime_state.watchdog_state
 
 	os_pin_thread_to_core(i32(config.target_core))
 

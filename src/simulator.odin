@@ -14,7 +14,7 @@ when TINA_SIMULATION_MODE {
 	Simulator :: struct {
 		spec:               ^SystemSpec,
 		shards:             []Shard, // Allocated as a flat array
-		shard_states:       []u8, // Backing for Shard.shared_state (bypasses watchdog)
+		watchdog_states:    []u8, // Backing for Shard.watchdog_state_pointer (bypasses watchdog)
 		network:            SimulatedNetwork,
 		prng_tree:          Prng_Tree,
 		fault_engine:       FaultEngine,
@@ -42,7 +42,7 @@ when TINA_SIMULATION_MODE {
 	) -> mem.Allocator_Error {
 		sim.spec = spec
 		sim.shards = make([]Shard, spec.shard_count, allocator)
-		sim.shard_states = make([]u8, spec.shard_count, allocator)
+		sim.watchdog_states = make([]u8, spec.shard_count, allocator)
 
 		// Use the validated timer resolution from the spec (uniform across all shards)
 		sim.tick_resolution_ns = spec.timer_resolution_ns
@@ -101,9 +101,9 @@ when TINA_SIMULATION_MODE {
 				return err
 			}
 
-			// Wire up shared_state before tree building (ctx_spawn reads it)
-			sim.shard_states[i] = u8(Shard_State.Running)
-			shard.shared_state = &sim.shard_states[i]
+			// Wire up watchdog_state_pointer before tree building (ctx_spawn reads it)
+			sim.watchdog_states[i] = u8(Shard_State.Running)
+			shard.watchdog_state_pointer = &sim.watchdog_states[i]
 
 			// Initialize Supervision Tree
 			alloc_data := Grand_Arena_Allocator_Data {

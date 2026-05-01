@@ -345,7 +345,7 @@ ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, size
 ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
 	shard := _ctx_extract_shard(ctx)
 	return(
-		cast(Shard_State)sync.atomic_load_explicit(shard.shared_state, .Relaxed) ==
+		cast(Shard_State)sync.atomic_load_explicit(shard.watchdog_state_pointer, .Relaxed) ==
 		.Shutting_Down \
 	)
 }

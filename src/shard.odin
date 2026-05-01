@@ -179,7 +179,7 @@ Shard :: struct {
 	peer_alive_mask:        Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
 	control_signal:         Control_Signal, // Atomic, mutually exclusive signals from watchdog
 	_padding:               [5]u8,
-	shared_state:           ^u8, // Points to external shared state (config or simulator backing)
+	watchdog_state_pointer: ^u8, // Points to external watchdog state (config or simulator backing)
 
 	// --- Cold / Massive Storage ---
 	timer_wheel:            Timer_Wheel,

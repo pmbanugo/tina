@@ -42,7 +42,7 @@ shard_control_signal_set :: #force_inline proc "contextless" (
 
 @(private = "package")
 shard_runtime_state_set :: #force_inline proc "contextless" (shard: ^Shard, state: Shard_State) {
-	sync.atomic_store_explicit(shard.shared_state, u8(state), .Release)
+	sync.atomic_store_explicit(shard.watchdog_state_pointer, u8(state), .Release)
 }
 
 // Atomically read the current process phase.
