@@ -46,7 +46,7 @@ reactor_buffer_pool_init :: proc(
 	}
 }
 
-reactor_buffer_pool_alloc :: proc(pool: ^Reactor_Buffer_Pool) -> (u16, Buffer_Pool_Error) {
+reactor_buffer_pool_alloc :: #force_inline proc(pool: ^Reactor_Buffer_Pool) -> (u16, Buffer_Pool_Error) {
 	if pool.free_head == BUFFER_INDEX_NONE {
 		return BUFFER_INDEX_NONE, .Empty
 	}
@@ -62,7 +62,7 @@ reactor_buffer_pool_alloc :: proc(pool: ^Reactor_Buffer_Pool) -> (u16, Buffer_Po
 	return index, .None
 }
 
-reactor_buffer_pool_free :: proc(pool: ^Reactor_Buffer_Pool, index: u16) {
+reactor_buffer_pool_free :: #force_inline proc(pool: ^Reactor_Buffer_Pool, index: u16) {
 	assert(index < pool.slot_count, "buffer index out of bounds")
 
 	slot_pointer := _buffer_pool_slot_ptr(pool, index)
@@ -73,39 +73,60 @@ reactor_buffer_pool_free :: proc(pool: ^Reactor_Buffer_Pool, index: u16) {
 }
 
 // Get a pointer to the buffer data for a given slot index.
-reactor_buffer_pool_slot_ptr :: #force_inline proc(
-	pool: ^Reactor_Buffer_Pool,
-	index: u16,
-) -> [^]u8 {
-	assert(index < pool.slot_count, "buffer index out of bounds")
-	return _buffer_pool_slot_ptr(pool, index)
-}
-
 // Get a read-only slice of the buffer data for a completed read.
-reactor_buffer_pool_read_slice :: proc(pool: ^Reactor_Buffer_Pool, index: u16, size: u32) -> []u8 {
+reactor_buffer_pool_read_slice :: #force_inline proc(pool: ^Reactor_Buffer_Pool, index: u16, size: u32) -> []u8 {
 	assert(index < pool.slot_count, "buffer index out of bounds")
 	slot_pointer := _buffer_pool_slot_ptr(pool, index)
 	actual_size := min(size, pool.slot_size)
 	return slot_pointer[:actual_size]
 }
 
+// Get a writable slice view of a buffer slot.
+reactor_buffer_pool_write_slice :: #force_inline proc(pool: ^Reactor_Buffer_Pool, index: u16) -> []u8 {
+	assert(index < pool.slot_count, "buffer index out of bounds")
+	slot_pointer := _buffer_pool_slot_ptr(pool, index)
+	return slot_pointer[:pool.slot_size]
+}
+
 // Copy payload from an Isolate's struct into a buffer slot (copy-on-submit for writes).
-reactor_buffer_pool_copy_in :: proc(
+reactor_buffer_pool_copy_in :: #force_inline proc(
 	pool: ^Reactor_Buffer_Pool,
 	index: u16,
 	source: rawptr,
 	payload_size: u32,
-) -> [^]u8 {
+) {
 	assert(index < pool.slot_count, "buffer index out of bounds")
 	assert(payload_size <= pool.slot_size, "payload exceeds slot size")
 
 	target := _buffer_pool_slot_ptr(pool, index)
 	mem.copy(target, source, int(payload_size))
-	return target
+}
+
+// Copy byte slice contents into a buffer slot.
+reactor_buffer_pool_write_bytes :: #force_inline proc(
+	pool: ^Reactor_Buffer_Pool,
+	index: u16,
+	source: []u8,
+) {
+	assert(index < pool.slot_count, "buffer index out of bounds")
+	assert(len(source) <= int(pool.slot_size), "payload exceeds slot size")
+	target := _buffer_pool_slot_ptr(pool, index)
+	mem.copy(target, raw_data(source), len(source))
+}
+
+// Rebuild the pool's free list and mark every slot free.
+reactor_buffer_pool_reset :: #force_inline proc(pool: ^Reactor_Buffer_Pool) {
+	pool.free_count = pool.slot_count
+	pool.free_head = BUFFER_INDEX_NONE
+	for i := int(pool.slot_count) - 1; i >= 0; i -= 1 {
+		slot_pointer := _buffer_pool_slot_ptr(pool, u16(i))
+		(cast(^u16)slot_pointer)^ = pool.free_head
+		pool.free_head = u16(i)
+	}
 }
 
 @(private = "file")
-_buffer_pool_slot_ptr :: #force_inline proc(pool: ^Reactor_Buffer_Pool, index: u16) -> [^]u8 {
+_buffer_pool_slot_ptr :: #force_inline proc "contextless" (pool: ^Reactor_Buffer_Pool, index: u16) -> [^]u8 {
 	offset := u32(index) << pool.slot_shift
 	return raw_data(pool.buffer[offset:])
 }

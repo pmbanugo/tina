@@ -998,12 +998,8 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		shard.message_pool.free_head = u32(i)
 	}
 
-	shard.transfer_pool.free_count = shard.transfer_pool.slot_count
-	shard.transfer_pool.free_head = BUFFER_INDEX_NONE
-	for i := int(shard.transfer_pool.slot_count) - 1; i >= 0; i -= 1 {
-		slot_pointer := reactor_buffer_pool_slot_ptr(&shard.transfer_pool, u16(i))
-		(cast(^u16)slot_pointer)^ = shard.transfer_pool.free_head
-		shard.transfer_pool.free_head = u16(i)
+	reactor_buffer_pool_reset(&shard.transfer_pool)
+	for i in 0 ..< shard.transfer_pool.slot_count {
 		shard.transfer_generations[i] += 1
 		if shard.transfer_generations[i] == 0 do shard.transfer_generations[i] = 1
 	}

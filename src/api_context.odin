@@ -200,8 +200,7 @@ ctx_transfer_write_raw :: #force_inline proc(
 		return .Bounds_Violation
 	}
 
-	target := reactor_buffer_pool_slot_ptr(&shard.transfer_pool, index)
-	mem.copy(target, raw_data(data), len(data))
+	reactor_buffer_pool_write_bytes(&shard.transfer_pool, index, data)
 	return .None
 }
 
@@ -245,8 +244,7 @@ ctx_transfer_read :: #force_inline proc(
 	}
 	shard.metadata[type_id][slot].pending_transfer_read = handle
 
-	ptr := reactor_buffer_pool_slot_ptr(&shard.transfer_pool, index)
-	return ptr[:shard.transfer_pool.slot_size]
+	return reactor_buffer_pool_write_slice(&shard.transfer_pool, index)
 }
 
 // ============================================================================
