@@ -4,8 +4,8 @@ import "core:testing"
 
 @(private = "package")
 Header_View :: struct {
-	name_offset:  u32,
-	value_offset: u32,
+	name_offset:  u16,
+	value_offset: u16,
 	hash:         FNV_Hash_1a, // FNV-1a, A..Z folded — see Parser Notes §1
 	name_size:    u16,
 	value_size:   u16,
@@ -13,8 +13,8 @@ Header_View :: struct {
 
 @(private = "package")
 Param_View :: struct {
-	name_offset:  u32,
-	value_offset: u32,
+	name_offset:  u16,
+	value_offset: u16,
 	name_size:    u16,
 	value_size:   u16,
 }
@@ -32,13 +32,13 @@ Request_Flags :: distinct bit_set[Request_Flag;u8]
 @(private = "package")
 Request_State :: struct {
 	header_bloom:       u64,
-	target_offset:      u32,
-	path_offset:        u32,
-	query_offset:       u32,
-	status_flags:       Request_Flags,
+	target_offset:      u16,
+	path_offset:        u16,
+	query_offset:       u16,
 	target_size:        u16,
 	path_size:          u16,
 	query_size:         u16,
+	status_flags:       Request_Flags,
 	header_count:       u8,
 	path_segment_count: u8,
 	param_count:        u8,
@@ -64,15 +64,15 @@ request_state_reset :: #force_inline proc "contextless" (request: ^Request_State
 
 @(test)
 test_header_view_layout :: proc(t: ^testing.T) {
-	// Header_View must stay compact (3 × u32 + 2 × u16 = 16 bytes) so that
-	// `header_count_max` slots fit predictably in working memory.
-	testing.expect_value(t, size_of(Header_View), 16)
+	// Header_View must stay compact (2 × u16 offsets + u32 + 2 × u16 = 12 bytes)
+	// so that `header_count_max` slots fit predictably in working memory.
+	testing.expect_value(t, size_of(Header_View), 12)
 }
 
 @(test)
 test_param_view_layout :: proc(t: ^testing.T) {
-	// Param_View is the slim cousin of Header_View — no hash field.
-	testing.expect_value(t, size_of(Param_View), 12)
+	// Param_View is the slim cousin of Header_View with no hash field.
+	testing.expect_value(t, size_of(Param_View), 8)
 }
 
 @(test)

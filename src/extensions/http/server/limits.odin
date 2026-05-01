@@ -9,13 +9,13 @@ import "core:testing"
 // per-request maximums. Under-provisioning is caught at startup, not at runtime.
 
 Limits :: struct {
-	header_size_max:       u32, // Max total header bytes (all headers combined).
 	request_arena_size:    u32, // App-owned per-request working arena budget (bytes).
 	handler_scratch_max:   u32, // App max scratch use per callback (bytes).
+	header_size_max:       u16, // Max total header bytes (all headers combined).
 	request_line_size_max: u16, // Max bytes for the request line (method + target + version).
 	header_count_max:      u16, // Max number of individual headers.
 	query_pair_count_max:  u16, // Max query key-value pairs for lazy parse.
-	param_count_max:       u8,  // Max route parameters.
+	param_count_max:       u8, // Max route parameters.
 }
 
 // ─── Timeouts ───────────────────────────────────────────────────────────────
@@ -37,20 +37,20 @@ Timeouts :: struct {
 // Operators tune via Server config; these are the safe starting point.
 
 DEFAULT_LIMITS :: Limits {
-	header_size_max       = 8192,  // 8 KB — covers most real-world header sets.
-	request_arena_size    = 4096,  // 4 KB — sufficient for typical per-request state.
-	handler_scratch_max   = 2048,  // 2 KB — percent decode, temp formatting.
-	request_line_size_max = 2048,  // 2 KB — long URIs with query strings.
-	header_count_max      = 64,    // Practical ceiling; most requests use < 20.
-	query_pair_count_max  = 32,    // Generous for typical API query strings.
-	param_count_max       = 8,     // Route params like /a/:b/:c/:d.
+	header_size_max       = 8192, // 8 KB — covers most real-world header sets.
+	request_arena_size    = 4096, // 4 KB — sufficient for typical per-request state.
+	handler_scratch_max   = 2048, // 2 KB — percent decode, temp formatting.
+	request_line_size_max = 2048, // 2 KB — long URIs with query strings.
+	header_count_max      = 64, // Practical ceiling; most requests use < 20.
+	query_pair_count_max  = 32, // Generous for typical API query strings.
+	param_count_max       = 8, // Route params like /a/:b/:c/:d.
 }
 
 DEFAULT_TIMEOUTS :: Timeouts {
-	timeout_ms_idle   = 60_000,  // 60 seconds — standard keep-alive idle.
-	timeout_ms_header = 10_000,  // 10 seconds — slow-loris defense.
-	timeout_ms_body   = 30_000,  // 30 seconds — body progress deadline.
-	timeout_ms_send   = 30_000,  // 30 seconds — slow-read defense.
+	timeout_ms_idle   = 60_000, // 60 seconds — standard keep-alive idle.
+	timeout_ms_header = 10_000, // 10 seconds — slow-loris defense.
+	timeout_ms_body   = 30_000, // 30 seconds — body progress deadline.
+	timeout_ms_send   = 30_000, // 30 seconds — slow-read defense.
 }
 
 
@@ -78,7 +78,7 @@ test_default_limits_invariants :: proc(t: ^testing.T) {
 	// otherwise a valid request line could never fit in the header space.
 	testing.expect(
 		t,
-		limits.header_size_max >= u32(limits.request_line_size_max),
+		limits.header_size_max >= limits.request_line_size_max,
 		"header_size_max must be >= request_line_size_max",
 	)
 }

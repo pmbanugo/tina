@@ -28,8 +28,10 @@ Parser_Flag :: enum u8 {
 	Keep_Alive_Allowed,
 }
 
+// 8 flags fit exactly in u8. A 9th flag is a deliberate decision that must
+// bump the backing type to u16; the type advertises remaining capacity.
 @(private = "package")
-Parser_Flags :: distinct bit_set[Parser_Flag;u16]
+Parser_Flags :: distinct bit_set[Parser_Flag;u8]
 
 // ─── 256-Bit Validation Tables ──────────────────────────────────
 //
@@ -184,21 +186,21 @@ parse_hexadecimal_size :: proc "contextless" (hex_bytes: []u8) -> (u64, bool) {
 @(private = "package")
 find_newline_offset :: proc "contextless" (
 	buffer_bytes: []u8,
-	parsed_size_current: u32,
-	size_maximum: u32,
+	parsed_size_current: u16,
+	size_maximum: u16,
 ) -> (
 	offset: int,
 	limit_exceeded: bool,
 ) {
-	remaining_size_allowed := size_maximum - parsed_size_current
-	scan_size := min(u32(len(buffer_bytes)), remaining_size_allowed)
+	remaining_size_allowed := int(size_maximum - parsed_size_current)
+	scan_size := min(len(buffer_bytes), remaining_size_allowed)
 
 	// bytes.index_byte leverages SIMD vectorization automatically
 	newline_offset := bytes.index_byte(buffer_bytes[:scan_size], '\r')
 
 	// If no newline is found AND we hit our strict size maximum, the client
 	// is violating limits. Connection must be dropped.
-	if newline_offset < 0 && u32(len(buffer_bytes)) >= remaining_size_allowed {
+	if newline_offset < 0 && len(buffer_bytes) >= remaining_size_allowed {
 		return -1, true
 	}
 
@@ -213,7 +215,7 @@ Parser_State :: struct {
 	body_size_remaining:  u64, // Content-Length remaining; tracked from header parse onward
 	chunk_size_remaining: u64, // bytes left inside the current chunk's data section
 	chunk_size_parsed:    u64, // partial hex value while accumulating a chunk size line
-	header_size:          u32, // total header bytes consumed (incl. CRLFs); bounded by Limits.header_size_max
+	header_size:          u16, // total header bytes consumed (incl. CRLFs); bounded by Limits.header_size_max
 	request_line_size:    u16, // size of the request line (incl. trailing CRLF)
 	header_count:         u8, // number of headers parsed so far
 	flags:                Parser_Flags,
@@ -378,11 +380,11 @@ parse_request_line :: #force_inline proc "contextless" (
 	state: ^Parser_State,
 	request: ^Request_State,
 	buffer: []u8,
-	parsed_offset: ^u32,
+	parsed_offset: ^u16,
 	limits: ^Limits,
 ) -> Parse_Status {
 	frame_offset := parsed_offset^
-	if u32(len(buffer)) <= frame_offset {
+	if len(buffer) <= int(frame_offset) {
 		return .Need_More
 	}
 
@@ -394,7 +396,7 @@ parse_request_line :: #force_inline proc "contextless" (
 		return .Error_Bad_Request
 	}
 
-	cr_offset, limit_exceeded := find_newline_offset(view, 0, u32(limits.request_line_size_max))
+	cr_offset, limit_exceeded := find_newline_offset(view, 0, limits.request_line_size_max)
 	if limit_exceeded {
 		// A request line that exceeds the configured cap is treated as a
 		// malformed request rather than 414 — request-target overrun is
@@ -445,7 +447,7 @@ parse_request_line :: #force_inline proc "contextless" (
 	if !method_known do request.status_flags += {.Unknown_Method}
 	if method == .HEAD do state.flags += {.Head_Method}
 
-	target_offset_in_frame := frame_offset + u32(first_space) + 1
+	target_offset_in_frame := frame_offset + u16(first_space) + 1
 
 	is_asterisk := len(target_bytes) == 1 && target_bytes[0] == '*'
 	if is_asterisk {
@@ -475,13 +477,13 @@ parse_request_line :: #force_inline proc "contextless" (
 		} else {
 			request.path_offset = target_offset_in_frame
 			request.path_size = u16(query_marker)
-			request.query_offset = target_offset_in_frame + u32(query_marker) + 1
+			request.query_offset = target_offset_in_frame + u16(query_marker) + 1
 			request.query_size = u16(len(target_bytes) - query_marker - 1)
 		}
 	}
 
-	line_total := u32(cr_offset) + 2 // bytes consumed including CRLF
-	state.request_line_size = u16(line_total)
+	line_total := u16(cr_offset) + 2 // bytes consumed including CRLF
+	state.request_line_size = line_total
 	parsed_offset^ = frame_offset + line_total
 
 	return .Continue
@@ -498,11 +500,11 @@ parse_one_header :: proc "contextless" (
 	request: ^Request_State,
 	headers: []Header_View,
 	buffer: []u8,
-	parsed_offset: ^u32,
+	parsed_offset: ^u16,
 	limits: ^Limits,
 ) -> Parse_Status {
 	frame_offset := parsed_offset^
-	if u32(len(buffer)) <= frame_offset {
+	if len(buffer) <= int(frame_offset) {
 		return .Need_More
 	}
 
@@ -569,7 +571,7 @@ parse_one_header :: proc "contextless" (
 	// promoted from reactor buffer to Working Memory (DR-3, I3).
 	headers[state.header_count] = Header_View {
 		name_offset  = frame_offset,
-		value_offset = frame_offset + u32(value_start),
+		value_offset = frame_offset + u16(value_start),
 		hash         = hash,
 		name_size    = u16(len(name_bytes)),
 		value_size   = u16(len(value_bytes)),
@@ -610,7 +612,7 @@ parse_one_header :: proc "contextless" (
 		bloom_set(&request.header_bloom, hash)
 	}
 
-	line_total := u32(cr_offset) + 2
+	line_total := u16(cr_offset) + 2
 	state.header_size += line_total
 	state.header_count += 1
 	request.header_count = state.header_count
@@ -656,7 +658,7 @@ parse_step :: #force_inline proc "contextless" (
 	request: ^Request_State,
 	headers: []Header_View,
 	buffer: []u8,
-	parsed_offset: ^u32,
+	parsed_offset: ^u16,
 	limits: ^Limits,
 ) -> Parse_Status {
 	for {
@@ -1026,7 +1028,7 @@ test_find_newline_ignores_bare_lf_smuggling :: proc(t: ^testing.T) {
 	malicious_bytes := transmute([]u8)string("Host: malicious.com\nBut-No-CR-Here")
 
 	// Let's say the limit is exactly the length of this string
-	offset, limit_exceeded := find_newline_offset(malicious_bytes, 0, u32(len(malicious_bytes)))
+	offset, limit_exceeded := find_newline_offset(malicious_bytes, 0, u16(len(malicious_bytes)))
 
 	testing.expect(t, limit_exceeded, "Must exceed limit because no \r was found")
 	testing.expect_value(t, offset, -1)
@@ -1067,7 +1069,7 @@ Parse_Harness :: struct {
 	state:         Parser_State,
 	request:       Request_State,
 	headers:       [64]Header_View,
-	parsed_offset: u32,
+	parsed_offset: u16,
 	limits:        Limits,
 }
 
@@ -1138,7 +1140,7 @@ test_parse_step_simple_get :: proc(t: ^testing.T) {
 	testing.expect_value(t, harness.request.query_size, 0)
 	testing.expect_value(t, harness.request.header_count, 1)
 	testing.expect(t, .Host in harness.request.known_headers, "Host should be classified")
-	testing.expect_value(t, harness.parsed_offset, u32(len(request_bytes)))
+	testing.expect_value(t, harness.parsed_offset, u16(len(request_bytes)))
 	testing.expect_value(t, harness.state.phase, Parse_Phase.Complete)
 }
 
