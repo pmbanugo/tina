@@ -87,11 +87,10 @@ validate_and_hash_header_name :: proc "contextless" (
 
 // Sets 2 bits in a 64-bit bloom filter derived from the hash.
 @(private = "package")
-bloom_set :: #force_inline proc "contextless" (bloom: ^u64, hash: FNV_Hash_1a) {
-	h := u32(hash)
-	bit_a := h & 0x3F // low 6 bits  -> bit position 0..63
-	bit_b := (h >> 6) & 0x3F // next 6 bits -> bit position 0..63
-	bloom^ |= (1 << bit_a) | (1 << bit_b)
+bloom_set :: #force_inline proc "contextless" (bloom: u64, hash: FNV_Hash_1a) -> u64 {
+	bit_a := hash & 0x3F // low 6 bits  -> bit position 0..63
+	bit_b := (hash >> 6) & 0x3F // next 6 bits -> bit position 0..63
+	return bloom | (1 << bit_a) | (1 << bit_b)
 }
 
 // Check if  the bloom filter may contain a header with the given hash.
@@ -312,7 +311,7 @@ test_bloom_set_and_query :: proc(t: ^testing.T) {
 	bloom: u64 = 0
 
 	hash_host := compute_header_hash(transmute([]u8)string("host"))
-	bloom_set(&bloom, hash_host)
+	bloom = bloom_set(bloom, hash_host)
 
 	testing.expect(
 		t,
@@ -334,7 +333,7 @@ test_bloom_no_false_negatives :: proc(t: ^testing.T) {
 
 	for header, index in headers {
 		hashes[index] = compute_header_hash(transmute([]u8)header)
-		bloom_set(&bloom, hashes[index])
+		bloom = bloom_set(bloom, hashes[index])
 	}
 
 	// Every inserted hash must be found — zero false negatives.

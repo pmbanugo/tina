@@ -380,20 +380,22 @@ parse_request_line :: #force_inline proc "contextless" (
 	state: ^Parser_State,
 	request: ^Request_State,
 	buffer: []u8,
-	parsed_offset: ^u16,
-	limits: ^Limits,
-) -> Parse_Status {
-	frame_offset := parsed_offset^
-	if len(buffer) <= int(frame_offset) {
-		return .Need_More
+	parsed_offset: u16,
+	limits: Limits,
+) -> (
+	Parse_Status,
+	u16,
+) {
+	if len(buffer) <= int(parsed_offset) {
+		return .Need_More, parsed_offset
 	}
 
-	view := buffer[frame_offset:]
+	view := buffer[parsed_offset:]
 
 	// Reject leading blank lines (RFC 9112 §2.2 RECOMMENDS ignore; we strictly
 	// reject to harden against parser-desync smuggling vectors).
 	if view[0] == '\r' || view[0] == '\n' {
-		return .Error_Bad_Request
+		return .Error_Bad_Request, parsed_offset
 	}
 
 	cr_offset, limit_exceeded := find_newline_offset(view, 0, limits.request_line_size_max)
@@ -401,44 +403,44 @@ parse_request_line :: #force_inline proc "contextless" (
 		// A request line that exceeds the configured cap is treated as a
 		// malformed request rather than 414 — request-target overrun is
 		// indistinguishable from missing CRLF at the parser boundary.
-		return .Error_Bad_Request
+		return .Error_Bad_Request, parsed_offset
 	}
 	if cr_offset < 0 {
-		return .Need_More
+		return .Need_More, parsed_offset
 	}
 	if cr_offset + 1 >= len(view) {
-		return .Need_More // saw '\r', waiting for '\n'
+		return .Need_More, parsed_offset // saw '\r', waiting for '\n'
 	}
 	if view[cr_offset + 1] != '\n' {
-		return .Error_Bad_Request // bare CR without LF — smuggling vector
+		return .Error_Bad_Request, parsed_offset // bare CR without LF — smuggling vector
 	}
 
 	line := view[:cr_offset]
 
 	// Reject HTAB anywhere in the request line — only SP is permitted.
 	for byte_value in line {
-		if byte_value == '\t' do return .Error_Bad_Request
+		if byte_value == '\t' do return .Error_Bad_Request, parsed_offset
 	}
 
 	first_space := index_byte_in(line, ' ')
-	if first_space < 0 do return .Error_Bad_Request
+	if first_space < 0 do return .Error_Bad_Request, parsed_offset
 	method_bytes := line[:first_space]
 
 	rest_after_method := line[first_space + 1:]
 	second_space := index_byte_in(rest_after_method, ' ')
-	if second_space < 0 do return .Error_Bad_Request
+	if second_space < 0 do return .Error_Bad_Request, parsed_offset
 	target_bytes := rest_after_method[:second_space]
 	version_bytes := rest_after_method[second_space + 1:]
 
-	if !validate_token_bytes(method_bytes) do return .Error_Bad_Request
+	if !validate_token_bytes(method_bytes) do return .Error_Bad_Request, parsed_offset
 
 	// Version must be exactly "HTTP/1.1". Anything else (HTTP/1.0, HTTP/2.0,
 	// junk) is a 505 — the connection is unusable for the requested version.
-	if !equal_bytes(version_bytes, "HTTP/1.1") do return .Error_Version
+	if !equal_bytes(version_bytes, "HTTP/1.1") do return .Error_Version, parsed_offset
 
-	if len(target_bytes) == 0 do return .Error_Bad_Request
+	if len(target_bytes) == 0 do return .Error_Bad_Request, parsed_offset
 	for byte_value in target_bytes {
-		if !is_uri_byte(byte_value) do return .Error_Bad_Request
+		if !is_uri_byte(byte_value) do return .Error_Bad_Request, parsed_offset
 	}
 
 	// Method classification — accept any token but flag unknown for the router.
@@ -447,13 +449,13 @@ parse_request_line :: #force_inline proc "contextless" (
 	if !method_known do request.status_flags += {.Unknown_Method}
 	if method == .HEAD do state.flags += {.Head_Method}
 
-	target_offset_in_frame := frame_offset + u16(first_space) + 1
+	target_offset_in_frame := parsed_offset + u16(first_space) + 1
 
 	is_asterisk := len(target_bytes) == 1 && target_bytes[0] == '*'
 	if is_asterisk {
 		// asterisk-form is only valid for OPTIONS. Any other method gets
 		// 400 + close (DR-10). Path/query are degenerate; record `*` as both.
-		if method != .OPTIONS do return .Error_Bad_Request
+		if method != .OPTIONS do return .Error_Bad_Request, parsed_offset
 		request.status_flags += {.Options_Asterisk}
 		request.target_offset = target_offset_in_frame
 		request.target_size = 1
@@ -463,7 +465,7 @@ parse_request_line :: #force_inline proc "contextless" (
 		request.query_size = 0
 	} else if target_bytes[0] != '/' {
 		// absolute-form (`http://...`) and authority-form (CONNECT) rejected.
-		return .Error_Bad_Request
+		return .Error_Bad_Request, parsed_offset
 	} else {
 		request.target_offset = target_offset_in_frame
 		request.target_size = u16(len(target_bytes))
@@ -484,9 +486,8 @@ parse_request_line :: #force_inline proc "contextless" (
 
 	line_total := u16(cr_offset) + 2 // bytes consumed including CRLF
 	state.request_line_size = line_total
-	parsed_offset^ = frame_offset + line_total
 
-	return .Continue
+	return .Continue, parsed_offset + line_total
 }
 
 // Parses one `Field-Name: field-value CRLF` line at `parsed_offset`. The empty
@@ -500,48 +501,49 @@ parse_one_header :: proc "contextless" (
 	request: ^Request_State,
 	headers: []Header_View,
 	buffer: []u8,
-	parsed_offset: ^u16,
-	limits: ^Limits,
-) -> Parse_Status {
-	frame_offset := parsed_offset^
-	if len(buffer) <= int(frame_offset) {
-		return .Need_More
+	parsed_offset: u16,
+	limits: Limits,
+) -> (
+	Parse_Status,
+	u16,
+) {
+	if len(buffer) <= int(parsed_offset) {
+		return .Need_More, parsed_offset
 	}
 
-	view := buffer[frame_offset:]
+	view := buffer[parsed_offset:]
 
 	// Empty line ⇒ end of header section.
 	if len(view) >= 2 && view[0] == '\r' && view[1] == '\n' {
-		parsed_offset^ = frame_offset + 2
-		return .Headers_Done
+		return .Headers_Done, parsed_offset + 2
 	}
 	if len(view) == 1 && view[0] == '\r' {
-		return .Need_More // need to see the '\n' to know whether headers end here
+		return .Need_More, parsed_offset // need to see the '\n' to know whether headers end here
 	}
 
 	// Header lines must begin with a token byte. obs-fold (a continuation
 	// line beginning with SP/HTAB) is unconditionally rejected per RFC 9112
 	// §5.2 to neutralize smuggling via line-folding ambiguity.
-	if view[0] == ' ' || view[0] == '\t' do return .Error_Bad_Request
+	if view[0] == ' ' || view[0] == '\t' do return .Error_Bad_Request, parsed_offset
 
 	remaining_budget := limits.header_size_max - state.header_size
 	cr_offset, limit_exceeded := find_newline_offset(view, 0, remaining_budget)
-	if limit_exceeded do return .Error_Header_Too_Large
-	if cr_offset < 0 do return .Need_More
-	if cr_offset + 1 >= len(view) do return .Need_More
-	if view[cr_offset + 1] != '\n' do return .Error_Bad_Request
-	if cr_offset == 0 do return .Error_Bad_Request // protocol-impossible: empty is handled above
+	if limit_exceeded do return .Error_Header_Too_Large, parsed_offset
+	if cr_offset < 0 do return .Need_More, parsed_offset
+	if cr_offset + 1 >= len(view) do return .Need_More, parsed_offset
+	if view[cr_offset + 1] != '\n' do return .Error_Bad_Request, parsed_offset
+	if cr_offset == 0 do return .Error_Bad_Request, parsed_offset // protocol-impossible: empty is handled above
 
 	line := view[:cr_offset]
 
 	// Bound header_count before we touch any storage.
 	if int(state.header_count) >= int(limits.header_count_max) ||
 	   int(state.header_count) >= len(headers) {
-		return .Error_Header_Too_Large
+		return .Error_Header_Too_Large, parsed_offset
 	}
 
 	colon_index := index_byte_in(line, ':')
-	if colon_index <= 0 do return .Error_Bad_Request
+	if colon_index <= 0 do return .Error_Bad_Request, parsed_offset
 
 	name_bytes := line[:colon_index]
 
@@ -550,7 +552,7 @@ parse_one_header :: proc "contextless" (
 	//   - any byte outside CHARS_HTTP_TOKEN (CTL, SP, HTAB, delimiters, high
 	//     bytes) — including the "whitespace before colon" smuggling vector.
 	hash, name_valid := validate_and_hash_header_name(name_bytes)
-	if !name_valid do return .Error_Bad_Request
+	if !name_valid do return .Error_Bad_Request, parsed_offset
 
 	// Trim OWS surrounding the value (RFC 9110 §5.5).
 	value_start := colon_index + 1
@@ -564,14 +566,14 @@ parse_one_header :: proc "contextless" (
 	value_bytes := line[value_start:value_end]
 
 	for byte_value in value_bytes {
-		if !is_header_value_byte(byte_value) do return .Error_Bad_Request
+		if !is_header_value_byte(byte_value) do return .Error_Bad_Request, parsed_offset
 	}
 
 	// Frame-relative offsets — preserved verbatim if the bytes are later
 	// promoted from reactor buffer to Working Memory (DR-3, I3).
 	headers[state.header_count] = Header_View {
-		name_offset  = frame_offset,
-		value_offset = frame_offset + u16(value_start),
+		name_offset  = parsed_offset,
+		value_offset = parsed_offset + u16(value_start),
 		hash         = hash,
 		name_size    = u16(len(name_bytes)),
 		value_size   = u16(len(value_bytes)),
@@ -581,25 +583,25 @@ parse_one_header :: proc "contextless" (
 	if is_known {
 		switch known_header {
 		case .Host:
-			if .Host in request.known_headers do return .Error_Bad_Request
+			if .Host in request.known_headers do return .Error_Bad_Request, parsed_offset
 		case .Content_Length:
-			if .Has_Content_Length in state.flags do return .Error_Bad_Request
-			if .Has_Transfer_Encoding in state.flags do return .Error_Bad_Request
+			if .Has_Content_Length in state.flags do return .Error_Bad_Request, parsed_offset
+			if .Has_Transfer_Encoding in state.flags do return .Error_Bad_Request, parsed_offset
 			content_length, parsed_ok := parse_decimal_size(value_bytes)
-			if !parsed_ok do return .Error_Bad_Request
+			if !parsed_ok do return .Error_Bad_Request, parsed_offset
 			state.body_size_remaining = content_length
 			state.flags += {.Has_Content_Length}
 		case .Transfer_Encoding:
-			if .Has_Transfer_Encoding in state.flags do return .Error_Bad_Request
-			if .Has_Content_Length in state.flags do return .Error_Bad_Request
+			if .Has_Transfer_Encoding in state.flags do return .Error_Bad_Request, parsed_offset
+			if .Has_Content_Length in state.flags do return .Error_Bad_Request, parsed_offset
 			// v1 accepts only the single token `chunked`. Any list (e.g.
 			// "gzip, chunked") or unknown coding is 501 + close.
-			if !equal_bytes_ci(value_bytes, "chunked") do return .Error_Not_Implemented
+			if !equal_bytes_ci(value_bytes, "chunked") do return .Error_Not_Implemented, parsed_offset
 			state.flags += {.Has_Transfer_Encoding, .Chunked_Request}
 		case .Connection:
 			parse_connection_tokens(state, value_bytes)
 		case .Expect:
-			if !equal_bytes_ci(value_bytes, "100-continue") do return .Error_Expectation
+			if !equal_bytes_ci(value_bytes, "100-continue") do return .Error_Expectation, parsed_offset
 			state.flags += {.Expect_100}
 		case .Upgrade:
 			state.flags += {.Upgrade_Request}
@@ -609,16 +611,15 @@ parse_one_header :: proc "contextless" (
 		// Bloom is populated for arbitrary headers only; known headers go
 		// through the exact `Known_Header_Mask` check, which has zero false
 		// positives.
-		bloom_set(&request.header_bloom, hash)
+		request.header_bloom = bloom_set(request.header_bloom, hash)
 	}
 
 	line_total := u16(cr_offset) + 2
 	state.header_size += line_total
 	state.header_count += 1
 	request.header_count = state.header_count
-	parsed_offset^ = frame_offset + line_total
 
-	return .Continue
+	return .Continue, parsed_offset + line_total
 }
 
 // Called once header parsing completes. Sets `state.phase` to the appropriate
@@ -658,52 +659,71 @@ parse_step :: #force_inline proc "contextless" (
 	request: ^Request_State,
 	headers: []Header_View,
 	buffer: []u8,
-	parsed_offset: ^u16,
-	limits: ^Limits,
-) -> Parse_Status {
+	parsed_offset: u16,
+	limits: Limits,
+) -> (
+	Parse_Status,
+	u16,
+) {
+	current_offset := parsed_offset
 	for {
 		switch state.phase {
 		case .Request_Line:
-			result := parse_request_line(state, request, buffer, parsed_offset, limits)
+			result, new_offset := parse_request_line(
+				state,
+				request,
+				buffer,
+				current_offset,
+				limits,
+			)
+			current_offset = new_offset
 			#partial switch result {
 			case .Continue:
 				state.phase = .Headers
 			case .Need_More:
-				return .Need_More
+				return .Need_More, current_offset
 			case:
 				state.phase = .Error
-				return result
+				return result, current_offset
 			}
 
 		case .Headers:
-			result := parse_one_header(state, request, headers, buffer, parsed_offset, limits)
+			result, new_offset := parse_one_header(
+				state,
+				request,
+				headers,
+				buffer,
+				current_offset,
+				limits,
+			)
+			current_offset = new_offset
 			#partial switch result {
 			case .Continue:
 			// Loop and parse the next header line.
 			case .Need_More:
-				return .Need_More
+				return .Need_More, current_offset
 			case .Headers_Done:
 				// Mandatory-header validation gate: HTTP/1.1 requires Host.
 				// (Duplicate Host was already caught inline by parse_one_header.)
 				if .Host not_in request.known_headers {
 					state.phase = .Error
-					return .Error_Bad_Request
+					return .Error_Bad_Request, current_offset
 				}
 				determine_body_framing(state)
-				return .Headers_Done
+				return .Headers_Done, current_offset
 			case:
 				state.phase = .Error
-				return result
+				return result, current_offset
 			}
 
 		case .Body_Fixed, .Chunk_Size, .Chunk_Data, .Chunk_Data_CRLF, .Trailers, .Complete:
 			// Body phases are owned by body.odin (Phase 3). For Phase 2,
 			// returning Need_More keeps parse_step idempotent if a caller
 			// re-enters after Headers_Done without owning body parsing.
-			return .Need_More
+			return .Need_More, current_offset
 
 		case .Error:
-			return .Error_Bad_Request
+			return .Error_Bad_Request, current_offset
 		}
 	}
 }
@@ -1087,14 +1107,16 @@ parse_harness_make :: proc() -> Parse_Harness {
 // repeatedly calling parse_step on the same buffer. Returns the final status.
 @(private = "file")
 parse_harness_run :: proc(harness: ^Parse_Harness, buffer: []u8) -> Parse_Status {
-	return parse_step(
+	status, new_offset := parse_step(
 		&harness.state,
 		&harness.request,
 		harness.headers[:],
 		buffer,
-		&harness.parsed_offset,
-		&harness.limits,
+		harness.parsed_offset,
+		harness.limits,
 	)
+	harness.parsed_offset = new_offset
+	return status
 }
 
 // Feeds the buffer to the parser one byte at a time.
@@ -1108,14 +1130,15 @@ parse_harness_run_byte_by_byte :: proc(
 	terminal_index: int,
 ) {
 	for index := 1; index <= len(buffer); index += 1 {
-		status := parse_step(
+		status, new_offset := parse_step(
 			&harness.state,
 			&harness.request,
 			harness.headers[:],
 			buffer[:index],
-			&harness.parsed_offset,
-			&harness.limits,
+			harness.parsed_offset,
+			harness.limits,
 		)
+		harness.parsed_offset = new_offset
 		if status != .Need_More {
 			return status, index
 		}
