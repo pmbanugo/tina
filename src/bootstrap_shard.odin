@@ -137,11 +137,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 						"[QUARANTINE] Shard %d exceeded restart limits. Quarantining.",
 						shard.id,
 					)
-					sync.atomic_store_explicit(
-						&runtime_state.watchdog_state,
-						u8(Shard_State.Quarantined),
-						.Release,
-					)
+					runtime_state_set(runtime_state, .Quarantined)
 
 					// Single Writer Principle: Shard broadcasts its own quarantine state
 					env: Message_Envelope
@@ -165,17 +161,17 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		}
 
 		// 3. The Dormant Sleep Loop (Fixes Silent Escapes)
-		state := cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
+		state := runtime_state_get(runtime_state)
 		if state == .Quarantined {
 			// Poll interval derived from watchdog cadence — never faster than the watchdog can act.
 			poll_ms := config.system_spec.watchdog.check_interval_ms
 			if poll_ms == 0 do poll_ms = 500
 			poll_interval := time.Duration(poll_ms) * time.Millisecond
 
-			for cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed) == .Quarantined {
+			for runtime_state_get(runtime_state) == .Quarantined {
 				phase := get_process_phase()
 				if phase == .Shutting_Down || phase == .Terminated {
-					sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(Shard_State.Terminated), .Release)
+					runtime_state_set(runtime_state, .Terminated)
 					return // Safely exit thread to unblock watchdog join
 				}
 				when !TINA_SIMULATION_MODE {
@@ -207,21 +203,18 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		}
 
 		// Safe transition to Running (Never blindly overwrite a Quarantined state)
-		sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(Shard_State.Running), .Release)
+		runtime_state_set(runtime_state, .Running)
 
 		// S16. Enter scheduler loop
 		for {
-			current_state := cast(Shard_State)sync.atomic_load_explicit(
-				&runtime_state.watchdog_state,
-				.Relaxed,
-			)
+			current_state := runtime_state_get(runtime_state)
 			if current_state == .Shutting_Down && !shard_has_live_isolates(shard) do break
 			if current_state != .Running && current_state != .Shutting_Down do break
 
 			scheduler_tick(shard)
 		}
 
-		if cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed) != .Running do break
+		if runtime_state_get(runtime_state) != .Running do break
 	}
 
 	when TINA_DEBUG_ASSERTS {
@@ -237,5 +230,5 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	}
 
 	log_flush(shard)
-	sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(Shard_State.Terminated), .Release)
+	runtime_state_set(runtime_state, .Terminated)
 }

@@ -194,21 +194,14 @@ Shard :: struct {
 // --- Scheduler Loop ---
 
 scheduler_tick :: proc(shard: ^Shard) {
-	signal := cast(Control_Signal)sync.atomic_load_explicit(
-		cast(^u8)&shard.control_signal,
-		.Relaxed,
-	)
+	signal := shard_control_signal_get(shard)
 	if signal != .None {
 		switch signal {
 		case .None: // Unreachable but satisfies switch exhaustion
 		case .Shutdown:
 			// Consume the signal, transition Shard state to Shutting_Down
-			sync.atomic_store_explicit(
-				cast(^u8)&shard.control_signal,
-				u8(Control_Signal.None),
-				.Relaxed,
-			)
-			sync.atomic_store_explicit(shard.shared_state, u8(Shard_State.Shutting_Down), .Release)
+			shard_control_signal_set(shard, .None)
+			shard_runtime_state_set(shard, .Shutting_Down)
 
 			// Phase 1 Notification: wake all parked isolates
 			for type_desc in shard.type_descriptors {
@@ -1077,7 +1070,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
 	shard.next_correlation_id = 0
 	// Control Signal reset
-	sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(Control_Signal.None), .Relaxed)
+	shard_control_signal_set(shard, .None)
 
 	// Step 6: Notify peers via SHARD_RESTARTED
 	env: Message_Envelope

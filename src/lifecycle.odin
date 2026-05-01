@@ -14,6 +14,37 @@ Process_Phase :: enum u8 {
 // Modified by the main/watchdog thread, read asynchronously by Shards (e.g. during exit).
 g_process_phase: Process_Phase = .Bootstrap
 
+@(private = "package")
+runtime_state_get :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
+	return cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
+}
+
+@(private = "package")
+runtime_state_set :: #force_inline proc "contextless" (
+	runtime_state: ^Shard_Runtime_State,
+	state: Shard_State,
+) {
+	sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(state), .Release)
+}
+
+@(private = "package")
+shard_control_signal_get :: #force_inline proc "contextless" (shard: ^Shard) -> Control_Signal {
+	return cast(Control_Signal)sync.atomic_load_explicit(cast(^u8)&shard.control_signal, .Relaxed)
+}
+
+@(private = "package")
+shard_control_signal_set :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	signal: Control_Signal,
+) {
+	sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(signal), .Relaxed)
+}
+
+@(private = "package")
+shard_runtime_state_set :: #force_inline proc "contextless" (shard: ^Shard, state: Shard_State) {
+	sync.atomic_store_explicit(shard.shared_state, u8(state), .Release)
+}
+
 // Atomically read the current process phase.
 get_process_phase :: #force_inline proc "contextless" () -> Process_Phase {
 	return cast(Process_Phase)sync.atomic_load_explicit(cast(^u8)&g_process_phase, .Relaxed)

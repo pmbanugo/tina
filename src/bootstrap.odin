@@ -204,10 +204,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	init_loop: for {
 		all_running := true
 		for index in 0 ..< spec.shard_count {
-			state := cast(Shard_State)sync.atomic_load_explicit(
-				&shard_runtime_states[index].watchdog_state,
-				.Relaxed,
-			)
+			state := runtime_state_get(&shard_runtime_states[index])
 			if state != .Running {
 				all_running = false
 				break
@@ -218,10 +215,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 		if time.stopwatch_duration(stopwatch) > timeout_duration {
 			for index in 0 ..< spec.shard_count {
-				state := cast(Shard_State)sync.atomic_load_explicit(
-					&shard_runtime_states[index].watchdog_state,
-					.Relaxed,
-				)
+				state := runtime_state_get(&shard_runtime_states[index])
 				if state == .Init {
 					fmt.eprintfln(
 						"[FATAL] Shard %d failed to initialize within %v",
