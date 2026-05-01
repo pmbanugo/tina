@@ -264,14 +264,17 @@ equal_bytes :: #force_inline proc "contextless" (lhs: []u8, rhs: string) -> bool
 }
 
 // ASCII case-insensitive equality (folds A..Z only — see Parser Notes §1).
-// The right-hand literal is treated as the canonical form; both sides are
-// folded so callers may pass arbitrary case in either argument.
+// PRECONDITION: `rhs_lowercase` MUST be a fully lowercase ASCII string —
+// typically a compile-time literal.
 @(private = "package")
-equal_bytes_ci :: #force_inline proc "contextless" (lhs: []u8, rhs: string) -> bool {
-	if len(lhs) != len(rhs) do return false
-	rhs_bytes := transmute([]u8)rhs
+equal_bytes_ci_with_rhs_lowercase :: #force_inline proc "contextless" (
+	lhs: []u8,
+	rhs_lowercase: string,
+) -> bool {
+	if len(lhs) != len(rhs_lowercase) do return false
+	rhs_bytes := transmute([]u8)rhs_lowercase
 	for index in 0 ..< len(lhs) {
-		if fold_ascii_upper_to_lower(lhs[index]) != fold_ascii_upper_to_lower(rhs_bytes[index]) do return false
+		if fold_ascii_upper_to_lower(lhs[index]) != rhs_bytes[index] do return false
 	}
 	return true
 }
@@ -318,17 +321,17 @@ classify_known_header :: #force_inline proc "contextless" (
 ) {
 	switch len(name_bytes) {
 	case 4:
-		if equal_bytes_ci(name_bytes, "Host") do return .Host, true
+		if equal_bytes_ci_with_rhs_lowercase(name_bytes, "host") do return .Host, true
 	case 6:
-		if equal_bytes_ci(name_bytes, "Expect") do return .Expect, true
+		if equal_bytes_ci_with_rhs_lowercase(name_bytes, "expect") do return .Expect, true
 	case 7:
-		if equal_bytes_ci(name_bytes, "Upgrade") do return .Upgrade, true
+		if equal_bytes_ci_with_rhs_lowercase(name_bytes, "upgrade") do return .Upgrade, true
 	case 10:
-		if equal_bytes_ci(name_bytes, "Connection") do return .Connection, true
+		if equal_bytes_ci_with_rhs_lowercase(name_bytes, "connection") do return .Connection, true
 	case 14:
-		if equal_bytes_ci(name_bytes, "Content-Length") do return .Content_Length, true
+		if equal_bytes_ci_with_rhs_lowercase(name_bytes, "content-length") do return .Content_Length, true
 	case 17:
-		if equal_bytes_ci(name_bytes, "Transfer-Encoding") do return .Transfer_Encoding, true
+		if equal_bytes_ci_with_rhs_lowercase(name_bytes, "transfer-encoding") do return .Transfer_Encoding, true
 	}
 	return .Host, false
 }
@@ -360,11 +363,11 @@ parse_connection_tokens :: #force_inline proc "contextless" (
 		token := value_bytes[token_start:cursor]
 
 		switch {
-		case equal_bytes_ci(token, "close"):
+		case equal_bytes_ci_with_rhs_lowercase(token, "close"):
 			state.flags += {.Connection_Close}
-		case equal_bytes_ci(token, "upgrade"):
+		case equal_bytes_ci_with_rhs_lowercase(token, "upgrade"):
 			state.flags += {.Upgrade_Request}
-		case equal_bytes_ci(token, "keep-alive"):
+		case equal_bytes_ci_with_rhs_lowercase(token, "keep-alive"):
 			state.flags += {.Keep_Alive_Allowed}
 		}
 	}
@@ -596,12 +599,12 @@ parse_one_header :: proc "contextless" (
 			if .Has_Content_Length in state.flags do return .Error_Bad_Request, parsed_offset
 			// v1 accepts only the single token `chunked`. Any list (e.g.
 			// "gzip, chunked") or unknown coding is 501 + close.
-			if !equal_bytes_ci(value_bytes, "chunked") do return .Error_Not_Implemented, parsed_offset
+			if !equal_bytes_ci_with_rhs_lowercase(value_bytes, "chunked") do return .Error_Not_Implemented, parsed_offset
 			state.flags += {.Has_Transfer_Encoding, .Chunked_Request}
 		case .Connection:
 			parse_connection_tokens(state, value_bytes)
 		case .Expect:
-			if !equal_bytes_ci(value_bytes, "100-continue") do return .Error_Expectation, parsed_offset
+			if !equal_bytes_ci_with_rhs_lowercase(value_bytes, "100-continue") do return .Error_Expectation, parsed_offset
 			state.flags += {.Expect_100}
 		case .Upgrade:
 			state.flags += {.Upgrade_Request}
@@ -1699,8 +1702,9 @@ test_classify_known_header :: proc(t: ^testing.T) {
 
 @(test)
 test_equal_bytes_ci :: proc(t: ^testing.T) {
-	testing.expect(t, equal_bytes_ci(transmute([]u8)string("HOST"), "host"))
-	testing.expect(t, equal_bytes_ci(transmute([]u8)string("Host"), "HOST"))
-	testing.expect(t, !equal_bytes_ci(transmute([]u8)string("Hosts"), "host"))
-	testing.expect(t, !equal_bytes_ci(transmute([]u8)string("Hxst"), "host"))
+	testing.expect(t, equal_bytes_ci_with_rhs_lowercase(transmute([]u8)string("HOST"), "host"))
+	testing.expect(t, equal_bytes_ci_with_rhs_lowercase(transmute([]u8)string("Host"), "host"))
+	testing.expect(t, equal_bytes_ci_with_rhs_lowercase(transmute([]u8)string("host"), "host"))
+	testing.expect(t, !equal_bytes_ci_with_rhs_lowercase(transmute([]u8)string("Hosts"), "host"))
+	testing.expect(t, !equal_bytes_ci_with_rhs_lowercase(transmute([]u8)string("Hxst"), "host"))
 }
