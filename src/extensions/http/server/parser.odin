@@ -271,7 +271,7 @@ equal_bytes_ci :: #force_inline proc "contextless" (lhs: []u8, rhs: string) -> b
 	if len(lhs) != len(rhs) do return false
 	rhs_bytes := transmute([]u8)rhs
 	for index in 0 ..< len(lhs) {
-		if fold_ascii_upper(lhs[index]) != fold_ascii_upper(rhs_bytes[index]) do return false
+		if fold_ascii_upper_to_lower(lhs[index]) != fold_ascii_upper_to_lower(rhs_bytes[index]) do return false
 	}
 	return true
 }

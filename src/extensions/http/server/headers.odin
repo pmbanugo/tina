@@ -33,7 +33,7 @@ FNV1A_PRIME :: u32(16777619)
 // Fold ASCII uppercase A..Z to lowercase a..z. All other bytes pass through
 // unchanged — See Parser Notes §1.
 @(private = "package")
-fold_ascii_upper :: #force_inline proc "contextless" (character: u8) -> u8 {
+fold_ascii_upper_to_lower :: #force_inline proc "contextless" (character: u8) -> u8 {
 	difference_from_A := character - 'A'
 	is_upper_alpha := u8(difference_from_A < 26)
 	return character | (is_upper_alpha << 5)
@@ -48,7 +48,7 @@ compute_header_hash :: #force_inline proc "contextless" (name_bytes: []u8) -> FN
 	hash_value: u32 = FNV1A_OFFSET_BASIS
 
 	for character in name_bytes {
-		hash_value = (hash_value ~ u32(fold_ascii_upper(character))) * FNV1A_PRIME
+		hash_value = (hash_value ~ u32(fold_ascii_upper_to_lower(character))) * FNV1A_PRIME
 	}
 
 	return FNV_Hash_1a(hash_value)
@@ -76,7 +76,7 @@ validate_and_hash_header_name :: proc "contextless" (
 		if !is_token_byte(character) {
 			return 0, false
 		}
-		hash_value = (hash_value ~ u32(fold_ascii_upper(character))) * FNV1A_PRIME
+		hash_value = (hash_value ~ u32(fold_ascii_upper_to_lower(character))) * FNV1A_PRIME
 	}
 
 	return FNV_Hash_1a(hash_value), true
@@ -128,7 +128,7 @@ test_fold_ascii_upper_alpha_range :: proc(t: ^testing.T) {
 	// Every byte in 'A'..'Z' folds to its lowercase counterpart.
 	for byte_value: u8 = 'A'; byte_value <= 'Z'; byte_value += 1 {
 		expected := byte_value | 0x20
-		actual := fold_ascii_upper(byte_value)
+		actual := fold_ascii_upper_to_lower(byte_value)
 		testing.expectf(
 			t,
 			actual == expected,
@@ -171,7 +171,7 @@ test_fold_ascii_upper_boundary_neighbors :: proc(t: ^testing.T) {
 		0xFF, // DEL and high bytes
 	}
 	for byte_value in unchanged_bytes {
-		actual := fold_ascii_upper(byte_value)
+		actual := fold_ascii_upper_to_lower(byte_value)
 		testing.expectf(
 			t,
 			actual == byte_value,
