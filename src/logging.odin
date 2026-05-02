@@ -23,17 +23,38 @@ USER_LOG_TAG_BASE: Log_Tag : 0x40
 POSIX_PIPE_BUF_SIZE :: 4096 // Guaranteed atomic write size on POSIX
 MAX_FORMATTED_LOG_LINE :: 512 // Max size for the formatted log line output
 
+// On-ring record header. Field order is the wire format — see ADR §4.1.
+
 Log_Record_Header :: struct {
-	timestamp:      u64,
-	isolate_handle: Handle,
 	payload_size:   u16,
 	_reserved_0:    u16,
 	level:          Log_Level,
 	tag:            Log_Tag,
 	_reserved_1:    u16,
+	timestamp:      u64,
+	isolate_handle: Handle,
 }
 
 Log_Record_Header_Size :: u64(size_of(Log_Record_Header))
+
+// Lock the wire format. If a contributor reorders fields or changes a type,
+// these fail at compile time instead of silently desyncing the ring.
+#assert(size_of(Log_Record_Header) == 24)
+#assert(offset_of(Log_Record_Header, payload_size) == 0)
+#assert(offset_of(Log_Record_Header, level) == 4)
+#assert(offset_of(Log_Record_Header, tag) == 5)
+#assert(offset_of(Log_Record_Header, timestamp) == 8)
+#assert(offset_of(Log_Record_Header, isolate_handle) == 16)
+
+// Single source of truth for on-ring record size: header followed by payload
+// padded to 8-byte alignment. Used by writer, normal flush, and emergency flush
+// paths so a Log_Record_Header layout change cannot desynchronize them.
+@(private = "package")
+log_record_size_from_payload_size :: #force_inline proc "contextless" (
+	payload_size: u16,
+) -> u64 {
+	return Log_Record_Header_Size + u64((payload_size + 7) & ~u16(7))
+}
 
 Log_Ring_Buffer :: struct {
 	buffer:        []u8,
@@ -107,8 +128,8 @@ _shard_log :: #force_inline proc "contextless" (
 	payload: []u8,
 ) {
 	timestamp := shard.current_tick
-	clamped_size := min(len(payload), MAX_PAYLOAD_SIZE)
-	record_size := Log_Record_Header_Size + u64(((clamped_size + 7) & ~int(7)))
+	payload_size := u16(min(len(payload), MAX_PAYLOAD_SIZE))
+	record_size := log_record_size_from_payload_size(payload_size)
 
 	capacity := shard.log_ring.capacity_mask + 1
 	if shard.log_ring.write_cursor + record_size - shard.log_ring.read_cursor > capacity {
@@ -118,7 +139,7 @@ _shard_log :: #force_inline proc "contextless" (
 	header := Log_Record_Header {
 		timestamp      = timestamp,
 		isolate_handle = source,
-		payload_size   = u16(clamped_size),
+		payload_size   = payload_size,
 		level          = level,
 		tag            = tag,
 	}
@@ -126,10 +147,14 @@ _shard_log :: #force_inline proc "contextless" (
 	_write_ring_data(
 		&shard.log_ring,
 		shard.log_ring.write_cursor,
-		mem.byte_slice(cast(^u8)&header, 24),
+		mem.byte_slice(cast(^u8)&header, Log_Record_Header_Size),
 	)
-	if len(payload) > 0 {
-		_write_ring_data(&shard.log_ring, shard.log_ring.write_cursor + 24, payload[:clamped_size])
+	if payload_size > 0 {
+		_write_ring_data(
+			&shard.log_ring,
+			shard.log_ring.write_cursor + Log_Record_Header_Size,
+			payload[:payload_size],
+		)
 	}
 	shard.log_ring.write_cursor += record_size
 }
@@ -210,7 +235,7 @@ log_flush :: proc(shard: ^Shard) {
 			commit_cursor,
 			mem.byte_slice(cast(^u8)&header, Log_Record_Header_Size),
 		)
-		record_size := Log_Record_Header_Size + u64((header.payload_size + 7) & ~u16(7))
+		record_size := log_record_size_from_payload_size(header.payload_size)
 
 		if ring.write_cursor - commit_cursor < record_size {break}
 
