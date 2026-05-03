@@ -9,13 +9,14 @@ import "core:testing"
 // per-request maximums. Under-provisioning is caught at startup, not at runtime.
 
 Limits :: struct {
-	request_arena_size:    u32, // App-owned per-request working arena budget (bytes).
-	handler_scratch_max:   u32, // App max scratch use per callback (bytes).
-	header_size_max:       u16, // Max total header bytes (all headers combined).
-	request_line_size_max: u16, // Max bytes for the request line (method + target + version).
-	header_count_max:      u16, // Max number of individual headers.
-	query_pair_count_max:  u16, // Max query key-value pairs for lazy parse.
-	param_count_max:       u8, // Max route parameters.
+	request_arena_size:        u32, // App-owned per-request working arena budget (bytes).
+	handler_scratch_max:       u32, // App max scratch use per callback (bytes).
+	header_size_max:           u16, // Max total request header bytes (all headers combined).
+	request_line_size_max:     u16, // Max bytes for the request line (method + target + version).
+	header_count_max:          u16, // Max number of individual request headers.
+	query_pair_count_max:      u16, // Max query key-value pairs for lazy parse.
+	response_header_bytes_max: u16, // Max bytes the response header staging region (Working Memory) holds (DR-1).
+	param_count_max:           u8, // Max route parameters.
 }
 
 // ─── Timeouts ───────────────────────────────────────────────────────────────
@@ -37,13 +38,14 @@ Timeouts :: struct {
 // Operators tune via Server config; these are the safe starting point.
 
 DEFAULT_LIMITS :: Limits {
-	header_size_max       = 8192, // 8 KB — covers most real-world header sets.
-	request_arena_size    = 4096, // 4 KB — sufficient for typical per-request state.
-	handler_scratch_max   = 2048, // 2 KB — percent decode, temp formatting.
-	request_line_size_max = 2048, // 2 KB — long URIs with query strings.
-	header_count_max      = 64, // Practical ceiling; most requests use < 20.
-	query_pair_count_max  = 32, // Generous for typical API query strings.
-	param_count_max       = 8, // Route params like /a/:b/:c/:d.
+	header_size_max           = 8192, // 8 KB — covers most real-world header sets.
+	request_arena_size        = 4096, // 4 KB — sufficient for typical per-request state.
+	handler_scratch_max       = 2048, // 2 KB — percent decode, temp formatting.
+	request_line_size_max     = 2048, // 2 KB — long URIs with query strings.
+	header_count_max          = 64, // Practical ceiling; most requests use < 20.
+	query_pair_count_max      = 32, // Generous for typical API query strings.
+	response_header_bytes_max = 1024, // 1 KB — typical response headers + retries (DR-1).
+	param_count_max           = 8, // Route params like /a/:b/:c/:d.
 }
 
 DEFAULT_TIMEOUTS :: Timeouts {
@@ -67,6 +69,7 @@ test_default_limits_non_zero :: proc(t: ^testing.T) {
 	testing.expect(t, limits.request_line_size_max > 0, "request_line_size_max must be > 0")
 	testing.expect(t, limits.header_count_max > 0, "header_count_max must be > 0")
 	testing.expect(t, limits.query_pair_count_max > 0, "query_pair_count_max must be > 0")
+	testing.expect(t, limits.response_header_bytes_max > 0, "response_header_bytes_max must be > 0")
 	testing.expect(t, limits.param_count_max > 0, "param_count_max must be > 0")
 }
 
