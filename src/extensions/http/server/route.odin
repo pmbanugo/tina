@@ -1,61 +1,55 @@
 package http_server
 
-import "core:testing"
-
 // ─── Route Step ─────────────────────────────────────────────────────────────
 //
 // Small instruction returned by route handlers telling the library what
 // phase to enter next. The connection state machine interprets this after
 // each handler invocation.
+
+Route_Step :: enum u8 {
+	Flush,
+	Flush_Final,
+	Read_Body,
+	Close,
+	Expect_Application,
+}
+
+// Per-route opt-in for request body acquisition. Selected at registration time;
+// not changeable per-request. `Request_Handler` supports `.None`/`.Buffered`
+// only; `Route_Event_Handler` may additionally use `.Streamed`.
+
+Route_Body_Mode :: enum u8 {
+	None, // no request body accepted
+	Buffered, // body fully buffered before handler dispatch
+	Streamed, // body delivered incrementally via Body_Chunk events
+}
+
+// `Route` is the user-facing struct passed to the boot-time router compiler.
+// Builder helpers (`get`, `post`, …) will be added in the route-model phase
+// once `Request_Handler` and `Route_Event_Handler` proc types exist; until
+// then `Route` is constructed directly.
 //
-// Public API per HTTP_LIBRARY_DESIGN.md §2 — the route model lives in
-// route.odin alongside the eventual route builders, Route_Event,
-// Route_Context, and route_send/spawn helpers.
+// `handler` is held opaquely as `rawptr` here so that route compilation and
+// matching can be implemented and tested before the request/response facades
+// land. It is reinterpreted as a typed `Route_Handler` union by the dispatch
+// layer in a later phase.
 
-Route_Step :: union {
-	Step_Flush,
-	Step_Read_Body,
-	Step_Close,
+Route :: struct {
+	handler:       rawptr,
+	pattern:       string,
+	body_size_max: u32,
+	methods_mask:  Method_Mask,
+	body_mode:     Route_Body_Mode,
+	state_size:    u16,
 }
 
-// Send the current egress buffer contents.
-Step_Flush :: struct {
-	final: bool,
-}
+// Compiled, immutable per-route record stored in `Compiled_Router.descriptors`
+// and indexed by `Route_Index`. Mirrors Tina core's `TypeDescriptor` pattern.
 
-// Begin or continue reading request body. Body limit is set per-route
-// in Route_Descriptor.body_limit.
-Step_Read_Body :: struct {}
-
-// Close the connection after the current safe point.
-Step_Close :: struct {}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Tests
-// ═══════════════════════════════════════════════════════════════════════════
-
-@(test)
-test_route_step_variant_discrimination :: proc(t: ^testing.T) {
-	// Step_Flush
-	step_flush: Route_Step = Step_Flush {
-		final = true,
-	}
-	flush, is_flush := step_flush.(Step_Flush)
-	testing.expect(t, is_flush, "should be Step_Flush")
-	testing.expect(t, flush.final, "final should be true")
-
-	// Step_Read_Body
-	step_read: Route_Step = Step_Read_Body{}
-	_, is_read := step_read.(Step_Read_Body)
-	testing.expect(t, is_read, "should be Step_Read_Body")
-
-	// Step_Close
-	step_close: Route_Step = Step_Close{}
-	_, is_close := step_close.(Step_Close)
-	testing.expect(t, is_close, "should be Step_Close")
-
-	// nil union — the zero value
-	step_nil: Route_Step
-	testing.expect(t, step_nil == nil, "zero Route_Step should be nil")
+@(private = "package")
+Route_Descriptor :: struct {
+	handler:       rawptr,
+	body_size_max: u32,
+	body_mode:     Route_Body_Mode,
+	state_size:    u16,
 }

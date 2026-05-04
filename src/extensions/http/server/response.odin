@@ -85,6 +85,10 @@ Response_Header_Entry :: struct {
 	value_offset: u16,
 	value_size:   u16,
 }
+#assert(
+	size_of(Response_Header_Entry) == 8,
+	"Response_Header_Entry size/layout changed — expected to be exactly 8 bytes so HTTP_RESPONSE_HEADERS_MAX × 8 = 256 bytes",
+)
 
 @(private = "package")
 Response_State :: struct {
@@ -195,7 +199,7 @@ _stage_header :: proc "contextless" (
 	region_size := len(bytes_region)
 
 	if replace_existing {
-		for index in 0 ..< response.header_count {
+		#no_bounds_check for index in 0 ..< response.header_count {
 			entry := response.headers[index]
 			existing_name := bytes_region[entry.name_offset:][:entry.name_size]
 			if !equal_bytes_ci(existing_name, name) do continue
@@ -257,7 +261,7 @@ _name_is_reserved_framing :: #force_inline proc "contextless" (name: []u8) -> bo
 @(private = "file")
 equal_bytes_ci :: #force_inline proc "contextless" (lhs: []u8, rhs: []u8) -> bool {
 	if len(lhs) != len(rhs) do return false
-	for index in 0 ..< len(lhs) {
+	#no_bounds_check for index in 0 ..< len(lhs) {
 		if fold_ascii_upper_to_lower(lhs[index]) != fold_ascii_upper_to_lower(rhs[index]) {
 			return false
 		}
@@ -483,12 +487,11 @@ serialize_response_headers :: proc "contextless" (
 	//    has been marked `Close_After_Send`. HTTP/1.1's default is keep-alive,
 	//    so the absence of this header is the affirmative keep-alive signal.
 	if .Close_After_Send in response.flags {
-		cursor =
-			_write_bytes_into(
-				destination,
-				cursor,
-				transmute([]u8)string("Connection: close\r\n"),
-			) or_return
+		cursor = _write_bytes_into(
+			destination,
+			cursor,
+			transmute([]u8)string("Connection: close\r\n"),
+		) or_return
 	}
 
 	// 4. Framing header per response mode (library-owned, written here only).
@@ -500,12 +503,11 @@ serialize_response_headers :: proc "contextless" (
 	case .Fixed_Length, .Head_Suppressed:
 		cursor = _write_content_length(destination, cursor, response.body_size_total) or_return
 	case .Chunked:
-		cursor =
-			_write_bytes_into(
-				destination,
-				cursor,
-				transmute([]u8)string("Transfer-Encoding: chunked\r\n"),
-			) or_return
+		cursor = _write_bytes_into(
+			destination,
+			cursor,
+			transmute([]u8)string("Transfer-Encoding: chunked\r\n"),
+		) or_return
 	case .Closed:
 		// Closed responses must never round-trip through the serializer; the
 		// state machine writes the canned 500 directly. Treat as overflow.
@@ -513,7 +515,7 @@ serialize_response_headers :: proc "contextless" (
 	}
 
 	// 5. User headers — entries are live by construction (DR-1 update-in-place).
-	for index in 0 ..< response.header_count {
+	#no_bounds_check for index in 0 ..< response.header_count {
 		entry := response.headers[index]
 		name := bytes_region[entry.name_offset:][:entry.name_size]
 		value := bytes_region[entry.value_offset:][:entry.value_size]
@@ -545,7 +547,7 @@ _write_bytes_into :: #force_inline proc "contextless" (
 ) {
 	next_cursor = cursor + len(payload)
 	if next_cursor > len(destination) do return cursor, false
-	if len(payload) > 0 do copy(destination[cursor:], payload)
+	#no_bounds_check if len(payload) > 0 do copy(destination[cursor:], payload)
 	return next_cursor, true
 }
 
@@ -559,7 +561,7 @@ _write_byte_into :: #force_inline proc "contextless" (
 	ok: bool,
 ) {
 	if cursor >= len(destination) do return cursor, false
-	destination[cursor] = value
+	#no_bounds_check destination[cursor] = value
 	return cursor + 1, true
 }
 
@@ -580,9 +582,11 @@ _write_status_code :: #force_inline proc "contextless" (
 ) {
 	if cursor + 3 > len(destination) do return cursor, false
 	value := u16(code)
-	destination[cursor + 0] = u8('0' + (value / 100) % 10)
-	destination[cursor + 1] = u8('0' + (value / 10) % 10)
-	destination[cursor + 2] = u8('0' + value % 10)
+	#no_bounds_check {
+		destination[cursor + 0] = u8('0' + (value / 100) % 10)
+		destination[cursor + 1] = u8('0' + (value / 10) % 10)
+		destination[cursor + 2] = u8('0' + value % 10)
+	}
 	return cursor + 3, true
 }
 
@@ -634,7 +638,7 @@ _write_decimal_u64 :: proc "contextless" (
 	}
 	next_cursor = cursor + digit_count
 	if next_cursor > len(destination) do return cursor, false
-	for index in 0 ..< digit_count {
+	#no_bounds_check for index in 0 ..< digit_count {
 		destination[cursor + index] = scratch[digit_count - 1 - index]
 	}
 	return next_cursor, true
@@ -665,13 +669,6 @@ test_response_state_reset_baseline :: proc(t: ^testing.T) {
 	testing.expect_value(t, response.mode, Response_Mode.Not_Started)
 	testing.expect_value(t, response.egress_size, Egress_Size(0))
 	testing.expect(t, response.flags == {}, "flags must reset to empty")
-}
-
-@(test)
-test_response_header_entry_layout :: proc(t: ^testing.T) {
-	// Per DR-1, a Response_Header_Entry must be exactly 8 bytes so
-	// HTTP_RESPONSE_HEADERS_MAX × 8 = 256 bytes (4 cache lines) at default.
-	testing.expect_value(t, size_of(Response_Header_Entry), 8)
 }
 
 // ─── header_set / header_add ───────────────────────────────────────────────

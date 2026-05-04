@@ -19,6 +19,15 @@ Param_View :: struct {
 	value_size:   u16,
 }
 
+#assert(
+	size_of(Header_View) == 12,
+	"Header_View layout changed — expected 12 bytes (2×u16 offset + u32 hash + 2×u16 size)",
+)
+#assert(
+	size_of(Param_View) == 8,
+	"Param_View layout changed — expected 8 bytes (2×u16 offset + 2×u16 size)",
+)
+
 // Per-request semantic flags populated by the parser. These are distinct from
 // `Parser_Flags` (which tracks header presence during parsing); `Request_Flags`
 // records request-level conditions consumed by routing and dispatch.
@@ -28,6 +37,12 @@ Request_Flag :: enum u8 {
 	Unknown_Method, // method passed token validation but is not in the known set
 }
 Request_Flags :: distinct bit_set[Request_Flag;u8]
+
+// Sentinel meaning "path_segment_count has not been computed yet".
+// Using a sentinel instead of zero disambiguates the legitimate
+//  root-path case (`/` has 0 segments) from the not-yet-computed state.
+@(private = "package")
+PATH_SEGMENT_COUNT_NONE :: u8(0xFF)
 
 @(private = "package")
 Request_State :: struct {
@@ -53,7 +68,8 @@ Request_State :: struct {
 @(private = "package")
 request_state_reset :: #force_inline proc "contextless" (request: ^Request_State) {
 	request^ = Request_State {
-		route_index = ROUTE_INDEX_NONE,
+		route_index        = ROUTE_INDEX_NONE,
+		path_segment_count = PATH_SEGMENT_COUNT_NONE,
 	}
 }
 
@@ -61,19 +77,6 @@ request_state_reset :: #force_inline proc "contextless" (request: ^Request_State
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
-
-@(test)
-test_header_view_layout :: proc(t: ^testing.T) {
-	// Header_View must stay compact (2 × u16 offsets + u32 + 2 × u16 = 12 bytes)
-	// so that `header_count_max` slots fit predictably in working memory.
-	testing.expect_value(t, size_of(Header_View), 12)
-}
-
-@(test)
-test_param_view_layout :: proc(t: ^testing.T) {
-	// Param_View is the slim cousin of Header_View with no hash field.
-	testing.expect_value(t, size_of(Param_View), 8)
-}
 
 @(test)
 test_request_state_reset_baseline :: proc(t: ^testing.T) {
@@ -91,16 +94,7 @@ test_request_state_reset_baseline :: proc(t: ^testing.T) {
 	testing.expect_value(t, request.header_count, 0)
 	testing.expect_value(t, request.header_bloom, 0)
 	testing.expect_value(t, request.route_index, ROUTE_INDEX_NONE)
+	testing.expect_value(t, request.path_segment_count, PATH_SEGMENT_COUNT_NONE)
 	testing.expect(t, request.status_flags == {}, "status_flags should reset to empty")
 	testing.expect(t, request.known_headers == {}, "known_headers should reset to empty")
-}
-
-@(test)
-test_request_flags_membership :: proc(t: ^testing.T) {
-	flags := Request_Flags{.Options_Asterisk}
-	testing.expect(t, .Options_Asterisk in flags, "Options_Asterisk should be in mask")
-	testing.expect(t, .Unknown_Method not_in flags, "Unknown_Method should not be in mask")
-
-	flags += {.Unknown_Method}
-	testing.expect(t, .Unknown_Method in flags, "Unknown_Method should be in mask after add")
 }
