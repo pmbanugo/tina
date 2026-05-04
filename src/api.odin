@@ -159,6 +159,13 @@ bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 	return mem.byte_slice(ptr, size_of(T))
 }
 
+// Retrieves the current deterministic time (in nanoseconds) from the scheduler.
+// This ensures all isolates process events using a consistent, uniform clock per tick.
+ctx_monotonic_time_ns :: #force_inline proc "contextless" (ctx: ^TinaContext) -> u64 {
+	shard := _ctx_extract_shard(ctx)
+	return shard.current_tick * shard.timer_resolution_ns
+}
+
 // Helper to safely cast an incoming message payload byte slice into a typed pointer.
 payload_as :: #force_inline proc($T: typeid, payload: []u8) -> ^T {
 	assert(size_of(T) <= len(payload), "Payload slice too small for type")
