@@ -105,27 +105,27 @@ CHARS_DIGIT_DECIMAL := Table_256 {
 
 @(private = "package")
 is_token_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	return (CHARS_HTTP_TOKEN[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	#no_bounds_check return (CHARS_HTTP_TOKEN[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
 }
 
 @(private = "package")
 is_uri_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	return (CHARS_URI[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	#no_bounds_check return (CHARS_URI[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
 }
 
 @(private = "package")
 is_header_value_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	return (CHARS_HEADER_VALUE[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	#no_bounds_check return (CHARS_HEADER_VALUE[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
 }
 
 @(private = "package")
 is_hex_digit_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	return (CHARS_DIGIT_HEX[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	#no_bounds_check return (CHARS_DIGIT_HEX[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
 }
 
 @(private = "package")
 is_decimal_digit_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	return (CHARS_DIGIT_DECIMAL[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	#no_bounds_check return (CHARS_DIGIT_DECIMAL[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
 }
 
 // Validates that every byte in the slice is a valid HTTP token character.
@@ -196,7 +196,7 @@ find_newline_offset :: proc "contextless" (
 	scan_size := min(len(buffer_bytes), remaining_size_allowed)
 
 	// bytes.index_byte leverages SIMD vectorization automatically
-	newline_offset := bytes.index_byte(buffer_bytes[:scan_size], '\r')
+	#no_bounds_check newline_offset := bytes.index_byte(buffer_bytes[:scan_size], '\r')
 
 	// If no newline is found AND we hit our strict size maximum, the client
 	// is violating limits. Connection must be dropped.
@@ -257,7 +257,7 @@ Parse_Status :: enum u8 {
 equal_bytes :: #force_inline proc "contextless" (lhs: []u8, rhs: string) -> bool {
 	if len(lhs) != len(rhs) do return false
 	rhs_bytes := transmute([]u8)rhs
-	for index in 0 ..< len(lhs) {
+	#no_bounds_check for index in 0 ..< len(lhs) {
 		if lhs[index] != rhs_bytes[index] do return false
 	}
 	return true
@@ -273,7 +273,7 @@ equal_bytes_ci_with_rhs_lowercase :: #force_inline proc "contextless" (
 ) -> bool {
 	if len(lhs) != len(rhs_lowercase) do return false
 	rhs_bytes := transmute([]u8)rhs_lowercase
-	for index in 0 ..< len(lhs) {
+	#no_bounds_check for index in 0 ..< len(lhs) {
 		if fold_ascii_upper_to_lower(lhs[index]) != rhs_bytes[index] do return false
 	}
 	return true
@@ -348,7 +348,7 @@ parse_connection_tokens :: #force_inline proc "contextless" (
 	for cursor < len(value_bytes) {
 		// Skip leading OWS and commas.
 		for cursor < len(value_bytes) {
-			byte_value := value_bytes[cursor]
+			#no_bounds_check byte_value := value_bytes[cursor]
 			if byte_value != ' ' && byte_value != '\t' && byte_value != ',' do break
 			cursor += 1
 		}
@@ -356,7 +356,7 @@ parse_connection_tokens :: #force_inline proc "contextless" (
 
 		token_start := cursor
 		for cursor < len(value_bytes) {
-			byte_value := value_bytes[cursor]
+			#no_bounds_check byte_value := value_bytes[cursor]
 			if byte_value == ',' || byte_value == ' ' || byte_value == '\t' do break
 			cursor += 1
 		}
@@ -397,7 +397,7 @@ parse_request_line :: #force_inline proc "contextless" (
 
 	// Reject leading blank lines (RFC 9112 §2.2 RECOMMENDS ignore; we strictly
 	// reject to harden against parser-desync smuggling vectors).
-	if view[0] == '\r' || view[0] == '\n' {
+	#no_bounds_check if view[0] == '\r' || view[0] == '\n' {
 		return .Error_Bad_Request, parsed_offset
 	}
 
@@ -414,7 +414,7 @@ parse_request_line :: #force_inline proc "contextless" (
 	if cr_offset + 1 >= len(view) {
 		return .Need_More, parsed_offset // saw '\r', waiting for '\n'
 	}
-	if view[cr_offset + 1] != '\n' {
+	#no_bounds_check if view[cr_offset + 1] != '\n' {
 		return .Error_Bad_Request, parsed_offset // bare CR without LF — smuggling vector
 	}
 
@@ -427,13 +427,13 @@ parse_request_line :: #force_inline proc "contextless" (
 
 	first_space := index_byte_in(line, ' ')
 	if first_space < 0 do return .Error_Bad_Request, parsed_offset
-	method_bytes := line[:first_space]
+	#no_bounds_check method_bytes := line[:first_space]
 
-	rest_after_method := line[first_space + 1:]
+	#no_bounds_check rest_after_method := line[first_space + 1:]
 	second_space := index_byte_in(rest_after_method, ' ')
 	if second_space < 0 do return .Error_Bad_Request, parsed_offset
-	target_bytes := rest_after_method[:second_space]
-	version_bytes := rest_after_method[second_space + 1:]
+	#no_bounds_check target_bytes := rest_after_method[:second_space]
+	#no_bounds_check version_bytes := rest_after_method[second_space + 1:]
 
 	if !validate_token_bytes(method_bytes) do return .Error_Bad_Request, parsed_offset
 
@@ -454,7 +454,7 @@ parse_request_line :: #force_inline proc "contextless" (
 
 	target_offset_in_frame := parsed_offset + u16(first_space) + 1
 
-	is_asterisk := len(target_bytes) == 1 && target_bytes[0] == '*'
+	#no_bounds_check is_asterisk := len(target_bytes) == 1 && target_bytes[0] == '*'
 	if is_asterisk {
 		// asterisk-form is only valid for OPTIONS. Any other method gets
 		// 400 + close (DR-10). Path/query are degenerate; record `*` as both.
@@ -466,10 +466,11 @@ parse_request_line :: #force_inline proc "contextless" (
 		request.path_size = 1
 		request.query_offset = 0
 		request.query_size = 0
-	} else if target_bytes[0] != '/' {
-		// absolute-form (`http://...`) and authority-form (CONNECT) rejected.
-		return .Error_Bad_Request, parsed_offset
 	} else {
+		#no_bounds_check if target_bytes[0] != '/' {
+			// absolute-form (`http://...`) and authority-form (CONNECT) rejected.
+			return .Error_Bad_Request, parsed_offset
+		}
 		request.target_offset = target_offset_in_frame
 		request.target_size = u16(len(target_bytes))
 
@@ -517,24 +518,24 @@ parse_one_header :: proc "contextless" (
 	view := buffer[parsed_offset:]
 
 	// Empty line ⇒ end of header section.
-	if len(view) >= 2 && view[0] == '\r' && view[1] == '\n' {
+	#no_bounds_check if len(view) >= 2 && view[0] == '\r' && view[1] == '\n' {
 		return .Headers_Done, parsed_offset + 2
 	}
-	if len(view) == 1 && view[0] == '\r' {
+	#no_bounds_check if len(view) == 1 && view[0] == '\r' {
 		return .Need_More, parsed_offset // need to see the '\n' to know whether headers end here
 	}
 
 	// Header lines must begin with a token byte. obs-fold (a continuation
 	// line beginning with SP/HTAB) is unconditionally rejected per RFC 9112
 	// §5.2 to neutralize smuggling via line-folding ambiguity.
-	if view[0] == ' ' || view[0] == '\t' do return .Error_Bad_Request, parsed_offset
+	#no_bounds_check if view[0] == ' ' || view[0] == '\t' do return .Error_Bad_Request, parsed_offset
 
 	remaining_budget := limits.header_size_max - state.header_size
 	cr_offset, limit_exceeded := find_newline_offset(view, 0, remaining_budget)
 	if limit_exceeded do return .Error_Header_Too_Large, parsed_offset
 	if cr_offset < 0 do return .Need_More, parsed_offset
 	if cr_offset + 1 >= len(view) do return .Need_More, parsed_offset
-	if view[cr_offset + 1] != '\n' do return .Error_Bad_Request, parsed_offset
+	#no_bounds_check if view[cr_offset + 1] != '\n' do return .Error_Bad_Request, parsed_offset
 	if cr_offset == 0 do return .Error_Bad_Request, parsed_offset // protocol-impossible: empty is handled above
 
 	line := view[:cr_offset]
@@ -548,7 +549,7 @@ parse_one_header :: proc "contextless" (
 	colon_index := index_byte_in(line, ':')
 	if colon_index <= 0 do return .Error_Bad_Request, parsed_offset
 
-	name_bytes := line[:colon_index]
+	#no_bounds_check name_bytes := line[:colon_index]
 
 	// validate_and_hash_header_name catches:
 	//   - empty names
@@ -559,14 +560,14 @@ parse_one_header :: proc "contextless" (
 
 	// Trim OWS surrounding the value (RFC 9110 §5.5).
 	value_start := colon_index + 1
-	for value_start < len(line) && (line[value_start] == ' ' || line[value_start] == '\t') {
+	#no_bounds_check for value_start < len(line) && (line[value_start] == ' ' || line[value_start] == '\t') {
 		value_start += 1
 	}
 	value_end := len(line)
-	for value_end > value_start && (line[value_end - 1] == ' ' || line[value_end - 1] == '\t') {
+	#no_bounds_check for value_end > value_start && (line[value_end - 1] == ' ' || line[value_end - 1] == '\t') {
 		value_end -= 1
 	}
-	value_bytes := line[value_start:value_end]
+	#no_bounds_check value_bytes := line[value_start:value_end]
 
 	for byte_value in value_bytes {
 		if !is_header_value_byte(byte_value) do return .Error_Bad_Request, parsed_offset
@@ -574,7 +575,7 @@ parse_one_header :: proc "contextless" (
 
 	// Frame-relative offsets — preserved verbatim if the bytes are later
 	// promoted from reactor buffer to Working Memory (DR-3, I3).
-	headers[state.header_count] = Header_View {
+	#no_bounds_check headers[state.header_count] = Header_View {
 		name_offset  = parsed_offset,
 		value_offset = parsed_offset + u16(value_start),
 		hash         = hash,
