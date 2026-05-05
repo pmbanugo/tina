@@ -56,6 +56,21 @@ Server :: struct {
 	graceful_drain_ms: u32,
 }
 
+// Baked, immutable runtime configuration derived at install time.
+// This intentionally excludes user-facing route tables and other boot-only input.
+@(private = "package")
+Server_Runtime :: struct {
+	address:                tina.Socket_Address,
+	backlog:                u32,
+	distribution:           Distribution_Mode,
+	limits:                 Limits,
+	timeouts:               Timeouts,
+	keepalive_reserve_slots: u16,
+	graceful_drain_ms:      u32,
+	buffered_body_size_max: u32,
+	route_state_size_max:   u16,
+}
+
 // Strictly monotonic shard tick clock. Derived from `ctx_monotonic_time_ns`.
 @(private = "package")
 Monotonic_Time_NS :: distinct u64
@@ -125,7 +140,7 @@ Application_Pending_Message :: struct {
 // its own slot index.
 @(private = "package")
 HTTP_Shard_Runtime :: struct {
-	server:               Server,
+	server:               Server_Runtime,
 	router:               ^Compiled_Router,
 	connection_type_id:    u8,
 	date_cache:           Date_Cache,
@@ -195,7 +210,6 @@ HTTP_Connection_State :: struct {
 	ingress_size:               Ingress_Size,
 	ingress_parsed_offset:      Ingress_Offset,
 	state:                      Connection_Phase,
-	route_index:                Route_Index,
 	idle_array_index:           Idle_Array_Index,
 	request_frame_size:          u16,
 	pipeline_tail_size:         u16,
@@ -244,7 +258,7 @@ HTTP_Connection :: struct {
 
 @(private = "package")
 HTTP_Listener_Init_Args :: struct {
-	server:                  ^Server,
+	server:                  ^Server_Runtime,
 	router:                  ^Compiled_Router,
 	connection_slot_count:    u16,
 	connection_type_id:       u8,
@@ -254,7 +268,7 @@ HTTP_Listener_Init_Args :: struct {
 
 @(private = "package")
 HTTP_Dispatcher_Init_Args :: struct {
-	server:                ^Server,
+	server:                ^Server_Runtime,
 	router:                ^Compiled_Router,
 	connection_slot_count: u16,
 	connection_type_id:    u8,
@@ -410,6 +424,9 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	router_storage := make([]Compiled_Router, 1, context.allocator)
 	router_storage[0] = router_value
 	router := &router_storage[0]
+	server_runtime_storage := make([]Server_Runtime, 1, context.allocator)
+	server_runtime_storage[0] = _bake_server_runtime(server)
+	server_runtime := &server_runtime_storage[0]
 
 	// --- Derive memory budgets ---
 	working_memory_size := _compute_working_memory_size(server)
@@ -448,7 +465,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	dispatcher_type_id := base_type_id + HTTP_TYPE_OFFSET_DISPATCHER
 
 	listener_init_args := HTTP_Listener_Init_Args {
-		server                = server,
+		server                = server_runtime,
 		router                = router,
 		connection_slot_count = u16(connection_slot_count),
 		connection_type_id    = connection_type_id,
@@ -458,7 +475,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	listener_args_payload, listener_args_size := tina.init_args_of(&listener_init_args)
 
 	dispatcher_init_args := HTTP_Dispatcher_Init_Args {
-		server                = server,
+		server                = server_runtime,
 		router                = router,
 		connection_slot_count = u16(connection_slot_count),
 		connection_type_id    = connection_type_id,
@@ -713,30 +730,39 @@ _make_base_system_spec :: proc(
 // at parse time. See HTTP_LIBRARY_MEMORY_LAYOUT.md §2.5.
 @(private = "package")
 _compute_working_memory_size :: proc(server: ^Server) -> int {
-	limits := server.limits
+	server_runtime := _bake_server_runtime(server)
+	limits := server_runtime.limits
 
 	// Pre-compute u32 sums to keep arithmetic in one width and avoid surprise
 	// promotions deep inside the formula.
 	frame_size := int(limits.request_line_size_max) + int(limits.header_size_max)
 	header_table_size := int(limits.header_count_max) * size_of(Header_View)
-	param_table_size := int(limits.param_count_max) * size_of(Param_View)
-	query_table_size := int(limits.query_pair_count_max) * size_of(Query_Pair)
-
-	max_buffered_body := _max_buffered_body_size(server.app.routes)
-	max_route_state := _max_route_state_size(server.app.routes)
 
 	total :=
 		_align_up(frame_size) +
-		_align_up(int(max_buffered_body)) +
+		_align_up(int(server_runtime.buffered_body_size_max)) +
 		_align_up(int(limits.pipeline_size_max)) +
 		_align_up(header_table_size) +
-		_align_up(param_table_size) +
-		_align_up(query_table_size) +
-		_align_up(int(max_route_state)) +
+		_align_up(int(server_runtime.route_state_size_max)) +
 		int(limits.request_arena_size) +
 		_align_up(int(limits.response_header_bytes_max))
 
 	return total
+}
+
+@(private = "package")
+_bake_server_runtime :: proc(server: ^Server) -> Server_Runtime {
+	return Server_Runtime {
+		address                = server.address,
+		backlog                = server.backlog,
+		distribution           = server.distribution,
+		limits                 = server.limits,
+		timeouts               = server.timeouts,
+		keepalive_reserve_slots = server.keepalive.reserve_slots,
+		graceful_drain_ms      = server.graceful_drain_ms,
+		buffered_body_size_max = _max_buffered_body_size(server.app.routes),
+		route_state_size_max   = _max_route_state_size(server.app.routes),
+	}
 }
 
 @(private = "package")
@@ -754,6 +780,39 @@ _listener_working_memory_size :: #force_inline proc "contextless" (
 		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(tina.Handle)) +
 		_align_up(connection_slot_count * size_of(u16))
+}
+
+@(private = "package")
+_make_shard_runtime :: proc(
+	allocator: mem.Allocator,
+	server: ^Server_Runtime,
+	router: ^Compiled_Router,
+	connection_slot_count: u16,
+	connection_type_id: u8,
+) -> ^HTTP_Shard_Runtime {
+	runtime_storage := make([]HTTP_Shard_Runtime, 1, allocator)
+	idle_slot_indices := make([]u16, int(connection_slot_count), allocator)
+	idle_slot_handles := make([]tina.Handle, int(connection_slot_count), allocator)
+	idle_slot_positions := make([]u16, int(connection_slot_count), allocator)
+	for index in 0 ..< len(idle_slot_positions) {
+		idle_slot_positions[index] = u16(IDLE_ARRAY_INDEX_NONE)
+	}
+
+	runtime := &runtime_storage[0]
+	runtime^ = HTTP_Shard_Runtime {
+		server                = server^,
+		router                = router,
+		connection_type_id    = connection_type_id,
+		keepalive_reserve     = server.keepalive_reserve_slots,
+		idle_slot_indices     = idle_slot_indices,
+		idle_slot_handles     = idle_slot_handles,
+		idle_slot_positions   = idle_slot_positions,
+		idle_count            = 0,
+		free_count            = connection_slot_count,
+		connection_slot_count = connection_slot_count,
+		accept_backoff_ns     = 50_000_000,
+	}
+	return runtime
 }
 
 // Resolves the connection capacity used to size HTTP TypeDescriptor fields

@@ -75,7 +75,6 @@ _connection_begin_keep_alive_wait :: proc(connection: ^HTTP_Connection, ctx: ^ti
 	response_state_reset(&state.response)
 	parser_state_reset(&state.parser)
 
-	state.route_index = ROUTE_INDEX_NONE
 	state.ingress_size = 0
 	state.ingress_parsed_offset = 0
 	state.state = .Keep_Alive_Idle
@@ -217,6 +216,7 @@ test_idle_slot_swap_and_pop :: proc(t: ^testing.T) {
 	}
 
 	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime{},
 		idle_slot_indices   = indices[:],
 		idle_slot_handles   = handles[:],
 		idle_slot_positions = positions[:],

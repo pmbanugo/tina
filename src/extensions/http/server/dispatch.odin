@@ -1,6 +1,7 @@
 package http_server
 
 import tina "../../.."
+import "core:strings"
 
 @(private = "package")
 HTTP_INTERNAL_TAG_AWAIT_TIMEOUT :: tina.Message_Tag(0xFFFE)
@@ -12,6 +13,8 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 	if state == nil || runtime == nil || runtime.router == nil {
 		return .Close
 	}
+
+	_apply_request_connection_policy(state)
 
 	// `OPTIONS *` is a server-wide capability query. If an explicit handler was
 	// registered, dispatch it; otherwise emit the canned response from the router.
@@ -46,6 +49,9 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 			}
 			return _normalize_route_step(respond_text(response, HTTP_STATUS_METHOD_NOT_ALLOWED, "Method Not Allowed"))
 		case .Not_Found:
+			if .Unknown_Method in state.request.status_flags {
+				return _normalize_route_step(respond_text(response, HTTP_STATUS_NOT_IMPLEMENTED, "Not Implemented"))
+			}
 			return _normalize_route_step(respond_text(response, HTTP_STATUS_NOT_FOUND, "Not Found"))
 		}
 	}
@@ -83,6 +89,13 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 	handler := cast(Request_Handler)descriptor.handler
 	step := handler(request, response)
 	return _normalize_route_step(step)
+}
+
+@(private = "file")
+_apply_request_connection_policy :: #force_inline proc "contextless" (state: ^HTTP_Connection_State) {
+	if .Connection_Close in state.parser.flags {
+		state.response.flags += {.Close_After_Send}
+	}
 }
 
 @(private = "package")
@@ -175,4 +188,98 @@ allow_value_write_and_stage :: proc(response: ^Response, methods_mask: Method_Ma
 		return false
 	}
 	return header_set(response, "Allow", string(allow_buffer[:allow_size]))
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+import "core:testing"
+
+@(test)
+test_dispatch_unknown_method_missing_path_returns_not_implemented :: proc(t: ^testing.T) {
+	routes := []Route{{pattern = "/x", methods_mask = {.GET}}}
+	router, compile_error, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, compile_error, Compile_Error.None)
+
+	response_header_storage: [128]u8
+	request_frame := transmute([]u8)string("FOO /missing HTTP/1.1\r\nHost: example\r\n\r\n")
+	runtime := HTTP_Shard_Runtime{router = &router}
+	connection_state := HTTP_Connection_State{
+		shard_runtime          = &runtime,
+		response_header_bytes  = response_header_storage[:],
+		request = Request_State{
+			method       = .GET,
+			path_offset  = 4,
+			path_size    = 8,
+			route_index  = ROUTE_INDEX_NONE,
+			status_flags = {.Unknown_Method},
+		},
+	}
+	egress_buffer: [HTTP_EGRESS_BUFFER_SIZE]u8
+	request := Request{
+		connection_state = &connection_state,
+		request_state    = &connection_state.request,
+		frame            = request_frame,
+	}
+	response := Response{
+		connection_state      = &connection_state,
+		egress_buffer         = egress_buffer[:],
+		response_header_bytes = response_header_storage[:],
+	}
+
+	step := _dispatch_route(&request, &response)
+	testing.expect_value(t, step, Route_Step.Flush_Final)
+	testing.expect_value(t, connection_state.response.status_code, HTTP_STATUS_NOT_IMPLEMENTED)
+}
+
+@(private = "file")
+_dispatch_test_ok_handler :: proc(request: ^Request, response: ^Response) -> Route_Step {
+	_ = request
+	return respond_text(response, HTTP_STATUS_OK, "ok")
+}
+
+@(test)
+test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^testing.T) {
+	routes := []Route{{pattern = "/x", methods_mask = {.GET}, handler = rawptr(_dispatch_test_ok_handler)}}
+	router, compile_error, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, compile_error, Compile_Error.None)
+
+	response_header_storage: [128]u8
+	request_frame := transmute([]u8)string("GET /x HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n")
+	runtime := HTTP_Shard_Runtime{router = &router}
+	connection_state := HTTP_Connection_State{
+		shard_runtime         = &runtime,
+		response_header_bytes = response_header_storage[:],
+		parser                = Parser_State{flags = {.Connection_Close}},
+		request = Request_State{
+			method      = .GET,
+			path_offset = 4,
+			path_size   = 2,
+			route_index = ROUTE_INDEX_NONE,
+		},
+	}
+	egress_buffer: [HTTP_EGRESS_BUFFER_SIZE]u8
+	request := Request{
+		connection_state = &connection_state,
+		request_state    = &connection_state.request,
+		frame            = request_frame,
+	}
+	response := Response{
+		connection_state      = &connection_state,
+		egress_buffer         = egress_buffer[:],
+		response_header_bytes = response_header_storage[:],
+	}
+
+	step := _dispatch_route(&request, &response)
+	testing.expect_value(t, step, Route_Step.Flush_Final)
+	testing.expect(t, .Close_After_Send in connection_state.response.flags, "response must close after send")
+	testing.expect(
+		t,
+		strings.index(string(egress_buffer[:int(connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
+		"serialized response must advertise Connection: close",
+	)
 }

@@ -636,6 +636,7 @@ match_route :: proc(
 	path_bytes: []u8,
 ) -> Match_Result {
 	method := request.method
+	method_known := .Unknown_Method not_in request.status_flags
 	path_size := u16(len(path_bytes))
 
 	for entry_index in 0 ..< int(router.static_count) {
@@ -645,6 +646,10 @@ match_route :: proc(
 		pattern_bytes := router.literal_buffer[int(pattern_offset):][:int(path_size)]
 		if !slice.equal(path_bytes, pattern_bytes) do continue
 
+		if !method_known {
+			return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+		}
+
 		route_index := router.entries[entry_index].route_index_by_method[method]
 		if route_index != ROUTE_INDEX_NONE {
 			return Match_Result{outcome = .Found, route_index = route_index}
@@ -652,7 +657,7 @@ match_route :: proc(
 		return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
 	}
 
-	return match_route_parametric_or_wildcard(router, request, path_bytes, method)
+	return match_route_parametric_or_wildcard(router, request, path_bytes, method, method_known)
 }
 
 @(private = "file")
@@ -661,6 +666,7 @@ match_route_parametric_or_wildcard :: proc(
 	request: ^Request_State,
 	path_bytes: []u8,
 	method: Method,
+	method_known: bool,
 ) -> Match_Result {
 	if router.parametric_count == 0 && router.wildcard_count == 0 {
 		return Match_Result{outcome = .Not_Found}
@@ -680,6 +686,10 @@ match_route_parametric_or_wildcard :: proc(
 			path_bytes,
 			false,
 		) { continue }
+
+		if !method_known {
+			return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+		}
 
 		route_index := router.entries[entry_index].route_index_by_method[method]
 		if route_index != ROUTE_INDEX_NONE {
@@ -701,6 +711,10 @@ match_route_parametric_or_wildcard :: proc(
 			path_bytes,
 			true,
 		) { continue }
+
+		if !method_known {
+			return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+		}
 
 		route_index := router.entries[entry_index].route_index_by_method[method]
 		if route_index != ROUTE_INDEX_NONE {
@@ -1148,6 +1162,41 @@ test_match_method_not_allowed_emits_correct_mask :: proc(t: ^testing.T) {
 	testing.expect(t, .POST in result.methods_mask, "POST present")
 	testing.expect(t, .HEAD in result.methods_mask, "HEAD auto-fallback present")
 	testing.expect(t, .DELETE not_in result.methods_mask, "DELETE absent")
+}
+
+@(test)
+test_match_unknown_method_known_path_still_reports_method_not_allowed :: proc(t: ^testing.T) {
+	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
+	router, err, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, err, Compile_Error.None)
+
+	request: Request_State
+	request_state_reset(&request)
+	request.method = .GET
+	request.status_flags += {.Unknown_Method}
+
+	result := match_route(&router, &request, transmute([]u8)string("/x"))
+	testing.expect_value(t, result.outcome, Match_Outcome.Method_Not_Allowed)
+	testing.expect(t, .GET in result.methods_mask, "GET present")
+	testing.expect(t, .POST in result.methods_mask, "POST present")
+	testing.expect(t, .HEAD in result.methods_mask, "HEAD auto-fallback present")
+}
+
+@(test)
+test_match_unknown_method_missing_path_stays_not_found :: proc(t: ^testing.T) {
+	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
+	router, err, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, err, Compile_Error.None)
+
+	request: Request_State
+	request_state_reset(&request)
+	request.method = .GET
+	request.status_flags += {.Unknown_Method}
+
+	result := match_route(&router, &request, transmute([]u8)string("/missing"))
+	testing.expect_value(t, result.outcome, Match_Outcome.Not_Found)
 }
 
 @(test)

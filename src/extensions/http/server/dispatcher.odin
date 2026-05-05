@@ -12,27 +12,13 @@ _http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) 
 	init_args := (cast(^HTTP_Dispatcher_Init_Args)raw_data(args))^
 	runtime_allocator := tina.ctx_working_arena(ctx)
 
-	runtime_storage := make([]HTTP_Shard_Runtime, 1, runtime_allocator)
-	dispatcher.shard_runtime = &runtime_storage[0]
-	idle_slot_indices := make([]u16, int(init_args.connection_slot_count), runtime_allocator)
-	idle_slot_handles := make([]tina.Handle, int(init_args.connection_slot_count), runtime_allocator)
-	idle_slot_positions := make([]u16, int(init_args.connection_slot_count), runtime_allocator)
-	for index in 0 ..< len(idle_slot_positions) {
-		idle_slot_positions[index] = u16(IDLE_ARRAY_INDEX_NONE)
-	}
-	dispatcher.shard_runtime^ = HTTP_Shard_Runtime {
-		server               = init_args.server^,
-		router               = init_args.router,
-		connection_type_id   = init_args.connection_type_id,
-		keepalive_reserve    = init_args.server.keepalive.reserve_slots,
-		idle_slot_indices    = idle_slot_indices,
-		idle_slot_handles    = idle_slot_handles,
-		idle_slot_positions  = idle_slot_positions,
-		idle_count           = 0,
-		free_count           = init_args.connection_slot_count,
-		connection_slot_count = init_args.connection_slot_count,
-		accept_backoff_ns    = 50_000_000,
-	}
+	dispatcher.shard_runtime = _make_shard_runtime(
+		runtime_allocator,
+		init_args.server,
+		init_args.router,
+		init_args.connection_slot_count,
+		init_args.connection_type_id,
+	)
 
 	return tina.Effect_Receive{}
 }

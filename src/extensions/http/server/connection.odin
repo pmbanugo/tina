@@ -21,17 +21,11 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) 
 
 	working_allocator := tina.ctx_working_arena(ctx)
 	frame_size := int(runtime.server.limits.request_line_size_max) + int(runtime.server.limits.header_size_max)
-	buffered_body_size_max := 0
-	for route in runtime.server.app.routes {
-		if route.body_mode == .Buffered && int(route.body_size_max) > buffered_body_size_max {
-			buffered_body_size_max = int(route.body_size_max)
-		}
-	}
 	connection.connection_state.shard_runtime = runtime
 	connection.connection_state.fd = init_args.client_fd
 	connection.connection_state.request_frame_bytes = make([]u8, frame_size, working_allocator)
 	connection.connection_state.header_views = make([]Header_View, int(runtime.server.limits.header_count_max), working_allocator)
-	connection.connection_state.buffered_body_bytes = make([]u8, buffered_body_size_max, working_allocator)
+	connection.connection_state.buffered_body_bytes = make([]u8, int(runtime.server.buffered_body_size_max), working_allocator)
 	connection.connection_state.pipeline_tail_bytes = make([]u8, int(runtime.server.limits.pipeline_size_max), working_allocator)
 	connection.connection_state.response_header_bytes = make(
 		[]u8,
@@ -40,7 +34,7 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) 
 	)
 	connection.connection_state.route_state_bytes = make(
 		[]u8,
-		int(_max_route_state_size(runtime.server.app.routes)),
+		int(runtime.server.route_state_size_max),
 		working_allocator,
 	)
 	connection.connection_state.peer = {}
@@ -158,15 +152,13 @@ _http_connection_handler :: proc(
 
 	case tina.IO_TAG_SEND_COMPLETE:
 		if message.io.result <= 0 {
-			state.state = .Closing
-			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+			return _connection_dispatch_peer_closed(connection, ctx)
 		}
 		return _connection_handle_send_complete(connection, u32(message.io.result), ctx)
 
 	case tina.IO_TAG_SENDFILE_COMPLETE:
 		if message.io.result < 0 {
-			state.state = .Closing
-			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+			return _connection_dispatch_peer_closed(connection, ctx)
 		}
 		return _connection_handle_sendfile_complete(connection, u32(message.io.result), ctx)
 
@@ -387,9 +379,8 @@ _connection_handle_sendfile_complete :: proc(connection: ^HTTP_Connection, bytes
 			return _connection_finalize_flushed_response(connection, ctx)
 		}
 		state.response.flags += {.Close_After_Send, .Aborted}
-		state.state = .Closing
 		_connection_release_slot(connection, ctx)
-		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+		return _connection_dispatch_peer_closed(connection, ctx)
 	}
 
 	sent_size := min(u64(bytes_sent), state.sendfile_size_remaining)
@@ -620,6 +611,30 @@ _connection_dispatch_server_drain :: proc(connection: ^HTTP_Connection, ctx: ^ti
 	route_context := _make_route_context(state, ctx)
 	step := _dispatch_route_event(Route_Event(Server_Drain{}), &request, &response, route_context, _route_state_ptr(state))
 	return _dispatch_step(connection, step, ctx)
+}
+
+@(private = "file")
+_connection_dispatch_peer_closed :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
+	state := &connection.connection_state
+	runtime := state.shard_runtime
+	if runtime != nil && runtime.router != nil && state.request.route_index != ROUTE_INDEX_NONE {
+		descriptor := runtime.router.descriptors[state.request.route_index]
+		if descriptor.handler_kind == .Event {
+			request := _connection_make_request(connection, nil, ctx)
+			response := _connection_make_response(connection, ctx)
+			route_context := _make_route_context(state, ctx)
+			_ = _dispatch_route_event(
+				Route_Event(Peer_Closed{}),
+				&request,
+				&response,
+				route_context,
+				_route_state_ptr(state),
+			)
+		}
+	}
+
+	state.state = .Closing
+	return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 }
 
 @(private = "file")
@@ -1059,6 +1074,32 @@ Notification_Test_Payload :: struct {
 }
 
 @(private = "file")
+Peer_Closed_Test_State :: struct {
+	peer_closed_count: u32,
+}
+
+@(private = "file")
+_peer_closed_route_event_handler :: proc(
+	event: Route_Event,
+	request: ^Request,
+	response: ^Response,
+	route_context: Route_Context,
+	state: rawptr,
+) -> Route_Step {
+	_ = request
+	_ = response
+	_ = route_context
+	test_state := cast(^Peer_Closed_Test_State)state
+	#partial switch _ in event {
+	case Peer_Closed:
+		test_state.peer_closed_count += 1
+		return flush(true)
+	case:
+		return close()
+	}
+}
+
+@(private = "file")
 _notification_route_event_handler :: proc(
 	event: Route_Event,
 	request: ^Request,
@@ -1120,7 +1161,7 @@ test_stale_notification_on_keep_alive_connection_is_dropped :: proc(t: ^testing.
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			timeouts = Timeouts {
 				timeout_ms_idle   = 1,
 				timeout_ms_header = 1,
@@ -1134,7 +1175,6 @@ test_stale_notification_on_keep_alive_connection_is_dropped :: proc(t: ^testing.
 	connection.connection_state.shard_runtime = &runtime
 	connection.connection_state.request_token = Request_Token(7)
 	connection.connection_state.state = .Recv_Headers
-	connection.connection_state.route_index = Route_Index(0)
 	connection.connection_state.header_views = header_views_storage[:]
 	connection.connection_state.response_header_bytes = response_header_storage[:]
 	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
@@ -1229,7 +1269,7 @@ test_pending_application_message_is_preserved_until_expectation :: proc(t: ^test
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			timeouts = Timeouts {
 				timeout_ms_idle   = 1,
 				timeout_ms_header = 1,
@@ -1243,7 +1283,6 @@ test_pending_application_message_is_preserved_until_expectation :: proc(t: ^test
 	connection.connection_state.shard_runtime = &runtime
 	connection.connection_state.request_token = Request_Token(7)
 	connection.connection_state.state = .Sending
-	connection.connection_state.route_index = Route_Index(0)
 	connection.connection_state.request.route_index = Route_Index(0)
 	connection.connection_state.header_views = header_views_storage[:]
 	connection.connection_state.response_header_bytes = response_header_storage[:]
@@ -1319,7 +1358,7 @@ test_pending_application_message_first_wins_when_multiple_arrive :: proc(t: ^tes
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			timeouts = Timeouts {
 				timeout_ms_idle   = 1,
 				timeout_ms_header = 1,
@@ -1333,7 +1372,6 @@ test_pending_application_message_first_wins_when_multiple_arrive :: proc(t: ^tes
 	connection.connection_state.shard_runtime = &runtime
 	connection.connection_state.request_token = Request_Token(7)
 	connection.connection_state.state = .Sending
-	connection.connection_state.route_index = Route_Index(0)
 	connection.connection_state.request.route_index = Route_Index(0)
 	connection.connection_state.header_views = header_views_storage[:]
 	connection.connection_state.response_header_bytes = response_header_storage[:]
@@ -1414,7 +1452,7 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			timeouts = Timeouts {
 				timeout_ms_idle   = 1,
 				timeout_ms_header = 1,
@@ -1430,7 +1468,6 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 	connection.connection_state.shard_runtime = &runtime
 	connection.connection_state.state = .Application_Expectation
 	connection.connection_state.fd = tina.FD_Handle(17)
-	connection.connection_state.route_index = Route_Index(0)
 	connection.connection_state.request.route_index = Route_Index(0)
 	connection.connection_state.header_views = header_views_storage[:]
 	connection.connection_state.response_header_bytes = response_header_storage[:]
@@ -1501,7 +1538,7 @@ test_dispatch_step_flush_non_final_dispatches_send_ready_without_io :: proc(t: ^
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			timeouts = Timeouts {
 				timeout_ms_idle   = 1,
 				timeout_ms_header = 1,
@@ -1516,7 +1553,6 @@ test_dispatch_step_flush_non_final_dispatches_send_ready_without_io :: proc(t: ^
 
 	connection := HTTP_Connection{}
 	connection.connection_state.shard_runtime = &runtime
-	connection.connection_state.route_index = Route_Index(0)
 	connection.connection_state.request.route_index = Route_Index(0)
 	connection.connection_state.response_header_bytes = response_header_storage[:]
 	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
@@ -1557,7 +1593,7 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			timeouts = Timeouts {
 				timeout_ms_idle   = 1,
 				timeout_ms_header = 1,
@@ -1572,7 +1608,6 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 
 	connection := HTTP_Connection{}
 	connection.connection_state.shard_runtime = &runtime
-	connection.connection_state.route_index = Route_Index(0)
 	connection.connection_state.request.route_index = Route_Index(0)
 	connection.connection_state.response_header_bytes = response_header_storage[:]
 	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
@@ -1610,7 +1645,7 @@ test_send_complete_with_sendfile_plan_transitions_to_sendfile_io :: proc(t: ^tes
 	)
 
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			timeouts = Timeouts {
 				timeout_ms_idle   = 1,
 				timeout_ms_header = 1,
@@ -1655,6 +1690,122 @@ test_send_complete_with_sendfile_plan_transitions_to_sendfile_io :: proc(t: ^tes
 }
 
 @(test)
+test_send_complete_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
+	route_state_storage := [1]Peer_Closed_Test_State{}
+	response_header_storage: [32]u8
+	router_descriptors: [1]Route_Descriptor = [1]Route_Descriptor {
+		Route_Descriptor {
+			handler       = rawptr(_peer_closed_route_event_handler),
+			handler_kind  = .Event,
+			body_size_max = 0,
+			body_mode     = .None,
+			state_size    = u16(size_of(Peer_Closed_Test_State)),
+		},
+	}
+	router := Compiled_Router {
+		descriptors = router_descriptors[:],
+	}
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime {
+			timeouts = Timeouts {
+				timeout_ms_idle   = 1,
+				timeout_ms_header = 1,
+				timeout_ms_body   = 1,
+				timeout_ms_send   = 1,
+			},
+		},
+		router = &router,
+	}
+
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.state = .Sending
+	connection.connection_state.fd = tina.FD_Handle(19)
+	connection.connection_state.request.route_index = Route_Index(0)
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
+
+	ctx := tina.TinaContext{}
+	ctx.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
+
+	message: tina.Message
+	message.tag = tina.IO_TAG_SEND_COMPLETE
+	message.io.result = -1
+
+	effect := _http_connection_handler(rawptr(&connection), &message, &ctx)
+	#partial switch io_effect in effect {
+	case tina.Effect_Io:
+		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
+			testing.expect(t, false, "send failure should close after Peer_Closed dispatch")
+		}
+	case:
+		testing.expect(t, false, "expected close effect")
+	}
+	testing.expect_value(t, route_state_storage[0].peer_closed_count, u32(1))
+	testing.expect_value(t, connection.connection_state.state, Connection_Phase.Closing)
+	testing.expect_value(t, connection.connection_state.response.egress_size, Egress_Size(0))
+}
+
+@(test)
+test_sendfile_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
+	route_state_storage := [1]Peer_Closed_Test_State{}
+	response_header_storage: [32]u8
+	router_descriptors: [1]Route_Descriptor = [1]Route_Descriptor {
+		Route_Descriptor {
+			handler       = rawptr(_peer_closed_route_event_handler),
+			handler_kind  = .Event,
+			body_size_max = 0,
+			body_mode     = .None,
+			state_size    = u16(size_of(Peer_Closed_Test_State)),
+		},
+	}
+	router := Compiled_Router {
+		descriptors = router_descriptors[:],
+	}
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime {
+			timeouts = Timeouts {
+				timeout_ms_idle   = 1,
+				timeout_ms_header = 1,
+				timeout_ms_body   = 1,
+				timeout_ms_send   = 1,
+			},
+		},
+		router = &router,
+	}
+
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.state = .Sending
+	connection.connection_state.fd = tina.FD_Handle(23)
+	connection.connection_state.request.route_index = Route_Index(0)
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
+	connection.connection_state.sendfile_active = true
+	connection.connection_state.sendfile_size_remaining = 4096
+
+	ctx := tina.TinaContext{}
+	ctx.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
+
+	message: tina.Message
+	message.tag = tina.IO_TAG_SENDFILE_COMPLETE
+	message.io.result = -1
+
+	effect := _http_connection_handler(rawptr(&connection), &message, &ctx)
+	#partial switch io_effect in effect {
+	case tina.Effect_Io:
+		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
+			testing.expect(t, false, "sendfile failure should close after Peer_Closed dispatch")
+		}
+	case:
+		testing.expect(t, false, "expected close effect")
+	}
+	testing.expect_value(t, route_state_storage[0].peer_closed_count, u32(1))
+	testing.expect_value(t, connection.connection_state.state, Connection_Phase.Closing)
+	testing.expect_value(t, connection.connection_state.response.egress_size, Egress_Size(0))
+}
+
+@(test)
 test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T) {
 	shard := tina.Shard{}
 	spokes: [8]u32
@@ -1669,7 +1820,7 @@ test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T)
 
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			limits   = DEFAULT_LIMITS,
 			timeouts = DEFAULT_TIMEOUTS,
 		},
@@ -1735,7 +1886,7 @@ test_finalize_flushed_response_processes_pipeline_tail_before_recv :: proc(t: ^t
 
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server {
+		server = Server_Runtime {
 			limits   = DEFAULT_LIMITS,
 			timeouts = DEFAULT_TIMEOUTS,
 		},
