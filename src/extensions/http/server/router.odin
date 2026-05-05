@@ -2,6 +2,7 @@ package http_server
 
 import "core:bytes"
 import "core:fmt"
+import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:testing"
@@ -178,6 +179,7 @@ compile_router :: proc(
 				&descriptors_dynamic,
 				Route_Descriptor {
 					handler = route.handler,
+					handler_kind = route.handler_kind,
 					body_size_max = route.body_size_max,
 					body_mode = route.body_mode,
 					state_size = route.state_size,
@@ -226,6 +228,7 @@ compile_router :: proc(
 				&descriptors_dynamic,
 				Route_Descriptor {
 					handler = route.handler,
+					handler_kind = route.handler_kind,
 					body_size_max = route.body_size_max,
 					body_mode = route.body_mode,
 					state_size = route.state_size,
@@ -446,11 +449,11 @@ compile_router :: proc(
 compiled_router_destroy :: proc(router: ^Compiled_Router, allocator := context.allocator) {
 	context.allocator = allocator
 	delete_soa(router.entries)
-	delete(router.literal_buffer)
-	delete(router.route_parts)
-	delete(router.descriptors)
+	mem.delete(router.literal_buffer)
+	mem.delete(router.route_parts)
+	mem.delete(router.descriptors)
 	if len(router.options_asterisk_response) > 0 {
-		delete(router.options_asterisk_response)
+		mem.delete(router.options_asterisk_response)
 	}
 	router^ = {}
 }

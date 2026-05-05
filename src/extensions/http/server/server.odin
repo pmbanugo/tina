@@ -2,6 +2,7 @@ package http_server
 
 import tina "../../.."
 import "core:fmt"
+import "core:mem"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tina HTTP — Phase 6: System Integration & Boot Sequence
@@ -30,8 +31,8 @@ App :: struct {
 // `Reuse_Port` is a platform-specific fallback for environments where
 // SO_REUSEPORT semantics are acceptable.
 Distribution_Mode :: enum u8 {
-	Reuse_Port,
 	Coordinator,
+	Reuse_Port,
 }
 
 // Keep-alive shedding policy.
@@ -39,8 +40,8 @@ Keepalive_Config :: struct {
 	reserve_slots: u16,
 }
 
-// `Server` is the user-facing root configuration. One `Server` produces one
-// HTTP listener group per shard, all sharing a single compiled `App`.
+// `Server` is the user-facing root configuration. One `Server` produces an
+// HTTP listener and connection topology from a single compiled `App`.
 //
 // Naming: `graceful_drain_ms` mirrors `Timeouts.timeout_ms_*` units (ms) for
 // API consistency. The library converts to ticks internally.
@@ -61,13 +62,6 @@ Monotonic_Time_NS :: distinct u64
 
 @(private = "package")
 Request_Token :: distinct u32
-
-// Tina core dependency placeholder. The real `tina.Correlation_Id` is added
-// by CORRELATED_DELIVERY_AND_PARKING.md (DR-7 amendment). Kept as a local
-// distinct type until Tina core grows the public symbol; only the field width
-// matters for Phase 6 sizing.
-@(private = "package")
-Correlation_Id :: distinct u32
 
 // Total bytes currently in the ingress buffer (request frame region only).
 // Body bytes never inflate this; they flow through the reactor buffer or
@@ -90,6 +84,9 @@ Idle_Array_Index :: distinct u16
 Idle_Array_Count :: distinct u16
 
 @(private = "package")
+IDLE_ARRAY_INDEX_NONE :: Idle_Array_Index(0xFFFF)
+
+@(private = "package")
 Connection_Phase :: enum u8 {
 	// Recv path
 	Recv_Headers, // accumulating request line + headers
@@ -104,6 +101,20 @@ Connection_Phase :: enum u8 {
 	Closing, // io_close issued; waiting for IO_TAG_CLOSE_COMPLETE
 }
 
+Application_Expectation_Kind :: enum u8 {
+	Reply,
+	Notification,
+}
+
+@(private = "package")
+Application_Pending_Message :: struct {
+	source_handle: tina.Handle,
+	message_tag:   Message_Tag,
+	correlation_id: tina.Correlation_Id,
+	payload_size:  u16,
+	payload:       [tina.MAX_PAYLOAD_SIZE]u8,
+}
+
 
 // ─── Shard-Local Runtime ───
 //
@@ -116,10 +127,15 @@ Connection_Phase :: enum u8 {
 HTTP_Shard_Runtime :: struct {
 	server:               Server,
 	router:               ^Compiled_Router,
+	connection_type_id:    u8,
 	date_cache:           Date_Cache,
+	draining:             bool,
+	deadline_ns_drain:    Monotonic_Time_NS,
 	next_request_token:   Request_Token, // monotonic across the shard
 	keepalive_reserve:    u16, // mirrors Keepalive_Config.reserve_slots
 	idle_slot_indices:    []u16, // dense swap-and-pop tracker
+	idle_slot_handles:    []tina.Handle,
+	idle_slot_positions:  []u16,
 	idle_count:           Idle_Array_Count,
 	free_count:           u16, // free connection slots (dropped on spawn, restored on close)
 	connection_slot_count: u16, // hard cap for cross-checking spawn / eviction
@@ -135,9 +151,11 @@ HTTP_Shard_Runtime :: struct {
 // Restart type: `.permanent` (HTTP_LIBRARY_SYSTEM_INTEGRATION.md §1.1).
 @(private = "package")
 HTTP_Listener :: struct {
-	listen_fd:     tina.FD_Handle,
-	shard_runtime: ^HTTP_Shard_Runtime,
-	accept_backoff_ns: u64,
+	listen_fd:                  tina.FD_Handle,
+	shard_runtime:              ^HTTP_Shard_Runtime,
+	dispatcher_handles:         []tina.Handle,
+	next_dispatcher_shard_index: u8,
+	accept_backoff_ns:          u64,
 }
 
 // One per shard, only instantiated in multi-shard `Coordinator` mode.
@@ -163,7 +181,15 @@ HTTP_Connection_State :: struct {
 	deadline_ns_drain:          Monotonic_Time_NS,
 	fd:                         tina.FD_Handle,
 	request_token:              Request_Token,
-	application_correlation_id: Correlation_Id,
+	application_expectation_kind: Application_Expectation_Kind,
+	application_expected_source: tina.Handle,
+	application_expected_tag:    Message_Tag,
+	application_correlation_id:  tina.Correlation_Id,
+	application_timeout_ns:      u64,
+	application_pending_message:  Application_Pending_Message,
+	request_body_size_received:   u64,
+	sendfile_offset:             u64,
+	sendfile_size_remaining:     u64,
 
 	// --- Recv / parse ingress cursors ---
 	ingress_size:               Ingress_Size,
@@ -171,6 +197,14 @@ HTTP_Connection_State :: struct {
 	state:                      Connection_Phase,
 	route_index:                Route_Index,
 	idle_array_index:           Idle_Array_Index,
+	request_frame_size:          u16,
+	pipeline_tail_size:         u16,
+	buffered_body_size:         u32,
+	sendfile_file_fd:           tina.FD_Handle,
+	response_flush_final:       bool,
+	sendfile_active:            bool,
+	application_pending_message_valid: bool,
+	request_body_complete_notified: bool,
 
 	// --- Sub-state machines (sized by Phase 1–5 types) ---
 	parser:                     Parser_State,
@@ -178,6 +212,10 @@ HTTP_Connection_State :: struct {
 	request:                    Request_State,
 	header_views:                []Header_View,
 	response_header_bytes:       []u8,
+	route_state_bytes:           []u8,
+	request_frame_bytes:         []u8,
+	buffered_body_bytes:         []u8,
+	pipeline_tail_bytes:         []u8,
 
 	// --- Cold: read only by `peer_address(request)` helper ---
 	peer:                       tina.Peer_Address,
@@ -206,14 +244,20 @@ HTTP_Connection :: struct {
 
 @(private = "package")
 HTTP_Listener_Init_Args :: struct {
-	server:               ^Server,
-	router:               ^Compiled_Router,
-	connection_slot_count: u16,
+	server:                  ^Server,
+	router:                  ^Compiled_Router,
+	connection_slot_count:    u16,
+	connection_type_id:       u8,
+	dispatcher_type_id:       u8,
+	dispatcher_shard_count:   u8,
 }
 
 @(private = "package")
 HTTP_Dispatcher_Init_Args :: struct {
-	shard_runtime: ^HTTP_Shard_Runtime,
+	server:                ^Server,
+	router:                ^Compiled_Router,
+	connection_slot_count: u16,
+	connection_type_id:    u8,
 }
 
 @(private = "package")
@@ -227,20 +271,28 @@ HTTP_Connection_Init_Args :: struct {
 #assert(size_of(HTTP_Connection_Init_Args) <= tina.MAX_INIT_ARGS_SIZE)
 
 
-// ─── Type IDs ───────────────────────────────────────────────────────────────
+// ─── Type-ID Offsets ────────────────────────────────────────────────────────
 //
-// Intentionally low and contiguous. Applications composing HTTP with their
-// own types should pick IDs above HTTP_TYPE_ID_MAX and call install() before
-// registering their own.
+// These are *positional offsets* relative to `base_type_id`, not absolute
+// type IDs. `install_into_system_spec` derives `base_type_id := len(spec.types)`
+// at install time, then assigns each HTTP TypeDescriptor as
+// `base_type_id + HTTP_TYPE_OFFSET_<role>`. This keeps the install contract
+// position-independent: callers may register their own TypeDescriptors before
+// (or after) `install()` and the HTTP wiring still resolves correctly.
+//
+// The runtime never reads these constants directly. Every place that needs
+// the actual type id reads it from a runtime field that was populated from
+// install-time args (e.g. `HTTP_Shard_Runtime.connection_type_id`,
+// `HTTP_Listener_Init_Args.dispatcher_type_id`).
 
 @(private = "package")
-HTTP_TYPE_ID_LISTENER :: 0
+HTTP_TYPE_OFFSET_LISTENER :: 0
 @(private = "package")
-HTTP_TYPE_ID_CONNECTION :: 1
+HTTP_TYPE_OFFSET_CONNECTION :: 1
 @(private = "package")
-HTTP_TYPE_ID_DISPATCHER :: 2
+HTTP_TYPE_OFFSET_DISPATCHER :: 2
 @(private = "package")
-HTTP_TYPE_ID_MAX :: HTTP_TYPE_ID_DISPATCHER
+HTTP_TYPE_OFFSET_MAX :: HTTP_TYPE_OFFSET_DISPATCHER
 
 
 // ─── Library-internal scratch headroom (parser percent-decode, formatting) ──
@@ -370,15 +422,48 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	}
 
 	// --- Append HTTP TypeDescriptors ---
-	include_dispatcher := spec.shard_count > 1 && server.distribution == .Coordinator
+	coordinator_mode_enabled := spec.shard_count > 1 && server.distribution == .Coordinator
+	include_dispatcher := coordinator_mode_enabled
 	http_type_count := 2 + (include_dispatcher ? 1 : 0)
+	if coordinator_mode_enabled {
+		for shard_index in 0 ..< len(spec.shard_specs) {
+			assert(
+				spec.shard_specs[shard_index].shard_id == tina.Shard_Id(u8(shard_index)),
+				"Coordinator mode requires contiguous shard ids (0..shard_count-1) for dispatcher handoff routing",
+			)
+		}
+	}
+	// Position-independence: HTTP types are appended after whatever the caller
+	// has already registered. Guard against u8 overflow before we cast — failing
+	// loud here is far better than silently wrapping a type id and producing
+	// undeliverable handles at runtime.
+	assert(
+		len(spec.types) + http_type_count <= tina.MAX_TYPE_DESCRIPTOR_ID + 1,
+		"install_into_system_spec: appending HTTP types would exceed MAX_TYPE_DESCRIPTOR_ID; reduce pre-existing types or split installs",
+	)
+	base_type_id := u8(len(spec.types))
+
+	listener_type_id := base_type_id + HTTP_TYPE_OFFSET_LISTENER
+	connection_type_id := base_type_id + HTTP_TYPE_OFFSET_CONNECTION
+	dispatcher_type_id := base_type_id + HTTP_TYPE_OFFSET_DISPATCHER
 
 	listener_init_args := HTTP_Listener_Init_Args {
 		server                = server,
 		router                = router,
 		connection_slot_count = u16(connection_slot_count),
+		connection_type_id    = connection_type_id,
+		dispatcher_type_id    = dispatcher_type_id,
+		dispatcher_shard_count = spec.shard_count,
 	}
 	listener_args_payload, listener_args_size := tina.init_args_of(&listener_init_args)
+
+	dispatcher_init_args := HTTP_Dispatcher_Init_Args {
+		server                = server,
+		router                = router,
+		connection_slot_count = u16(connection_slot_count),
+		connection_type_id    = connection_type_id,
+	}
+	dispatcher_args_payload, dispatcher_args_size := tina.init_args_of(&dispatcher_init_args)
 
 	new_types := make(
 		[]tina.TypeDescriptor,
@@ -387,26 +472,20 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	)
 	copy(new_types, spec.types)
 
-	base_type_id := u8(len(spec.types))
-
-	listener_type_id := base_type_id + HTTP_TYPE_ID_LISTENER
-	connection_type_id := base_type_id + HTTP_TYPE_ID_CONNECTION
-	dispatcher_type_id := base_type_id + HTTP_TYPE_ID_DISPATCHER
-
 	new_types[listener_type_id] = tina.TypeDescriptor {
 		id                      = listener_type_id,
 		slot_count              = 1,
 		stride                  = size_of(HTTP_Listener),
-			soa_metadata_size       = size_of(tina.Isolate_Metadata),
-			working_memory_size     = _listener_working_memory_size(int(connection_slot_count)),
-			scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
-			mailbox_capacity        = 16,
-			// The listener bootstraps the shard-local runtime and drives accept.
-			// Its init args carry the immutable boot-time config.
-			// The runtime lives in the listener's working arena.
-			init_handler            = _http_listener_init,
-			handler_fn              = _http_listener_handler,
-		}
+		soa_metadata_size       = size_of(tina.Isolate_Metadata),
+		working_memory_size     = _listener_working_memory_size(int(connection_slot_count)),
+		scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
+		mailbox_capacity        = 16,
+		// The listener bootstraps the shard-local runtime and drives accept.
+		// Its init args carry the immutable boot-time config.
+		// The runtime lives in the listener's working arena.
+		init_handler            = _http_listener_init,
+		handler_fn              = _http_listener_handler,
+	}
 
 	new_types[connection_type_id] = tina.TypeDescriptor {
 		id                      = connection_type_id,
@@ -426,7 +505,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 			slot_count              = 1,
 			stride                  = size_of(HTTP_Dispatcher),
 			soa_metadata_size       = size_of(tina.Isolate_Metadata),
-			working_memory_size     = 0,
+			working_memory_size     = _listener_working_memory_size(int(connection_slot_count)),
 			scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
 			mailbox_capacity        = 16,
 			init_handler            = _http_dispatcher_init,
@@ -439,15 +518,18 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	// --- Wire the supervision tree on each shard ---
 	for shard_index in 0 ..< len(spec.shard_specs) {
 		shard_spec := &spec.shard_specs[shard_index]
+		include_listener := !coordinator_mode_enabled || shard_index == 0
 		_attach_http_children(
 			shard_spec,
 			listener_type_id,
-			connection_type_id,
 			dispatcher_type_id,
+			include_listener,
 			include_dispatcher,
 			u16(connection_slot_count),
 			listener_args_payload,
 			listener_args_size,
+			dispatcher_args_payload,
+			dispatcher_args_size,
 		)
 	}
 }
@@ -669,6 +751,8 @@ _listener_working_memory_size :: #force_inline proc "contextless" (
 	connection_slot_count: int,
 ) -> int {
 	return _align_up(size_of(HTTP_Shard_Runtime)) +
+		_align_up(connection_slot_count * size_of(u16)) +
+		_align_up(connection_slot_count * size_of(tina.Handle)) +
 		_align_up(connection_slot_count * size_of(u16))
 }
 
@@ -697,7 +781,7 @@ _max_buffered_body_size :: proc(routes: []Route) -> u32 {
 	return max_size
 }
 
-@(private = "file")
+@(private = "package")
 _max_route_state_size :: proc(routes: []Route) -> u16 {
 	max_size: u16
 	for route in routes {
@@ -731,20 +815,23 @@ _next_power_of_two_u64 :: proc "contextless" (n: u64) -> u64 {
 
 // ─── Supervision tree wiring ────────────────────────────────────────────────
 //
-// Append the listener (and dispatcher, if multi-shard Coordinator) as static
-// children of the shard's root group. Reserve `connection_slot_count` dynamic
-// child slots so spawned connections have somewhere to live in the tree.
+// Append shard infrastructure as static children of the shard's root group.
+// In coordinator mode this is one ingress listener (shard 0) plus one
+// dispatcher on every shard. Reserve `connection_slot_count` dynamic child
+// slots so spawned connections have somewhere to live in the tree.
 
 @(private = "file")
 _attach_http_children :: proc(
 	shard_spec: ^tina.ShardSpec,
 	listener_type_id: u8,
-	connection_type_id: u8,
 	dispatcher_type_id: u8,
+	include_listener: bool,
 	include_dispatcher: bool,
 	connection_slot_count: u16,
 	listener_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
 	listener_args_size: u8,
+	dispatcher_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
+	dispatcher_args_size: u8,
 ) {
 	root := &shard_spec.root_group
 
@@ -753,16 +840,18 @@ _attach_http_children :: proc(
 		root.child_count_dynamic_max = connection_slot_count
 	}
 
-	// We do not pre-fill init args here — the listener's args (the
-	// HTTP_Shard_Runtime pointer) are not known until the listener allocates
-	// the runtime from its own working_arena on init. Phase 7 fills this in.
+	// Both listener and dispatcher get immutable boot-time args (server config,
+	// compiled router pointer, slot sizing, and dynamic type ids).
 	new_static := _append_static_children(
 		root.children,
 		listener_type_id,
 		dispatcher_type_id,
+		include_listener,
 		include_dispatcher,
 		listener_args_payload,
 		listener_args_size,
+		dispatcher_args_payload,
+		dispatcher_args_size,
 	)
 	root.children = new_static
 }
@@ -772,25 +861,34 @@ _append_static_children :: proc(
 	existing: []tina.Child_Spec,
 	listener_type_id: u8,
 	dispatcher_type_id: u8,
+	include_listener: bool,
 	include_dispatcher: bool,
 	listener_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
 	listener_args_size: u8,
+	dispatcher_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
+	dispatcher_args_size: u8,
 ) -> []tina.Child_Spec {
-	added := 1 + (include_dispatcher ? 1 : 0)
+	added := (include_listener ? 1 : 0) + (include_dispatcher ? 1 : 0)
 	new_children := make([]tina.Child_Spec, len(existing) + added, context.allocator)
 	copy(new_children, existing)
+	child_index := len(existing)
 
-	new_children[len(existing)] = tina.Static_Child_Spec {
-		type_id      = listener_type_id,
-		restart_type = .permanent,
-		args_size    = listener_args_size,
-		args_payload = listener_args_payload,
+	if include_listener {
+		new_children[child_index] = tina.Static_Child_Spec {
+			type_id      = listener_type_id,
+			restart_type = .permanent,
+			args_size    = listener_args_size,
+			args_payload = listener_args_payload,
+		}
+		child_index += 1
 	}
 
 	if include_dispatcher {
-		new_children[len(existing) + 1] = tina.Static_Child_Spec {
+		new_children[child_index] = tina.Static_Child_Spec {
 			type_id      = dispatcher_type_id,
 			restart_type = .permanent,
+			args_size    = dispatcher_args_size,
+			args_payload = dispatcher_args_payload,
 		}
 	}
 
@@ -965,8 +1063,8 @@ test_install_make_system_spec_multi_shard_includes_dispatcher :: proc(t: ^testin
 	testing.expect(t, spec.fd_handoff_entry_count > 0, "multi-shard requires fd_handoff_entry_count > 0")
 	testing.expect_value(t, len(spec.types), 3) // listener + connection + dispatcher
 
-	// Both shards have the listener AND the dispatcher attached as static
-	// children (single dispatcher per shard, infrastructure component).
+	// Coordinator topology: one ingress listener on shard 0, one dispatcher on
+	// every shard.
 	for shard_index in 0 ..< len(spec.shard_specs) {
 		root := spec.shard_specs[shard_index].root_group
 		static_count := 0
@@ -975,10 +1073,139 @@ test_install_make_system_spec_multi_shard_includes_dispatcher :: proc(t: ^testin
 				static_count += 1
 			}
 		}
+		expected_static_count := 1
+		if shard_index == 0 {
+			expected_static_count = 2
+		}
 		testing.expect(
 			t,
-			static_count >= 2,
-			fmt.tprintf("shard %d should have >= 2 static children", shard_index),
+			static_count == expected_static_count,
+			fmt.tprintf("shard %d static children mismatch", shard_index),
 		)
 	}
+}
+
+@(test)
+test_install_make_system_spec_multi_shard_defaults_to_coordinator :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+
+	when ODIN_OS == .Windows {
+		return
+	}
+
+	app := App{}
+	server := Server {
+		address = tina.ipv4(127, 0, 0, 1, 8080),
+		app     = &app,
+	}
+
+	spec := install_make_system_spec(&server, 2, 64)
+
+	// Derive expected type ids from the spec rather than from constants:
+	// after install, HTTP types occupy the tail of `spec.types`. Reading the
+	// ids back out of the descriptor table is the same lookup the supervision
+	// tree did at install time.
+	base_type_id := u8(len(spec.types) - 3) // listener + connection + dispatcher
+	listener_type_id := base_type_id + HTTP_TYPE_OFFSET_LISTENER
+	dispatcher_type_id := base_type_id + HTTP_TYPE_OFFSET_DISPATCHER
+
+	for shard_index in 0 ..< len(spec.shard_specs) {
+		root := spec.shard_specs[shard_index].root_group
+		listener_count := 0
+		dispatcher_count := 0
+		for child in root.children {
+			static_child, ok := child.(tina.Static_Child_Spec)
+			if !ok do continue
+			if static_child.type_id == listener_type_id do listener_count += 1
+			if static_child.type_id == dispatcher_type_id do dispatcher_count += 1
+		}
+		expected_listener_count := 0
+		if shard_index == 0 {
+			expected_listener_count = 1
+		}
+		testing.expect_value(t, listener_count, expected_listener_count)
+		testing.expect_value(t, dispatcher_count, 1)
+	}
+}
+
+// Verifies that `install_into_system_spec` appends HTTP TypeDescriptors at
+// `len(spec.types) + HTTP_TYPE_OFFSET_<role>` rather than at fixed absolute
+// IDs. We seed the spec with a stub TypeDescriptor first so the HTTP types
+// are forced off the [0..2] offsets and any accidental hardcoding of those
+// values would surface as a mismatch between the supervision wiring (which
+// reads the dynamic id) and the installed descriptor table.
+@(test)
+test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+
+	app := App{}
+	server := Server {
+		address = tina.ipv4(127, 0, 0, 1, 8080),
+		app     = &app,
+	}
+
+	// Build a single-shard spec by hand and pre-register one external type at
+	// id 0 so HTTP types cannot land at offset 0.
+	stub_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+		return tina.Effect_Receive{}
+	}
+	stub_handler :: proc(self: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
+		return tina.Effect_Receive{}
+	}
+	external_types := []tina.TypeDescriptor {
+		{
+			id                      = 0,
+			slot_count              = 1,
+			stride                  = 8,
+			soa_metadata_size       = size_of(tina.Isolate_Metadata),
+			working_memory_size     = 0,
+			scratch_requirement_max = 0,
+			mailbox_capacity        = 4,
+			init_handler            = stub_init,
+			handler_fn              = stub_handler,
+		},
+	}
+
+	spec := _make_base_system_spec(
+		&server,
+		1,
+		HTTP_DEV_CONNECTION_SLOT_COUNT_DEFAULT,
+		.Development,
+		HTTP_DEV_SHUTDOWN_TIMEOUT_MS,
+		HTTP_DEV_DEFAULT_RING_SIZE,
+	)
+	spec.types = external_types
+
+	install_into_system_spec(&spec, &server)
+
+	// HTTP types must be appended *after* the stub at the documented offsets.
+	expected_listener_id := u8(1) + HTTP_TYPE_OFFSET_LISTENER
+	expected_connection_id := u8(1) + HTTP_TYPE_OFFSET_CONNECTION
+
+	testing.expect_value(t, len(spec.types), 3) // stub + listener + connection (single shard, no dispatcher)
+	testing.expect_value(t, spec.types[0].id, u8(0))
+	testing.expect_value(t, spec.types[expected_listener_id].id, expected_listener_id)
+	testing.expect_value(t, spec.types[expected_connection_id].id, expected_connection_id)
+
+	// The supervision tree must reference the *dynamic* listener id, not the
+	// HTTP_TYPE_OFFSET_LISTENER constant.
+	root := spec.shard_specs[0].root_group
+	found_listener_child := false
+	for child in root.children {
+		static_child, ok := child.(tina.Static_Child_Spec)
+		if !ok do continue
+		if static_child.type_id == expected_listener_id {
+			found_listener_child = true
+		}
+		// No HTTP child should reference the stub type id.
+		testing.expect(t, static_child.type_id != 0, "HTTP wiring must not collide with pre-installed type")
+	}
+	testing.expect(t, found_listener_child, "listener child must use dynamic type id")
+
+	// Connection TypeDescriptor's stored id must equal the dynamic id, so
+	// `runtime.connection_type_id` (set from install args) and the descriptor
+	// table agree at boot.
+	testing.expect_value(t, spec.types[expected_connection_id].stride, size_of(HTTP_Connection))
 }

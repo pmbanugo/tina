@@ -233,6 +233,9 @@ hydrate_shard :: proc(
 		spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE,
 	) or_return
 	pool_init(&shard.message_pool, msg_pool_buf, MESSAGE_ENVELOPE_SIZE)
+	shard.handoff_retry_head = POOL_NONE_INDEX
+	shard.handoff_retry_tail = POOL_NONE_INDEX
+	shard.handoff_retry_count = 0
 
 	transfer_buf := grand_arena_alloc_slice(
 		arena,

@@ -11,6 +11,7 @@
 package http_server
 
 import "core:bytes"
+import "core:mem"
 import "core:testing"
 
 
@@ -94,7 +95,7 @@ test_path_canon_no_percent_fast_path :: proc(t: ^testing.T) {
 	buffer := transmute([]u8)([]u8{'/', 'a', 'p', 'i', '/', 'u', 's', 'e', 'r', 's'})
 	original := make([]u8, len(buffer))
 	copy(original, buffer)
-	defer delete(original)
+	defer mem.delete(original)
 
 	size, err, _ := path_canonicalize_selective_in_place(buffer)
 	testing.expect_value(t, err, Path_Canon_Error.None)

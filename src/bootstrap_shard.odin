@@ -138,6 +138,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 						shard.id,
 					)
 					store_watchdog_state(runtime_state, .Quarantined)
+					_fd_handoff_close_all_entries(shard, false)
 
 					// Single Writer Principle: Shard broadcasts its own quarantine state
 					env: Message_Envelope

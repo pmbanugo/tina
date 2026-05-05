@@ -27,6 +27,68 @@ ctx_send_raw :: #force_inline proc(
 	return response
 }
 
+// Reserves a shard-local correlation id for a logical parked wait.
+@(require_results)
+ctx_reserve_correlation_id :: #force_inline proc(ctx: ^TinaContext) -> Correlation_Id {
+	shard := _ctx_extract_shard(ctx)
+	shard.next_correlation_id += 1
+	if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
+	return Correlation_Id(shard.next_correlation_id)
+}
+
+// Sends an inline message with an explicit correlation id.
+@(require_results)
+ctx_send_with_correlation :: #force_inline proc(
+	ctx: ^TinaContext,
+	to: Handle,
+	$tag: Message_Tag,
+	payload: []u8,
+	correlation_id: Correlation_Id,
+) -> Send_Result {
+	#assert(
+		tag >= USER_MESSAGE_TAG_BASE,
+		"ctx_send_with_correlation: Cannot forge system messages. Tag must be >= 0x0040.",
+	)
+	when TINA_DEBUG_ASSERTS {
+		assert(
+			len(payload) <= MAX_PAYLOAD_SIZE,
+			"ctx_send_with_correlation payload exceeds MAX_PAYLOAD_SIZE",
+		)
+	}
+	shard := _ctx_extract_shard(ctx)
+
+	envelope: Message_Envelope
+	envelope.source = ctx.self_handle
+	envelope.destination = to
+	envelope.tag = tag
+	envelope.correlation = correlation_id
+	envelope.payload_size = u16(len(payload))
+	copy(envelope.payload[:], payload)
+
+	return _route_envelope_user(shard, to, &envelope)
+}
+
+// Sends an inline transfer-buffer handle with an explicit correlation id.
+@(require_results)
+ctx_transfer_send_with_correlation :: #force_inline proc(
+	ctx: ^TinaContext,
+	to: Handle,
+	handle: Transfer_Handle,
+	correlation_id: Correlation_Id,
+) -> Send_Result {
+	shard := _ctx_extract_shard(ctx)
+	envelope: Message_Envelope
+	envelope.source = ctx.self_handle
+	envelope.destination = to
+	envelope.tag = TAG_TRANSFER
+	envelope.correlation = correlation_id
+	envelope.payload_size = size_of(Transfer_Handle)
+
+	(cast(^Transfer_Handle)&envelope.payload[0])^ = handle
+
+	return _route_envelope_system(shard, to, &envelope)
+}
+
 ctx_transfer_send :: #force_inline proc(
 	ctx: ^TinaContext,
 	to: Handle,

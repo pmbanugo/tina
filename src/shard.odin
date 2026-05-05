@@ -74,7 +74,7 @@ Isolate_Metadata :: struct {
 	io_peer_address:       Peer_Address,
 	inbox_head:            u32,
 	inbox_tail:            u32,
-	pending_correlation:   u32,
+	pending_correlation:   Correlation_Id,
 	io_fd:                 FD_Handle,
 	io_result:             i32,
 	pending_transfer_read: Transfer_Handle,
@@ -107,6 +107,9 @@ Shard_Counters :: struct {
 	handoff_exhaustions:       u64,
 	handoff_timeouts:          u64,
 	handoff_rejects:           u64,
+	handoff_control_send_failures:    u64,
+	handoff_control_retry_exhaustions: u64,
+	handoff_control_retry_drops:      u64,
 }
 
 Dynamic_Child_Spec :: struct {
@@ -171,7 +174,10 @@ Shard :: struct {
 	current_tick:           u64, // The current time quantized to the resolution
 	timer_resolution_ns:    u64, // E.g., 1_000_000 for 1ms ticks
 	heartbeat_tick:         u64,
-	next_correlation_id:    u32,
+	next_correlation_id:    Correlation_Id,
+	handoff_retry_head:     u32,
+	handoff_retry_tail:     u32,
+	handoff_retry_count:    u32,
 	current_msg_slot:       u32,
 	current_slot_index:     u32,
 	id:                     Shard_Id,
@@ -239,6 +245,8 @@ scheduler_tick :: proc(shard: ^Shard) {
 					}
 				}
 			}
+
+			_fd_handoff_close_all_entries(shard, true)
 		case .Kill:
 			os_trap_restore(&shard.trap_environment_outer, RECOVERY_SOFT_KILL)
 		}
@@ -364,7 +372,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 				message: Message
 				message_pointer: ^Message = nil
-				correlation: u32 = 0
+				correlation: Correlation_Id = CORRELATION_ID_NONE
 				envelope_flags: Envelope_Flags = {}
 
 				is_io_completion := false
@@ -373,6 +381,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 				// Dispatch Priority: I/O > Shutdown > Inbox (ADR §6.13.4)
 				if io_completions[slot] != IO_TAG_NONE {
 					message.tag = io_completions[slot]
+					message.correlation = CORRELATION_ID_NONE
 					message.io.result = io_results[slot]
 					message.io.fd = io_fds[slot]
 					message.io.buffer_index = io_buffer_indices[slot]
@@ -383,6 +392,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 					buffer_to_free = io_buffer_indices[slot]
 				} else if .Shutdown_Pending in flags[slot] {
 					message.tag = TAG_SHUTDOWN
+					message.correlation = CORRELATION_ID_NONE
 					message.user.source = HANDLE_NONE
 					message.user.payload_size = 0
 
@@ -397,6 +407,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 					shard.current_msg_slot = dequeue_result.pool_index
 					if shard.current_msg_slot != POOL_NONE_INDEX {
 						message = dequeue_result.message
+						message.correlation = dequeue_result.correlation
 						correlation = dequeue_result.correlation
 						envelope_flags = dequeue_result.flags
 						message_pointer = &message
@@ -494,6 +505,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// Step 4: Flush I/O submissions
 	// ========================================================================
 	reactor_flush_submissions(&shard.reactor, shard)
+	_fd_handoff_retry_scan(shard)
 	_fd_handoff_timeout_scan(shard, now)
 
 	// ========================================================================
@@ -771,7 +783,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 @(private = "package")
 Dequeue_Result :: struct {
 	pool_index:   u32,
-	correlation:  u32,
+	correlation:  Correlation_Id,
 	message:      Message,
 	flags:        Envelope_Flags,
 }
@@ -826,12 +838,183 @@ _fd_handoff_close_entry :: proc "contextless" (shard: ^Shard, ref: FD_Handoff_Re
 }
 
 @(private = "file")
+FD_Handoff_Control_Send :: enum u8 {
+	Sent,
+	Deferred,
+	Failed,
+}
+
+@(private = "file")
+_fd_handoff_retry_enqueue :: proc "contextless" (
+	shard: ^Shard,
+	envelope: ^Message_Envelope,
+) -> bool {
+	retry_pool_index, pool_error := pool_alloc_system(&shard.message_pool)
+	if pool_error != .None {
+		return false
+	}
+
+	retry_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, retry_pool_index)
+	retry_envelope^ = envelope^
+	retry_envelope.next_in_mailbox = POOL_NONE_INDEX
+
+	if shard.handoff_retry_head == POOL_NONE_INDEX {
+		shard.handoff_retry_head = retry_pool_index
+	} else {
+		tail_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+			&shard.message_pool,
+			shard.handoff_retry_tail,
+		)
+		tail_envelope.next_in_mailbox = retry_pool_index
+	}
+
+	shard.handoff_retry_tail = retry_pool_index
+	shard.handoff_retry_count += 1
+	return true
+}
+
+@(private = "file")
+_fd_handoff_retry_scan :: proc "contextless" (shard: ^Shard) {
+	retry_pool_index := shard.handoff_retry_head
+	previous_pool_index: u32 = POOL_NONE_INDEX
+
+	for retry_pool_index != POOL_NONE_INDEX {
+		retry_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+			&shard.message_pool,
+			retry_pool_index,
+		)
+		next_pool_index := retry_envelope.next_in_mailbox
+
+		route_result := _route_envelope_system(shard, retry_envelope.destination, retry_envelope)
+		should_keep_retry := route_result == .mailbox_full || route_result == .pool_exhausted
+
+		if should_keep_retry {
+			previous_pool_index = retry_pool_index
+		} else {
+			if route_result != .ok {
+				shard.counters.handoff_control_retry_drops += 1
+			}
+
+			if previous_pool_index == POOL_NONE_INDEX {
+				shard.handoff_retry_head = next_pool_index
+			} else {
+				previous_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+					&shard.message_pool,
+					previous_pool_index,
+				)
+				previous_envelope.next_in_mailbox = next_pool_index
+			}
+
+			if shard.handoff_retry_tail == retry_pool_index {
+				shard.handoff_retry_tail = previous_pool_index
+			}
+
+			pool_free_unchecked(&shard.message_pool, retry_pool_index)
+			shard.handoff_retry_count -= 1
+		}
+
+		retry_pool_index = next_pool_index
+	}
+
+	if shard.handoff_retry_head == POOL_NONE_INDEX {
+		shard.handoff_retry_tail = POOL_NONE_INDEX
+	}
+}
+
+@(private = "file")
+_fd_handoff_send_or_defer :: proc "contextless" (
+	shard: ^Shard,
+	envelope: ^Message_Envelope,
+) -> FD_Handoff_Control_Send {
+	route_result := _route_envelope_system(shard, envelope.destination, envelope)
+	if route_result == .ok {
+		return .Sent
+	}
+
+	shard.counters.handoff_control_send_failures += 1
+	if route_result != .mailbox_full && route_result != .pool_exhausted {
+		return .Failed
+	}
+
+	if _fd_handoff_retry_enqueue(shard, envelope) {
+		return .Deferred
+	}
+
+	shard.counters.handoff_control_retry_exhaustions += 1
+	return .Failed
+}
+
+@(private = "file")
+_fd_handoff_send_abort :: proc "contextless" (
+	shard: ^Shard,
+	destination: Handle,
+	ref: FD_Handoff_Ref,
+	os_fd: OS_FD,
+) -> FD_Handoff_Control_Send {
+	env: Message_Envelope
+	env.source = HANDLE_NONE
+	env.destination = destination
+	env.tag = TAG_FD_HANDOFF_ABORT
+	env.payload_size = u16(size_of(FD_Handoff_Abort))
+	(cast(^FD_Handoff_Abort)&env.payload[0])^ = FD_Handoff_Abort {
+		handoff = ref,
+		os_fd   = os_fd,
+	}
+	return _fd_handoff_send_or_defer(shard, &env)
+}
+
+@(private = "file")
+_fd_handoff_close_entries_for_target_shard :: proc "contextless" (
+	shard: ^Shard,
+	target_shard: Shard_Id,
+	send_abort: bool,
+) {
+	for handoff_index in 0 ..< int(shard.handoff_table.entry_count) {
+		entry := &shard.handoff_table.entries[handoff_index]
+		if entry.state != .In_Flight {
+			continue
+		}
+		if extract_shard_id(entry.target_handle) != target_shard {
+			continue
+		}
+
+		ref := fd_handoff_ref_make(u16(handoff_index), entry.generation, shard.id)
+		target_handle := entry.target_handle
+		if send_abort {
+			if _fd_handoff_send_abort(shard, target_handle, ref, entry.cleanup_fd) == .Sent {
+				entry.cleanup_fd = OS_FD_INVALID
+			}
+		}
+		_ = _fd_handoff_close_entry(shard, ref)
+	}
+}
+
+@(private = "package")
+_fd_handoff_close_all_entries :: proc "contextless" (shard: ^Shard, send_abort: bool) {
+	for handoff_index in 0 ..< int(shard.handoff_table.entry_count) {
+		entry := &shard.handoff_table.entries[handoff_index]
+		if entry.state != .In_Flight {
+			continue
+		}
+
+		ref := fd_handoff_ref_make(u16(handoff_index), entry.generation, shard.id)
+		target_handle := entry.target_handle
+		if send_abort {
+			if _fd_handoff_send_abort(shard, target_handle, ref, entry.cleanup_fd) == .Sent {
+				entry.cleanup_fd = OS_FD_INVALID
+			}
+		}
+		_ = _fd_handoff_close_entry(shard, ref)
+	}
+}
+
+@(private = "file")
 _fd_handoff_send_ack :: proc "contextless" (
 	shard: ^Shard,
 	destination: Handle,
 	source: Handle,
 	ref: FD_Handoff_Ref,
-) {
+) -> FD_Handoff_Control_Send {
 	env: Message_Envelope
 	env.source = source
 	env.destination = destination
@@ -840,7 +1023,7 @@ _fd_handoff_send_ack :: proc "contextless" (
 	(cast(^FD_Handoff_Ack)&env.payload[0])^ = FD_Handoff_Ack {
 		handoff = ref,
 	}
-	_ = _route_envelope_system(shard, destination, &env)
+	return _fd_handoff_send_or_defer(shard, &env)
 }
 
 @(private = "file")
@@ -850,7 +1033,7 @@ _fd_handoff_send_reject :: proc "contextless" (
 	source: Handle,
 	ref: FD_Handoff_Ref,
 	reason: FD_Handoff_Reject_Reason,
-) {
+) -> FD_Handoff_Control_Send {
 	env: Message_Envelope
 	env.source = source
 	env.destination = destination
@@ -860,7 +1043,7 @@ _fd_handoff_send_reject :: proc "contextless" (
 		handoff = ref,
 		reason  = reason,
 	}
-	_ = _route_envelope_system(shard, destination, &env)
+	return _fd_handoff_send_or_defer(shard, &env)
 }
 
 @(private = "file")
@@ -899,6 +1082,39 @@ _inject_fd_handoff_accept :: proc "contextless" (
 }
 
 @(private = "file")
+_clear_fd_handoff_accept :: proc "contextless" (
+	shard: ^Shard,
+	target: Handle,
+	fd: FD_Handle,
+) {
+	type_id := extract_type_id(target)
+	if int(type_id) >= len(shard.metadata) {
+		return
+	}
+
+	soa_meta := shard.metadata[type_id]
+	slot := extract_slot(target)
+	if int(slot) >= len(soa_meta) {
+		return
+	}
+	if soa_meta[slot].generation != extract_generation(target) {
+		return
+	}
+	if soa_meta[slot].io_completion_tag != IO_TAG_ACCEPT_COMPLETE {
+		return
+	}
+	if soa_meta[slot].io_fd != fd {
+		return
+	}
+
+	soa_meta[slot].io_completion_tag = IO_TAG_NONE
+	soa_meta[slot].io_result = 0
+	soa_meta[slot].io_fd = FD_HANDLE_NONE
+	soa_meta[slot].io_buffer_index = BUFFER_INDEX_NONE
+	soa_meta[slot].io_peer_address = Peer_Address{}
+}
+
+@(private = "file")
 _process_fd_handoff_offer :: proc "contextless" (shard: ^Shard, envelope: ^Message_Envelope) {
 	if envelope.payload_size < u16(size_of(FD_Handoff_Offer)) {
 		return
@@ -912,7 +1128,7 @@ _process_fd_handoff_offer :: proc "contextless" (shard: ^Shard, envelope: ^Messa
 		offer.peer_address,
 	)
 	if adopt_reason != .None {
-		_fd_handoff_send_reject(
+		_ = _fd_handoff_send_reject(
 			shard,
 			envelope.source,
 			envelope.destination,
@@ -930,7 +1146,7 @@ _process_fd_handoff_offer :: proc "contextless" (shard: ^Shard, envelope: ^Messa
 	)
 	if inject_reason != .None {
 		reactor_internal_close_fd(&shard.reactor, adopted_fd)
-		_fd_handoff_send_reject(
+		_ = _fd_handoff_send_reject(
 			shard,
 			envelope.source,
 			envelope.destination,
@@ -940,7 +1156,18 @@ _process_fd_handoff_offer :: proc "contextless" (shard: ^Shard, envelope: ^Messa
 		return
 	}
 
-	_fd_handoff_send_ack(shard, envelope.source, envelope.destination, offer.handoff)
+	ack_send := _fd_handoff_send_ack(shard, envelope.source, envelope.destination, offer.handoff)
+	if ack_send == .Failed {
+		_clear_fd_handoff_accept(shard, envelope.destination, adopted_fd)
+		reactor_internal_close_fd(&shard.reactor, adopted_fd)
+		_ = _fd_handoff_send_reject(
+			shard,
+			envelope.source,
+			envelope.destination,
+			offer.handoff,
+			.Adopt_Failed,
+		)
+	}
 }
 
 @(private = "file")
@@ -960,6 +1187,31 @@ _process_fd_handoff_reject :: proc "contextless" (shard: ^Shard, envelope: ^Mess
 	reject := (cast(^FD_Handoff_Reject)&envelope.payload[0])^
 	if _fd_handoff_close_entry(shard, reject.handoff) {
 		shard.counters.handoff_rejects += 1
+	}
+}
+
+@(private = "file")
+_process_fd_handoff_abort :: proc "contextless" (shard: ^Shard, envelope: ^Message_Envelope) {
+	if envelope.payload_size < u16(size_of(FD_Handoff_Abort)) {
+		return
+	}
+	abort := (cast(^FD_Handoff_Abort)&envelope.payload[0])^
+	
+	type_id := extract_type_id(envelope.destination)
+	if int(type_id) < len(shard.metadata) {
+		soa_meta := shard.metadata[type_id]
+		slot := extract_slot(envelope.destination)
+		if int(slot) < len(soa_meta) && soa_meta[slot].generation == extract_generation(envelope.destination) {
+			if soa_meta[slot].io_completion_tag == IO_TAG_ACCEPT_COMPLETE {
+				fd := soa_meta[slot].io_fd
+				_clear_fd_handoff_accept(shard, envelope.destination, fd)
+				reactor_internal_close_fd(&shard.reactor, fd)
+			}
+		}
+	}
+	
+	if abort.os_fd != OS_FD_INVALID {
+		_ = backend_control_close(&shard.reactor.backend, abort.os_fd)
 	}
 }
 
@@ -990,6 +1242,9 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		(cast(^u32)slot_pointer)^ = shard.message_pool.free_head
 		shard.message_pool.free_head = u32(i)
 	}
+	shard.handoff_retry_head = POOL_NONE_INDEX
+	shard.handoff_retry_tail = POOL_NONE_INDEX
+	shard.handoff_retry_count = 0
 
 	reactor_buffer_pool_reset(&shard.transfer_pool)
 	for i in 0 ..< shard.transfer_pool.slot_count {
@@ -1112,6 +1367,7 @@ _process_inbound_envelope :: #force_inline proc "contextless" (
 		} else if envelope.tag == TAG_SHARD_QUARANTINED {
 			// Peer died, quarantine it
 			shard_mask_exclude(&shard.peer_alive_mask, source_shard)
+			_fd_handoff_close_entries_for_target_shard(shard, source_shard, false)
 			// NOTE: Same concern as above if-block. Pending calls will naturally time out.
 		}
 		return
@@ -1124,6 +1380,8 @@ _process_inbound_envelope :: #force_inline proc "contextless" (
 		_process_fd_handoff_ack(shard, envelope)
 	case TAG_FD_HANDOFF_REJECT:
 		_process_fd_handoff_reject(shard, envelope)
+	case TAG_FD_HANDOFF_ABORT:
+		_process_fd_handoff_abort(shard, envelope)
 	case:
 		_ = _enqueue_user_msg(shard, envelope.destination, envelope)
 	}
@@ -1136,6 +1394,9 @@ _init_handoff_test_shard :: proc(
 	handoff_backing: []FD_Handoff_Entry,
 ) {
 	shard.id = 0
+	shard.handoff_retry_head = POOL_NONE_INDEX
+	shard.handoff_retry_tail = POOL_NONE_INDEX
+	shard.handoff_retry_count = 0
 	fd_handoff_table_init(&shard.handoff_table, handoff_backing)
 	backend_config := Backend_Config {
 		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
@@ -1165,6 +1426,175 @@ _alloc_handoff_test_entry :: proc(
 	)
 	testing.expect(t, ok, "handoff entry should allocate")
 	return ref
+}
+
+@(test)
+test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+
+	shard.id = 1
+	shard.handoff_retry_head = POOL_NONE_INDEX
+	shard.handoff_retry_tail = POOL_NONE_INDEX
+	shard.handoff_retry_count = 0
+	shard_mask_include(&shard.peer_alive_mask, 0)
+
+	msg_pool_backing: [MESSAGE_ENVELOPE_SIZE * 4]u8
+	pool_init(&shard.message_pool, msg_pool_backing[:], MESSAGE_ENVELOPE_SIZE)
+
+	when TINA_SIMULATION_MODE {
+		defer free_all(context.temp_allocator)
+
+		ring_sizes := make([][]u32, 2, context.temp_allocator)
+		ring_sizes[0] = make([]u32, 2, context.temp_allocator)
+		ring_sizes[1] = make([]u32, 2, context.temp_allocator)
+		ring_sizes[0][1] = 1
+		ring_sizes[1][0] = 1
+
+		drop_prng: Prng
+		prng_init(&drop_prng, 0xD10D)
+
+		network: SimulatedNetwork
+		sim_network_init(&network, 2, ring_sizes, &drop_prng, context.temp_allocator)
+
+		fault_config := FaultConfig{}
+		shard.sim_state.network = &network
+		shard.sim_state.fault_config = &fault_config
+
+		prefill_envelope := Message_Envelope {source = make_handle(1, 1, 0, 1), destination = HANDLE_NONE}
+		prefill_result := sim_network_enqueue(
+			&network,
+			shard,
+			0,
+			prefill_envelope,
+			0,
+			shard.sim_state.fault_config,
+		)
+		testing.expect_value(t, prefill_result, Send_Result.ok)
+	} else {
+		ring_backing: [1]Message_Envelope
+		ring: SPSC_Ring
+		spsc_ring_init(&ring, 1, ring_backing[:])
+
+		prefill_envelope := Message_Envelope{source = make_handle(1, 1, 0, 1), destination = make_handle(0, 1, 0, 1)}
+		testing.expect_value(t, spsc_ring_enqueue(&ring, &prefill_envelope), Enqueue_Result.Success)
+
+		outbound_rings: [2]^SPSC_Ring
+		outbound_rings[0] = &ring
+		shard.outbound_rings = outbound_rings[:]
+	}
+
+	ack_send := _fd_handoff_send_ack(
+		shard,
+		make_handle(0, 1, 0, 1),
+		make_handle(1, 1, 0, 1),
+		FD_HANDOFF_REF_NONE,
+	)
+
+	testing.expect_value(t, ack_send, FD_Handoff_Control_Send.Deferred)
+	testing.expect_value(t, shard.handoff_retry_count, u32(1))
+	testing.expect_value(t, shard.counters.handoff_control_send_failures, u64(1))
+
+	when TINA_SIMULATION_MODE {
+		target_shard := Shard {id = 0}
+		target_shard.sim_state.network = shard.sim_state.network
+		target_shard.sim_state.fault_config = shard.sim_state.fault_config
+		sim_network_drain(shard.sim_state.network, &target_shard, shard.id, 0)
+	} else {
+		outbound_ring := shard.outbound_rings[0]
+		spsc_ring_flush_producer(outbound_ring)
+		available_to_read := spsc_ring_available_to_read(outbound_ring)
+		spsc_ring_commit_read(outbound_ring, available_to_read)
+	}
+
+	_fd_handoff_retry_scan(shard)
+	testing.expect_value(t, shard.handoff_retry_count, u32(0))
+	testing.expect_value(t, shard.handoff_retry_head, u32(POOL_NONE_INDEX))
+	testing.expect_value(t, shard.handoff_retry_tail, u32(POOL_NONE_INDEX))
+	testing.expect_value(t, shard.counters.handoff_control_retry_drops, u64(0))
+}
+
+@(test)
+test_fd_handoff_retry_scan_drops_unroutable_control_messages :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+
+	shard.id = 0
+	shard.handoff_retry_head = POOL_NONE_INDEX
+	shard.handoff_retry_tail = POOL_NONE_INDEX
+	shard.handoff_retry_count = 0
+
+	msg_pool_backing: [MESSAGE_ENVELOPE_SIZE * 2]u8
+	pool_init(&shard.message_pool, msg_pool_backing[:], MESSAGE_ENVELOPE_SIZE)
+
+	retry_envelope := Message_Envelope {
+		source = make_handle(0, 1, 0, 1),
+		destination = make_handle(1, 1, 0, 1),
+		tag = TAG_FD_HANDOFF_REJECT,
+		payload_size = u16(size_of(FD_Handoff_Reject)),
+	}
+
+	testing.expect(
+		t,
+		_fd_handoff_retry_enqueue(shard, &retry_envelope),
+		"retry enqueue should succeed for unroutable test envelope",
+	)
+	testing.expect_value(t, shard.handoff_retry_count, u32(1))
+
+	_fd_handoff_retry_scan(shard)
+	testing.expect_value(t, shard.handoff_retry_count, u32(0))
+	testing.expect_value(t, shard.handoff_retry_head, u32(POOL_NONE_INDEX))
+	testing.expect_value(t, shard.handoff_retry_tail, u32(POOL_NONE_INDEX))
+	testing.expect_value(t, shard.counters.handoff_control_retry_drops, u64(1))
+}
+
+@(test)
+test_fd_handoff_peer_quarantine_closes_entries_targeting_that_shard :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+	handoff_backing: [4]FD_Handoff_Entry
+	_init_handoff_test_shard(t, shard, handoff_backing[:])
+	defer backend_deinit(&shard.reactor.backend)
+
+	ref_target_1_a := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 0, 1), 100)
+	ref_target_1_b := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 1, 1), 100)
+	ref_target_2 := _alloc_handoff_test_entry(t, shard, make_handle(2, 1, 0, 1), 100)
+
+	quarantine_envelope := Message_Envelope {
+		source = HANDLE_NONE,
+		destination = HANDLE_NONE,
+		tag = TAG_SHARD_QUARANTINED,
+	}
+	_process_inbound_envelope(shard, 1, &quarantine_envelope)
+
+	_, found_target_1_a := fd_handoff_table_lookup(&shard.handoff_table, ref_target_1_a)
+	_, found_target_1_b := fd_handoff_table_lookup(&shard.handoff_table, ref_target_1_b)
+	_, found_target_2 := fd_handoff_table_lookup(&shard.handoff_table, ref_target_2)
+
+	testing.expect(t, !found_target_1_a, "quarantined target shard entries should be reclaimed")
+	testing.expect(t, !found_target_1_b, "all quarantined target shard entries should be reclaimed")
+	testing.expect(t, found_target_2, "entries to healthy shards must remain in flight")
+}
+
+@(test)
+test_fd_handoff_close_all_entries_reclaims_all_in_flight_entries :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+	handoff_backing: [4]FD_Handoff_Entry
+	_init_handoff_test_shard(t, shard, handoff_backing[:])
+	defer backend_deinit(&shard.reactor.backend)
+
+	ref_a := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 0, 1), 100)
+	ref_b := _alloc_handoff_test_entry(t, shard, make_handle(2, 1, 0, 1), 100)
+
+	_fd_handoff_close_all_entries(shard, false)
+
+	_, found_a := fd_handoff_table_lookup(&shard.handoff_table, ref_a)
+	_, found_b := fd_handoff_table_lookup(&shard.handoff_table, ref_b)
+
+	testing.expect(t, !found_a, "close_all should reclaim first in-flight entry")
+	testing.expect(t, !found_b, "close_all should reclaim second in-flight entry")
+	testing.expect_value(t, shard.handoff_table.free_count, shard.handoff_table.entry_count)
 }
 
 @(test)

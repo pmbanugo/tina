@@ -14,6 +14,7 @@ TAG_SHARD_QUARANTINED: Message_Tag : 0x0006
 TAG_FD_HANDOFF_OFFER: Message_Tag : 0x0007
 TAG_FD_HANDOFF_ACK: Message_Tag : 0x0008
 TAG_FD_HANDOFF_REJECT: Message_Tag : 0x0009
+TAG_FD_HANDOFF_ABORT: Message_Tag : 0x000A
 // Application message tags can start from here (0x0040 - 0xFFFF)
 USER_MESSAGE_TAG_BASE: Message_Tag : 0x0040
 
@@ -41,7 +42,8 @@ Message :: struct {
 			buffer_index: u16, // 2 bytes — reactor buffer pool index
 		},
 	},
-	tag:        Message_Tag,
+	tag:         Message_Tag,
+	correlation: Correlation_Id,
 }
 
 // 128 bytes exactly. Fields ordered largest-to-smallest to eliminate implicit padding.
@@ -51,7 +53,7 @@ Message_Envelope :: struct #align (128) {
 		next_free_slot: u32, // DEAD STATE: Intrusive pool free-list linkage
 	},
 	destination:      Handle,
-	correlation:      u32,
+	correlation:      Correlation_Id,
 	next_in_mailbox:  u32, // (The queue linkage, overwrites index)
 	tag:              Message_Tag,
 	flags:            Envelope_Flags,

@@ -6,7 +6,7 @@ TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256
 Timer_Entry :: struct {
 	deliver_at:  u64,
 	next:        u32,
-	correlation: u32,
+	correlation: Correlation_Id,
 	target:      Handle,
 	tag:         Message_Tag,
 }
@@ -76,7 +76,33 @@ ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag
 	}
 	// Convert nanoseconds to ticks
 	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
-	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, ctx.self_handle, tag, 0)
+	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, ctx.self_handle, tag, CORRELATION_ID_NONE)
+}
+
+// Registers a timer with an explicit correlation token so the receiver can
+// reject stale lazy-cancelled expirations in O(1).
+ctx_register_timer_with_correlation :: proc(
+	ctx: ^TinaContext,
+	duration_ns: u64,
+	tag: Message_Tag,
+	correlation: Correlation_Id,
+) {
+	shard := _ctx_extract_shard(ctx)
+	wheel := &shard.timer_wheel
+	if wheel.free_head == POOL_NONE_INDEX {
+		_shard_log(
+			_ctx_extract_shard(ctx),
+			ctx.self_handle,
+			.ERROR,
+			USER_LOG_TAG_BASE,
+			transmute([]u8)string("Timer pool exhausted"),
+		)
+		return
+	}
+
+	// Convert nanoseconds to ticks.
+	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
+	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, ctx.self_handle, tag, correlation)
 }
 
 @(private = "package")
@@ -85,7 +111,7 @@ _register_system_timer :: proc(
 	target: Handle,
 	delay_ticks: u64,
 	tag: Message_Tag,
-	correlation: u32,
+	correlation: Correlation_Id,
 ) {
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
@@ -100,7 +126,7 @@ _timer_wheel_insert :: #force_inline proc "contextless" (
 	deliver_at: u64,
 	target: Handle,
 	tag: Message_Tag,
-	correlation: u32,
+	correlation: Correlation_Id,
 ) {
 	index := wheel.free_head
 	wheel.free_head = wheel.entries[index].next

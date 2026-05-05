@@ -1,5 +1,6 @@
 package http_server
 
+import "core:bytes"
 import "core:mem"
 import "core:testing"
 
@@ -43,6 +44,240 @@ retain_pipeline_tail :: #force_inline proc "contextless" (
 	return source_size, false
 }
 
+@(private = "package")
+Body_Drain_Result :: struct {
+	consumed_size:  int,
+	data_offset:    int,
+	data_size:      int,
+	done:           bool,
+	need_more:      bool,
+	protocol_error: bool,
+	body_too_large: bool,
+}
+
+@(private = "package")
+drain_request_body :: proc "contextless" (
+	parser: ^Parser_State,
+	network: []u8,
+	destination: []u8,
+	destination_size: ^u32,
+	body_size_received: ^u64,
+	body_size_max: u32,
+	limits: Limits,
+	buffered: bool,
+) -> Body_Drain_Result {
+	result: Body_Drain_Result
+
+	#partial switch parser.phase {
+	case .Body_Fixed:
+		return _drain_body_payload(
+			parser,
+			network,
+			destination,
+			destination_size,
+			body_size_received,
+			body_size_max,
+			buffered,
+			fixed_length = true,
+		)
+
+	case .Chunk_Size:
+		parsed_size := parser.chunk_size_parsed
+		for index in 0 ..< len(network) {
+			byte_value := network[index]
+			if is_hex_digit_byte(byte_value) {
+				if (parsed_size >> 60) != 0 {
+					result.protocol_error = true
+					return result
+				}
+				parsed_size = (parsed_size << 4) | hex_digit_value(byte_value)
+				continue
+			}
+			if byte_value != '\r' {
+				result.protocol_error = true
+				return result
+			}
+			if index + 1 >= len(network) {
+				parser.chunk_size_parsed = parsed_size
+				result.consumed_size = index
+				result.need_more = true
+				return result
+			}
+			if network[index + 1] != '\n' {
+				result.protocol_error = true
+				return result
+			}
+			parser.chunk_size_remaining = parsed_size
+			parser.chunk_size_parsed = 0
+			parser.phase = .Trailers if parsed_size == 0 else .Chunk_Data
+			result.consumed_size = index + 2
+			return result
+		}
+		parser.chunk_size_parsed = parsed_size
+		result.consumed_size = len(network)
+		result.need_more = true
+		return result
+
+	case .Chunk_Data:
+		return _drain_body_payload(
+			parser,
+			network,
+			destination,
+			destination_size,
+			body_size_received,
+			body_size_max,
+			buffered,
+			fixed_length = false,
+		)
+
+	case .Chunk_Data_CRLF:
+		if len(network) == 0 {
+			result.need_more = true
+			return result
+		}
+		if network[0] != '\r' {
+			result.protocol_error = true
+			return result
+		}
+		if len(network) == 1 {
+			result.need_more = true
+			return result
+		}
+		if network[1] != '\n' {
+			result.protocol_error = true
+			return result
+		}
+		parser.phase = .Chunk_Size
+		result.consumed_size = 2
+		return result
+
+	case .Trailers:
+		cursor := 0
+		for {
+			if cursor >= len(network) {
+				result.consumed_size = cursor
+				result.need_more = true
+				return result
+			}
+			view := network[cursor:]
+			if len(view) == 1 && view[0] == '\r' {
+				result.consumed_size = cursor
+				result.need_more = true
+				return result
+			}
+			if len(view) >= 2 && view[0] == '\r' && view[1] == '\n' {
+				parser.phase = .Complete
+				result.consumed_size = cursor + 2
+				result.done = true
+				return result
+			}
+
+			line_end := bytes.index_byte(view, '\r')
+			if line_end < 0 {
+				if int(parser.header_size) + len(view) > int(limits.header_size_max) {
+					result.protocol_error = true
+					return result
+				}
+				result.consumed_size = cursor
+				result.need_more = true
+				return result
+			}
+			if line_end + 1 >= len(view) {
+				result.consumed_size = cursor
+				result.need_more = true
+				return result
+			}
+			if view[line_end + 1] != '\n' {
+				result.protocol_error = true
+				return result
+			}
+
+			line_size := line_end + 2
+			if int(parser.header_size) + line_size > int(limits.header_size_max) {
+				result.protocol_error = true
+				return result
+			}
+			if int(parser.header_count) >= int(limits.header_count_max) {
+				result.protocol_error = true
+				return result
+			}
+			parser.header_size += u16(line_size)
+			parser.header_count += 1
+			cursor += line_size
+		}
+
+	case .Complete:
+		result.done = true
+		return result
+
+	case:
+		result.protocol_error = true
+		return result
+	}
+}
+
+@(private = "file")
+_drain_body_payload :: proc "contextless" (
+	parser: ^Parser_State,
+	network: []u8,
+	destination: []u8,
+	destination_size: ^u32,
+	body_size_received: ^u64,
+	body_size_max: u32,
+	buffered: bool,
+	fixed_length: bool,
+) -> Body_Drain_Result {
+	result: Body_Drain_Result
+	remaining_size := parser.body_size_remaining if fixed_length else parser.chunk_size_remaining
+	if remaining_size == 0 {
+		parser.phase = .Complete if fixed_length else .Chunk_Data_CRLF
+		result.done = fixed_length
+		return result
+	}
+
+	available_size := min(len(network), int(remaining_size))
+	if available_size == 0 {
+		result.need_more = true
+		return result
+	}
+
+	next_body_size_received := body_size_received^ + u64(available_size)
+	if next_body_size_received > u64(body_size_max) {
+		result.body_too_large = true
+		return result
+	}
+
+	if buffered {
+		next_destination_size := int(destination_size^) + available_size
+		if next_destination_size > len(destination) {
+			result.body_too_large = true
+			return result
+		}
+		copy(destination[int(destination_size^):][:available_size], network[:available_size])
+		destination_size^ = u32(next_destination_size)
+	} else {
+		result.data_size = available_size
+	}
+
+	body_size_received^ = next_body_size_received
+	result.consumed_size = available_size
+
+	if fixed_length {
+		parser.body_size_remaining -= u64(available_size)
+		if parser.body_size_remaining == 0 {
+			parser.phase = .Complete
+			result.done = true
+		}
+		return result
+	}
+
+	parser.chunk_size_remaining -= u64(available_size)
+	if parser.chunk_size_remaining == 0 {
+		parser.phase = .Chunk_Data_CRLF
+	}
+	return result
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -53,7 +288,7 @@ test_drain_buffered_body :: proc(t: ^testing.T) {
 
 	// Test partial drain (budget < network)
 	destination_small := make([]u8, 4)
-	defer delete(destination_small)
+	defer mem.delete(destination_small)
 	copied_small := drain_buffered_body(network_data, destination_small)
 	testing.expect_value(t, copied_small, 4)
 	testing.expect_value(t, destination_small[0], 1)
@@ -61,7 +296,7 @@ test_drain_buffered_body :: proc(t: ^testing.T) {
 
 	// Test full drain (budget > network)
 	destination_large := make([]u8, 10)
-	defer delete(destination_large)
+	defer mem.delete(destination_large)
 	copied_large := drain_buffered_body(network_data, destination_large)
 	testing.expect_value(t, copied_large, 8)
 	testing.expect_value(t, destination_large[7], 8)
@@ -75,7 +310,7 @@ test_retain_pipeline_tail :: proc(t: ^testing.T) {
 
 	// Budget is large enough
 	pipeline_region := make([]u8, 64)
-	defer delete(pipeline_region)
+	defer mem.delete(pipeline_region)
 
 	retained_size, budget_exceeded := retain_pipeline_tail(unconsumed, pipeline_region)
 	testing.expect_value(t, budget_exceeded, false)
@@ -84,9 +319,115 @@ test_retain_pipeline_tail :: proc(t: ^testing.T) {
 
 	// Budget is too small
 	small_region := make([]u8, 4)
-	defer delete(small_region)
+	defer mem.delete(small_region)
 
 	retained_size_small, budget_exceeded_small := retain_pipeline_tail(unconsumed, small_region)
 	testing.expect_value(t, budget_exceeded_small, true)
 	testing.expect_value(t, retained_size_small, 0)
+}
+
+@(test)
+test_drain_request_body_fixed_buffered :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Body_Fixed,
+		body_size_remaining = 5,
+	}
+	destination := make([]u8, 8)
+	defer mem.delete(destination)
+	destination_size: u32
+	body_size_received: u64
+	result := drain_request_body(
+		&parser,
+		transmute([]u8)string("hello"),
+		destination,
+		&destination_size,
+		&body_size_received,
+		5,
+		DEFAULT_LIMITS,
+		true,
+	)
+
+	testing.expect_value(t, result.protocol_error, false)
+	testing.expect_value(t, result.body_too_large, false)
+	testing.expect_value(t, result.done, true)
+	testing.expect_value(t, parser.phase, Parse_Phase.Complete)
+	testing.expect_value(t, destination_size, u32(5))
+	testing.expect_value(t, string(destination[:int(destination_size)]), "hello")
+}
+
+@(test)
+test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size_line := drain_request_body(
+		&parser,
+		transmute([]u8)string("4\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_LIMITS,
+		false,
+	)
+	testing.expect_value(t, size_line.protocol_error, false)
+	testing.expect_value(t, size_line.consumed_size, 3)
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
+
+	payload := drain_request_body(
+		&parser,
+		transmute([]u8)string("Wiki"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_LIMITS,
+		false,
+	)
+	testing.expect_value(t, payload.protocol_error, false)
+	testing.expect_value(t, payload.data_size, 4)
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data_CRLF)
+
+	chunk_data_end := drain_request_body(
+		&parser,
+		transmute([]u8)string("\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_LIMITS,
+		false,
+	)
+	testing.expect_value(t, chunk_data_end.protocol_error, false)
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Size)
+
+	zero_line := drain_request_body(
+		&parser,
+		transmute([]u8)string("0\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_LIMITS,
+		false,
+	)
+	testing.expect_value(t, zero_line.protocol_error, false)
+	testing.expect_value(t, parser.phase, Parse_Phase.Trailers)
+
+	trailers_end := drain_request_body(
+		&parser,
+		transmute([]u8)string("\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_LIMITS,
+		false,
+	)
+	testing.expect_value(t, trailers_end.protocol_error, false)
+	testing.expect_value(t, trailers_end.done, true)
+	testing.expect_value(t, parser.phase, Parse_Phase.Complete)
 }

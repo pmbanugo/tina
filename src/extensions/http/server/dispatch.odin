@@ -55,9 +55,29 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 	}
 
 	descriptor := runtime.router.descriptors[state.request.route_index]
-	if descriptor.body_mode != .None {
-		// The vertical slice only wires the zero-body `Request_Handler` path.
+	if descriptor.body_mode != .None && _known_body_size_exceeds_limit(state, descriptor) {
+		state.response.flags += {.Close_After_Send}
+		return _normalize_route_step(respond_text(response, HTTP_STATUS_CONTENT_TOO_LARGE, "Content Too Large"))
+	}
+	route_context := _make_route_context(state, request.tina_context)
+	route_state := _route_state_ptr(state)
+	if descriptor.handler_kind == .Event {
+		if descriptor.body_mode == .Buffered && state.parser.phase != .Complete {
+			return .Read_Body
+		}
+		handler := cast(Route_Event_Handler)descriptor.handler
+		step := handler(Route_Event(Request_Start{}), request, response, route_context, route_state)
+		return _normalize_route_step(
+			step,
+			allow_read_body = descriptor.body_mode == .Streamed,
+			allow_expect_application = true,
+		)
+	}
+	if descriptor.body_mode == .Streamed {
 		return .Close
+	}
+	if descriptor.body_mode == .Buffered && state.parser.phase != .Complete {
+		return .Read_Body
 	}
 
 	handler := cast(Request_Handler)descriptor.handler
@@ -65,13 +85,85 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 	return _normalize_route_step(step)
 }
 
+@(private = "package")
+_dispatch_route_event :: proc(
+	event: Route_Event,
+	request: ^Request,
+	response: ^Response,
+	route_context: Route_Context,
+	state: rawptr,
+) -> Route_Step {
+	state_connection := request.connection_state
+	runtime := state_connection.shard_runtime
+	if state_connection == nil || runtime == nil || runtime.router == nil {
+		return .Close
+	}
+	if state_connection.request.route_index == ROUTE_INDEX_NONE {
+		return .Close
+	}
+
+	descriptor := runtime.router.descriptors[state_connection.request.route_index]
+	if descriptor.handler_kind != .Event {
+		return .Close
+	}
+
+	handler := cast(Route_Event_Handler)descriptor.handler
+	step := handler(event, request, response, route_context, state)
+	return _normalize_route_step(
+		step,
+		allow_read_body = descriptor.body_mode == .Streamed,
+		allow_expect_application = true,
+	)
+}
+
 @(private = "file")
-_normalize_route_step :: #force_inline proc "contextless" (step: Route_Step) -> Route_Step {
+_normalize_route_step :: #force_inline proc "contextless" (
+	step: Route_Step,
+	allow_read_body: bool = false,
+	allow_expect_application: bool = false,
+) -> Route_Step {
 	#partial switch step {
 	case .Flush, .Flush_Final, .Close:
 		return step
+	case .Read_Body:
+		if allow_read_body {
+			return step
+		}
+		return .Close
+	case .Expect_Application:
+		if allow_expect_application {
+			return step
+		}
+		return .Close
 	case:
 		return .Close
+	}
+}
+
+@(private = "file")
+_known_body_size_exceeds_limit :: proc "contextless" (
+	state: ^HTTP_Connection_State,
+	descriptor: Route_Descriptor,
+) -> bool {
+	if state.parser.phase != .Body_Fixed {
+		return false
+	}
+	return state.parser.body_size_remaining > u64(descriptor.body_size_max)
+}
+
+@(private = "package")
+_route_state_ptr :: proc "contextless" (state: ^HTTP_Connection_State) -> rawptr {
+	if len(state.route_state_bytes) == 0 {
+		return nil
+	}
+	return raw_data(state.route_state_bytes)
+}
+
+@(private = "package")
+_make_route_context :: proc "contextless" (state: ^HTTP_Connection_State, ctx: ^tina.TinaContext) -> Route_Context {
+	return Route_Context {
+		connection_state = state,
+		tina_context     = ctx,
 	}
 }
 

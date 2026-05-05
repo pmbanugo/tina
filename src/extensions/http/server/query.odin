@@ -1,6 +1,7 @@
 package http_server
 
 import "core:bytes"
+import "core:mem"
 import "core:testing"
 
 // A single decoded `key=value` slice from a URL query string.
@@ -172,7 +173,7 @@ parse_query :: #force_inline proc "contextless" (query_string: string, target_pa
 @(test)
 test_percent_decode :: proc(t: ^testing.T) {
 	target := make([]u8, 32)
-	defer delete(target)
+	defer mem.delete(target)
 
 	// No decoding needed
 	decoded_size, ok := percent_decode(target, "hello")
@@ -200,7 +201,7 @@ test_percent_decode :: proc(t: ^testing.T) {
 @(test)
 test_parse_query :: proc(t: ^testing.T) {
 	pairs := make([]Query_Pair, 4)
-	defer delete(pairs)
+	defer mem.delete(pairs)
 
 	pair_count, ok := parse_query("foo=bar&baz=qux&empty=&no_val", pairs)
 	testing.expect_value(t, ok, true)

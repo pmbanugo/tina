@@ -307,6 +307,12 @@ FD_Handoff_Reject :: struct {
 }
 
 @(private = "package")
+FD_Handoff_Abort :: struct {
+	handoff: FD_Handoff_Ref,
+	os_fd:   OS_FD,
+}
+
+@(private = "package")
 FD_Handoff_Entry :: struct {
 	target_handle:   Handle,
 	peer_address:    Peer_Address,
@@ -330,6 +336,7 @@ FD_Handoff_Table :: struct {
 #assert(size_of(FD_Handoff_Offer) <= MAX_PAYLOAD_SIZE)
 #assert(size_of(FD_Handoff_Ack) <= MAX_PAYLOAD_SIZE)
 #assert(size_of(FD_Handoff_Reject) <= MAX_PAYLOAD_SIZE)
+#assert(size_of(FD_Handoff_Abort) <= MAX_PAYLOAD_SIZE)
 
 @(private = "package")
 fd_handoff_ref_make :: #force_inline proc "contextless" (

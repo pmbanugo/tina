@@ -74,6 +74,10 @@ Spawn_Result :: union {
 	Handle,
 	Spawn_Error,
 }
+
+Correlation_Id :: distinct u32
+
+CORRELATION_ID_NONE :: Correlation_Id(0)
 Restart_Type :: enum u8 {
 	permanent,
 	transient,
@@ -131,7 +135,7 @@ TinaContext :: struct {
 	// Memory surfaces (initialized per handler invocation by the scheduler)
 	working_arena:          mem.Arena,
 	scratch_arena:          mem.Arena,
-	current_correlation:    u32,
+	current_correlation:    Correlation_Id,
 	flags:                  Context_Flags,
 	_padding:               [3]u8,
 }
