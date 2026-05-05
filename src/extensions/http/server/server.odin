@@ -114,6 +114,7 @@ Connection_Phase :: enum u8 {
 // its own slot index.
 @(private = "package")
 HTTP_Shard_Runtime :: struct {
+	server:               Server,
 	router:               ^Compiled_Router,
 	date_cache:           Date_Cache,
 	next_request_token:   Request_Token, // monotonic across the shard
@@ -122,6 +123,7 @@ HTTP_Shard_Runtime :: struct {
 	idle_count:           Idle_Array_Count,
 	free_count:           u16, // free connection slots (dropped on spawn, restored on close)
 	connection_slot_count: u16, // hard cap for cross-checking spawn / eviction
+	accept_backoff_ns:     u64,
 }
 
 
@@ -135,6 +137,7 @@ HTTP_Shard_Runtime :: struct {
 HTTP_Listener :: struct {
 	listen_fd:     tina.FD_Handle,
 	shard_runtime: ^HTTP_Shard_Runtime,
+	accept_backoff_ns: u64,
 }
 
 // One per shard, only instantiated in multi-shard `Coordinator` mode.
@@ -173,6 +176,8 @@ HTTP_Connection_State :: struct {
 	parser:                     Parser_State,
 	response:                   Response_State,
 	request:                    Request_State,
+	header_views:                []Header_View,
+	response_header_bytes:       []u8,
 
 	// --- Cold: read only by `peer_address(request)` helper ---
 	peer:                       tina.Peer_Address,
@@ -201,7 +206,9 @@ HTTP_Connection :: struct {
 
 @(private = "package")
 HTTP_Listener_Init_Args :: struct {
-	shard_runtime: ^HTTP_Shard_Runtime,
+	server:               ^Server,
+	router:               ^Compiled_Router,
+	connection_slot_count: u16,
 }
 
 @(private = "package")
@@ -341,6 +348,17 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 		"timer_resolution_ns must be <= 1 s (Date cache lower bound)",
 	)
 
+	// Compile the route table once at boot and keep it alive for the lifetime
+	// of the system spec.
+	router_value, router_error, router_error_index := compile_router(server.app.routes, context.allocator)
+	assert(
+		router_error == .None,
+		fmt.tprintf("install_into_system_spec: route compilation failed at index %d with %v", router_error_index, router_error),
+	)
+	router_storage := make([]Compiled_Router, 1, context.allocator)
+	router_storage[0] = router_value
+	router := &router_storage[0]
+
 	// --- Derive memory budgets ---
 	working_memory_size := _compute_working_memory_size(server)
 	scratch_requirement := _compute_scratch_requirement(server)
@@ -354,6 +372,13 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	// --- Append HTTP TypeDescriptors ---
 	include_dispatcher := spec.shard_count > 1 && server.distribution == .Coordinator
 	http_type_count := 2 + (include_dispatcher ? 1 : 0)
+
+	listener_init_args := HTTP_Listener_Init_Args {
+		server                = server,
+		router                = router,
+		connection_slot_count = u16(connection_slot_count),
+	}
+	listener_args_payload, listener_args_size := tina.init_args_of(&listener_init_args)
 
 	new_types := make(
 		[]tina.TypeDescriptor,
@@ -372,13 +397,16 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 		id                      = listener_type_id,
 		slot_count              = 1,
 		stride                  = size_of(HTTP_Listener),
-		soa_metadata_size       = size_of(tina.Isolate_Metadata),
-		working_memory_size     = _listener_working_memory_size(int(connection_slot_count)),
-		scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
-		mailbox_capacity        = 16,
-		init_handler            = _http_listener_init,
-		handler_fn              = _http_listener_handler,
-	}
+			soa_metadata_size       = size_of(tina.Isolate_Metadata),
+			working_memory_size     = _listener_working_memory_size(int(connection_slot_count)),
+			scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
+			mailbox_capacity        = 16,
+			// The listener bootstraps the shard-local runtime and drives accept.
+			// Its init args carry the immutable boot-time config.
+			// The runtime lives in the listener's working arena.
+			init_handler            = _http_listener_init,
+			handler_fn              = _http_listener_handler,
+		}
 
 	new_types[connection_type_id] = tina.TypeDescriptor {
 		id                      = connection_type_id,
@@ -418,6 +446,8 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 			dispatcher_type_id,
 			include_dispatcher,
 			u16(connection_slot_count),
+			listener_args_payload,
+			listener_args_size,
 		)
 	}
 }
@@ -713,6 +743,8 @@ _attach_http_children :: proc(
 	dispatcher_type_id: u8,
 	include_dispatcher: bool,
 	connection_slot_count: u16,
+	listener_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
+	listener_args_size: u8,
 ) {
 	root := &shard_spec.root_group
 
@@ -729,6 +761,8 @@ _attach_http_children :: proc(
 		listener_type_id,
 		dispatcher_type_id,
 		include_dispatcher,
+		listener_args_payload,
+		listener_args_size,
 	)
 	root.children = new_static
 }
@@ -739,6 +773,8 @@ _append_static_children :: proc(
 	listener_type_id: u8,
 	dispatcher_type_id: u8,
 	include_dispatcher: bool,
+	listener_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
+	listener_args_size: u8,
 ) -> []tina.Child_Spec {
 	added := 1 + (include_dispatcher ? 1 : 0)
 	new_children := make([]tina.Child_Spec, len(existing) + added, context.allocator)
@@ -747,6 +783,8 @@ _append_static_children :: proc(
 	new_children[len(existing)] = tina.Static_Child_Spec {
 		type_id      = listener_type_id,
 		restart_type = .permanent,
+		args_size    = listener_args_size,
+		args_payload = listener_args_payload,
 	}
 
 	if include_dispatcher {
@@ -758,59 +796,6 @@ _append_static_children :: proc(
 
 	return new_children
 }
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Phase 6 stub init/handler procs
-//
-// Real recv/parse/dispatch/send wiring lives in Phase 7+. These stubs satisfy
-// the TypeDescriptor contract so install() produces a SystemSpec that
-// validates and boots; each Isolate parks immediately.
-// ═══════════════════════════════════════════════════════════════════════════
-
-@(private = "file")
-_http_listener_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
-	return tina.Effect_Receive{}
-}
-
-@(private = "file")
-_http_listener_handler :: proc(
-	self: rawptr,
-	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
-) -> tina.Effect {
-	return tina.Effect_Receive{}
-}
-
-@(private = "file")
-_http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
-	return tina.Effect_Receive{}
-}
-
-@(private = "file")
-_http_dispatcher_handler :: proc(
-	self: rawptr,
-	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
-) -> tina.Effect {
-	return tina.Effect_Receive{}
-}
-
-@(private = "file")
-_http_connection_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
-	return tina.Effect_Receive{}
-}
-
-@(private = "file")
-_http_connection_handler :: proc(
-	self: rawptr,
-	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
-) -> tina.Effect {
-	return tina.Effect_Receive{}
-}
-
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════

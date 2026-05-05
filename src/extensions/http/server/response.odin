@@ -536,6 +536,186 @@ serialize_response_headers :: proc "contextless" (
 	return
 }
 
+// ─── Response Facade Helpers ────────────────────────────────────────────────
+
+@(private = "file")
+_response_state :: #force_inline proc "contextless" (response: ^Response) -> ^Response_State {
+	return &response.connection_state.response
+}
+
+@(private = "file")
+_response_preserve_flags :: proc "contextless" (state: ^Response_State) {
+	head_suppressed := state.mode == .Head_Suppressed
+	close_after_send := .Close_After_Send in state.flags
+	in_drain := .In_Drain in state.flags
+	response_state_reset(state)
+	if head_suppressed {
+		state.mode = .Head_Suppressed
+	}
+	if close_after_send {
+		state.flags += {.Close_After_Send}
+	}
+	if in_drain {
+		state.flags += {.In_Drain}
+	}
+}
+
+status :: #force_inline proc "contextless" (response: ^Response, code: HTTP_Status) {
+	state := _response_state(response)
+	state.status_code = code
+	if code == HTTP_STATUS_NO_CONTENT || code == HTTP_STATUS_NOT_MODIFIED || code == HTTP_STATUS_CONTINUE {
+		state.mode = .Head_Suppressed
+	}
+}
+
+@(private = "package")
+header_set :: #force_inline proc "contextless" (response: ^Response, name: string, value: string) -> bool {
+	return response_header_set(
+		_response_state(response),
+		response.response_header_bytes,
+		transmute([]u8)name,
+		transmute([]u8)value,
+	)
+}
+
+@(private = "package")
+header_add :: #force_inline proc "contextless" (response: ^Response, name: string, value: string) -> bool {
+	return response_header_add(
+		_response_state(response),
+		response.response_header_bytes,
+		transmute([]u8)name,
+		transmute([]u8)value,
+	)
+}
+
+@(private = "package")
+respond_text :: #force_inline proc "contextless" (response: ^Response, status_code: HTTP_Status, body: string) -> Route_Step {
+	return _respond_bytes(response, status_code, "text/plain; charset=utf-8", transmute([]u8)body)
+}
+
+@(private = "package")
+respond_json :: #force_inline proc "contextless" (response: ^Response, status_code: HTTP_Status, body: string) -> Route_Step {
+	return _respond_bytes(response, status_code, "application/json", transmute([]u8)body)
+}
+
+@(private = "package")
+respond_bytes :: #force_inline proc "contextless" (
+	response: ^Response,
+	status_code: HTTP_Status,
+	content_type: string,
+	body: []u8,
+) -> Route_Step {
+	return _respond_bytes(response, status_code, content_type, body)
+}
+
+begin_stream :: #force_inline proc "contextless" (response: ^Response, status_code: HTTP_Status, content_type: string) {
+	state := _response_state(response)
+	_response_preserve_flags(state)
+	state.status_code = status_code
+	state.mode = .Chunked
+	state.body_size_total = 0
+	state.body_size_sent = 0
+	state.egress_size = Egress_Size(0)
+	state.egress_size_sent = Egress_Size_Sent(0)
+	_ = header_set(response, "content-type", content_type)
+}
+
+begin_fixed_stream :: #force_inline proc "contextless" (
+	response: ^Response,
+	status_code: HTTP_Status,
+	content_type: string,
+	total_size: u64,
+) {
+	state := _response_state(response)
+	_response_preserve_flags(state)
+	state.status_code = status_code
+	if state.mode != .Head_Suppressed {
+		state.mode = .Fixed_Length
+	}
+	state.body_size_total = total_size
+	state.body_size_sent = 0
+	state.egress_size = Egress_Size(0)
+	state.egress_size_sent = Egress_Size_Sent(0)
+	_ = header_set(response, "Content-Type", content_type)
+}
+
+write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
+	state := _response_state(response)
+	if state.mode == .Head_Suppressed {
+		return u16(len(data))
+	}
+
+	cursor := int(state.egress_size)
+	remaining := len(response.egress_buffer) - cursor
+	if remaining <= 0 do return 0
+	copy_size := min(len(data), remaining)
+	if copy_size > 0 {
+		copy(response.egress_buffer[cursor:], data[:copy_size])
+		state.egress_size = Egress_Size(cursor + copy_size)
+	}
+	if copy_size < len(data) {
+		state.flags += {.Backpressured}
+	}
+	return u16(copy_size)
+}
+
+flush :: proc(final: bool = false) -> Route_Step {
+	return .Flush_Final if final else .Flush
+}
+
+close :: proc() -> Route_Step { return .Close }
+
+@(private = "file")
+_respond_bytes :: proc "contextless" (
+	response: ^Response,
+	status_code: HTTP_Status,
+	content_type: string,
+	body: []u8,
+) -> Route_Step {
+	state := _response_state(response)
+	_response_preserve_flags(state)
+	state.status_code = status_code
+	state.body_size_total = u64(len(body))
+	state.body_size_sent = 0
+	if state.mode != .Head_Suppressed {
+		state.mode = .Fixed_Length
+	}
+	state.egress_size = Egress_Size(0)
+	state.egress_size_sent = Egress_Size_Sent(0)
+	_ = header_set(response, "Content-Type", content_type)
+
+	size, ok := serialize_response_headers(
+		response.egress_buffer,
+		state,
+		response.response_header_bytes,
+		nil,
+	)
+	if !ok {
+		copy(response.egress_buffer[:], ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR)
+		state.flags += {.Aborted, .Close_After_Send}
+		state.mode = .Closed
+		state.egress_size = Egress_Size(len(ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR))
+		return .Flush_Final
+	}
+
+	if state.mode != .Head_Suppressed {
+		body_size := len(body)
+		if int(size) + body_size > len(response.egress_buffer) {
+			copy(response.egress_buffer[:], ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR)
+			state.flags += {.Aborted, .Close_After_Send}
+			state.mode = .Closed
+			state.egress_size = Egress_Size(len(ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR))
+			return .Flush_Final
+		}
+		copy(response.egress_buffer[int(size):], body)
+		state.egress_size = Egress_Size(int(size) + body_size)
+	} else {
+		state.egress_size = size
+	}
+	state.flags += {.Headers_Committed}
+	return .Flush_Final
+}
+
 @(private = "file")
 _write_bytes_into :: #force_inline proc "contextless" (
 	destination: []u8,

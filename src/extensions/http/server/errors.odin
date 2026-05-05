@@ -27,6 +27,12 @@ import "core:testing"
 ERROR_RESPONSE_400_BAD_REQUEST :: "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request"
 
 @(private = "package")
+ERROR_RESPONSE_404_NOT_FOUND :: "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found"
+
+@(private = "package")
+ERROR_RESPONSE_405_METHOD_NOT_ALLOWED :: "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\nConnection: close\r\n\r\nMethod Not Allowed"
+
+@(private = "package")
 ERROR_RESPONSE_408_REQUEST_TIMEOUT :: "HTTP/1.1 408 Request Timeout\r\nContent-Length: 15\r\nConnection: close\r\n\r\nRequest Timeout"
 
 @(private = "package")
@@ -140,8 +146,10 @@ test_error_response_well_formed_500 :: proc(t: ^testing.T) {
 
 @(test)
 test_error_response_all_have_close :: proc(t: ^testing.T) {
-	all_responses := [?]string {
+ all_responses := [?]string {
 		ERROR_RESPONSE_400_BAD_REQUEST,
+		ERROR_RESPONSE_404_NOT_FOUND,
+		ERROR_RESPONSE_405_METHOD_NOT_ALLOWED,
 		ERROR_RESPONSE_408_REQUEST_TIMEOUT,
 		ERROR_RESPONSE_413_CONTENT_TOO_LARGE,
 		ERROR_RESPONSE_414_URI_TOO_LONG,

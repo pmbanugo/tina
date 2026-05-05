@@ -1,5 +1,7 @@
 package http_server
 
+import tina "../../.."
+
 // ─── Route Step ─────────────────────────────────────────────────────────────
 //
 // Small instruction returned by route handlers telling the library what
@@ -12,6 +14,29 @@ Route_Step :: enum u8 {
 	Read_Body,
 	Close,
 	Expect_Application,
+}
+
+// Simple request handler used by the Phase 7 vertical slice.
+Request_Handler :: #type proc(request: ^Request, response: ^Response) -> Route_Step
+
+// Opaque request facade passed to handlers. Fields stay package-private so the
+// request lifetime and backing storage remain under library control.
+@(private = "package")
+Request :: struct {
+	connection_state: ^HTTP_Connection_State,
+	request_state:    ^Request_State,
+	frame:            []u8,
+	header_views:     []Header_View,
+	tina_context:     ^tina.TinaContext,
+}
+
+// Opaque response facade passed to handlers. It owns the staged header bytes
+// slice and the connection-local egress buffer view.
+@(private = "package")
+Response :: struct {
+	connection_state:    ^HTTP_Connection_State,
+	egress_buffer:       []u8,
+	response_header_bytes: []u8,
 }
 
 // Per-route opt-in for request body acquisition. Selected at registration time;
@@ -41,6 +66,18 @@ Route :: struct {
 	methods_mask:  Method_Mask,
 	body_mode:     Route_Body_Mode,
 	state_size:    u16,
+}
+
+// Convenience builder for the common GET route case.
+get :: proc(pattern: string, handler: Request_Handler) -> Route {
+	return Route {
+		handler       = rawptr(handler),
+		pattern       = pattern,
+		methods_mask  = {.GET},
+		body_mode     = .None,
+		body_size_max = 0,
+		state_size    = 0,
+	}
 }
 
 // Compiled, immutable per-route record stored in `Compiled_Router.descriptors`
