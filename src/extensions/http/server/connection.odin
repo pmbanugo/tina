@@ -347,7 +347,7 @@ _connection_handle_send_complete :: proc(connection: ^HTTP_Connection, bytes_sen
 		return _connection_drive_sendfile(connection, ctx)
 	}
 
-	if state.shard_runtime != nil && state.shard_runtime.router != nil && state.request.route_index != ROUTE_INDEX_NONE {
+	if state.shard_runtime != nil && state.request.route_index != ROUTE_INDEX_NONE {
 		descriptor := state.shard_runtime.router.descriptors[state.request.route_index]
 		if state.response.status_code == HTTP_STATUS_CONTINUE {
 			_response_prepare_next_message(&state.response)
@@ -471,7 +471,7 @@ _connection_continue_after_non_final_flush :: proc(connection: ^HTTP_Connection,
 	state.response.egress_size = 0
 	state.response.egress_size_sent = 0
 
-	if state.shard_runtime != nil && state.shard_runtime.router != nil && state.request.route_index != ROUTE_INDEX_NONE {
+	if state.shard_runtime != nil && state.request.route_index != ROUTE_INDEX_NONE {
 		descriptor := state.shard_runtime.router.descriptors[state.request.route_index]
 		if descriptor.handler_kind == .Event {
 			request := _connection_make_request(connection, nil, ctx)
@@ -510,15 +510,13 @@ _connection_make_request :: proc(connection: ^HTTP_Connection, frame: []u8, ctx:
 	}
 	return Request {
 		connection_state = &connection.connection_state,
-		request_state    = &connection.connection_state.request,
-		frame            = request_frame,
-		header_views     = connection.connection_state.header_views,
 		tina_context     = ctx,
+		frame            = request_frame,
 	}
 }
 
-@(private = "file")
-_connection_date_value :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> []u8 {
+@(private = "package")
+_connection_date_value :: proc "contextless" (connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> []u8 {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil || ctx == nil || ctx._shard == nil {
@@ -540,10 +538,8 @@ _connection_date_value :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaCont
 @(private = "file")
 _connection_make_response :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext = nil) -> Response {
 	return Response {
-		connection_state    = &connection.connection_state,
-		egress_buffer       = connection.egress_buffer[:],
-		response_header_bytes = connection.connection_state.response_header_bytes,
-		date_value          = _connection_date_value(connection, ctx),
+		connection   = connection,
+		tina_context = ctx,
 	}
 }
 
@@ -596,7 +592,7 @@ _connection_pending_application_message_take :: proc(
 _connection_dispatch_server_drain :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
-	if runtime == nil || runtime.router == nil || state.request.route_index == ROUTE_INDEX_NONE {
+	if runtime == nil || state.request.route_index == ROUTE_INDEX_NONE {
 		return tina.Effect_Receive{}
 	}
 
@@ -616,7 +612,7 @@ _connection_dispatch_server_drain :: proc(connection: ^HTTP_Connection, ctx: ^ti
 _connection_dispatch_peer_closed :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
-	if runtime != nil && runtime.router != nil && state.request.route_index != ROUTE_INDEX_NONE {
+	if runtime != nil && state.request.route_index != ROUTE_INDEX_NONE {
 		descriptor := runtime.router.descriptors[state.request.route_index]
 		if descriptor.handler_kind == .Event {
 			request := _connection_make_request(connection, nil, ctx)
@@ -644,7 +640,7 @@ _connection_handle_application_mailbox_message :: proc(
 ) -> tina.Effect {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
-	if state.state != .Application_Expectation || runtime == nil || runtime.router == nil {
+	if state.state != .Application_Expectation || runtime == nil {
 		return tina.Effect_Receive{}
 	}
 	if state.request.route_index == ROUTE_INDEX_NONE {
@@ -876,7 +872,7 @@ _connection_handle_body_recv_complete :: proc(
 _connection_drive_body_read :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
-	if runtime == nil || runtime.router == nil || state.request.route_index == ROUTE_INDEX_NONE {
+	if runtime == nil || state.request.route_index == ROUTE_INDEX_NONE {
 		state.state = .Closing
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 	}
@@ -939,104 +935,147 @@ _connection_process_body_bytes :: proc(
 ) -> tina.Effect {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
-	if runtime == nil || runtime.router == nil || state.request.route_index == ROUTE_INDEX_NONE {
+	if runtime == nil || state.request.route_index == ROUTE_INDEX_NONE {
 		state.state = .Closing
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 	}
 
 	descriptor := runtime.router.descriptors[state.request.route_index]
 	remaining_source := source
-	for {
-		if descriptor.body_mode == .Streamed && state.parser.phase == .Complete && !state.request_body_complete_notified {
-			if len(remaining_source) > 0 {
-				if !_connection_retain_tail(connection, remaining_source) {
-					state.response.flags += {.Close_After_Send}
+
+	if descriptor.body_mode == .Streamed {
+		for {
+			if state.parser.phase == .Complete && !state.request_body_complete_notified {
+				if len(remaining_source) > 0 {
+					if !_connection_retain_tail(connection, remaining_source) {
+						state.response.flags += {.Close_After_Send}
+					}
 				}
+				return _connection_drive_body_read(connection, ctx)
 			}
-			return _connection_drive_body_read(connection, ctx)
-		}
 
-		result := drain_request_body(
-			&state.parser,
-			remaining_source,
-			state.buffered_body_bytes,
-			&state.buffered_body_size,
-			&state.request_body_size_received,
-			descriptor.body_size_max,
-			runtime.server.limits,
-			buffered = descriptor.body_mode == .Buffered,
-		)
-
-		if result.protocol_error {
-			return _connection_send_parse_error(connection, .Error_Bad_Request)
-		}
-		if result.body_too_large {
-			state.response.flags += {.Close_After_Send, .Aborted}
-			return _connection_stage_canned_response(connection, transmute([]u8)string(ERROR_RESPONSE_413_CONTENT_TOO_LARGE))
-		}
-
-		next_source := remaining_source[result.consumed_size:]
-
-		if descriptor.body_mode == .Streamed && result.data_size > 0 {
-			request := _connection_make_request(connection, nil, ctx)
-			response := _connection_make_response(connection, ctx)
-			route_context := _make_route_context(state, ctx)
-			is_last := result.done && state.parser.phase == .Complete
-			if is_last {
-				state.request_body_complete_notified = true
-			}
-			step := _dispatch_route_event(
-				Route_Event(Body_Chunk {
-					data    = remaining_source[result.data_offset:][:result.data_size],
-					is_last = is_last,
-				}),
-				&request,
-				&response,
-				route_context,
-				_route_state_ptr(state),
+			result := drain_request_body(
+				&state.parser,
+				remaining_source,
+				state.buffered_body_bytes,
+				&state.buffered_body_size,
+				&state.request_body_size_received,
+				descriptor.body_size_max,
+				runtime.server.limits,
+				buffered = false,
 			)
-			if step != .Read_Body && !state.request_body_complete_notified {
-				state.response.flags += {.Close_After_Send}
+
+			if result.protocol_error {
+				return _connection_send_parse_error(connection, .Error_Bad_Request)
 			}
-			if step == .Read_Body {
-				remaining_source = next_source
-				if len(remaining_source) == 0 {
-					return _connection_drive_body_read(connection, ctx)
+			if result.body_too_large {
+				state.response.flags += {.Close_After_Send, .Aborted}
+				return _connection_stage_canned_response(connection, transmute([]u8)string(ERROR_RESPONSE_413_CONTENT_TOO_LARGE))
+			}
+
+			next_source := remaining_source[result.consumed_size:]
+
+			if result.data_size > 0 {
+				request := _connection_make_request(connection, nil, ctx)
+				response := _connection_make_response(connection, ctx)
+				route_context := _make_route_context(state, ctx)
+				is_last := result.done && state.parser.phase == .Complete
+				if is_last {
+					state.request_body_complete_notified = true
 				}
-				continue
-			}
-			if state.request_body_complete_notified && len(next_source) > 0 {
-				if !_connection_retain_tail(connection, next_source) {
+				step := _dispatch_route_event(
+					Route_Event(Body_Chunk {
+						data    = remaining_source[result.data_offset:][:result.data_size],
+						is_last = is_last,
+					}),
+					&request,
+					&response,
+					route_context,
+					_route_state_ptr(state),
+				)
+				if step != .Read_Body && !state.request_body_complete_notified {
 					state.response.flags += {.Close_After_Send}
 				}
-			}
-			return _dispatch_step(connection, step, ctx)
-		}
-
-		if descriptor.body_mode == .Buffered && result.done && state.parser.phase == .Complete {
-			if len(next_source) > 0 {
-				if !_connection_retain_tail(connection, next_source) {
-					state.response.flags += {.Close_After_Send}
+				if step == .Read_Body {
+					remaining_source = next_source
+					if len(remaining_source) == 0 {
+						return _connection_drive_body_read(connection, ctx)
+					}
+					continue
 				}
+				if state.request_body_complete_notified && len(next_source) > 0 {
+					if !_connection_retain_tail(connection, next_source) {
+						state.response.flags += {.Close_After_Send}
+					}
+				}
+				return _dispatch_step(connection, step, ctx)
 			}
-			return _connection_drive_body_read(connection, ctx)
-		}
 
-		if result.need_more {
-			if !_connection_retain_tail(connection, next_source) {
-				state.state = .Closing
-				return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+			if result.need_more {
+				if !_connection_retain_tail(connection, next_source) {
+					state.state = .Closing
+					return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+				}
+				return _connection_drive_body_read(connection, ctx)
 			}
-			return _connection_drive_body_read(connection, ctx)
-		}
 
-		if result.consumed_size <= 0 {
-			return _connection_drive_body_read(connection, ctx)
-		}
+			if result.consumed_size <= 0 {
+				return _connection_drive_body_read(connection, ctx)
+			}
 
-		remaining_source = next_source
-		if len(remaining_source) == 0 {
-			return _connection_drive_body_read(connection, ctx)
+			remaining_source = next_source
+			if len(remaining_source) == 0 {
+				return _connection_drive_body_read(connection, ctx)
+			}
+		}
+	} else {
+		for {
+			result := drain_request_body(
+				&state.parser,
+				remaining_source,
+				state.buffered_body_bytes,
+				&state.buffered_body_size,
+				&state.request_body_size_received,
+				descriptor.body_size_max,
+				runtime.server.limits,
+				buffered = true,
+			)
+
+			if result.protocol_error {
+				return _connection_send_parse_error(connection, .Error_Bad_Request)
+			}
+			if result.body_too_large {
+				state.response.flags += {.Close_After_Send, .Aborted}
+				return _connection_stage_canned_response(connection, transmute([]u8)string(ERROR_RESPONSE_413_CONTENT_TOO_LARGE))
+			}
+
+			next_source := remaining_source[result.consumed_size:]
+
+			if result.done && state.parser.phase == .Complete {
+				if len(next_source) > 0 {
+					if !_connection_retain_tail(connection, next_source) {
+						state.response.flags += {.Close_After_Send}
+					}
+				}
+				return _connection_drive_body_read(connection, ctx)
+			}
+
+			if result.need_more {
+				if !_connection_retain_tail(connection, next_source) {
+					state.state = .Closing
+					return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+				}
+				return _connection_drive_body_read(connection, ctx)
+			}
+
+			if result.consumed_size <= 0 {
+				return _connection_drive_body_read(connection, ctx)
+			}
+
+			remaining_source = next_source
+			if len(remaining_source) == 0 {
+				return _connection_drive_body_read(connection, ctx)
+			}
 		}
 	}
 }
@@ -1168,7 +1207,7 @@ test_stale_notification_on_keep_alive_connection_is_dropped :: proc(t: ^testing.
 				timeout_ms_send   = 1,
 			},
 		},
-		router = &router,
+		router = router,
 	}
 	connection := HTTP_Connection{}
 	connection.connection_state.shard_runtime = &runtime
@@ -1276,7 +1315,7 @@ test_pending_application_message_is_preserved_until_expectation :: proc(t: ^test
 				timeout_ms_send   = 1,
 			},
 		},
-		router = &router,
+		router = router,
 	}
 	connection := HTTP_Connection{}
 	connection.connection_state.shard_runtime = &runtime
@@ -1365,7 +1404,7 @@ test_pending_application_message_first_wins_when_multiple_arrive :: proc(t: ^tes
 				timeout_ms_send   = 1,
 			},
 		},
-		router = &router,
+		router = router,
 	}
 	connection := HTTP_Connection{}
 	connection.connection_state.shard_runtime = &runtime
@@ -1460,7 +1499,7 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 			},
 			graceful_drain_ms = 1,
 		},
-		router = &router,
+		router = router,
 	}
 
 	connection := HTTP_Connection{}
@@ -1545,7 +1584,7 @@ test_dispatch_step_flush_non_final_dispatches_send_ready_without_io :: proc(t: ^
 				timeout_ms_send   = 1,
 			},
 		},
-		router = &router,
+		router = router,
 		free_count = 8,
 		keepalive_reserve = 0,
 	}
@@ -1600,7 +1639,7 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 				timeout_ms_send   = 1,
 			},
 		},
-		router = &router,
+		router = router,
 		free_count = 8,
 		keepalive_reserve = 0,
 	}
@@ -1713,7 +1752,7 @@ test_send_complete_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.
 				timeout_ms_send   = 1,
 			},
 		},
-		router = &router,
+		router = router,
 	}
 
 	connection := HTTP_Connection{}
@@ -1770,7 +1809,7 @@ test_sendfile_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
 				timeout_ms_send   = 1,
 			},
 		},
-		router = &router,
+		router = router,
 	}
 
 	connection := HTTP_Connection{}
@@ -1823,7 +1862,7 @@ test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T)
 			limits   = DEFAULT_LIMITS,
 			timeouts = DEFAULT_TIMEOUTS,
 		},
-		router = &router,
+		router = router,
 	}
 
 	header_views_storage: [64]Header_View
@@ -1889,7 +1928,7 @@ test_finalize_flushed_response_processes_pipeline_tail_before_recv :: proc(t: ^t
 			limits   = DEFAULT_LIMITS,
 			timeouts = DEFAULT_TIMEOUTS,
 		},
-		router = &router,
+		router = router,
 		free_count = 4,
 		keepalive_reserve = 0,
 		connection_slot_count = 4,

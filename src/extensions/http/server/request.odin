@@ -77,28 +77,28 @@ request_state_reset :: #force_inline proc "contextless" (request: ^Request_State
 }
 
 method :: #force_inline proc "contextless" (request: ^Request) -> Method {
-	return request.request_state.method
+	return request.connection_state.request.method
 }
 
 target :: #force_inline proc "contextless" (request: ^Request) -> []u8 {
-	state := request.request_state
-	if state == nil || len(request.frame) == 0 || state.target_size == 0 {
+	state := request.connection_state.request
+	if request.connection_state == nil || len(request.frame) == 0 || state.target_size == 0 {
 		return nil
 	}
 	return request.frame[int(state.target_offset):][:int(state.target_size)]
 }
 
 path :: #force_inline proc "contextless" (request: ^Request) -> []u8 {
-	state := request.request_state
-	if state == nil || len(request.frame) == 0 || state.path_size == 0 {
+	state := request.connection_state.request
+	if request.connection_state == nil || len(request.frame) == 0 || state.path_size == 0 {
 		return nil
 	}
 	return request.frame[int(state.path_offset):][:int(state.path_size)]
 }
 
 query :: #force_inline proc "contextless" (request: ^Request) -> []u8 {
-	state := request.request_state
-	if state == nil || len(request.frame) == 0 || state.query_size == 0 {
+	state := request.connection_state.request
+	if request.connection_state == nil || len(request.frame) == 0 || state.query_size == 0 {
 		return nil
 	}
 	return request.frame[int(state.query_offset):][:int(state.query_size)]
@@ -109,7 +109,7 @@ body_buffered :: proc "contextless" (request: ^Request) -> []u8 {
 	if state == nil || state.buffered_body_size == 0 {
 		return nil
 	}
-	if state.request.route_index == ROUTE_INDEX_NONE || state.shard_runtime == nil || state.shard_runtime.router == nil {
+	if state.request.route_index == ROUTE_INDEX_NONE || state.shard_runtime == nil {
 		return nil
 	}
 	if state.shard_runtime.router.descriptors[state.request.route_index].body_mode != .Buffered {
@@ -124,7 +124,9 @@ header :: proc "contextless" (request: ^Request, name: string) -> []u8 {
 	}
 	name_bytes := transmute([]u8)name
 	target_hash := compute_header_hash(name_bytes)
-	for view in request.header_views[:int(request.request_state.header_count)] {
+	header_views := request.connection_state.header_views
+	header_count := int(request.connection_state.request.header_count)
+	for view in header_views[:header_count] {
 		if view.hash != target_hash {
 			continue
 		}
@@ -146,14 +148,14 @@ param :: proc "contextless" (request: ^Request, name: string) -> []u8 {
 		return nil
 	}
 	runtime := request.connection_state.shard_runtime
-	if runtime == nil || runtime.router == nil {
+	if runtime == nil {
 		return nil
 	}
 	if request.connection_state.request.route_index == ROUTE_INDEX_NONE {
 		return nil
 	}
 
-	router_entry, ok := _router_entry_for_route_index(runtime.router, request.connection_state.request.route_index)
+	router_entry, ok := _router_entry_for_route_index(&runtime.router, request.connection_state.request.route_index)
 	if !ok {
 		return nil
 	}
@@ -282,7 +284,7 @@ expects_continue :: #force_inline proc "contextless" (request: ^Request) -> bool
 }
 
 is_head :: #force_inline proc "contextless" (request: ^Request) -> bool {
-	return request.request_state.method == .HEAD
+	return request.connection_state.request.method == .HEAD
 }
 
 is_upgrade_requested :: #force_inline proc "contextless" (request: ^Request) -> bool {
@@ -457,14 +459,16 @@ test_request_state_reset_baseline :: proc(t: ^testing.T) {
 @(test)
 test_request_header_case_insensitive_lookup :: proc(t: ^testing.T) {
 	frame := transmute([]u8)string("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-	request_state := Request_State {header_count = 1}
 	views := [1]Header_View{
 		{name_offset = 16, value_offset = 22, hash = compute_header_hash(transmute([]u8)string("host")), name_size = 4, value_size = 11},
 	}
+	connection_state := HTTP_Connection_State{
+		request = Request_State{header_count = 1},
+		header_views = views[:],
+	}
 	request := Request {
-		request_state = &request_state,
-		frame         = frame,
-		header_views  = views[:],
+		connection_state = &connection_state,
+		frame            = frame,
 	}
 
 	value := header(&request, "HOST")
@@ -474,14 +478,16 @@ test_request_header_case_insensitive_lookup :: proc(t: ^testing.T) {
 @(test)
 test_request_header_trims_optional_whitespace :: proc(t: ^testing.T) {
 	frame := transmute([]u8)string("GET / HTTP/1.1\r\nX-Test:\t  value \t\r\n\r\n")
-	request_state := Request_State {header_count = 1}
 	views := [1]Header_View{
 		{name_offset = 16, value_offset = 24, hash = compute_header_hash(transmute([]u8)string("x-test")), name_size = 6, value_size = 9},
 	}
+	connection_state := HTTP_Connection_State{
+		request = Request_State{header_count = 1},
+		header_views = views[:],
+	}
 	request := Request {
-		request_state = &request_state,
-		frame         = frame,
-		header_views  = views[:],
+		connection_state = &connection_state,
+		frame            = frame,
 	}
 
 	value := header(&request, "x-test")
@@ -491,12 +497,14 @@ test_request_header_trims_optional_whitespace :: proc(t: ^testing.T) {
 @(test)
 test_query_value_finds_first_match :: proc(t: ^testing.T) {
 	frame := transmute([]u8)string("/users?id=42&mode=full&id=99")
-	request_state := Request_State {
-		query_offset = 7,
-		query_size   = 21,
+	connection_state := HTTP_Connection_State{
+		request = Request_State {
+			query_offset = 7,
+			query_size   = 21,
+		},
 	}
 	request := Request {
-		request_state = &request_state,
+		connection_state = &connection_state,
 		frame         = frame,
 	}
 
@@ -530,14 +538,13 @@ test_param_extracts_named_segment :: proc(t: ^testing.T) {
 	testing.expect_value(t, match_result.outcome, Match_Outcome.Found)
 	request_state.route_index = match_result.route_index
 
-	runtime := HTTP_Shard_Runtime {router = &router}
+	runtime := HTTP_Shard_Runtime {router = router}
 	connection_state := HTTP_Connection_State {
 		shard_runtime = &runtime,
 		request       = request_state,
 	}
 	request := Request {
 		connection_state = &connection_state,
-		request_state    = &connection_state.request,
 		frame            = path_bytes,
 	}
 
@@ -550,10 +557,9 @@ test_param_extracts_named_segment :: proc(t: ^testing.T) {
 @(test)
 test_is_upgrade_requested_reads_parser_flag :: proc(t: ^testing.T) {
 	connection_state := HTTP_Connection_State {}
-	request_state := Request_State {}
 	request := Request {
 		connection_state = &connection_state,
-		request_state    = &request_state,
+		frame            = nil,
 	}
 
 	testing.expect(t, !is_upgrade_requested(&request), "upgrade should be false when parser flag is unset")

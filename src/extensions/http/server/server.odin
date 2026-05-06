@@ -145,7 +145,7 @@ Application_Pending_Message :: struct {
 @(private = "package")
 HTTP_Shard_Runtime :: struct {
 	server:               Server_Runtime,
-	router:               ^Compiled_Router,
+	router:               Compiled_Router,
 	connection_type_id:    u8,
 	date_cache:           Date_Cache,
 	draining:             bool,
@@ -828,7 +828,7 @@ _make_shard_runtime :: proc(
 	runtime := &runtime_storage[0]
 	runtime^ = HTTP_Shard_Runtime {
 		server                = server^,
-		router                = router,
+		router                = router^,
 		connection_type_id    = connection_type_id,
 		keepalive_reserve     = server.keepalive_reserve_slots,
 		active_slot_indices   = active_slot_indices,

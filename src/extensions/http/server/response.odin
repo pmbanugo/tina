@@ -540,18 +540,18 @@ serialize_response_headers :: proc "contextless" (
 
 @(private = "file")
 _response_state :: #force_inline proc "contextless" (response: ^Response) -> ^Response_State {
-	return &response.connection_state.response
+	return &response.connection.connection_state.response
 }
 
 @(private = "file")
 _response_clear_sendfile_plan :: #force_inline proc "contextless" (response: ^Response) {
-	if response.connection_state == nil {
+	if response.connection == nil {
 		return
 	}
-	response.connection_state.sendfile_file_fd = tina.FD_HANDLE_NONE
-	response.connection_state.sendfile_offset = 0
-	response.connection_state.sendfile_size_remaining = 0
-	response.connection_state.sendfile_active = false
+	response.connection.connection_state.sendfile_file_fd = tina.FD_HANDLE_NONE
+	response.connection.connection_state.sendfile_offset = 0
+	response.connection.connection_state.sendfile_size_remaining = 0
+	response.connection.connection_state.sendfile_active = false
 }
 
 @(private = "file")
@@ -559,7 +559,7 @@ _response_stage_internal_server_error :: proc "contextless" (
 	response: ^Response,
 	state: ^Response_State,
 ) {
-	copy(response.egress_buffer[:], ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR)
+	copy(response.connection.egress_buffer[:], ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR)
 	state.flags += {.Aborted, .Close_After_Send}
 	state.mode = .Closed
 	state.egress_size = Egress_Size(len(ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR))
@@ -605,7 +605,7 @@ header_set :: #force_inline proc "contextless" (
 ) -> bool {
 	return response_header_set(
 		_response_state(response),
-		response.response_header_bytes,
+		response.connection.connection_state.response_header_bytes,
 		transmute([]u8)name,
 		transmute([]u8)value,
 	)
@@ -618,7 +618,7 @@ header_add :: #force_inline proc "contextless" (
 ) -> bool {
 	return response_header_add(
 		_response_state(response),
-		response.response_header_bytes,
+		response.connection.connection_state.response_header_bytes,
 		transmute([]u8)name,
 		transmute([]u8)value,
 	)
@@ -721,15 +721,15 @@ respond_file :: proc "contextless" (
 		return .Flush_Final
 	}
 
-	if response.connection_state == nil {
+	if response.connection == nil {
 		state.flags += {.Aborted, .Close_After_Send}
 		return .Flush_Final
 	}
 
-	response.connection_state.sendfile_file_fd = fd_file
-	response.connection_state.sendfile_offset = 0
-	response.connection_state.sendfile_size_remaining = file_size
-	response.connection_state.sendfile_active = true
+	response.connection.connection_state.sendfile_file_fd = fd_file
+	response.connection.connection_state.sendfile_offset = 0
+	response.connection.connection_state.sendfile_size_remaining = file_size
+	response.connection.connection_state.sendfile_active = true
 	return .Flush
 }
 
@@ -748,10 +748,10 @@ continue_100 :: proc "contextless" (response: ^Response) {
 	_response_clear_sendfile_plan(response)
 
 	size, ok := serialize_response_headers(
-		response.egress_buffer,
+		response.connection.egress_buffer[:],
 		state,
-		response.response_header_bytes,
-		response.date_value,
+		response.connection.connection_state.response_header_bytes,
+		_connection_date_value(response.connection, response.tina_context),
 	)
 	if !ok {
 		_response_stage_internal_server_error(response, state)
@@ -774,7 +774,7 @@ write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 	}
 
 	cursor := int(state.egress_size)
-	remaining := len(response.egress_buffer) - cursor
+	remaining := len(response.connection.egress_buffer) - cursor
 	if remaining <= 0 do return 0
 
 	if state.mode == .Chunked {
@@ -790,22 +790,22 @@ write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 			return 0
 		}
 
-		next_cursor, ok := _write_hex_u16(response.egress_buffer, cursor, admitted)
+		next_cursor, ok := _write_hex_u16(response.connection.egress_buffer[:], cursor, admitted)
 		if !ok do return 0
 		next_cursor, ok = _write_bytes_into(
-			response.egress_buffer,
+			response.connection.egress_buffer[:],
 			next_cursor,
 			transmute([]u8)string("\r\n"),
 		)
 		if !ok do return 0
 		next_cursor, ok = _write_bytes_into(
-			response.egress_buffer,
+			response.connection.egress_buffer[:],
 			next_cursor,
 			data[:int(admitted)],
 		)
 		if !ok do return 0
 		next_cursor, ok = _write_bytes_into(
-			response.egress_buffer,
+			response.connection.egress_buffer[:],
 			next_cursor,
 			transmute([]u8)string("\r\n"),
 		)
@@ -821,7 +821,7 @@ write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 
 	copy_size := min(len(data), remaining)
 	if copy_size > 0 {
-		copy(response.egress_buffer[cursor:], data[:copy_size])
+		copy(response.connection.egress_buffer[cursor:], data[:copy_size])
 		state.egress_size = Egress_Size(cursor + copy_size)
 		state.body_size_sent += u64(copy_size)
 	}
@@ -863,10 +863,10 @@ _response_commit_headers :: proc "contextless" (response: ^Response) -> bool {
 	}
 
 	size, ok := serialize_response_headers(
-		response.egress_buffer,
+		response.connection.egress_buffer[:],
 		state,
-		response.response_header_bytes,
-		response.date_value,
+		response.connection.connection_state.response_header_bytes,
+		_connection_date_value(response.connection, response.tina_context),
 	)
 	if !ok {
 		_response_stage_internal_server_error(response, state)
@@ -888,7 +888,7 @@ _response_prepare_flush :: proc "contextless" (response: ^Response, final: bool)
 
 	if final {
 		if state.mode == .Chunked {
-			if !_response_append_chunked_terminator(state, response.egress_buffer) {
+			if !_response_append_chunked_terminator(state, response.connection.egress_buffer[:]) {
 				state.flags += {.Aborted, .Close_After_Send}
 				return false
 			}
@@ -997,10 +997,10 @@ _respond_bytes :: proc "contextless" (
 	_ = header_set(response, "Content-Type", content_type)
 
 	size, ok := serialize_response_headers(
-		response.egress_buffer,
+		response.connection.egress_buffer[:],
 		state,
-		response.response_header_bytes,
-		response.date_value,
+		response.connection.connection_state.response_header_bytes,
+		_connection_date_value(response.connection, response.tina_context),
 	)
 	if !ok {
 		_response_stage_internal_server_error(response, state)
@@ -1009,11 +1009,11 @@ _respond_bytes :: proc "contextless" (
 
 	if state.mode != .Head_Suppressed {
 		body_size := len(body)
-		if int(size) + body_size > len(response.egress_buffer) {
+		if int(size) + body_size > len(response.connection.egress_buffer) {
 			_response_stage_internal_server_error(response, state)
 			return .Flush_Final
 		}
-		copy(response.egress_buffer[int(size):], body)
+		copy(response.connection.egress_buffer[int(size):], body)
 		state.egress_size = Egress_Size(int(size) + body_size)
 		state.body_size_sent = u64(body_size)
 	} else {
@@ -1661,10 +1661,10 @@ test_serialize_head_suppressed_emits_content_length :: proc(t: ^testing.T) {
 test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testing.T) {
 	connection: HTTP_Connection
 	response_header_storage: [256]u8
-	response := Response {
-		connection_state      = &connection.connection_state,
-		egress_buffer         = connection.egress_buffer[:],
-		response_header_bytes = response_header_storage[:],
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	response := Response{
+		connection         = &connection,
+		tina_context       = nil,
 	}
 
 	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
@@ -1673,13 +1673,13 @@ test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testi
 	testing.expect(t, .Headers_Committed in state.flags)
 	head_size := int(state.egress_size)
 	testing.expect(t, head_size > 0)
-	committed_head := string(response.egress_buffer[:head_size])
+	committed_head := string(response.connection.egress_buffer[:head_size])
 	testing.expect(t, strings.index(committed_head, "\r\nTransfer-Encoding: chunked\r\n") >= 0)
 
 	admitted := write_bytes(&response, transmute([]u8)string("hello"))
 	testing.expect_value(t, admitted, u16(5))
 
-	wire_chunk := string(response.egress_buffer[head_size:int(state.egress_size)])
+	wire_chunk := string(response.connection.egress_buffer[head_size:int(state.egress_size)])
 	testing.expect_value(t, wire_chunk, "5\r\nhello\r\n")
 }
 
@@ -1687,10 +1687,10 @@ test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testi
 test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing.T) {
 	connection: HTTP_Connection
 	response_header_storage: [256]u8
-	response := Response {
-		connection_state      = &connection.connection_state,
-		egress_buffer         = connection.egress_buffer[:],
-		response_header_bytes = response_header_storage[:],
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	response := Response{
+		connection         = &connection,
+		tina_context       = nil,
 	}
 
 	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
@@ -1703,7 +1703,7 @@ test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing
 	testing.expect(t, state.mode == .Closed)
 	testing.expect_value(
 		t,
-		string(response.egress_buffer[pre_flush_size:int(state.egress_size)]),
+		string(response.connection.egress_buffer[pre_flush_size:int(state.egress_size)]),
 		"0\r\n\r\n",
 	)
 }
@@ -1713,10 +1713,10 @@ test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) 
 	connection: HTTP_Connection
 	response_header_storage: [128]u8
 	connection.connection_state.response.mode = .Head_Suppressed
-	response := Response {
-		connection_state      = &connection.connection_state,
-		egress_buffer         = connection.egress_buffer[:],
-		response_header_bytes = response_header_storage[:],
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	response := Response{
+		connection         = &connection,
+		tina_context       = nil,
 	}
 
 	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
@@ -1733,10 +1733,10 @@ test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) 
 test_respond_file_sets_sendfile_plan_and_returns_flush :: proc(t: ^testing.T) {
 	connection: HTTP_Connection
 	response_header_storage: [256]u8
-	response := Response {
-		connection_state      = &connection.connection_state,
-		egress_buffer         = connection.egress_buffer[:],
-		response_header_bytes = response_header_storage[:],
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	response := Response{
+		connection         = &connection,
+		tina_context       = nil,
 	}
 
 	step := respond_file(&response, tina.FD_Handle(42), 8192, "application/octet-stream")

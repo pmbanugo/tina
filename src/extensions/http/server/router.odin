@@ -639,8 +639,8 @@ match_route :: proc(
 	method_known := .Unknown_Method not_in request.status_flags
 	path_size := u16(len(path_bytes))
 
-	for entry_index in 0 ..< int(router.static_count) {
-		if router.entries[entry_index].pattern_size != path_size do continue
+	for size, entry_index in router.entries.pattern_size[:int(router.static_count)] {
+		if size != path_size do continue
 
 		pattern_offset := router.entries[entry_index].pattern_offset
 		pattern_bytes := router.literal_buffer[int(pattern_offset):][:int(path_size)]

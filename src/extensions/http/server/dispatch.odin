@@ -10,7 +10,7 @@ HTTP_INTERNAL_TAG_AWAIT_TIMEOUT :: tina.Message_Tag(0xFFFE)
 _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 	state := request.connection_state
 	runtime := state.shard_runtime
-	if state == nil || runtime == nil || runtime.router == nil {
+	if state == nil || runtime == nil {
 		return .Close
 	}
 
@@ -27,7 +27,7 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 			return _normalize_route_step(step)
 		}
 		if len(runtime.router.options_asterisk_response) > 0 {
-			copy(response.egress_buffer, runtime.router.options_asterisk_response)
+			copy(response.connection.egress_buffer[:], runtime.router.options_asterisk_response)
 			state.response.egress_size = Egress_Size(len(runtime.router.options_asterisk_response))
 			state.response.egress_size_sent = 0
 			state.response.flags += {.Headers_Committed}
@@ -39,7 +39,7 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 
 	if state.request.route_index == ROUTE_INDEX_NONE {
 		path_bytes := request.frame[int(state.request.path_offset):][:int(state.request.path_size)]
-		match_result := match_route(runtime.router, &state.request, path_bytes)
+		match_result := match_route(&runtime.router, &state.request, path_bytes)
 		#partial switch match_result.outcome {
 		case .Found:
 			state.request.route_index = match_result.route_index
@@ -108,7 +108,7 @@ _dispatch_route_event :: proc(
 ) -> Route_Step {
 	state_connection := request.connection_state
 	runtime := state_connection.shard_runtime
-	if state_connection == nil || runtime == nil || runtime.router == nil {
+	if state_connection == nil || runtime == nil {
 		return .Close
 	}
 	if state_connection.request.route_index == ROUTE_INDEX_NONE {
@@ -206,33 +206,32 @@ test_dispatch_unknown_method_missing_path_returns_not_implemented :: proc(t: ^te
 
 	response_header_storage: [128]u8
 	request_frame := transmute([]u8)string("FOO /missing HTTP/1.1\r\nHost: example\r\n\r\n")
-	runtime := HTTP_Shard_Runtime{router = &router}
-	connection_state := HTTP_Connection_State{
-		shard_runtime          = &runtime,
-		response_header_bytes  = response_header_storage[:],
-		request = Request_State{
-			method       = .GET,
-			path_offset  = 4,
-			path_size    = 8,
-			route_index  = ROUTE_INDEX_NONE,
-			status_flags = {.Unknown_Method},
+	runtime := HTTP_Shard_Runtime{router = router}
+	connection := HTTP_Connection{
+		connection_state = HTTP_Connection_State{
+			shard_runtime          = &runtime,
+			response_header_bytes  = response_header_storage[:],
+			request = Request_State{
+				method       = .GET,
+				path_offset  = 4,
+				path_size    = 8,
+				route_index  = ROUTE_INDEX_NONE,
+				status_flags = {.Unknown_Method},
+			},
 		},
 	}
-	egress_buffer: [HTTP_EGRESS_BUFFER_SIZE]u8
 	request := Request{
-		connection_state = &connection_state,
-		request_state    = &connection_state.request,
+		connection_state = &connection.connection_state,
 		frame            = request_frame,
 	}
 	response := Response{
-		connection_state      = &connection_state,
-		egress_buffer         = egress_buffer[:],
-		response_header_bytes = response_header_storage[:],
+		connection   = &connection,
+		tina_context = nil,
 	}
 
 	step := _dispatch_route(&request, &response)
 	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect_value(t, connection_state.response.status_code, HTTP_STATUS_NOT_IMPLEMENTED)
+	testing.expect_value(t, connection.connection_state.response.status_code, HTTP_STATUS_NOT_IMPLEMENTED)
 }
 
 @(private = "file")
@@ -250,36 +249,35 @@ test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^t
 
 	response_header_storage: [128]u8
 	request_frame := transmute([]u8)string("GET /x HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n")
-	runtime := HTTP_Shard_Runtime{router = &router}
-	connection_state := HTTP_Connection_State{
-		shard_runtime         = &runtime,
-		response_header_bytes = response_header_storage[:],
-		parser                = Parser_State{flags = {.Connection_Close}},
-		request = Request_State{
-			method      = .GET,
-			path_offset = 4,
-			path_size   = 2,
-			route_index = ROUTE_INDEX_NONE,
+	runtime := HTTP_Shard_Runtime{router = router}
+	connection := HTTP_Connection{
+		connection_state = HTTP_Connection_State{
+			shard_runtime         = &runtime,
+			response_header_bytes = response_header_storage[:],
+			parser                = Parser_State{flags = {.Connection_Close}},
+			request = Request_State{
+				method      = .GET,
+				path_offset = 4,
+				path_size   = 2,
+				route_index = ROUTE_INDEX_NONE,
+			},
 		},
 	}
-	egress_buffer: [HTTP_EGRESS_BUFFER_SIZE]u8
 	request := Request{
-		connection_state = &connection_state,
-		request_state    = &connection_state.request,
+		connection_state = &connection.connection_state,
 		frame            = request_frame,
 	}
 	response := Response{
-		connection_state      = &connection_state,
-		egress_buffer         = egress_buffer[:],
-		response_header_bytes = response_header_storage[:],
+		connection   = &connection,
+		tina_context = nil,
 	}
 
 	step := _dispatch_route(&request, &response)
 	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect(t, .Close_After_Send in connection_state.response.flags, "response must close after send")
+	testing.expect(t, .Close_After_Send in connection.connection_state.response.flags, "response must close after send")
 	testing.expect(
 		t,
-		strings.index(string(egress_buffer[:int(connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
+		strings.index(string(connection.egress_buffer[:int(connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
 		"serialized response must advertise Connection: close",
 	)
 }

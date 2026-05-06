@@ -692,32 +692,34 @@ parse_step :: #force_inline proc "contextless" (
 			}
 
 		case .Headers:
-			result, new_offset := parse_one_header(
-				state,
-				request,
-				headers,
-				buffer,
-				current_offset,
-				limits,
-			)
-			current_offset = new_offset
-			#partial switch result {
-			case .Continue:
-			// Loop and parse the next header line.
-			case .Need_More:
-				return .Need_More, current_offset
-			case .Headers_Done:
-				// Mandatory-header validation gate: HTTP/1.1 requires Host.
-				// (Duplicate Host was already caught inline by parse_one_header.)
-				if .Host not_in request.known_headers {
+			for {
+				result, new_offset := parse_one_header(
+					state,
+					request,
+					headers,
+					buffer,
+					current_offset,
+					limits,
+				)
+				current_offset = new_offset
+				#partial switch result {
+				case .Continue:
+					continue // Loop and parse the next header line without hitting the outer switch
+				case .Need_More:
+					return .Need_More, current_offset
+				case .Headers_Done:
+					// Mandatory-header validation gate: HTTP/1.1 requires Host.
+					// (Duplicate Host was already caught inline by parse_one_header.)
+					if .Host not_in request.known_headers {
+						state.phase = .Error
+						return .Error_Bad_Request, current_offset
+					}
+					determine_body_framing(state)
+					return .Headers_Done, current_offset
+				case:
 					state.phase = .Error
-					return .Error_Bad_Request, current_offset
+					return result, current_offset
 				}
-				determine_body_framing(state)
-				return .Headers_Done, current_offset
-			case:
-				state.phase = .Error
-				return result, current_offset
 			}
 
 		case .Body_Fixed, .Chunk_Size, .Chunk_Data, .Chunk_Data_CRLF, .Trailers, .Complete:

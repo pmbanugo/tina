@@ -77,19 +77,15 @@ Route_Handler_Kind :: enum u8 {
 // request lifetime and backing storage remain under library control.
 Request :: struct {
 	connection_state: ^HTTP_Connection_State,
-	request_state:    ^Request_State,
-	frame:            []u8,
-	header_views:     []Header_View,
 	tina_context:     ^tina.TinaContext,
+	frame:            []u8,
 }
 
 // Opaque response facade passed to handlers. It owns the staged header bytes
 // slice and the connection-local egress buffer view.
 Response :: struct {
-	connection_state:      ^HTTP_Connection_State,
-	egress_buffer:         []u8,
-	response_header_bytes: []u8,
-	date_value:            []u8,
+	connection:   ^HTTP_Connection,
+	tina_context: ^tina.TinaContext,
 }
 
 // Connection-execution context. Passed by value to event handlers and helper
