@@ -251,6 +251,124 @@ reactor_adopt_fd_handoff :: proc "contextless" (
 // Scheduler Loop Integration (§6.6.1 §5 & §6.6.2 §9)
 // =====================================================
 
+@(private = "file")
+_reactor_completion_close_on_completion :: proc "contextless" (
+	reactor: ^Reactor,
+	soa_meta: #soa[]Isolate_Metadata,
+	slot_index: u32,
+) {
+	fd_handle := soa_meta[slot_index].io_fd
+	if fd_handle == FD_HANDLE_NONE {
+		return
+	}
+
+	entry, err := fd_table_lookup(&reactor.fd_table, fd_handle)
+	if err != .None || !fd_table_is_close_on_completion(entry) {
+		return
+	}
+
+	reactor_internal_close_fd(reactor, fd_handle)
+	soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+}
+
+@(private = "file")
+_reactor_completion_close_stale_accept_fd :: proc "contextless" (
+	reactor: ^Reactor,
+	completion: ^Raw_Completion,
+) {
+	if completion.result < 0 {
+		return
+	}
+
+	#partial switch e in completion.extra {
+	case Completion_Extra_Accept:
+		if e.client_fd != OS_FD_INVALID {
+			backend_control_close(&reactor.backend, e.client_fd)
+		}
+	}
+}
+
+@(private = "file")
+_reactor_completion_reclaim_stale :: proc (
+	reactor: ^Reactor,
+	shard: ^Shard,
+	completion: ^Raw_Completion,
+	soa_meta: #soa[]Isolate_Metadata,
+	slot_index: u32,
+	buffer_index: u16,
+	op_tag: u8,
+) {
+	if buffer_index != BUFFER_INDEX_NONE {
+		reactor_buffer_pool_free(&reactor.buffer_pool, buffer_index)
+	}
+
+	_reactor_completion_close_on_completion(reactor, soa_meta, slot_index)
+
+	if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) {
+		_reactor_completion_close_stale_accept_fd(reactor, completion)
+	}
+
+	shard.counters.io_stale_completions += 1
+}
+
+@(private = "file")
+_reactor_completion_apply_accept :: proc (
+	reactor: ^Reactor,
+	shard: ^Shard,
+	soa_meta: #soa[]Isolate_Metadata,
+	type_index: u8,
+	slot_index: u32,
+	completion: ^Raw_Completion,
+) {
+	#partial switch e in completion.extra {
+	case Completion_Extra_Accept:
+		soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(e.client_address)
+
+		if completion.result < 0 || e.client_fd == OS_FD_INVALID {
+			soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+			return
+		}
+
+		owner := make_handle(
+			shard.id,
+			u16(type_index),
+			slot_index,
+			soa_meta[slot_index].generation,
+		)
+		fd_handle, fd_err := fd_table_alloc(&reactor.fd_table, e.client_fd, owner)
+		if fd_err == .None {
+			backend_register_fixed_fd(
+				&reactor.backend,
+				fd_handle_index(fd_handle),
+				e.client_fd,
+			)
+			_ = fd_table_mark_fresh_accept(
+				&reactor.fd_table,
+				fd_handle,
+				soa_meta[slot_index].io_peer_address,
+			)
+			soa_meta[slot_index].io_fd = fd_handle
+			return
+		}
+
+		backend_control_close(&reactor.backend, e.client_fd)
+		soa_meta[slot_index].io_result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+		soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+	}
+}
+
+@(private = "file")
+_reactor_completion_apply_recvfrom :: proc (
+	soa_meta: #soa[]Isolate_Metadata,
+	slot_index: u32,
+	completion: ^Raw_Completion,
+) {
+	#partial switch e in completion.extra {
+	case Completion_Extra_Recvfrom:
+		soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(e.peer_address)
+	}
+}
+
 reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns: i64) {
 	completions: [MAX_REACTOR_BATCH]Raw_Completion
 
@@ -273,90 +391,34 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		soa_meta := shard.metadata[type_index]
 		if int(slot_index) >= len(soa_meta) do continue
 
-		// Flat Routing Firewall
+		// Flat routing firewall.
 		is_stale :=
 			u8(soa_meta[slot_index].generation) != token_gen ||
 			soa_meta[slot_index].io_sequence != token_seq
 
-		// Fast-fail the stale path to keep the valid path unnested
+		// Fast-fail the stale path to keep the valid path unnested.
 		if is_stale {
-			if buffer_index != BUFFER_INDEX_NONE {
-				reactor_buffer_pool_free(&reactor.buffer_pool, buffer_index)
-			}
-
-			fd_handle := soa_meta[slot_index].io_fd
-			if fd_handle != FD_HANDLE_NONE {
-				entry, err := fd_table_lookup(&reactor.fd_table, fd_handle)
-				if err == .None && fd_table_is_close_on_completion(entry) {
-					reactor_internal_close_fd(reactor, fd_handle)
-					soa_meta[slot_index].io_fd = FD_HANDLE_NONE
-				}
-			}
-
-			// Reclaim leaked OS resources from accept completions.
-			// The kernel allocated a client_fd that has no Isolate handler.
-			if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) {
-				#partial switch e in completion.extra {
-				case Completion_Extra_Accept:
-					if completion.result >= 0 && e.client_fd != OS_FD_INVALID {
-						backend_control_close(&reactor.backend, e.client_fd)
-					}
-				}
-			}
-
-			shard.counters.io_stale_completions += 1
+			_reactor_completion_reclaim_stale(
+				reactor,
+				shard,
+				completion,
+				soa_meta,
+				slot_index,
+				buffer_index,
+				op_tag,
+			)
 			continue
 		}
 
-		// Valid Completion Delivery
+		// Valid completion delivery.
 		soa_meta[slot_index].io_completion_tag = Message_Tag(op_tag)
 		soa_meta[slot_index].io_result = completion.result
 		soa_meta[slot_index].io_buffer_index = buffer_index
 
 		if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) {
-			#partial switch e in completion.extra {
-			case Completion_Extra_Accept:
-				soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(
-					e.client_address,
-				)
-
-				if completion.result >= 0 && e.client_fd != OS_FD_INVALID {
-					owner := make_handle(
-						shard.id,
-						u16(type_index),
-						u32(slot_index),
-						soa_meta[slot_index].generation,
-					)
-					fd_handle, fd_err := fd_table_alloc(&reactor.fd_table, e.client_fd, owner)
-
-					if fd_err == .None {
-						backend_register_fixed_fd(
-							&reactor.backend,
-							fd_handle_index(fd_handle),
-							e.client_fd,
-						)
-						_ = fd_table_mark_fresh_accept(
-							&reactor.fd_table,
-							fd_handle,
-							soa_meta[slot_index].io_peer_address,
-						)
-						soa_meta[slot_index].io_fd = fd_handle
-					} else {
-						backend_control_close(&reactor.backend, e.client_fd)
-						soa_meta[slot_index].io_result = i32(IO_ERR_RESOURCE_EXHAUSTED)
-						soa_meta[slot_index].io_fd = FD_HANDLE_NONE
-					}
-				} else {
-					soa_meta[slot_index].io_fd = FD_HANDLE_NONE
-				}
-			}
+			_reactor_completion_apply_accept(reactor, shard, soa_meta, type_index, slot_index, completion)
 		} else if op_tag == u8(IO_TAG_RECVFROM_COMPLETE) {
-			#partial switch e in completion.extra {
-			case Completion_Extra_Recvfrom:
-				soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(
-					e.peer_address,
-				)
-			}
+			_reactor_completion_apply_recvfrom(soa_meta, slot_index, completion)
 		}
 
 		if soa_meta[slot_index].state == .Waiting_For_Io {
@@ -439,7 +501,7 @@ reactor_submit_io :: proc(
 
 	soa_meta[slot_index].io_sequence += 1
 	seq := soa_meta[slot_index].io_sequence
-	gen := soa_meta[slot_index].generation
+	gen := u8(soa_meta[slot_index].generation)
 
 	submission: Submission
 	submission.fixed_file_index = FIXED_FILE_INDEX_NONE
@@ -454,8 +516,8 @@ reactor_submit_io :: proc(
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
-		if alloc_error != .None do return IO_ERR_RESOURCE_EXHAUSTED
+		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
+		if alloc_error != IO_ERR_NONE do return alloc_error
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Read {
@@ -470,7 +532,7 @@ reactor_submit_io :: proc(
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _alloc_and_copy_in(
+		alloc_index, alloc_error := _reactor_buffer_alloc_write(
 			reactor,
 			shard,
 			type_index,
@@ -512,7 +574,7 @@ reactor_submit_io :: proc(
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _alloc_and_copy_in(
+		alloc_index, alloc_error := _reactor_buffer_alloc_write(
 			reactor,
 			shard,
 			type_index,
@@ -534,8 +596,8 @@ reactor_submit_io :: proc(
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
-		if alloc_error != .None do return IO_ERR_RESOURCE_EXHAUSTED
+		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
+		if alloc_error != IO_ERR_NONE do return alloc_error
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Recv {
@@ -549,7 +611,7 @@ reactor_submit_io :: proc(
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _alloc_and_copy_in(
+		alloc_index, alloc_error := _reactor_buffer_alloc_write(
 			reactor,
 			shard,
 			type_index,
@@ -572,8 +634,8 @@ reactor_submit_io :: proc(
 		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
-		if alloc_error != .None do return IO_ERR_RESOURCE_EXHAUSTED
+		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
+		if alloc_error != IO_ERR_NONE do return alloc_error
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Recvfrom {
@@ -611,10 +673,77 @@ reactor_submit_io :: proc(
 		}
 	}
 
-	// Hoist fixed-file assignment: all ops except Close use their target_fd's index.
-	// Close must stay FIXED_FILE_INDEX_NONE because io_uring close uses raw FDs.
+	_reactor_submission_finalize(
+		reactor,
+		shard,
+		type_index,
+		slot_index,
+		gen,
+		seq,
+		target_fd,
+		buffer_index,
+		submission_op_tag,
+		submission,
+	)
+
+	return IO_ERR_NONE
+}
+
+// ================
+// Internal Helpers
+// ================
+
+@(private = "file")
+_reactor_buffer_alloc_read :: #force_inline proc (reactor: ^Reactor) -> (
+	u16,
+	IO_Error,
+) {
+	alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
+	if alloc_error != .None {
+		return BUFFER_INDEX_NONE, IO_ERR_RESOURCE_EXHAUSTED
+	}
+	return alloc_index, IO_ERR_NONE
+}
+
+@(private = "file")
+_reactor_buffer_alloc_write :: #force_inline proc(
+	reactor: ^Reactor,
+	shard: ^Shard,
+	type_index: u16,
+	slot_index: u32,
+	payload_offset: u16,
+	payload_size: u32,
+) -> (
+	u16,
+	IO_Error,
+) {
+	return _alloc_and_copy_in(
+		reactor,
+		shard,
+		type_index,
+		slot_index,
+		payload_offset,
+		payload_size,
+	)
+}
+
+@(private = "file")
+_reactor_submission_finalize :: #force_inline proc (
+	reactor: ^Reactor,
+	shard: ^Shard,
+	type_index: u16,
+	slot_index: u32,
+	generation: u8,
+	sequence: u8,
+	target_fd: FD_Handle,
+	buffer_index: u16,
+	submission_op_tag: u8,
+	submission: Submission,
+) {
+	submission_value := submission
+
 	if target_fd != FD_HANDLE_NONE {
-		submission.fixed_file_index = fd_handle_index(target_fd)
+		submission_value.fixed_file_index = fd_handle_index(target_fd)
 	}
 
 	if target_fd != FD_HANDLE_NONE &&
@@ -623,24 +752,18 @@ reactor_submit_io :: proc(
 		_ = fd_table_clear_fresh_accept(&reactor.fd_table, target_fd)
 	}
 
-	submission.token = submission_token_pack(
+	submission_value.token = submission_token_pack(
 		u8(type_index),
 		slot_index,
-		u8(gen),
-		seq,
+		generation,
+		sequence,
 		buffer_index,
 		submission_op_tag,
 	)
-	reactor.pending_submissions[reactor.pending_count] = submission
+	reactor.pending_submissions[reactor.pending_count] = submission_value
 	reactor.pending_count += 1
-	soa_meta[slot_index].io_fd = target_fd
-
-	return IO_ERR_NONE
+	shard.metadata[type_index][slot_index].io_fd = target_fd
 }
-
-// ================
-// Internal Helpers
-// ================
 
 @(private = "package")
 _io_op_to_completion_tag :: #force_inline proc(op: IoOp) -> Message_Tag {

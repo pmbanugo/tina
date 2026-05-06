@@ -197,60 +197,311 @@ Shard :: struct {
 	using _sim_mixin:       Sim_State_Mixin,
 }
 
+@(private = "file")
+Dispatch_Kind :: enum u8 {
+	None,
+	Runnable,
+	Inbox,
+	Shutdown,
+	Io_Completion,
+}
+
+@(private = "file")
+_wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot_count: u32) {
+	states := shard.metadata[type_id].state[:]
+	flags := shard.metadata[type_id].flags[:]
+	io_sequences := shard.metadata[type_id].io_sequence[:]
+	pending_correlations := shard.metadata[type_id].pending_correlation[:]
+
+	for slot_index in 0 ..< slot_count {
+		if states[slot_index] == .Unallocated do continue
+		flags[slot_index] += {.Shutdown_Pending}
+	}
+
+	for slot_index in 0 ..< slot_count {
+		state := states[slot_index]
+		if state == .Waiting {
+			states[slot_index] = .Runnable
+			continue
+		}
+		if state == .Waiting_For_Io {
+			// Invalidate pending completion via io_sequence bump.
+			// No explicit backend_cancel — the stale completion will
+			// arrive naturally, fail the io_sequence check in
+			// reactor_collect_completions, and have its buffer freed
+			// by the stale-path reclamation. See §6.6.3 §12 design note.
+			io_sequences[slot_index] += 1
+			states[slot_index] = .Runnable
+			continue
+		}
+		if state == .Waiting_For_Reply {
+			// Discard stale replies.
+			pending_correlations[slot_index] = 0
+			states[slot_index] = .Runnable
+		}
+	}
+}
+
+@(private = "file")
+_handle_shard_control_signal :: proc(shard: ^Shard) {
+	switch load_shard_control_signal(shard) {
+	case .None:
+		return
+	case .Shutdown:
+		store_shard_control_signal(shard, .None)
+		store_watchdog_state(shard, .Shutting_Down)
+
+		for type_descriptor in shard.type_descriptors {
+			_wake_type_for_shutdown(shard, u16(type_descriptor.id), u32(type_descriptor.slot_count))
+		}
+
+		_fd_handoff_close_all_entries(shard, true)
+	case .Kill:
+		os_trap_restore(&shard.trap_environment_outer, RECOVERY_SOFT_KILL)
+	}
+}
+
+@(private = "file")
+_dispatch_kind_for_slot :: #force_inline proc "contextless" (
+	state: Isolate_State,
+	flags: Isolate_Flags,
+	inbox_count: u16,
+	io_completion_tag: IO_Completion_Tag,
+) -> Dispatch_Kind {
+	if state == .Unallocated {
+		return .None
+	}
+	if io_completion_tag != IO_TAG_NONE {
+		return .Io_Completion
+	}
+	if .Shutdown_Pending in flags {
+		return .Shutdown
+	}
+	if inbox_count > 0 && (state == .Runnable || state == .Waiting) {
+		return .Inbox
+	}
+	if state == .Runnable {
+		return .Runnable
+	}
+	return .None
+}
+
+@(private = "file")
+_dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
+	type_id := type_descriptor.id
+	slot_count := u32(type_descriptor.slot_count)
+
+	if type_descriptor.tick_handler != nil {
+		type_descriptor.tick_handler(shard, u16(type_id))
+	}
+
+	// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop.
+	states := shard.metadata[type_id].state[:]
+	flags := shard.metadata[type_id].flags[:]
+	inbox_counts := shard.metadata[type_id].inbox_count[:]
+	io_completions := shard.metadata[type_id].io_completion_tag[:]
+	generations := shard.metadata[type_id].generation[:]
+	io_results := shard.metadata[type_id].io_result[:]
+	io_fds := shard.metadata[type_id].io_fd[:]
+	io_buffer_indices := shard.metadata[type_id].io_buffer_index[:]
+	io_peer_addresses := shard.metadata[type_id].io_peer_address[:]
+	working_arena_offsets := shard.metadata[type_id].working_arena_offset[:]
+	pending_transfer_reads := shard.metadata[type_id].pending_transfer_read[:]
+
+	dispatch_budget := u32(type_descriptor.budget_weight) * DISPATCH_QUOTA_PER_WEIGHT
+	dispatched_count: u32 = 0
+
+	shard.current_type_id = u16(type_id)
+
+	// Capture original cursor before trap to calculate distance if a crash occurs.
+	original_cursor := shard.dispatch_cursors[type_id]
+	slots_to_check := slot_count
+
+	if os_trap_save(&shard.trap_environment_inner) != 0 {
+		when !TINA_SIMULATION_MODE {
+			// Sweep orphaned temp allocations from panic string formatting.
+			free_all(context.temp_allocator)
+			// Unblock signals masked by the OS during handler execution.
+			os_signals_restore_thread_mask()
+		}
+
+		if shard.current_msg_slot != POOL_NONE_INDEX {
+			pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
+			shard.current_msg_slot = POOL_NONE_INDEX
+		}
+		_teardown_isolate(shard, shard.current_type_id, shard.current_slot_index, .Crashed)
+
+		// Advance the cursor past the crashed isolate.
+		next_cursor := shard.current_slot_index + 1
+		if next_cursor >= slot_count do next_cursor = 0
+		shard.dispatch_cursors[type_id] = next_cursor
+
+		// siglongjmp wipes the loop counter. Recompute how much of the arena this tick already consumed.
+		checked_count: u32 = 0
+		if shard.current_slot_index >= original_cursor {
+			checked_count = shard.current_slot_index - original_cursor
+		} else {
+			checked_count = shard.current_slot_index + slot_count - original_cursor
+		}
+		checked_count += 1 // Include the slot that just crashed.
+
+		if checked_count >= slot_count {
+			slots_to_check = 0
+		} else {
+			slots_to_check = slot_count - checked_count
+		}
+	}
+
+	cursor := shard.dispatch_cursors[type_id]
+
+	slot_loop: for slot_offset in 0 ..< slots_to_check {
+		slot_index := cursor + slot_offset
+		if slot_index >= slot_count do slot_index -= slot_count
+
+		dispatch_kind := _dispatch_kind_for_slot(
+			states[slot_index],
+			flags[slot_index],
+			inbox_counts[slot_index],
+			io_completions[slot_index],
+		)
+		if dispatch_kind == .None do continue
+
+		if dispatched_count >= dispatch_budget {
+			// Budget exhausted: resume from the current slot on the next tick.
+			shard.dispatch_cursors[type_id] = slot_index
+			break slot_loop
+		}
+		dispatched_count += 1
+
+		shard.current_slot_index = slot_index
+		shard.current_msg_slot = POOL_NONE_INDEX
+
+		message: Message
+		message_pointer: ^Message = nil
+		correlation: Correlation_Id = CORRELATION_ID_NONE
+		envelope_flags: Envelope_Flags = {}
+
+		is_io_completion := false
+		buffer_to_free: u16 = BUFFER_INDEX_NONE
+
+		switch dispatch_kind {
+		case .None:
+		case .Io_Completion:
+			message.tag = io_completions[slot_index]
+			message.correlation = CORRELATION_ID_NONE
+			message.io.result = io_results[slot_index]
+			message.io.fd = io_fds[slot_index]
+			message.io.buffer_index = io_buffer_indices[slot_index]
+			message.io.peer_address = io_peer_addresses[slot_index]
+
+			message_pointer = &message
+			is_io_completion = true
+			buffer_to_free = io_buffer_indices[slot_index]
+		case .Shutdown:
+			message.tag = TAG_SHUTDOWN
+			message.correlation = CORRELATION_ID_NONE
+			message.user.source = HANDLE_NONE
+			message.user.payload_size = 0
+
+			message_pointer = &message
+			flags[slot_index] -= {.Shutdown_Pending}
+		case .Inbox:
+			dequeue_result := _dequeue(shard, u16(type_id), slot_index)
+			shard.current_msg_slot = dequeue_result.pool_index
+			if shard.current_msg_slot != POOL_NONE_INDEX {
+				message = dequeue_result.message
+				message.correlation = dequeue_result.correlation
+				correlation = dequeue_result.correlation
+				envelope_flags = dequeue_result.flags
+				message_pointer = &message
+			}
+		case .Runnable:
+		}
+
+		ctx_flags: Context_Flags
+		if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
+
+		ctx := TinaContext {
+			_shard                 = shard,
+			self_handle            = make_handle(
+				shard.id,
+				u16(type_id),
+				slot_index,
+				generations[slot_index],
+			),
+			current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : HANDLE_NONE,
+			current_correlation    = correlation,
+			flags                  = ctx_flags,
+		}
+
+		mem.arena_init(&ctx.scratch_arena, shard.scratch_memory)
+
+		working_stride := type_descriptor.working_memory_size
+		if working_stride > 0 {
+			start_index := int(slot_index) * working_stride
+			working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
+			ctx.working_arena = mem.Arena {
+				data   = working_slice,
+				offset = int(working_arena_offsets[slot_index]),
+			}
+		}
+
+		isolate_pointer := _get_isolate_ptr(shard, u16(type_id), slot_index)
+
+		context.allocator = mem.arena_allocator(&ctx.scratch_arena)
+		context.temp_allocator = mem.arena_allocator(&ctx.scratch_arena)
+
+		when TINA_SIMULATION_MODE {
+			if ratio_chance(
+				shard.sim_state.fault_config.isolate_crash_rate,
+				shard.sim_state.crash_prng,
+			) {
+				if shard.current_msg_slot != POOL_NONE_INDEX {
+					pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
+					shard.current_msg_slot = POOL_NONE_INDEX
+				}
+				_teardown_isolate(shard, u16(type_id), slot_index, .Crashed)
+				continue slot_loop
+			}
+		}
+
+		effect := type_descriptor.handler_fn(isolate_pointer, message_pointer, &ctx)
+
+		if working_stride > 0 {
+			working_arena_offsets[slot_index] = u32(ctx.working_arena.offset)
+		}
+
+		if is_io_completion {
+			io_completions[slot_index] = IO_TAG_NONE
+			io_peer_addresses[slot_index] = {}
+			if buffer_to_free != BUFFER_INDEX_NONE {
+				reactor_buffer_pool_free(&shard.reactor.buffer_pool, buffer_to_free)
+			}
+		}
+
+		if pending_transfer_reads[slot_index] != TRANSFER_HANDLE_NONE {
+			t_handle := pending_transfer_reads[slot_index]
+			_transfer_pool_free(shard, transfer_handle_index(t_handle))
+			pending_transfer_reads[slot_index] = TRANSFER_HANDLE_NONE
+		}
+
+		if shard.current_msg_slot != POOL_NONE_INDEX {
+			pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
+			shard.current_msg_slot = POOL_NONE_INDEX
+		}
+
+		_interpret_effect(shard, u16(type_id), slot_index, effect, &ctx)
+	}
+
+	if dispatched_count < dispatch_budget {
+		shard.dispatch_cursors[type_id] = 0
+	}
+}
+
 // --- Scheduler Loop ---
 
 scheduler_tick :: proc(shard: ^Shard) {
-	signal := load_shard_control_signal(shard)
-	if signal != .None {
-		switch signal {
-		case .None: // Unreachable but satisfies switch exhaustion
-		case .Shutdown:
-			// Consume the signal, transition Shard state to Shutting_Down
-			store_shard_control_signal(shard, .None)
-			store_watchdog_state(shard, .Shutting_Down)
-
-			// Phase 1 Notification: wake all parked isolates
-			for type_desc in shard.type_descriptors {
-				type_id := type_desc.id
-				slot_count := u32(type_desc.slot_count)
-
-				// Extract 1D slices to bypass 2D lookups
-				states := shard.metadata[type_id].state[:]
-				flags := shard.metadata[type_id].flags[:]
-				io_sequences := shard.metadata[type_id].io_sequence[:]
-				pending_correlations := shard.metadata[type_id].pending_correlation[:]
-
-				for index in 0 ..< slot_count {
-					if states[index] != .Unallocated {
-						flags[index] += {.Shutdown_Pending}
-					}
-				}
-
-				for index in 0 ..< slot_count {
-					#partial switch states[index] {
-					case .Waiting:
-						states[index] = .Runnable
-					case .Waiting_For_Io:
-						// Invalidate pending completion via io_sequence bump.
-						// No explicit backend_cancel — the stale completion will
-						// arrive naturally, fail the io_sequence check in
-						// reactor_collect_completions, and have its buffer freed
-						// by the stale-path reclamation. See §6.6.3 §12 design note.
-						io_sequences[index] += 1
-						states[index] = .Runnable
-					case .Waiting_For_Reply:
-						// Discard stale replies
-						pending_correlations[index] = 0
-						states[index] = .Runnable
-					}
-				}
-			}
-
-			_fd_handoff_close_all_entries(shard, true)
-		case .Kill:
-			os_trap_restore(&shard.trap_environment_outer, RECOVERY_SOFT_KILL)
-		}
-	}
+	_handle_shard_control_signal(shard)
 
 	when !TINA_SIMULATION_MODE {
 		now_ns := os_monotonic_time_ns()
@@ -277,232 +528,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// Step 3: Isolate Dispatch (Budget-limited by type)
 	// ========================================================================
 	for type_descriptor in shard.type_descriptors {
-		type_id := type_descriptor.id
-		slot_count := u32(type_descriptor.slot_count)
-
-		if type_descriptor.tick_handler != nil {
-			type_descriptor.tick_handler(shard, u16(type_id))
-		}
-
-		// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop
-		states := shard.metadata[type_id].state[:]
-		flags := shard.metadata[type_id].flags[:]
-		inbox_counts := shard.metadata[type_id].inbox_count[:]
-		io_completions := shard.metadata[type_id].io_completion_tag[:]
-		generations := shard.metadata[type_id].generation[:]
-		io_results := shard.metadata[type_id].io_result[:]
-		io_fds := shard.metadata[type_id].io_fd[:]
-		io_buffer_indices := shard.metadata[type_id].io_buffer_index[:]
-		io_peer_addresses := shard.metadata[type_id].io_peer_address[:]
-		working_arena_offsets := shard.metadata[type_id].working_arena_offset[:]
-		pending_transfer_reads := shard.metadata[type_id].pending_transfer_read[:]
-
-		// Determine dynamic budget for this type batch
-		dispatch_budget := u32(type_descriptor.budget_weight) * DISPATCH_QUOTA_PER_WEIGHT
-		dispatched_count: u32 = 0
-
-		shard.current_type_id = u16(type_id)
-
-		// Capture original cursor before trap to calculate distance if a crash occurs
-		original_cursor := shard.dispatch_cursors[type_id]
-		slots_to_check := slot_count
-
-		if os_trap_save(&shard.trap_environment_inner) != 0 {
-			when !TINA_SIMULATION_MODE {
-				// Sweep orphaned temp allocations from panic string formatting.
-				free_all(context.temp_allocator)
-				// Unblock signals masked by the OS during handler execution.
-				os_signals_restore_thread_mask()
-			}
-
-			if shard.current_msg_slot != POOL_NONE_INDEX {
-				pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
-				shard.current_msg_slot = POOL_NONE_INDEX
-			}
-			_teardown_isolate(shard, shard.current_type_id, shard.current_slot_index, .Crashed)
-
-			// TRAP RECOVERY: Advance the cursor past the crashed isolate
-			next_cursor := shard.current_slot_index + 1
-			if next_cursor >= slot_count do next_cursor = 0
-			shard.dispatch_cursors[type_id] = next_cursor
-
-			// siglongjmp wipes the loop counter. We must calculate
-			// how many slots was evaluated before the crash so it doesn't wrap around
-			// and double-evaluate slots in the same tick.
-			checked: u32 = 0
-			if shard.current_slot_index >= original_cursor {
-				checked = shard.current_slot_index - original_cursor
-			} else {
-				checked = shard.current_slot_index + u32(slot_count) - original_cursor
-			}
-			checked += 1 // Include the slot that just crashed
-
-			if checked >= slot_count {
-				slots_to_check = 0 // We checked the whole arena
-			} else {
-				slots_to_check = slot_count - checked
-			}
-		}
-
-		cursor := shard.dispatch_cursors[type_id]
-
-		// Loop runs 'slots_to_check' times, calculating physical slot with fast wrap-around
-		slot_loop: for i in 0 ..< slots_to_check {
-			slot := cursor + i
-			if slot >= slot_count do slot -= slot_count
-
-			state := states[slot]
-
-			// FAST-PATH REJECT: If empty, skip immediately.
-			if state == .Unallocated do continue
-
-			// Use the extracted 1D slices
-			has_work :=
-				(state == .Runnable) ||
-				(state == .Waiting && inbox_counts[slot] > 0) ||
-				(io_completions[slot] != IO_TAG_NONE) ||
-				(.Shutdown_Pending in flags[slot])
-
-			if has_work {
-				if dispatched_count >= dispatch_budget {
-					// Budget exhausted: save the CURRENT slot to resume exactly here on the next tick
-					shard.dispatch_cursors[type_id] = slot
-					break slot_loop
-				}
-				dispatched_count += 1
-
-				shard.current_slot_index = slot
-				shard.current_msg_slot = POOL_NONE_INDEX
-
-				message: Message
-				message_pointer: ^Message = nil
-				correlation: Correlation_Id = CORRELATION_ID_NONE
-				envelope_flags: Envelope_Flags = {}
-
-				is_io_completion := false
-				buffer_to_free: u16 = BUFFER_INDEX_NONE
-
-				// Dispatch Priority: I/O > Shutdown > Inbox (ADR §6.13.4)
-				if io_completions[slot] != IO_TAG_NONE {
-					message.tag = io_completions[slot]
-					message.correlation = CORRELATION_ID_NONE
-					message.io.result = io_results[slot]
-					message.io.fd = io_fds[slot]
-					message.io.buffer_index = io_buffer_indices[slot]
-					message.io.peer_address = io_peer_addresses[slot]
-
-					message_pointer = &message
-					is_io_completion = true
-					buffer_to_free = io_buffer_indices[slot]
-				} else if .Shutdown_Pending in flags[slot] {
-					message.tag = TAG_SHUTDOWN
-					message.correlation = CORRELATION_ID_NONE
-					message.user.source = HANDLE_NONE
-					message.user.payload_size = 0
-
-					message_pointer = &message
-					flags[slot] -= {.Shutdown_Pending}
-				} else if inbox_counts[slot] > 0 {
-					dequeue_result := _dequeue(
-						shard,
-						u16(type_id),
-						slot,
-					)
-					shard.current_msg_slot = dequeue_result.pool_index
-					if shard.current_msg_slot != POOL_NONE_INDEX {
-						message = dequeue_result.message
-						message.correlation = dequeue_result.correlation
-						correlation = dequeue_result.correlation
-						envelope_flags = dequeue_result.flags
-						message_pointer = &message
-					}
-				}
-
-				ctx_flags: Context_Flags
-				if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
-
-				ctx := TinaContext {
-					_shard                 = shard,
-					self_handle            = make_handle(
-						shard.id,
-						u16(type_id),
-						slot,
-						generations[slot],
-					),
-					current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : HANDLE_NONE,
-					current_correlation    = correlation,
-					flags                  = ctx_flags,
-				}
-
-				// Initialize Context Arenas
-				mem.arena_init(&ctx.scratch_arena, shard.scratch_memory)
-
-				working_stride := type_descriptor.working_memory_size
-				if working_stride > 0 {
-					start_index := int(slot) * working_stride
-					working_slice := shard.working_memory[type_id][start_index:start_index +
-					working_stride]
-					ctx.working_arena = mem.Arena {
-						data   = working_slice,
-						offset = int(working_arena_offsets[slot]),
-					}
-				}
-
-				isolate_pointer := _get_isolate_ptr(shard, u16(type_id), slot)
-
-				// Set up the implicit context for the user handler
-				context.allocator = mem.arena_allocator(&ctx.scratch_arena)
-				context.temp_allocator = mem.arena_allocator(&ctx.scratch_arena)
-
-				when TINA_SIMULATION_MODE {
-					if ratio_chance(
-						shard.sim_state.fault_config.isolate_crash_rate,
-						shard.sim_state.crash_prng,
-					) {
-						if shard.current_msg_slot != POOL_NONE_INDEX {
-							pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
-							shard.current_msg_slot = POOL_NONE_INDEX
-						}
-						_teardown_isolate(shard, u16(type_id), slot, .Crashed)
-						continue slot_loop
-					}
-				}
-
-				effect := type_descriptor.handler_fn(isolate_pointer, message_pointer, &ctx)
-
-				// Write back working arena offset
-				if working_stride > 0 {
-					working_arena_offsets[slot] = u32(ctx.working_arena.offset)
-				}
-
-				if is_io_completion {
-					io_completions[slot] = IO_TAG_NONE
-					io_peer_addresses[slot] = {}
-					if buffer_to_free != BUFFER_INDEX_NONE {
-						reactor_buffer_pool_free(&shard.reactor.buffer_pool, buffer_to_free)
-					}
-				}
-
-				// Transfer Buffer Auto-Free (§6.9 §8.3)
-				if pending_transfer_reads[slot] != TRANSFER_HANDLE_NONE {
-					t_handle := pending_transfer_reads[slot]
-					_transfer_pool_free(shard, transfer_handle_index(t_handle))
-					pending_transfer_reads[slot] = TRANSFER_HANDLE_NONE
-				}
-
-				if shard.current_msg_slot != POOL_NONE_INDEX {
-					pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
-					shard.current_msg_slot = POOL_NONE_INDEX
-				}
-
-				_interpret_effect(shard, u16(type_id), slot, effect, &ctx)
-			}
-		}
-
-		// If we drained all work without exhausting the budget, reset the cursor
-		if dispatched_count < dispatch_budget {
-			shard.dispatch_cursors[type_id] = 0
-		}
+		_dispatch_type_batch(shard, type_descriptor)
 	}
 
 	// ========================================================================
@@ -968,6 +994,60 @@ _fd_handoff_send_abort :: proc "contextless" (
 }
 
 @(private = "file")
+Target_Slot :: struct {
+	type_id:    u16,
+	slot_index: u32,
+}
+
+@(private = "file")
+_resolve_target_slot :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	target: Handle,
+) -> (
+	Target_Slot,
+	bool,
+) {
+	type_id := extract_type_id(target)
+	if int(type_id) >= len(shard.metadata) {
+		return {}, false
+	}
+
+	slot_index := extract_slot(target)
+	soa_meta := shard.metadata[type_id]
+	if int(slot_index) >= len(soa_meta) {
+		return {}, false
+	}
+	if soa_meta[slot_index].generation != extract_generation(target) {
+		return {}, false
+	}
+
+	return Target_Slot {
+		type_id    = type_id,
+		slot_index = slot_index,
+	}, true
+}
+
+@(private = "file")
+_fd_handoff_close_in_flight_entry :: proc "contextless" (
+	shard: ^Shard,
+	handoff_index: int,
+	entry: ^FD_Handoff_Entry,
+	send_abort: bool,
+) {
+	ref := fd_handoff_ref_make(u16(handoff_index), entry.generation, shard.id)
+	target_handle := entry.target_handle
+	cleanup_fd := entry.cleanup_fd
+
+	if send_abort {
+		if _fd_handoff_send_abort(shard, target_handle, ref, cleanup_fd) == .Sent {
+			entry.cleanup_fd = OS_FD_INVALID
+		}
+	}
+
+	_ = _fd_handoff_close_entry(shard, ref)
+}
+
+@(private = "file")
 _fd_handoff_close_entries_for_target_shard :: proc "contextless" (
 	shard: ^Shard,
 	target_shard: Shard_Id,
@@ -982,14 +1062,7 @@ _fd_handoff_close_entries_for_target_shard :: proc "contextless" (
 			continue
 		}
 
-		ref := fd_handoff_ref_make(u16(handoff_index), entry.generation, shard.id)
-		target_handle := entry.target_handle
-		if send_abort {
-			if _fd_handoff_send_abort(shard, target_handle, ref, entry.cleanup_fd) == .Sent {
-				entry.cleanup_fd = OS_FD_INVALID
-			}
-		}
-		_ = _fd_handoff_close_entry(shard, ref)
+		_fd_handoff_close_in_flight_entry(shard, handoff_index, entry, send_abort)
 	}
 }
 
@@ -1001,14 +1074,7 @@ _fd_handoff_close_all_entries :: proc "contextless" (shard: ^Shard, send_abort: 
 			continue
 		}
 
-		ref := fd_handoff_ref_make(u16(handoff_index), entry.generation, shard.id)
-		target_handle := entry.target_handle
-		if send_abort {
-			if _fd_handoff_send_abort(shard, target_handle, ref, entry.cleanup_fd) == .Sent {
-				entry.cleanup_fd = OS_FD_INVALID
-			}
-		}
-		_ = _fd_handoff_close_entry(shard, ref)
+		_fd_handoff_close_in_flight_entry(shard, handoff_index, entry, send_abort)
 	}
 }
 
@@ -1057,31 +1123,24 @@ _inject_fd_handoff_accept :: proc "contextless" (
 	fd: FD_Handle,
 	peer_address: Peer_Address,
 ) -> FD_Handoff_Reject_Reason {
-	type_id := extract_type_id(target)
-	if int(type_id) >= len(shard.metadata) {
+	target_slot, ok := _resolve_target_slot(shard, target)
+	if !ok {
 		return .Invalid_Target
 	}
 
-	soa_meta := shard.metadata[type_id]
-	slot := extract_slot(target)
-	if int(slot) >= len(soa_meta) {
+	soa_meta := shard.metadata[target_slot.type_id]
+	if soa_meta[target_slot.slot_index].state == .Unallocated || soa_meta[target_slot.slot_index].state == .Crashed {
 		return .Invalid_Target
 	}
-	if soa_meta[slot].generation != extract_generation(target) {
-		return .Invalid_Target
-	}
-	if soa_meta[slot].state == .Unallocated || soa_meta[slot].state == .Crashed {
-		return .Invalid_Target
-	}
-	if soa_meta[slot].state == .Waiting_For_Io || soa_meta[slot].io_completion_tag != IO_TAG_NONE {
+	if soa_meta[target_slot.slot_index].state == .Waiting_For_Io || soa_meta[target_slot.slot_index].io_completion_tag != IO_TAG_NONE {
 		return .Target_Busy
 	}
 
-	soa_meta[slot].io_completion_tag = IO_TAG_ACCEPT_COMPLETE
-	soa_meta[slot].io_result = 0
-	soa_meta[slot].io_fd = fd
-	soa_meta[slot].io_buffer_index = BUFFER_INDEX_NONE
-	soa_meta[slot].io_peer_address = peer_address
+	soa_meta[target_slot.slot_index].io_completion_tag = IO_TAG_ACCEPT_COMPLETE
+	soa_meta[target_slot.slot_index].io_result = 0
+	soa_meta[target_slot.slot_index].io_fd = fd
+	soa_meta[target_slot.slot_index].io_buffer_index = BUFFER_INDEX_NONE
+	soa_meta[target_slot.slot_index].io_peer_address = peer_address
 	return .None
 }
 
@@ -1091,31 +1150,24 @@ _clear_fd_handoff_accept :: proc "contextless" (
 	target: Handle,
 	fd: FD_Handle,
 ) {
-	type_id := extract_type_id(target)
-	if int(type_id) >= len(shard.metadata) {
+	target_slot, ok := _resolve_target_slot(shard, target)
+	if !ok {
 		return
 	}
 
-	soa_meta := shard.metadata[type_id]
-	slot := extract_slot(target)
-	if int(slot) >= len(soa_meta) {
+	soa_meta := shard.metadata[target_slot.type_id]
+	if soa_meta[target_slot.slot_index].io_completion_tag != IO_TAG_ACCEPT_COMPLETE {
 		return
 	}
-	if soa_meta[slot].generation != extract_generation(target) {
-		return
-	}
-	if soa_meta[slot].io_completion_tag != IO_TAG_ACCEPT_COMPLETE {
-		return
-	}
-	if soa_meta[slot].io_fd != fd {
+	if soa_meta[target_slot.slot_index].io_fd != fd {
 		return
 	}
 
-	soa_meta[slot].io_completion_tag = IO_TAG_NONE
-	soa_meta[slot].io_result = 0
-	soa_meta[slot].io_fd = FD_HANDLE_NONE
-	soa_meta[slot].io_buffer_index = BUFFER_INDEX_NONE
-	soa_meta[slot].io_peer_address = Peer_Address{}
+	soa_meta[target_slot.slot_index].io_completion_tag = IO_TAG_NONE
+	soa_meta[target_slot.slot_index].io_result = 0
+	soa_meta[target_slot.slot_index].io_fd = FD_HANDLE_NONE
+	soa_meta[target_slot.slot_index].io_buffer_index = BUFFER_INDEX_NONE
+	soa_meta[target_slot.slot_index].io_peer_address = Peer_Address{}
 }
 
 @(private = "file")
@@ -1200,20 +1252,17 @@ _process_fd_handoff_abort :: proc "contextless" (shard: ^Shard, envelope: ^Messa
 		return
 	}
 	abort := (cast(^FD_Handoff_Abort)&envelope.payload[0])^
-	
-	type_id := extract_type_id(envelope.destination)
-	if int(type_id) < len(shard.metadata) {
-		soa_meta := shard.metadata[type_id]
-		slot := extract_slot(envelope.destination)
-		if int(slot) < len(soa_meta) && soa_meta[slot].generation == extract_generation(envelope.destination) {
-			if soa_meta[slot].io_completion_tag == IO_TAG_ACCEPT_COMPLETE {
-				fd := soa_meta[slot].io_fd
-				_clear_fd_handoff_accept(shard, envelope.destination, fd)
-				reactor_internal_close_fd(&shard.reactor, fd)
-			}
+
+	target_slot, ok := _resolve_target_slot(shard, envelope.destination)
+	if ok {
+		soa_meta := shard.metadata[target_slot.type_id]
+		if soa_meta[target_slot.slot_index].io_completion_tag == IO_TAG_ACCEPT_COMPLETE {
+			fd := soa_meta[target_slot.slot_index].io_fd
+			_clear_fd_handoff_accept(shard, envelope.destination, fd)
+			reactor_internal_close_fd(&shard.reactor, fd)
 		}
 	}
-	
+
 	if abort.os_fd != OS_FD_INVALID {
 		_ = backend_control_close(&shard.reactor.backend, abort.os_fd)
 	}
