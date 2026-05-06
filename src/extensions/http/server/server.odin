@@ -75,7 +75,10 @@ Server_Runtime :: struct {
 @(private = "package")
 Monotonic_Time_NS :: distinct u64
 
-@(private = "package")
+// Per-request opaque token stamped at request_start. Exposed to handlers via
+// `route_request_token` and intended to be embedded in pub/sub payloads so
+// subscribers can detect stale notifications targeting a previous request on
+// a reused keep-alive connection.
 Request_Token :: distinct u32
 
 // Total bytes currently in the ingress buffer (request frame region only).
@@ -183,7 +186,7 @@ HTTP_Listener :: struct {
 // One per shard, only instantiated in multi-shard `Coordinator` mode.
 // Long-lived. Receives cross-shard FD handoff adoptions and spawns
 // shard-local `HTTP_Connection` per accepted FD.
-// Strictly L4 — does no HTTP parsing (DR-4).
+// Strictly L4 — does no HTTP parsing.
 //
 // Restart type: `.permanent`.
 @(private = "package")
