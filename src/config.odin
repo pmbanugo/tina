@@ -16,6 +16,7 @@ TINA_DEBUG_ASSERTS :: #config(TINA_ASSERTS, false)
 
 Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
+Tick_Handler :: #type proc(shard: ^Shard, type_id: u16)
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 TypeDescriptor :: struct {
@@ -29,6 +30,7 @@ TypeDescriptor :: struct {
 	budget_weight:           u16, // (default: 1)
 	init_handler:            Init_Handler,
 	handler_fn:              Handler_Fn,
+	tick_handler:            Tick_Handler,
 }
 
 Memory_Init_Mode :: enum u8 {

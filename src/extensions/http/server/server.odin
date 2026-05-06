@@ -98,6 +98,10 @@ Idle_Array_Index :: distinct u16
 @(private = "package")
 Idle_Array_Count :: distinct u16
 
+// Number of allocated connection slots currently tracked for deadline scans.
+@(private = "package")
+Active_Array_Count :: distinct u16
+
 @(private = "package")
 IDLE_ARRAY_INDEX_NONE :: Idle_Array_Index(0xFFFF)
 
@@ -148,6 +152,9 @@ HTTP_Shard_Runtime :: struct {
 	deadline_ns_drain:    Monotonic_Time_NS,
 	next_request_token:   Request_Token, // monotonic across the shard
 	keepalive_reserve:    u16, // mirrors Keepalive_Config.reserve_slots
+	active_slot_indices:   []u16, // dense swap-and-pop tracker for allocated connections
+	active_slot_positions: []u16,
+	active_count:          Active_Array_Count,
 	idle_slot_indices:    []u16, // dense swap-and-pop tracker
 	idle_slot_handles:    []tina.Handle,
 	idle_slot_positions:  []u16,
@@ -502,6 +509,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 		// The runtime lives in the listener's working arena.
 		init_handler            = _http_listener_init,
 		handler_fn              = _http_listener_handler,
+		tick_handler            = _http_runtime_tick,
 	}
 
 	new_types[connection_type_id] = tina.TypeDescriptor {
@@ -527,6 +535,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 			mailbox_capacity        = 16,
 			init_handler            = _http_dispatcher_init,
 			handler_fn              = _http_dispatcher_handler,
+			tick_handler            = _http_runtime_tick,
 		}
 	}
 
@@ -650,9 +659,10 @@ _is_zero_timeouts :: #force_inline proc "contextless" (timeouts: Timeouts) -> bo
 	return timeouts == zero
 }
 
-// Builds a production-shaped SystemSpec from HTTP-derived parameters. Sized
-// from `connection_slot_count` so doubling capacity scales every internal
-// pool/ring/timer in lockstep — no manual re-tuning per knob.
+// Builds a production-shaped SystemSpec from HTTP-derived parameters.
+// Capacity is derived from actual structural pressure points: pool-backed
+// queues keep power-of-two sizing where the core requires it, while direct
+// counts stay exact so validators can enforce the real ceiling.
 @(private = "package")
 _make_base_system_spec :: proc(
 	server: ^Server,
@@ -677,19 +687,12 @@ _make_base_system_spec :: proc(
 	}
 
 	pool_slot_count := int(_next_power_of_two_u64(max(u64(1024), u64(connection_slot_count) * 8)))
-	timer_entry_count := int(
-		_next_power_of_two_u64(max(u64(256), u64(connection_slot_count) * 4)),
-	)
-	reactor_buffer_slot_count := int(
-		_next_power_of_two_u64(min(u64(4094), max(u64(64), u64(connection_slot_count)))),
-	)
+	timer_entry_count := _derive_timer_entry_count(connection_slot_count, shard_count)
+	reactor_buffer_slot_count := int(min(u64(4094), max(u64(64), u64(connection_slot_count))))
 
 	fd_handoff_entry_count := 0
 	if shard_count > 1 {
-		fd_handoff_entry_count = int(_next_power_of_two_u64(u64(connection_slot_count) / 4))
-		if fd_handoff_entry_count == 0 {
-			fd_handoff_entry_count = 16
-		}
+		fd_handoff_entry_count = int(max(u64(16), u64(connection_slot_count) / 4))
 	}
 
 	spec := tina.SystemSpec {
@@ -723,6 +726,23 @@ _make_base_system_spec :: proc(
 		// types and scratch_arena_size are filled in by install_into_system_spec.
 	}
 	return spec
+}
+
+@(private = "file")
+_derive_timer_entry_count :: proc "contextless" (
+	connection_slot_count: u32,
+	shard_count: u8,
+) -> int {
+	// Renewable transport deadlines (idle/header/body/send/drain) are enforced by
+	// the shard-local deadline scan, not by one timer-wheel entry per re-arm.
+	// Keep a modest reserve here for sparse waits such as application parking,
+	// listener accept backoff, and route-owned timers.
+	entry_count := u64(connection_slot_count) * 4
+	entry_count += u64(shard_count) * 64
+	if entry_count < 2048 {
+		entry_count = 2048
+	}
+	return int(entry_count)
 }
 
 // Compute the per-Connection working_memory_size from limits + route metadata.
@@ -771,12 +791,14 @@ _compute_scratch_requirement :: proc(server: ^Server) -> int {
 }
 
 // The listener's working memory holds the shared HTTP_Shard_Runtime plus the
-// idle-slot tracker array. Sized to the connection capacity.
+// active/idle slot tracker arrays. Sized to the connection capacity.
 @(private = "package")
 _listener_working_memory_size :: #force_inline proc "contextless" (
 	connection_slot_count: int,
 ) -> int {
 	return _align_up(size_of(HTTP_Shard_Runtime)) +
+		_align_up(connection_slot_count * size_of(u16)) +
+		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(tina.Handle)) +
 		_align_up(connection_slot_count * size_of(u16))
@@ -791,9 +813,14 @@ _make_shard_runtime :: proc(
 	connection_type_id: u8,
 ) -> ^HTTP_Shard_Runtime {
 	runtime_storage := make([]HTTP_Shard_Runtime, 1, allocator)
+	active_slot_indices := make([]u16, int(connection_slot_count), allocator)
+	active_slot_positions := make([]u16, int(connection_slot_count), allocator)
 	idle_slot_indices := make([]u16, int(connection_slot_count), allocator)
 	idle_slot_handles := make([]tina.Handle, int(connection_slot_count), allocator)
 	idle_slot_positions := make([]u16, int(connection_slot_count), allocator)
+	for index in 0 ..< len(active_slot_positions) {
+		active_slot_positions[index] = u16(IDLE_ARRAY_INDEX_NONE)
+	}
 	for index in 0 ..< len(idle_slot_positions) {
 		idle_slot_positions[index] = u16(IDLE_ARRAY_INDEX_NONE)
 	}
@@ -804,6 +831,9 @@ _make_shard_runtime :: proc(
 		router                = router,
 		connection_type_id    = connection_type_id,
 		keepalive_reserve     = server.keepalive_reserve_slots,
+		active_slot_indices   = active_slot_indices,
+		active_slot_positions = active_slot_positions,
+		active_count          = 0,
 		idle_slot_indices     = idle_slot_indices,
 		idle_slot_handles     = idle_slot_handles,
 		idle_slot_positions   = idle_slot_positions,

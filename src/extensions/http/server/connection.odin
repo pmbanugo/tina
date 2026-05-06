@@ -38,6 +38,7 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) 
 		working_allocator,
 	)
 	connection.connection_state.peer = {}
+	_runtime_active_slot_add(connection, ctx)
 	_connection_begin_keep_alive_wait(connection, ctx)
 
 	return tina.Effect_Io {
@@ -68,7 +69,7 @@ _http_connection_handler :: proc(
 		return tina.Effect_Receive{}
 
 	case TAG_HEADER_TIMEOUT:
-		if state.state != .Keep_Alive_Idle && state.state != .Recv_Headers {
+		if state.state != .Recv_Headers {
 			return tina.Effect_Receive{}
 		}
 		if state.request.route_index != ROUTE_INDEX_NONE {
@@ -76,9 +77,6 @@ _http_connection_handler :: proc(
 		}
 		if !_connection_timeout_is_current(connection, ctx, state.deadline_ns_header, message.correlation) {
 			return tina.Effect_Receive{}
-		}
-		if state.state == .Keep_Alive_Idle {
-			_idle_slot_remove(connection, ctx)
 		}
 		state.response.flags += {.Close_After_Send, .Aborted}
 		return _connection_stage_canned_response(connection, transmute([]u8)string(ERROR_RESPONSE_408_REQUEST_TIMEOUT))
@@ -163,6 +161,7 @@ _http_connection_handler :: proc(
 		return _connection_handle_sendfile_complete(connection, u32(message.io.result), ctx)
 
 	case tina.IO_TAG_CLOSE_COMPLETE:
+		_runtime_active_slot_remove(connection, ctx)
 		_connection_release_slot(connection, ctx)
 		return tina.Effect_Done{}
 

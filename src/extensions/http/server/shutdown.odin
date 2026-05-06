@@ -15,16 +15,6 @@ _timeout_duration_ns :: #force_inline proc "contextless" (timeout_ms: u32) -> u6
 }
 
 @(private = "package")
-_connection_arm_timeout :: proc(
-	ctx: ^tina.TinaContext,
-	timeout_ms: u32,
-	tag: tina.Message_Tag,
-	correlation: tina.Correlation_Id,
-) {
-	tina.ctx_register_timer_with_correlation(ctx, _timeout_duration_ns(timeout_ms), tag, correlation)
-}
-
-@(private = "package")
 _idle_slot_push :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
@@ -102,16 +92,13 @@ _connection_begin_keep_alive_wait :: proc(connection: ^HTTP_Connection, ctx: ^ti
 	if state.request_token == 0 do state.request_token = 1
 
 	now_ns := _connection_now_ns(ctx)
-	state.deadline_ns_header = Monotonic_Time_NS(u64(now_ns) + _timeout_duration_ns(runtime.server.timeouts.timeout_ms_header))
 	state.deadline_ns_idle = Monotonic_Time_NS(u64(now_ns) + _timeout_duration_ns(runtime.server.timeouts.timeout_ms_idle))
+	state.deadline_ns_header = 0
 	state.deadline_ns_body = 0
 	state.deadline_ns_send = 0
 	state.deadline_ns_drain = 0
 
 	_idle_slot_push(connection, ctx)
-	request_token := u32(state.request_token)
-	_connection_arm_timeout(ctx, runtime.server.timeouts.timeout_ms_header, TAG_HEADER_TIMEOUT, tina.Correlation_Id(request_token))
-	_connection_arm_timeout(ctx, runtime.server.timeouts.timeout_ms_idle, TAG_IDLE_TIMEOUT, tina.Correlation_Id(request_token))
 }
 
 @(private = "package")
@@ -124,6 +111,9 @@ _connection_prepare_incoming_request :: proc(connection: ^HTTP_Connection, ctx: 
 	_idle_slot_remove(connection, ctx)
 	state.state = .Recv_Headers
 	state.deadline_ns_idle = 0
+	state.deadline_ns_header = Monotonic_Time_NS(
+		u64(_connection_now_ns(ctx)) + _timeout_duration_ns(state.shard_runtime.server.timeouts.timeout_ms_header),
+	)
 }
 
 @(private = "package")
@@ -134,7 +124,6 @@ _connection_arm_send_timeout :: proc(connection: ^HTTP_Connection, ctx: ^tina.Ti
 	state.deadline_ns_send = Monotonic_Time_NS(
 		u64(_connection_now_ns(ctx)) + _timeout_duration_ns(runtime.server.timeouts.timeout_ms_send),
 	)
-	_connection_arm_timeout(ctx, runtime.server.timeouts.timeout_ms_send, TAG_SEND_TIMEOUT, tina.Correlation_Id(state.request_token))
 }
 
 @(private = "package")
@@ -145,7 +134,6 @@ _connection_arm_body_timeout :: proc(connection: ^HTTP_Connection, ctx: ^tina.Ti
 	state.deadline_ns_body = Monotonic_Time_NS(
 		u64(_connection_now_ns(ctx)) + _timeout_duration_ns(runtime.server.timeouts.timeout_ms_body),
 	)
-	_connection_arm_timeout(ctx, runtime.server.timeouts.timeout_ms_body, TAG_BODY_TIMEOUT, tina.Correlation_Id(state.request_token))
 }
 
 @(private = "package")
@@ -156,7 +144,6 @@ _connection_arm_drain_timeout :: proc(connection: ^HTTP_Connection, ctx: ^tina.T
 	state.deadline_ns_drain = Monotonic_Time_NS(
 		u64(_connection_now_ns(ctx)) + _timeout_duration_ns(runtime.server.graceful_drain_ms),
 	)
-	_connection_arm_timeout(ctx, runtime.server.graceful_drain_ms, TAG_DRAIN_TIMEOUT, tina.Correlation_Id(state.request_token))
 }
 
 @(private = "package")

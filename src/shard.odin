@@ -280,6 +280,10 @@ scheduler_tick :: proc(shard: ^Shard) {
 		type_id := type_descriptor.id
 		slot_count := u32(type_descriptor.slot_count)
 
+		if type_descriptor.tick_handler != nil {
+			type_descriptor.tick_handler(shard, u16(type_id))
+		}
+
 		// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop
 		states := shard.metadata[type_id].state[:]
 		flags := shard.metadata[type_id].flags[:]
