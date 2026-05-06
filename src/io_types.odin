@@ -88,22 +88,26 @@ Socket_Level :: enum u8 {
 
 Socket_Option :: enum u16 {
 	// SOL_SOCKET
-	SO_REUSEADDR    = 0x0001,
-	SO_REUSEPORT    = 0x0002,
-	SO_KEEPALIVE    = 0x0003,
-	SO_RCVBUF       = 0x0004,
-	SO_SNDBUF       = 0x0005,
-	SO_LINGER       = 0x0006,
-	SO_BINDTODEVICE = 0x0007,
+	SO_REUSEADDR      = 0x0001,
+	SO_REUSEPORT      = 0x0002,
+	SO_KEEPALIVE      = 0x0003,
+	SO_RCVBUF         = 0x0004,
+	SO_SNDBUF         = 0x0005,
+	SO_LINGER         = 0x0006,
+	SO_BINDTODEVICE   = 0x0007,
 	// IPPROTO_TCP
-	TCP_NODELAY     = 0x0101,
-	TCP_CORK        = 0x0102,
-	TCP_NOPUSH      = 0x0103,
-	TCP_KEEPIDLE    = 0x0104,
-	TCP_KEEPINTVL   = 0x0105,
-	TCP_KEEPCNT     = 0x0106,
+	TCP_NODELAY       = 0x0101,
+	TCP_CORK          = 0x0102,
+	TCP_NOPUSH        = 0x0103,
+	TCP_KEEPIDLE      = 0x0104,
+	TCP_KEEPINTVL     = 0x0105,
+	TCP_KEEPCNT       = 0x0106,
+
+	TCP_DEFER_ACCEPT  = 0x0107,
+	TCP_NOTSENT_LOWAT = 0x0108,
+
 	// IPPROTO_IPV6
-	IPV6_V6ONLY     = 0x0201,
+	IPV6_V6ONLY       = 0x0201,
 }
 
 Socket_Linger :: struct {

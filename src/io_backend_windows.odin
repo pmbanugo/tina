@@ -791,6 +791,9 @@ when !TINA_SIMULATION_MODE {
 	) -> Backend_Error {
 		sol := _win_map_socket_level(level)
 		opt := _win_map_socket_option(option)
+		if opt == 0 {
+			return .Unsupported
+		}
 
 		switch v in value {
 		case bool:
@@ -1194,6 +1197,10 @@ when !TINA_SIMULATION_MODE {
 			return 17 // TCP_KEEPINTVL
 		case .TCP_KEEPCNT:
 			return 16 // TCP_KEEPCNT
+		case .TCP_DEFER_ACCEPT:
+			return 0 // Linux-only; LSP noop on Windows
+		case .TCP_NOTSENT_LOWAT:
+			return 0 // POSIX-only; LSP noop on Windows
 		case .IPV6_V6ONLY:
 			return win.IPV6_V6ONLY
 		}

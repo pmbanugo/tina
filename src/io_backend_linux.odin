@@ -468,45 +468,49 @@ when !TINA_SIMULATION_MODE {
 		sol: i32
 		switch level {
 		case .SOL_SOCKET:
-			sol = 1 // SOL_SOCKET
+			sol = 1
 		case .IPPROTO_TCP:
-			sol = 6 // IPPROTO_TCP
+			sol = 6
 		case .IPPROTO_UDP:
-			sol = 17 // IPPROTO_UDP
+			sol = 17
 		case .IPPROTO_IPV6:
-			sol = 41 // IPPROTO_IPV6
+			sol = 41
 		}
 
 		opt: i32
 		switch option {
 		case .SO_REUSEADDR:
-			opt = 2 // SO_REUSEADDR
+			opt = 2
 		case .SO_REUSEPORT:
-			opt = 15 // SO_REUSEPORT
+			opt = 15
 		case .SO_KEEPALIVE:
-			opt = 9 // SO_KEEPALIVE
+			opt = 9
 		case .SO_RCVBUF:
-			opt = 8 // SO_RCVBUF
+			opt = 8
 		case .SO_SNDBUF:
-			opt = 7 // SO_SNDBUF
+			opt = 7
 		case .SO_LINGER:
-			opt = 13 // SO_LINGER
+			opt = 13
 		case .SO_BINDTODEVICE:
-			opt = 25 // SO_BINDTODEVICE
+			opt = 25
 		case .TCP_NODELAY:
-			opt = 1 // TCP_NODELAY
+			opt = 1
 		case .TCP_CORK:
-			opt = 3 // TCP_CORK
+			opt = 3
 		case .TCP_NOPUSH:
 			opt = 3 // TCP_NOPUSH (alias for CORK on Linux)
 		case .TCP_KEEPIDLE:
-			opt = 4 // TCP_KEEPIDLE
+			opt = 4
 		case .TCP_KEEPINTVL:
-			opt = 5 // TCP_KEEPINTVL
+			opt = 5
 		case .TCP_KEEPCNT:
-			opt = 6 // TCP_KEEPCNT
+			opt = 6
+		case .TCP_DEFER_ACCEPT:
+			opt = 9
+		case .TCP_NOTSENT_LOWAT:
+			opt = 25
 		case .IPV6_V6ONLY:
-			opt = 26 // IPV6_V6ONLY
+			opt = 26
 		}
 
 		switch v in value {
@@ -541,45 +545,49 @@ when !TINA_SIMULATION_MODE {
 		sol: i32
 		switch level {
 		case .SOL_SOCKET:
-			sol = 1 // SOL_SOCKET
+			sol = 1
 		case .IPPROTO_TCP:
-			sol = 6 // IPPROTO_TCP
+			sol = 6
 		case .IPPROTO_UDP:
-			sol = 17 // IPPROTO_UDP
+			sol = 17
 		case .IPPROTO_IPV6:
-			sol = 41 // IPPROTO_IPV6
+			sol = 41
 		}
 
 		opt: i32
 		switch option {
 		case .SO_REUSEADDR:
-			opt = 2 // SO_REUSEADDR
+			opt = 2
 		case .SO_REUSEPORT:
-			opt = 15 // SO_REUSEPORT
+			opt = 15
 		case .SO_KEEPALIVE:
-			opt = 9 // SO_KEEPALIVE
+			opt = 9
 		case .SO_RCVBUF:
-			opt = 8 // SO_RCVBUF
+			opt = 8
 		case .SO_SNDBUF:
-			opt = 7 // SO_SNDBUF
+			opt = 7
 		case .SO_LINGER:
-			opt = 13 // SO_LINGER
+			opt = 13
 		case .SO_BINDTODEVICE:
-			opt = 25 // SO_BINDTODEVICE
+			opt = 25
 		case .TCP_NODELAY:
-			opt = 1 // TCP_NODELAY
+			opt = 1
 		case .TCP_CORK:
-			opt = 3 // TCP_CORK
+			opt = 3
 		case .TCP_NOPUSH:
 			opt = 3 // TCP_NOPUSH (alias for CORK on Linux)
 		case .TCP_KEEPIDLE:
-			opt = 4 // TCP_KEEPIDLE
+			opt = 4
 		case .TCP_KEEPINTVL:
-			opt = 5 // TCP_KEEPINTVL
+			opt = 5
 		case .TCP_KEEPCNT:
-			opt = 6 // TCP_KEEPCNT
+			opt = 6
+		case .TCP_DEFER_ACCEPT:
+			opt = 9
+		case .TCP_NOTSENT_LOWAT:
+			opt = 25
 		case .IPV6_V6ONLY:
-			opt = 26 // IPV6_V6ONLY
+			opt = 26
 		}
 
 		// SO_LINGER requires an 8-byte struct; route it separately to avoid stack overflow

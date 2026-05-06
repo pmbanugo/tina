@@ -2,6 +2,9 @@ package http_server
 
 import tina "../../.."
 
+@(private = "package")
+HTTP_TCP_NOTSENT_LOWAT_BYTES :: #config(HTTP_TCP_NOTSENT_LOWAT_BYTES, 16 * 1024)
+
 @(private = "file")
 Listener_Dispatch_Result :: enum u8 {
 	Local_Spawned,
@@ -245,6 +248,20 @@ _listener_open_listen_socket :: proc(ctx: ^tina.TinaContext, runtime: ^HTTP_Shar
 	if listen_error != .None {
 		return tina.FD_HANDLE_NONE
 	}
+
+	// Inherited by accepted connections to ensure zero setsockopt syscalls on each connections.
+	_ = tina.ctx_setsockopt_bool(ctx, listen_fd, .IPPROTO_TCP, .TCP_NODELAY, true)
+	when ODIN_OS == .Linux || ODIN_OS == .Darwin {
+		_ = tina.ctx_setsockopt_i32(ctx, listen_fd, .IPPROTO_TCP, .TCP_NOTSENT_LOWAT, i32(HTTP_TCP_NOTSENT_LOWAT_BYTES))
+	}
+	when ODIN_OS == .Linux {
+		_ = tina.ctx_setsockopt_i32(ctx, listen_fd, .IPPROTO_TCP, .TCP_DEFER_ACCEPT, 1)
+	}
+	// The following features are intentionally rejected/untouched (left as OS defaults):
+	// - TCP_CORK / TCP_NOPUSH (rejected in favor of Application equivalent)
+	// - SO_KEEPALIVE (rejected in favor of Tina's timer wheel)
+	// - SO_RCVBUF / SO_SNDBUF (untouched, leave to kernel auto-tuning)
+	// - TCP_FASTOPEN (deferred)
 
 	return listen_fd
 }

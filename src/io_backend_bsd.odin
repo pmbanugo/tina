@@ -502,10 +502,11 @@ when !TINA_SIMULATION_MODE {
 			plevel = 41
 		}
 
-		popt, opt_ok := _map_socket_option(option)
+		opt_int, opt_ok := _map_socket_option_int(option)
 		if !opt_ok {
 			return .Unsupported
 		}
+		popt := transmute(posix.Sock_Option)opt_int
 
 		switch v in value {
 		case bool:
@@ -551,10 +552,11 @@ when !TINA_SIMULATION_MODE {
 			plevel = 41
 		}
 
-		popt, opt_ok := _map_socket_option(option)
+		opt_int, opt_ok := _map_socket_option_int(option)
 		if !opt_ok {
 			return nil, .Unsupported
 		}
+		popt := transmute(posix.Sock_Option)opt_int
 
 		if option == .SO_LINGER {
 			lin: Socket_Linger
@@ -605,11 +607,6 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		fd: OS_FD,
 	) -> Backend_Error {
-		// Sweep pending operations for this FD BEFORE closing it.
-		// On BSD/macOS, close() silently removes kevents. Without this sweep,
-		// pending operations on this FD would never produce a completion,
-		// permanently leaking their reactor buffers. We synthesize -ECANCELED
-		// completions so the reactor's stale-path reclamation frees the buffers.
 		_sweep_pending_for_fd(backend, fd)
 
 		if posix.close(posix.FD(fd)) != .OK {
@@ -1133,20 +1130,35 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_map_socket_option :: proc(option: Socket_Option) -> (posix.Sock_Option, bool) {
+	_map_socket_option_int :: proc(option: Socket_Option) -> (c.int, bool) {
 		#partial switch option {
 		case .SO_REUSEADDR:
-			return .REUSEADDR, true
+			return c.int(posix.SO_REUSEADDR), true
 		case .SO_KEEPALIVE:
-			return .KEEPALIVE, true
+			return c.int(posix.SO_KEEPALIVE), true
 		case .SO_RCVBUF:
-			return .RCVBUF, true
+			return c.int(posix.SO_RCVBUF), true
 		case .SO_SNDBUF:
-			return .SNDBUF, true
+			return c.int(posix.SO_SNDBUF), true
 		case .SO_LINGER:
-			return .LINGER, true
+			return c.int(posix.SO_LINGER), true
+		case .SO_REUSEPORT:
+			// Identical numeric value across all BSD-derived kernels (incl. macOS).
+			return 0x0200, true
+		case .TCP_NODELAY:
+			return 1, true
+		case .TCP_NOTSENT_LOWAT:
+			when ODIN_OS == .Darwin {
+				return 0x201, true
+			} else when ODIN_OS == .FreeBSD {
+				return 90, true
+			} else {
+				return 0, false
+			}
+		case .IPV6_V6ONLY:
+			return 27, true
 		case:
-			return .REUSEADDR, false
+			return 0, false
 		}
 	}
 
