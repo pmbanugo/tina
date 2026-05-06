@@ -75,7 +75,6 @@ Route_Handler_Kind :: enum u8 {
 
 // Opaque request facade passed to handlers. Fields stay package-private so the
 // request lifetime and backing storage remain under library control.
-@(private = "package")
 Request :: struct {
 	connection_state: ^HTTP_Connection_State,
 	request_state:    ^Request_State,
@@ -86,7 +85,6 @@ Request :: struct {
 
 // Opaque response facade passed to handlers. It owns the staged header bytes
 // slice and the connection-local egress buffer view.
-@(private = "package")
 Response :: struct {
 	connection_state:      ^HTTP_Connection_State,
 	egress_buffer:         []u8,
@@ -191,7 +189,10 @@ _build_event_route :: #force_inline proc "contextless" (
 	}
 }
 
-get_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
+get_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
 	return _build_request_route(pattern, handler, {.GET})
 }
 
@@ -210,7 +211,10 @@ get :: proc {
 	get_event,
 }
 
-post_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
+post_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
 	return _build_request_route(pattern, handler, {.POST})
 }
 
@@ -229,7 +233,10 @@ post :: proc {
 	post_event,
 }
 
-put_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
+put_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
 	return _build_request_route(pattern, handler, {.PUT})
 }
 
@@ -248,7 +255,10 @@ put :: proc {
 	put_event,
 }
 
-delete_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
+delete_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
 	return _build_request_route(pattern, handler, {.DELETE})
 }
 
@@ -267,7 +277,10 @@ delete :: proc {
 	delete_event,
 }
 
-patch_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
+patch_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
 	return _build_request_route(pattern, handler, {.PATCH})
 }
 
@@ -286,7 +299,10 @@ patch :: proc {
 	patch_event,
 }
 
-head_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
+head_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
 	return _build_request_route(pattern, handler, {.HEAD})
 }
 
@@ -305,7 +321,10 @@ head :: proc {
 	head_event,
 }
 
-options_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
+options_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
 	return _build_request_route(pattern, handler, {.OPTIONS})
 }
 
@@ -324,17 +343,15 @@ options :: proc {
 	options_event,
 }
 
-any_simple :: #force_inline proc "contextless" (pattern: string, handler: Request_Handler) -> Route {
-	return _build_request_route(pattern, handler, {
-		.GET,
-		.POST,
-		.PUT,
-		.DELETE,
-		.PATCH,
-		.HEAD,
-		.OPTIONS,
-		.TRACE,
-	})
+any_simple :: #force_inline proc "contextless" (
+	pattern: string,
+	handler: Request_Handler,
+) -> Route {
+	return _build_request_route(
+		pattern,
+		handler,
+		{.GET, .POST, .PUT, .DELETE, .PATCH, .HEAD, .OPTIONS, .TRACE},
+	)
 }
 
 any_event :: #force_inline proc "contextless" (
@@ -344,16 +361,14 @@ any_event :: #force_inline proc "contextless" (
 	body_size_max: u32 = 0,
 	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_event_route(pattern, handler, {
-		.GET,
-		.POST,
-		.PUT,
-		.DELETE,
-		.PATCH,
-		.HEAD,
-		.OPTIONS,
-		.TRACE,
-	}, state_size, body_size_max, body_mode)
+	return _build_event_route(
+		pattern,
+		handler,
+		{.GET, .POST, .PUT, .DELETE, .PATCH, .HEAD, .OPTIONS, .TRACE},
+		state_size,
+		body_size_max,
+		body_mode,
+	)
 }
 
 any :: proc {

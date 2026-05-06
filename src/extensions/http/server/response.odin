@@ -153,7 +153,6 @@ response_state_reset :: #force_inline proc "contextless" (response: ^Response_St
 	}
 }
 
-@(private = "package")
 response_header_set :: proc "contextless" (
 	response: ^Response_State,
 	bytes_region: []u8,
@@ -556,7 +555,10 @@ _response_clear_sendfile_plan :: #force_inline proc "contextless" (response: ^Re
 }
 
 @(private = "file")
-_response_stage_internal_server_error :: proc "contextless" (response: ^Response, state: ^Response_State) {
+_response_stage_internal_server_error :: proc "contextless" (
+	response: ^Response,
+	state: ^Response_State,
+) {
 	copy(response.egress_buffer[:], ERROR_RESPONSE_500_INTERNAL_SERVER_ERROR)
 	state.flags += {.Aborted, .Close_After_Send}
 	state.mode = .Closed
@@ -589,13 +591,18 @@ _response_preserve_flags :: proc "contextless" (state: ^Response_State) {
 status :: #force_inline proc "contextless" (response: ^Response, code: HTTP_Status) {
 	state := _response_state(response)
 	state.status_code = code
-	if code == HTTP_STATUS_NO_CONTENT || code == HTTP_STATUS_NOT_MODIFIED || code == HTTP_STATUS_CONTINUE {
+	if code == HTTP_STATUS_NO_CONTENT ||
+	   code == HTTP_STATUS_NOT_MODIFIED ||
+	   code == HTTP_STATUS_CONTINUE {
 		state.mode = .Head_Suppressed
 	}
 }
 
-@(private = "package")
-header_set :: #force_inline proc "contextless" (response: ^Response, name: string, value: string) -> bool {
+header_set :: #force_inline proc "contextless" (
+	response: ^Response,
+	name: string,
+	value: string,
+) -> bool {
 	return response_header_set(
 		_response_state(response),
 		response.response_header_bytes,
@@ -604,8 +611,11 @@ header_set :: #force_inline proc "contextless" (response: ^Response, name: strin
 	)
 }
 
-@(private = "package")
-header_add :: #force_inline proc "contextless" (response: ^Response, name: string, value: string) -> bool {
+header_add :: #force_inline proc "contextless" (
+	response: ^Response,
+	name: string,
+	value: string,
+) -> bool {
 	return response_header_add(
 		_response_state(response),
 		response.response_header_bytes,
@@ -614,17 +624,22 @@ header_add :: #force_inline proc "contextless" (response: ^Response, name: strin
 	)
 }
 
-@(private = "package")
-respond_text :: #force_inline proc "contextless" (response: ^Response, status_code: HTTP_Status, body: string) -> Route_Step {
+respond_text :: #force_inline proc "contextless" (
+	response: ^Response,
+	status_code: HTTP_Status,
+	body: string,
+) -> Route_Step {
 	return _respond_bytes(response, status_code, "text/plain; charset=utf-8", transmute([]u8)body)
 }
 
-@(private = "package")
-respond_json :: #force_inline proc "contextless" (response: ^Response, status_code: HTTP_Status, body: string) -> Route_Step {
+respond_json :: #force_inline proc "contextless" (
+	response: ^Response,
+	status_code: HTTP_Status,
+	body: string,
+) -> Route_Step {
 	return _respond_bytes(response, status_code, "application/json", transmute([]u8)body)
 }
 
-@(private = "package")
 respond_bytes :: #force_inline proc "contextless" (
 	response: ^Response,
 	status_code: HTTP_Status,
@@ -634,7 +649,11 @@ respond_bytes :: #force_inline proc "contextless" (
 	return _respond_bytes(response, status_code, content_type, body)
 }
 
-begin_stream :: #force_inline proc "contextless" (response: ^Response, status_code: HTTP_Status, content_type: string) {
+begin_stream :: #force_inline proc "contextless" (
+	response: ^Response,
+	status_code: HTTP_Status,
+	content_type: string,
+) {
 	state := _response_state(response)
 	_response_preserve_flags(state)
 	state.status_code = status_code
@@ -675,7 +694,6 @@ begin_fixed_stream :: #force_inline proc "contextless" (
 	}
 }
 
-@(private = "package")
 respond_file :: proc "contextless" (
 	response: ^Response,
 	fd_file: tina.FD_Handle,
@@ -774,11 +792,23 @@ write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 
 		next_cursor, ok := _write_hex_u16(response.egress_buffer, cursor, admitted)
 		if !ok do return 0
-		next_cursor, ok = _write_bytes_into(response.egress_buffer, next_cursor, transmute([]u8)string("\r\n"))
+		next_cursor, ok = _write_bytes_into(
+			response.egress_buffer,
+			next_cursor,
+			transmute([]u8)string("\r\n"),
+		)
 		if !ok do return 0
-		next_cursor, ok = _write_bytes_into(response.egress_buffer, next_cursor, data[:int(admitted)])
+		next_cursor, ok = _write_bytes_into(
+			response.egress_buffer,
+			next_cursor,
+			data[:int(admitted)],
+		)
 		if !ok do return 0
-		next_cursor, ok = _write_bytes_into(response.egress_buffer, next_cursor, transmute([]u8)string("\r\n"))
+		next_cursor, ok = _write_bytes_into(
+			response.egress_buffer,
+			next_cursor,
+			transmute([]u8)string("\r\n"),
+		)
 		if !ok do return 0
 
 		state.egress_size = Egress_Size(next_cursor)
@@ -805,14 +835,17 @@ flush :: proc(final: bool = false) -> Route_Step {
 	return .Flush_Final if final else .Flush
 }
 
-read_body :: proc() -> Route_Step {
+read_body :: #force_inline proc "contextless" () -> Route_Step {
 	return .Read_Body
 }
 
-close :: proc() -> Route_Step { return .Close }
+close :: proc() -> Route_Step {return .Close}
 
 @(private = "file")
-_response_append_chunked_terminator :: proc "contextless" (state: ^Response_State, egress_buffer: []u8) -> bool {
+_response_append_chunked_terminator :: proc "contextless" (
+	state: ^Response_State,
+	egress_buffer: []u8,
+) -> bool {
 	cursor := int(state.egress_size)
 	if cursor + 5 > len(egress_buffer) {
 		return false
@@ -1668,7 +1701,11 @@ test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing
 	ok := _response_prepare_flush(&response, true)
 	testing.expect(t, ok)
 	testing.expect(t, state.mode == .Closed)
-	testing.expect_value(t, string(response.egress_buffer[pre_flush_size:int(state.egress_size)]), "0\r\n\r\n")
+	testing.expect_value(
+		t,
+		string(response.egress_buffer[pre_flush_size:int(state.egress_size)]),
+		"0\r\n\r\n",
+	)
 }
 
 @(test)
