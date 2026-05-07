@@ -53,7 +53,7 @@ This preserves three properties that work-stealing sacrifices:
 - **Cache locality.** An Isolate's struct, its mailbox metadata, and its working memory all reside in cache lines that are warm on the owning core. They stay warm because nothing evicts them across cores.
 - **Determinism.** The scheduler's dispatch order is a function of the Shard's local state — its inbound messages, I/O completions, and timer expirations. In simulation mode, the same seed reproduces the same execution, every time.
 
-Tina does not abandon load balancing; it moves it to **placement time**. When an Isolate is spawned, the caller decides which Shard it belongs to. Tina provides `key_to_shard(key, shard_count)` utility function for consistent key-based partitioning (e.g. `session_id % shard_count`). The topology is planned upfront in the boot spec, not discovered at runtime.
+Tina does not abandon load balancing; it moves it to **placement time**. When an Isolate is spawned, the caller decides which Shard it belongs to. Tina provides `key_to_shard(key, shard_count)` utility function for consistent key-based partitioning. The topology is planned upfront in the boot spec, not discovered at runtime.
 
 ## Cross-Shard Messaging
 
@@ -80,9 +80,9 @@ With dedicated channels, the writer needs **no atomics on the hot path**. It wri
 
 Each Shard runs a tight loop that processes work in a fixed, deterministic order.
 
-1. **Inbound message** (step 1): Messages from other Shards are delivered before local handlers run, so handlers see fresh cross-shard data.
-2. **I/O** (step 2): Completed I/O operations are available before dispatch.
-3. **Outbound messages after dispatch** (step 5): All messages generated running the handlers are batched and published in one atomic write.
+1. **Inbound message**: Messages from other Shards are delivered before local handlers run, so handlers see fresh cross-shard data.
+2. **I/O**: Completed I/O operations are available before dispatch.
+3. **Outbound messages after dispatch**: All messages generated running the handlers are batched and published in one atomic write.
 4. **Log last**
 
 ## Budgeted Batching by Type
