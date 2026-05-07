@@ -42,7 +42,7 @@ Work-stealing schedulers (Go, Tokio, .NET ThreadPool, Erlang VM) allow idle thre
 When a task migrates from core A to core B:
 
 1. **Every cache line of that task's working data** must be fetched from core A's L1/L2 caches (or from DRAM). On modern hardware, an L1 hit is ~1ns; a cross-core fetch is ~20–40ns; a DRAM miss is ~60–80ns.
-2. **The task's memory allocations** may now be on the wrong NUMA node, adding ~2× latency on every subsequent cache miss.
+2. **The task's memory allocations** may now be on the wrong core, adding ~2× latency on every subsequent cache miss.
 3. **Determinism is lost.** The execution order becomes a function of OS scheduling jitter, cache timing, and interrupt distribution — impossible to reproduce in testing.
 
 Tina makes a different choice: **an Isolate belongs to exactly one Shard for its entire lifetime.** No migration. Ever.
@@ -76,50 +76,25 @@ Why one channel per Shard-pair instead of one shared inbound queue per Shard? A 
 
 With dedicated channels, the writer needs **no atomics on the hot path**. It writes to its local write cursor, copies the envelope into the channel slot, and advances the cursor. The only atomic operation is the store-release that publishes the batch to the consumer — and that happens once per scheduler tick, not once per message. The consumer side is symmetric: one atomic load-acquire per tick to check for new messages.
 
-The memory cost of N×(N-1) channels is modest. Each channel is a contiguous array of 128-byte message envelopes, sized per Shard-pair in the boot spec (configurable via the Painter's Algorithm for ring topology). A default channel of 64 slots is 8KB. For 16 Shards at 240 channels, that is ~1.9MB total — well within the memory budget of a modern server.
-
 ## The Scheduler Loop
 
-Each Shard runs a tight loop that processes work in a fixed, deterministic order:
+Each Shard runs a tight loop that processes work in a fixed, deterministic order.
 
-```
-loop {
-    1. Drain inbound cross-shard channels → deliver to local mailboxes
-    2. Collect I/O completions (non-blocking) → deliver via Isolate metadata
-    3. For each Isolate type (budget-limited):
-         Dispatch Isolates with pending work
-         Call handler(isolate, message, ctx) → Effect
-         Interpret the Effect
-    4. Flush accumulated I/O submissions (one syscall per tick)
-    5. Flush outbound cross-shard channels (one atomic store per channel)
-    6. Advance timer wheel
-     7. Flush Logging Subsystem
-}
-```
-
-The order matters:
-
-- **Inbound first** (step 1): Messages from other Shards are delivered before local handlers run, so handlers see fresh cross-shard data.
-- **I/O second** (step 2): Completed I/O operations are available before dispatch.
-- **Outbound after dispatch** (step 5): All messages generated during step 3 are batched and published in one atomic store per ring. This is the LMAX Disruptor's batching effect — lagging consumers catch up in bursts, amortizing the cost of atomic operations.
-- **Log last** (step 7): String formatting pollutes the L1 instruction cache. Deferring it until after all handler execution keeps the cache hot during the performance-critical dispatch phase.
+1. **Inbound message** (step 1): Messages from other Shards are delivered before local handlers run, so handlers see fresh cross-shard data.
+2. **I/O** (step 2): Completed I/O operations are available before dispatch.
+3. **Outbound messages after dispatch** (step 5): All messages generated running the handlers are batched and published in one atomic write.
+4. **Log last**
 
 ## Budgeted Batching by Type
 
-In step 3, the scheduler does not round-robin individual Isolates. It processes Isolates **grouped by type** — all pending Session Isolates, then all pending Timer Isolates, and so on.
+The scheduler processes Isolates **grouped by type** — all pending Session Isolates, then all pending Timer Isolates, and so on.
 
-Why? When the scheduler calls the same handler function for 50 Session Isolates in a row, the handler's machine code stays hot in the L1 instruction cache. The Session Isolate struct has a uniform stride, so the hardware prefetcher (which handles strides up to 2KB) accurately predicts the next memory access.
-
-If the scheduler interleaved types — Session, Timer, Session, Listener, Session — the instruction cache would thrash between handler functions, and the data prefetcher would see irregular strides.
-
-The risk of pure type-batching is **starvation**: 10,000 pending Timer Isolates could starve a handful of urgent Session Isolates. Tina solves this with a **budget** per type. Each type has a configurable `budget_weight` (default: 1). The scheduler dispatches at most `budget_weight × 256` Isolates of that type per tick. When the budget is exhausted, the scheduler saves a cursor and moves to the next type, resuming from the saved position on the next tick.
-
-This preserves ~90% of the cache benefit of pure batching while bounding worst-case dispatch latency.
+> TODO: add more info if it's helpful, or restructure the document
 
 ## Tradeoffs Accepted
 
-**No work-stealing means potential load imbalance.** If Shard 3 has 10× more active Isolates than Shard 7, Shard 7 will idle while Shard 3 is saturated. This is solved by thoughtful placement at spawn time — partition your workload by key, spread your Isolate types across Shards in the boot spec, and monitor per-Shard utilization. The load distribution is a deployment decision, not a runtime guess.
+**No work-stealing means potential load imbalance.** If Shard 3 has 10× more active Isolates than Shard 7, Shard 7 will idle while Shard 3 is saturated. This is solved by thoughtful placement at spawn time — partition your workload appropriately, spread your Isolate types across Shards in the boot spec, and monitor per-Shard utilization. The load distribution is a deployment decision, not a runtime guess.
 
 **No Isolate migration means you must plan your topology upfront.** You cannot rebalance a running system by moving Isolates between Shards. If your traffic pattern changes dramatically, you redeploy with a new boot spec. This is the Seastar philosophy: the operator knows the workload shape better than a runtime heuristic.
 
-**Cross-shard channels mean N×(N-1) channels for N Shards.** For 16 cores, that is 240 channels. For 64 cores, that is 4,032 channels. At 8KB each, 64 cores costs ~31MB of channel memory — a rounding error on a server with 256GB of RAM. The payoff is zero contention on the messaging hot path: no CAS loops, no lock queues, no cache-line bouncing between cores.
+**Cross-shard channels mean N×(N-1) channels for N Shards.** For 16 cores, that is 240 channels. For 64 cores, that is 4,032 channels. At 8KB each, 64 cores costs ~31MB of channel memory — a small piece on a server with 256GB of RAM. The payoff is zero contention on the messaging hot path: no CAS loops, no lock queues, no cache-line bouncing between cores.
