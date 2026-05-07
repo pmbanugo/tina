@@ -153,14 +153,16 @@ _build_request_route :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
 	methods_mask: Method_Mask,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
 	return Route {
 		handler = rawptr(handler),
 		handler_kind = .Request,
 		pattern = pattern,
 		methods_mask = methods_mask,
-		body_mode = .None,
-		body_size_max = 0,
+		body_mode = body_mode,
+		body_size_max = body_size_max,
 		state_size = 0,
 	}
 }
@@ -188,8 +190,10 @@ _build_event_route :: #force_inline proc "contextless" (
 get_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_request_route(pattern, handler, {.GET})
+	return _build_request_route(pattern, handler, {.GET}, body_size_max, body_mode)
 }
 
 get_event :: #force_inline proc "contextless" (
@@ -210,8 +214,10 @@ get :: proc {
 post_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_request_route(pattern, handler, {.POST})
+	return _build_request_route(pattern, handler, {.POST}, body_size_max, body_mode)
 }
 
 post_event :: #force_inline proc "contextless" (
@@ -232,8 +238,10 @@ post :: proc {
 put_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_request_route(pattern, handler, {.PUT})
+	return _build_request_route(pattern, handler, {.PUT}, body_size_max, body_mode)
 }
 
 put_event :: #force_inline proc "contextless" (
@@ -254,8 +262,10 @@ put :: proc {
 delete_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_request_route(pattern, handler, {.DELETE})
+	return _build_request_route(pattern, handler, {.DELETE}, body_size_max, body_mode)
 }
 
 delete_event :: #force_inline proc "contextless" (
@@ -276,8 +286,10 @@ delete :: proc {
 patch_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_request_route(pattern, handler, {.PATCH})
+	return _build_request_route(pattern, handler, {.PATCH}, body_size_max, body_mode)
 }
 
 patch_event :: #force_inline proc "contextless" (
@@ -298,8 +310,10 @@ patch :: proc {
 head_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_request_route(pattern, handler, {.HEAD})
+	return _build_request_route(pattern, handler, {.HEAD}, body_size_max, body_mode)
 }
 
 head_event :: #force_inline proc "contextless" (
@@ -320,8 +334,10 @@ head :: proc {
 options_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
-	return _build_request_route(pattern, handler, {.OPTIONS})
+	return _build_request_route(pattern, handler, {.OPTIONS}, body_size_max, body_mode)
 }
 
 options_event :: #force_inline proc "contextless" (
@@ -342,11 +358,15 @@ options :: proc {
 any_simple :: #force_inline proc "contextless" (
 	pattern: string,
 	handler: Request_Handler,
+	body_size_max: u32 = 0,
+	body_mode: Route_Body_Mode = .None,
 ) -> Route {
 	return _build_request_route(
 		pattern,
 		handler,
 		{.GET, .POST, .PUT, .DELETE, .PATCH, .HEAD, .OPTIONS, .TRACE},
+		body_size_max,
+		body_mode,
 	)
 }
 
@@ -413,6 +433,14 @@ test_route_builder_post_simple_sets_method_mask :: proc(t: ^testing.T) {
 	testing.expect(t, .POST in route.methods_mask, "post route should include POST")
 	testing.expect(t, .GET not_in route.methods_mask, "post route should not include GET")
 	testing.expect_value(t, route.handler_kind, Route_Handler_Kind.Request)
+}
+
+@(test)
+test_route_builder_post_simple_accepts_buffered_body_mode :: proc(t: ^testing.T) {
+	route := post("/echo", _test_request_handler, body_size_max = 4096, body_mode = Route_Body_Mode.Buffered)
+	testing.expect_value(t, route.handler_kind, Route_Handler_Kind.Request)
+	testing.expect_value(t, route.body_mode, Route_Body_Mode.Buffered)
+	testing.expect_value(t, route.body_size_max, u32(4096))
 }
 
 @(test)
