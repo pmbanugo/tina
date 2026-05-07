@@ -313,6 +313,7 @@ peer_address :: #force_inline proc "contextless" (request: ^Request) -> tina.Pee
 	return request.connection_state.peer
 }
 
+// Returns the allocator for the Connection's (Isolate) working memory
 request_arena :: proc(request: ^Request) -> mem.Allocator {
 	when tina.TINA_DEBUG_ASSERTS {
 		assert(request != nil && request.tina_context != nil, "request_arena: request context is nil")
@@ -321,6 +322,7 @@ request_arena :: proc(request: ^Request) -> mem.Allocator {
 	return tina.ctx_working_arena(request.tina_context)
 }
 
+// Returns the allocator for the Connection's (Isolate) scratch memory
 request_scratch :: proc(request: ^Request) -> mem.Allocator {
 	when tina.TINA_DEBUG_ASSERTS {
 		assert(request != nil && request.tina_context != nil, "request_scratch: request context is nil")
