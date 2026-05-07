@@ -47,11 +47,9 @@ HTTP_CHUNKED_PAYLOAD_BUDGET :: HTTP_EGRESS_BUFFER_SIZE - HTTP_CHUNKED_FRAMING_RE
 #assert(HTTP_RESPONSE_HEADERS_MAX > 0 && HTTP_RESPONSE_HEADERS_MAX <= 255)
 
 // Bytes staged in egress_buffer ready to send.
-@(private = "package")
 Egress_Size :: distinct u16
 
 // Bytes already transmitted from egress_buffer.
-@(private = "package")
 Egress_Size_Sent :: distinct u16
 
 @(private = "package")
@@ -162,7 +160,6 @@ response_header_set :: proc "contextless" (
 	return _stage_header(response, bytes_region, name, value, replace_existing = true)
 }
 
-@(private = "package")
 response_header_add :: proc "contextless" (
 	response: ^Response_State,
 	bytes_region: []u8,
@@ -345,14 +342,9 @@ admit_chunk_payload :: #force_inline proc "contextless" (free: u16, want: u16) -
 	return 0
 }
 
-
-// ─── Status Reason Phrases ──────────────────────────────────────────────────
-//
 // Returns the canonical IANA reason phrase for the codes the library itself
 // emits. Unknown codes yield an empty string — the serializer still writes a
 // well-formed status line because the SP is preserved (`HTTP/1.1 999 \r\n`).
-
-@(private = "package")
 status_reason_phrase :: #force_inline proc "contextless" (code: HTTP_Status) -> string {
 	switch code {
 	case 100:
