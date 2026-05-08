@@ -40,7 +40,7 @@ when TINA_SIMULATION_MODE {
 
 		ctx_register_timer(
 			ctx,
-			2 * _ctx_extract_shard(ctx).timer_resolution_ns,
+			2 * ctx._shard.timer_resolution_ns,
 			APP_TAG_IO_TIMEOUT,
 		)
 
@@ -213,7 +213,7 @@ when TINA_SIMULATION_MODE {
 	}
 
 	write_crasher_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
-		if _ctx_extract_shard(ctx).current_tick == 1 do return Effect_Crash{reason = .None}
+		if ctx._shard.current_tick == 1 do return Effect_Crash{reason = .None}
 		return Effect_Done{}
 	}
 

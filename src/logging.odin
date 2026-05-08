@@ -88,7 +88,7 @@ ctx_log_raw :: #force_inline proc "contextless" (
 		tag >= USER_LOG_TAG_BASE,
 		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
 	)
-	_shard_log(_ctx_extract_shard(ctx), ctx.self_handle, level, tag, payload)
+	_shard_log(ctx._shard, ctx.self_handle, level, tag, payload)
 }
 
 // Writes a diagnostic log to the Shard's environment.
@@ -105,7 +105,7 @@ ctx_log_typed :: #force_inline proc "contextless" (
 		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
 	)
 	_shard_log(
-		_ctx_extract_shard(ctx),
+		ctx._shard,
 		ctx.self_handle,
 		level,
 		tag,

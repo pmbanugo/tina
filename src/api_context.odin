@@ -14,7 +14,7 @@ ctx_send_raw :: #force_inline proc(
 		tag >= USER_MESSAGE_TAG_BASE,
 		"ctx_send: Cannot forge system messages. Tag must be >= 0x0040.",
 	)
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 
 	envelope: Message_Envelope
 	envelope.source = ctx.self_handle
@@ -30,7 +30,7 @@ ctx_send_raw :: #force_inline proc(
 // Reserves a shard-local correlation id for a logical parked wait.
 @(require_results)
 ctx_reserve_correlation_id :: #force_inline proc(ctx: ^TinaContext) -> Correlation_Id {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	shard.next_correlation_id += 1
 	if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
 	return Correlation_Id(shard.next_correlation_id)
@@ -55,7 +55,7 @@ ctx_send_with_correlation :: #force_inline proc(
 			"ctx_send_with_correlation payload exceeds MAX_PAYLOAD_SIZE",
 		)
 	}
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 
 	envelope: Message_Envelope
 	envelope.source = ctx.self_handle
@@ -76,7 +76,7 @@ ctx_transfer_send_with_correlation :: #force_inline proc(
 	handle: Transfer_Handle,
 	correlation_id: Correlation_Id,
 ) -> Send_Result {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	envelope: Message_Envelope
 	envelope.source = ctx.self_handle
 	envelope.destination = to
@@ -94,7 +94,7 @@ ctx_transfer_send :: #force_inline proc(
 	to: Handle,
 	handle: Transfer_Handle,
 ) -> Send_Result {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	envelope: Message_Envelope
 	envelope.source = ctx.self_handle
 	envelope.destination = to
@@ -109,7 +109,7 @@ ctx_transfer_send :: #force_inline proc(
 // Spawns a new Isolate and attaches it to the specified supervision group.
 @(require_results)
 ctx_spawn :: #force_inline proc(ctx: ^TinaContext, spec: Spawn_Spec) -> Spawn_Result {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 
 	// 1. Group Capacity Check (Fail early!)
 	group: ^Supervision_Group = nil
@@ -152,7 +152,7 @@ ctx_fd_handoff :: #force_inline proc(
 	to: Handle,
 	fd: FD_Handle,
 ) -> FD_Handoff_Result {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 
 	if to == HANDLE_NONE || extract_shard_id(to) == shard.id {
 		return .not_remote_target
@@ -235,7 +235,7 @@ ctx_scratch_arena :: #force_inline proc(ctx: ^TinaContext) -> mem.Allocator {
 
 @(require_results)
 ctx_transfer_alloc :: #force_inline proc(ctx: ^TinaContext) -> Transfer_Alloc_Result {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	index, err := reactor_buffer_pool_alloc(&shard.transfer_pool)
 	if err != .None {
 		shard.counters.transfer_exhaustions += 1
@@ -250,7 +250,7 @@ ctx_transfer_write_raw :: #force_inline proc(
 	handle: Transfer_Handle,
 	data: []u8,
 ) -> Transfer_Write_Error {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
@@ -286,7 +286,7 @@ ctx_transfer_read :: #force_inline proc(
 	ctx: ^TinaContext,
 	handle: Transfer_Handle,
 ) -> Transfer_Read_Result {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
@@ -323,7 +323,7 @@ ctx_socket :: #force_inline proc(
 	FD_Handle,
 	Reactor_Socket_Error,
 ) {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return reactor_control_socket(&shard.reactor, ctx.self_handle, domain, socket_type, protocol)
 }
 
@@ -332,12 +332,12 @@ ctx_bind :: #force_inline proc(
 	fd: FD_Handle,
 	address: Socket_Address,
 ) -> Backend_Error {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return reactor_control_bind(&shard.reactor, fd, ctx.self_handle, address)
 }
 
 ctx_listen :: #force_inline proc(ctx: ^TinaContext, fd: FD_Handle, backlog: u32) -> Backend_Error {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return reactor_control_listen(&shard.reactor, fd, ctx.self_handle, backlog)
 }
 
@@ -348,7 +348,7 @@ ctx_setsockopt_raw :: #force_inline proc(
 	option: Socket_Option,
 	value: Socket_Option_Value,
 ) -> Backend_Error {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return reactor_control_setsockopt(&shard.reactor, fd, ctx.self_handle, level, option, value)
 }
 
@@ -394,18 +394,18 @@ ctx_shutdown :: #force_inline proc(
 	fd: FD_Handle,
 	how: Shutdown_How,
 ) -> Backend_Error {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return reactor_control_shutdown(&shard.reactor, fd, ctx.self_handle, how)
 }
 
 ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, size: u32) -> []u8 {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	if size <= 0 do return nil
 	return reactor_buffer_pool_read_slice(&shard.reactor.buffer_pool, buffer_index, size)
 }
 
 ctx_is_shutting_down :: #force_inline proc "contextless" (ctx: ^TinaContext) -> bool {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return(
 		cast(Shard_State)sync.atomic_load_explicit(shard.watchdog_state_pointer, .Relaxed) ==
 		.Shutting_Down
@@ -413,7 +413,7 @@ ctx_is_shutting_down :: #force_inline proc "contextless" (ctx: ^TinaContext) -> 
 }
 
 ctx_supervision_group_id :: #force_inline proc(ctx: ^TinaContext) -> Supervision_Group_Id {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	type_id := extract_type_id(ctx.self_handle)
 	slot := extract_slot(ctx.self_handle)
 	return shard.metadata[type_id][slot].group_id
@@ -424,13 +424,13 @@ ctx_root_supervision_group_id :: #force_inline proc() -> Supervision_Group_Id {
 }
 
 ctx_type_config :: #force_inline proc(ctx: ^TinaContext) -> ^TypeDescriptor {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	type_id := extract_type_id(ctx.self_handle)
 	return &shard.type_descriptors[type_id]
 }
 
 ctx_shard_id :: #force_inline proc(ctx: ^TinaContext) -> Shard_Id {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return shard.id
 }
 
@@ -443,7 +443,7 @@ ctx_getsockopt :: #force_inline proc(
 	Socket_Option_Value,
 	Backend_Error,
 ) {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return reactor_control_getsockopt(&shard.reactor, fd, level, option)
 }
 

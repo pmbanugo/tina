@@ -146,15 +146,6 @@ Enqueue_Result :: enum u8 {
 }
 
 // ============================================================================
-// Internal Helpers
-// ============================================================================
-
-@(private = "package")
-_ctx_extract_shard :: #force_inline proc "contextless" (ctx: ^TinaContext) -> ^Shard {
-	return ctx._shard
-}
-
-// ============================================================================
 // Ergonomic Helpers
 // ============================================================================
 
@@ -166,7 +157,7 @@ bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 // Retrieves the current deterministic time (in nanoseconds) from the scheduler.
 // This ensures all isolates process events using a consistent, uniform clock per tick.
 ctx_monotonic_time_ns :: #force_inline proc "contextless" (ctx: ^TinaContext) -> u64 {
-	shard := _ctx_extract_shard(ctx)
+	shard := ctx._shard
 	return shard.current_tick * shard.timer_resolution_ns
 }
 
@@ -188,7 +179,7 @@ init_args_of :: #force_inline proc(args: ^$T) -> (payload: [MAX_INIT_ARGS_SIZE]u
 // matches the target type, catching wrong-type casts before they corrupt memory.
 self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: ^TinaContext) -> ^T {
 	when TINA_DEBUG_ASSERTS {
-		shard := _ctx_extract_shard(ctx)
+		shard := ctx._shard
 		type_id := extract_type_id(ctx.self_handle)
 		registered_stride := shard.type_descriptors[type_id].stride
 		assert(
