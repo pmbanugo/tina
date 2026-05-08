@@ -60,13 +60,12 @@ _http_connection_handler :: proc(
 
 	switch message.tag {
 	case tina.TAG_SHUTDOWN:
-		if _connection_mark_draining(connection, ctx) {
-			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
-		}
+		_connection_mark_draining(connection, ctx)
 		if state.state == .Application_Expectation {
 			return _connection_dispatch_server_drain(connection, ctx)
 		}
-		return tina.Effect_Receive{}
+		state.state = .Closing
+		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 
 	case TAG_HEADER_TIMEOUT:
 		if state.state != .Recv_Headers {
@@ -191,14 +190,14 @@ _connection_handle_recv_complete :: proc(
 		return _connection_handle_body_recv_complete(connection, buffer, ctx)
 	}
 	if len(buffer) == 0 {
-		if runtime != nil && runtime.draining {
+		if _connection_should_drain(runtime, ctx) {
 			state.state = .Closing
 			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 		}
 		return tina.Effect_Io{operation = tina.IoOp_Recv{fd = state.fd, buffer_size_max = _recv_buffer_size_max(runtime)}}
 	}
 
-	if runtime != nil && runtime.draining && state.response.egress_size == 0 {
+	if _connection_should_drain(runtime, ctx) && state.response.egress_size == 0 {
 		state.state = .Closing
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 	}
@@ -233,7 +232,7 @@ _connection_process_header_bytes :: proc(
 		return tina.Effect_Io{operation = tina.IoOp_Recv{fd = state.fd, buffer_size_max = _recv_buffer_size_max(runtime)}}
 
 	case .Headers_Done:
-		if runtime != nil && runtime.draining {
+		if _connection_should_drain(runtime, ctx) {
 			state.state = .Closing
 			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 		}
@@ -434,7 +433,7 @@ _connection_finalize_flushed_response :: proc(connection: ^HTTP_Connection, ctx:
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 	}
 
-	if state.shard_runtime != nil && state.shard_runtime.draining {
+	if _connection_should_drain(state.shard_runtime, ctx) {
 		state.state = .Closing
 		_connection_release_slot(connection, ctx)
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
@@ -464,7 +463,7 @@ _connection_continue_after_non_final_flush :: proc(connection: ^HTTP_Connection,
 		state.response.flags += {.Close_After_Send}
 		return _connection_finalize_flushed_response(connection, ctx)
 	}
-	if state.shard_runtime != nil && state.shard_runtime.draining {
+	if _connection_should_drain(state.shard_runtime, ctx) {
 		return _connection_finalize_flushed_response(connection, ctx)
 	}
 
@@ -1533,6 +1532,58 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 	testing.expect_value(t, route_state_storage[0].drain_count, u32(1))
 }
 
+@(test)
+test_shutdown_while_reading_headers_closes_immediately :: proc(t: ^testing.T) {
+	shard := tina.Shard{}
+	spokes: [4]u32
+	entries: [4]tina.Timer_Entry
+	shard.timer_resolution_ns = 1
+	tina.timer_wheel_init(
+		&shard.timer_wheel,
+		spokes[:],
+		entries[:],
+		0,
+	)
+
+	idle_slot_indices: [1]u16
+	idle_slot_handles: [1]tina.Handle
+	idle_slot_positions: [1]u16
+	idle_slot_positions[0] = u16(IDLE_ARRAY_INDEX_NONE)
+
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime {
+			graceful_drain_ms = 1,
+		},
+		connection_slot_count = 1,
+		idle_slot_indices     = idle_slot_indices[:],
+		idle_slot_handles     = idle_slot_handles[:],
+		idle_slot_positions   = idle_slot_positions[:],
+	}
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.state = .Recv_Headers
+	connection.connection_state.fd = tina.FD_Handle(17)
+
+	ctx := tina.TinaContext {}
+	ctx._shard = &shard
+	ctx.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
+
+	shutdown_message: tina.Message
+	shutdown_message.tag = tina.TAG_SHUTDOWN
+
+	effect := _http_connection_handler(rawptr(&connection), &shutdown_message, &ctx)
+	#partial switch io_effect in effect {
+	case tina.Effect_Io:
+		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
+			testing.expect(t, false, "shutdown while reading headers should close immediately")
+		}
+	case:
+		testing.expect(t, false, "expected close effect")
+	}
+	testing.expect(t, runtime.draining)
+	testing.expect_value(t, connection.connection_state.state, Connection_Phase.Closing)
+}
+
 @(private = "file")
 Flush_Test_State :: struct {
 	send_ready_count: u32,
@@ -1900,6 +1951,60 @@ test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T)
 	testing.expect_value(t, int(connection.connection_state.pipeline_tail_size), second_request_size)
 	retained_tail := string(connection.connection_state.pipeline_tail_bytes[:int(connection.connection_state.pipeline_tail_size)])
 	testing.expect_value(t, retained_tail, second_request)
+}
+
+@(test)
+test_process_header_bytes_closes_when_core_shutdown_started_before_http_runtime_draining :: proc(t: ^testing.T) {
+	watchdog_state := u8(tina.Shard_State.Shutting_Down)
+	shard := tina.Shard {
+		timer_resolution_ns     = 1,
+		watchdog_state_pointer = &watchdog_state,
+	}
+	spokes: [8]u32
+	entries: [8]tina.Timer_Entry
+	tina.timer_wheel_init(
+		&shard.timer_wheel,
+		spokes[:],
+		entries[:],
+		0,
+	)
+
+	router := Compiled_Router{}
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime {
+			limits   = DEFAULT_LIMITS,
+			timeouts = DEFAULT_TIMEOUTS,
+		},
+		router = router,
+	}
+
+	header_views_storage: [64]Header_View
+	response_header_storage: [1024]u8
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.fd = tina.FD_Handle(33)
+	connection.connection_state.state = .Recv_Headers
+	connection.connection_state.header_views = header_views_storage[:]
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	request_state_reset(&connection.connection_state.request)
+	parser_state_reset(&connection.connection_state.parser)
+
+	ctx := tina.TinaContext{}
+	ctx._shard = &shard
+	ctx.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
+
+	request_bytes := transmute([]u8)string("GET /first HTTP/1.1\r\nHost: example\r\n\r\n")
+	effect := _connection_process_header_bytes(&connection, request_bytes, &ctx)
+	#partial switch io_effect in effect {
+	case tina.Effect_Io:
+		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
+			testing.expect(t, false, "core shutdown should close before dispatching a new request")
+		}
+	case:
+		testing.expect(t, false, "expected close effect")
+	}
+	testing.expect(t, !runtime.draining, "HTTP runtime may not have seen TAG_SHUTDOWN yet")
+	testing.expect_value(t, connection.connection_state.state, Connection_Phase.Closing)
 }
 
 @(test)

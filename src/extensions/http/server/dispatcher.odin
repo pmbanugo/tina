@@ -37,7 +37,7 @@ _http_dispatcher_handler :: proc(
 	switch message.tag {
 	case tina.TAG_SHUTDOWN:
 		dispatcher.shard_runtime.draining = true
-		return tina.Effect_Receive{}
+		return tina.Effect_Done{}
 
 	case tina.IO_TAG_ACCEPT_COMPLETE:
 		client_fd := message.io.fd

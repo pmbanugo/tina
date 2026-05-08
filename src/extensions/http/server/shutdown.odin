@@ -3,6 +3,7 @@ package http_server
 import tina "../../.."
 import "core:testing"
 import "core:mem"
+import "core:sync"
 
 @(private = "package")
 _connection_now_ns :: #force_inline proc "contextless" (ctx: ^tina.TinaContext) -> Monotonic_Time_NS {
@@ -12,6 +13,26 @@ _connection_now_ns :: #force_inline proc "contextless" (ctx: ^tina.TinaContext) 
 @(private = "package")
 _timeout_duration_ns :: #force_inline proc "contextless" (timeout_ms: u32) -> u64 {
 	return u64(timeout_ms) * 1_000_000
+}
+
+@(private = "package")
+_connection_context_is_shutting_down :: #force_inline proc "contextless" (ctx: ^tina.TinaContext) -> bool {
+	if ctx == nil || ctx._shard == nil {
+		return false
+	}
+	shard := cast(^tina.Shard)ctx._shard
+	if shard.watchdog_state_pointer == nil {
+		return false
+	}
+	return cast(tina.Shard_State)sync.atomic_load_explicit(shard.watchdog_state_pointer, .Relaxed) == .Shutting_Down
+}
+
+@(private = "package")
+_connection_should_drain :: #force_inline proc "contextless" (
+	runtime: ^HTTP_Shard_Runtime,
+	ctx: ^tina.TinaContext,
+) -> bool {
+	return(runtime != nil && runtime.draining) || _connection_context_is_shutting_down(ctx)
 }
 
 @(private = "package")

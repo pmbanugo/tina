@@ -404,11 +404,11 @@ ctx_read_buffer :: #force_inline proc(ctx: ^TinaContext, buffer_index: u16, size
 	return reactor_buffer_pool_read_slice(&shard.reactor.buffer_pool, buffer_index, size)
 }
 
-ctx_is_shutting_down :: #force_inline proc(ctx: ^TinaContext) -> bool {
+ctx_is_shutting_down :: #force_inline proc "contextless" (ctx: ^TinaContext) -> bool {
 	shard := _ctx_extract_shard(ctx)
 	return(
 		cast(Shard_State)sync.atomic_load_explicit(shard.watchdog_state_pointer, .Relaxed) ==
-		.Shutting_Down \
+		.Shutting_Down
 	)
 }
 

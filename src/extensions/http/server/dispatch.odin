@@ -61,6 +61,9 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 	}
 
 	descriptor := runtime.router.descriptors[state.request.route_index]
+	if descriptor.body_mode == .None && state.parser.phase != .Complete {
+		state.response.flags += {.Close_After_Send}
+	}
 	if descriptor.body_mode != .None && _known_body_size_exceeds_limit(state, descriptor) {
 		state.response.flags += {.Close_After_Send}
 		return _normalize_route_step(respond_text(response, HTTP_STATUS_CONTENT_TOO_LARGE, "Content Too Large"))
@@ -73,6 +76,14 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 		}
 		handler := cast(Route_Event_Handler)descriptor.handler
 		step := handler(Route_Event(Request_Start{}), request, response, route_context, route_state)
+		if descriptor.body_mode == .Streamed && state.parser.phase != .Complete {
+			if step == .Expect_Application {
+				return .Close
+			}
+			if step != .Read_Body {
+				state.response.flags += {.Close_After_Send}
+			}
+		}
 		return _normalize_route_step(
 			step,
 			allow_read_body = descriptor.body_mode == .Streamed,
@@ -240,6 +251,37 @@ _dispatch_test_ok_handler :: proc(request: ^Request, response: ^Response) -> Rou
 	return respond_text(response, HTTP_STATUS_OK, "ok")
 }
 
+@(private = "file")
+_dispatch_test_final_event_handler :: proc(
+	event: Route_Event,
+	request: ^Request,
+	response: ^Response,
+	route_context: Route_Context,
+	state: rawptr,
+) -> Route_Step {
+	_ = event
+	_ = request
+	_ = route_context
+	_ = state
+	return respond_text(response, HTTP_STATUS_OK, "done")
+}
+
+@(private = "file")
+_dispatch_test_expect_event_handler :: proc(
+	event: Route_Event,
+	request: ^Request,
+	response: ^Response,
+	route_context: Route_Context,
+	state: rawptr,
+) -> Route_Step {
+	_ = event
+	_ = request
+	_ = response
+	_ = route_context
+	_ = state
+	return .Expect_Application
+}
+
 @(test)
 test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET}, handler = rawptr(_dispatch_test_ok_handler)}}
@@ -280,4 +322,149 @@ test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^t
 		strings.index(string(connection.egress_buffer[:int(connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
 		"serialized response must advertise Connection: close",
 	)
+}
+
+@(test)
+test_dispatch_none_body_route_closes_after_response_when_body_present :: proc(t: ^testing.T) {
+	routes := []Route{{pattern = "/x", methods_mask = {.POST}, handler = rawptr(_dispatch_test_ok_handler)}}
+	router, compile_error, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, compile_error, Compile_Error.None)
+
+	response_header_storage: [128]u8
+	request_frame := transmute([]u8)string("POST /x HTTP/1.1\r\nHost: example\r\nContent-Length: 4\r\n\r\n")
+	runtime := HTTP_Shard_Runtime{router = router}
+	connection := HTTP_Connection{
+		connection_state = HTTP_Connection_State{
+			shard_runtime         = &runtime,
+			response_header_bytes = response_header_storage[:],
+			parser = Parser_State{
+				phase = .Body_Fixed,
+				body_size_remaining = 4,
+				flags = {.Has_Content_Length},
+			},
+			request = Request_State{
+				method      = .POST,
+				path_offset = 5,
+				path_size   = 2,
+				route_index = ROUTE_INDEX_NONE,
+			},
+		},
+	}
+	request := Request{
+		connection_state = &connection.connection_state,
+		frame            = request_frame,
+	}
+	response := Response{
+		connection   = &connection,
+		tina_context = nil,
+	}
+
+	step := _dispatch_route(&request, &response)
+	testing.expect_value(t, step, Route_Step.Flush_Final)
+	testing.expect(t, .Close_After_Send in connection.connection_state.response.flags, "unconsumed request body must close after response")
+	testing.expect(
+		t,
+		strings.index(string(connection.egress_buffer[:int(connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
+		"serialized response must advertise Connection: close when body is not consumed",
+	)
+}
+
+@(test)
+test_dispatch_streamed_route_final_response_before_body_closes_after_send :: proc(t: ^testing.T) {
+	routes := []Route{
+		{
+			pattern       = "/x",
+			methods_mask  = {.POST},
+			handler       = rawptr(_dispatch_test_final_event_handler),
+			handler_kind  = .Event,
+			body_mode     = .Streamed,
+			body_size_max = 16,
+		},
+	}
+	router, compile_error, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, compile_error, Compile_Error.None)
+
+	response_header_storage: [128]u8
+	request_frame := transmute([]u8)string("POST /x HTTP/1.1\r\nHost: example\r\nContent-Length: 4\r\n\r\n")
+	runtime := HTTP_Shard_Runtime{router = router}
+	connection := HTTP_Connection{
+		connection_state = HTTP_Connection_State{
+			shard_runtime         = &runtime,
+			response_header_bytes = response_header_storage[:],
+			parser = Parser_State{
+				phase = .Body_Fixed,
+				body_size_remaining = 4,
+				flags = {.Has_Content_Length},
+			},
+			request = Request_State{
+				method      = .POST,
+				path_offset = 5,
+				path_size   = 2,
+				route_index = ROUTE_INDEX_NONE,
+			},
+		},
+	}
+	request := Request{
+		connection_state = &connection.connection_state,
+		frame            = request_frame,
+	}
+	response := Response{
+		connection   = &connection,
+		tina_context = nil,
+	}
+
+	step := _dispatch_route(&request, &response)
+	testing.expect_value(t, step, Route_Step.Flush_Final)
+	testing.expect(t, .Close_After_Send in connection.connection_state.response.flags, "early final streamed response must close")
+}
+
+@(test)
+test_dispatch_streamed_route_cannot_park_before_consuming_body :: proc(t: ^testing.T) {
+	routes := []Route{
+		{
+			pattern       = "/x",
+			methods_mask  = {.POST},
+			handler       = rawptr(_dispatch_test_expect_event_handler),
+			handler_kind  = .Event,
+			body_mode     = .Streamed,
+			body_size_max = 16,
+		},
+	}
+	router, compile_error, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, compile_error, Compile_Error.None)
+
+	response_header_storage: [128]u8
+	request_frame := transmute([]u8)string("POST /x HTTP/1.1\r\nHost: example\r\nContent-Length: 4\r\n\r\n")
+	runtime := HTTP_Shard_Runtime{router = router}
+	connection := HTTP_Connection{
+		connection_state = HTTP_Connection_State{
+			shard_runtime         = &runtime,
+			response_header_bytes = response_header_storage[:],
+			parser = Parser_State{
+				phase = .Body_Fixed,
+				body_size_remaining = 4,
+				flags = {.Has_Content_Length},
+			},
+			request = Request_State{
+				method      = .POST,
+				path_offset = 5,
+				path_size   = 2,
+				route_index = ROUTE_INDEX_NONE,
+			},
+		},
+	}
+	request := Request{
+		connection_state = &connection.connection_state,
+		frame            = request_frame,
+	}
+	response := Response{
+		connection   = &connection,
+		tina_context = nil,
+	}
+
+	step := _dispatch_route(&request, &response)
+	testing.expect_value(t, step, Route_Step.Close)
 }
