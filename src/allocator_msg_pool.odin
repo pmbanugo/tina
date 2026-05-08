@@ -92,8 +92,8 @@ pool_free_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool, index
 	p.free_count += 1
 }
 
-// Resolves a pool index to its memory pointer.
-pool_get_ptr :: #force_inline proc(p: ^Message_Pool, index: u32) -> rawptr {
+// Resolves a pool index to its message envelope.
+pool_get_ptr :: #force_inline proc(p: ^Message_Pool, index: u32) -> ^Message_Envelope {
 	assert(index < p.slot_count, "Message pool ptr index out of bounds")
 	return pool_get_ptr_unchecked(p, index)
 }
@@ -104,8 +104,8 @@ pool_get_ptr :: #force_inline proc(p: ^Message_Pool, index: u32) -> rawptr {
 pool_get_ptr_unchecked :: #force_inline proc "contextless" (
 	p: ^Message_Pool,
 	index: u32,
-) -> rawptr {
-	return rawptr(&p.buffer[index << p.slot_shift])
+) -> ^Message_Envelope {
+	return cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
 }
 
 pool_stats :: proc(p: ^Message_Pool) -> Pool_Stats {
@@ -147,7 +147,11 @@ test_message_pool :: proc(t: ^testing.T) {
 
 	// Test pointer resolution
 	slot_pointer := pool_get_ptr(&pool, indices[0])
-	testing.expect(t, slot_pointer == raw_data(backing[:]), "Index 0 should map to backing buffer start")
+	testing.expect(
+		t,
+		uintptr(slot_pointer) == uintptr(raw_data(backing[:])),
+		"Index 0 should map to backing buffer start",
+	)
 
 	// Free them all back
 	for i in 0 ..< 10 {

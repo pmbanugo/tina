@@ -786,7 +786,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	}
 
 	// Link into Mailbox
-	envelope_destination := cast(^Message_Envelope)pool_get_ptr_unchecked(
+	envelope_destination := pool_get_ptr_unchecked(
 		&shard.message_pool,
 		pool_index,
 	)
@@ -796,7 +796,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	if soa_meta[slot].inbox_head == POOL_NONE_INDEX {
 		soa_meta[slot].inbox_head = pool_index
 	} else {
-		tail_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+		tail_envelope := pool_get_ptr_unchecked(
 			&shard.message_pool,
 			soa_meta[slot].inbox_tail,
 		)
@@ -832,7 +832,7 @@ _dequeue :: proc "contextless" (
 	head_index := soa_meta[slot].inbox_head
 	if head_index == POOL_NONE_INDEX {return result}
 
-	envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, head_index)
+	envelope := pool_get_ptr_unchecked(&shard.message_pool, head_index)
 
 	result.pool_index = head_index
 	result.message.tag = envelope.tag
@@ -884,14 +884,14 @@ _fd_handoff_retry_enqueue :: proc "contextless" (
 		return false
 	}
 
-	retry_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, retry_pool_index)
+	retry_envelope := pool_get_ptr_unchecked(&shard.message_pool, retry_pool_index)
 	retry_envelope^ = envelope^
 	retry_envelope.next_in_mailbox = POOL_NONE_INDEX
 
 	if shard.handoff_retry_head == POOL_NONE_INDEX {
 		shard.handoff_retry_head = retry_pool_index
 	} else {
-		tail_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+		tail_envelope := pool_get_ptr_unchecked(
 			&shard.message_pool,
 			shard.handoff_retry_tail,
 		)
@@ -909,7 +909,7 @@ _fd_handoff_retry_scan :: proc "contextless" (shard: ^Shard) {
 	previous_pool_index: u32 = POOL_NONE_INDEX
 
 	for retry_pool_index != POOL_NONE_INDEX {
-		retry_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+		retry_envelope := pool_get_ptr_unchecked(
 			&shard.message_pool,
 			retry_pool_index,
 		)
@@ -928,7 +928,7 @@ _fd_handoff_retry_scan :: proc "contextless" (shard: ^Shard) {
 			if previous_pool_index == POOL_NONE_INDEX {
 				shard.handoff_retry_head = next_pool_index
 			} else {
-				previous_envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(
+				previous_envelope := pool_get_ptr_unchecked(
 					&shard.message_pool,
 					previous_pool_index,
 				)
@@ -1292,7 +1292,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	shard.message_pool.free_head = POOL_NONE_INDEX
 	for i := int(shard.message_pool.slot_count) - 1; i >= 0; i -= 1 {
 		slot_pointer := pool_get_ptr(&shard.message_pool, u32(i))
-		(cast(^u32)slot_pointer)^ = shard.message_pool.free_head
+		slot_pointer.next_free_slot = shard.message_pool.free_head
 		shard.message_pool.free_head = u32(i)
 	}
 	shard.handoff_retry_head = POOL_NONE_INDEX

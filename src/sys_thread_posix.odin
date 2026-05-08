@@ -50,15 +50,15 @@ when ODIN_OS == .Darwin {
 		pthread_setname_np(cast(cstring)&buf[0])
 	}
 
-	// Returns the OS-specific thread handle (pthread_t on POSIX)
-	os_get_current_thread_handle :: proc "contextless" () -> rawptr {
-		return rawptr(pthread_self())
+	// Returns the OS-specific thread handle (pthread_t on POSIX).
+	os_get_current_thread_handle :: proc "contextless" () -> OS_Thread_Handle {
+		return OS_Thread_Handle(uintptr(pthread_self()))
 	}
 
-	// Sends a signal directly to a specific thread (for Watchdog forced recovery)
-	os_signal_thread :: proc "contextless" (thread_handle: rawptr, sig: posix.Signal) {
+	// Sends a signal directly to a specific thread (for Watchdog forced recovery).
+	os_signal_thread :: proc "contextless" (thread_handle: OS_Thread_Handle, sig: posix.Signal) {
 		// pthread_kill requires the pthread_t and the signal number
-		posix.pthread_kill(posix.pthread_t(thread_handle), sig)
+		posix.pthread_kill(posix.pthread_t(uintptr(thread_handle)), sig)
 	}
 } else {
 	// FreeBSD, OpenBSD, NetBSD
@@ -78,14 +78,12 @@ when ODIN_OS == .Darwin {
 	}
 
 	// Returns the OS-specific thread handle (pthread_t on POSIX).
-	// On FreeBSD, pthread_t is u64 (not rawptr), so we route through uintptr.
-	os_get_current_thread_handle :: proc "contextless" () -> rawptr {
-		return rawptr(uintptr(pthread_self()))
+	os_get_current_thread_handle :: proc "contextless" () -> OS_Thread_Handle {
+		return OS_Thread_Handle(uintptr(pthread_self()))
 	}
 
 	// Sends a signal directly to a specific thread (for Watchdog forced recovery).
-	// Reverses the uintptr packing from os_get_current_thread_handle.
-	os_signal_thread :: proc "contextless" (thread_handle: rawptr, sig: posix.Signal) {
+	os_signal_thread :: proc "contextless" (thread_handle: OS_Thread_Handle, sig: posix.Signal) {
 		posix.pthread_kill(posix.pthread_t(uintptr(thread_handle)), sig)
 	}
 }

@@ -213,7 +213,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	// Step 3: Drain mailbox
 	curr := soa_meta[slot_index].inbox_head
 	for curr != POOL_NONE_INDEX {
-		envelope := cast(^Message_Envelope)pool_get_ptr_unchecked(&shard.message_pool, curr)
+		envelope := pool_get_ptr_unchecked(&shard.message_pool, curr)
 		next := envelope.next_in_mailbox
 
 		if envelope.tag == TAG_TRANSFER && envelope.payload_size >= size_of(Transfer_Handle) {

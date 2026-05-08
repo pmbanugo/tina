@@ -143,7 +143,7 @@ _runtime_enqueue_timeout :: proc(
 		u32(slot_index),
 		meta.generation[slot_index],
 	)
-	envelope := cast(^tina.Message_Envelope)tina.pool_get_ptr_unchecked(&shard.message_pool, pool_index)
+	envelope := tina.pool_get_ptr_unchecked(&shard.message_pool, pool_index)
 	envelope.source = tina.HANDLE_NONE
 	envelope.destination = handle
 	envelope.correlation = correlation
@@ -155,7 +155,7 @@ _runtime_enqueue_timeout :: proc(
 	if meta.inbox_head[slot_index] == tina.POOL_NONE_INDEX {
 		meta.inbox_head[slot_index] = pool_index
 	} else {
-		tail := cast(^tina.Message_Envelope)tina.pool_get_ptr_unchecked(
+		tail := tina.pool_get_ptr_unchecked(
 			&shard.message_pool,
 			meta.inbox_tail[slot_index],
 		)
@@ -294,7 +294,7 @@ test_runtime_scan_deadlines_wakes_waiting_connection :: proc(t: ^testing.T) {
 	testing.expect_value(t, shard.metadata[0][0].io_sequence, u8(1))
 	testing.expect_value(t, shard.metadata[0][0].inbox_count, u16(1))
 
-	envelope := cast(^tina.Message_Envelope)tina.pool_get_ptr_unchecked(&shard.message_pool, shard.metadata[0][0].inbox_head)
+	envelope := tina.pool_get_ptr_unchecked(&shard.message_pool, shard.metadata[0][0].inbox_head)
 	testing.expect_value(t, envelope.tag, tina.Message_Tag(TAG_IDLE_TIMEOUT))
 	testing.expect_value(t, envelope.correlation, tina.Correlation_Id(7))
 }

@@ -128,8 +128,8 @@ Context_Flags :: distinct bit_set[Context_Flag;u8]
 // The primary API gateway for Isolates during execution.
 // Passed into `init_handler` and `handler_fn` to provide access to messaging, spawning, and memory.
 TinaContext :: struct {
-	// Opaque pointer to internal Shard state to prevents user mutation.
-	_shard:                 rawptr,
+	// Internal shard pointer. User code must treat this as framework-owned state.
+	_shard:                 ^Shard,
 	self_handle:            Handle,
 	current_message_source: Handle,
 	// Memory surfaces (initialized per handler invocation by the scheduler)
@@ -151,7 +151,7 @@ Enqueue_Result :: enum u8 {
 
 @(private = "package")
 _ctx_extract_shard :: #force_inline proc "contextless" (ctx: ^TinaContext) -> ^Shard {
-	return cast(^Shard)ctx._shard
+	return ctx._shard
 }
 
 // ============================================================================

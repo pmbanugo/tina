@@ -20,7 +20,7 @@ _connection_context_is_shutting_down :: #force_inline proc "contextless" (ctx: ^
 	if ctx == nil || ctx._shard == nil {
 		return false
 	}
-	shard := cast(^tina.Shard)ctx._shard
+	shard := ctx._shard
 	if shard.watchdog_state_pointer == nil {
 		return false
 	}

@@ -88,13 +88,13 @@ os_set_current_thread_name :: proc "contextless" (name: string) {
 	pthread_setname_np(pthread_self(), cast(cstring)&buf[0])
 }
 
-// Returns the OS-specific thread handle (pthread_t on POSIX)
-os_get_current_thread_handle :: proc "contextless" () -> rawptr {
-	return rawptr(uintptr(pthread_self()))
+// Returns the OS-specific thread handle (pthread_t on POSIX).
+os_get_current_thread_handle :: proc "contextless" () -> OS_Thread_Handle {
+	return OS_Thread_Handle(uintptr(pthread_self()))
 }
 
-// Sends a signal directly to a specific thread (for Watchdog forced recovery)
-os_signal_thread :: proc "contextless" (thread_handle: rawptr, sig: posix.Signal) {
+// Sends a signal directly to a specific thread (for Watchdog forced recovery).
+os_signal_thread :: proc "contextless" (thread_handle: OS_Thread_Handle, sig: posix.Signal) {
 	// pthread_kill requires the pthread_t and the signal number
 	posix.pthread_kill(posix.pthread_t(uintptr(thread_handle)), sig)
 }

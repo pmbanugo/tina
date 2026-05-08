@@ -12,10 +12,12 @@ import "core:time"
 
 MAX_SHARDS :: 256
 
+OS_Thread_Handle :: distinct uintptr
+
 // Shared control-plane state scanned by the watchdog and mutated by the shard thread.
 Shard_Runtime_State :: struct #align (CACHE_LINE_SIZE) {
 	shard_pointer:            ^Shard,
-	os_thread_handle:         rawptr,
+	os_thread_handle:         OS_Thread_Handle,
 	restart_window_start_ns:  u64,
 	watchdog_state:           u8,
 	restart_count:            u16,
