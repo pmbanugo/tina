@@ -1,7 +1,7 @@
 package main
 
 import tina "../src"
-import datastar "../src/extensions/http/server/datastar"
+import datastar "../src/extensions/http/datastar"
 import http "../src/extensions/http/server"
 import "core:fmt"
 

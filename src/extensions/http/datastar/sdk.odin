@@ -1,6 +1,6 @@
 package datastar
 
-import http ".."
+import http "../server"
 import json "core:encoding/json"
 import "core:fmt"
 import "core:strings"

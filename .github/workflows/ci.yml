@@ -4,27 +4,27 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - '**.md'
-      - 'ADR/**'
-      - 'notes/**'
-      - '*.cast'
-      - '*.bin'
-      - 'LICENSE'
-      - 'NOTICE'
-      - '.gitignore'
-      - 'examples/**'
+      - "**.md"
+      - "ADR/**"
+      - "notes/**"
+      - "*.cast"
+      - "*.bin"
+      - "LICENSE"
+      - "NOTICE"
+      - ".gitignore"
+      - "examples/**"
   pull_request:
     branches: [main]
     paths-ignore:
-      - '**.md'
-      - 'ADR/**'
-      - 'notes/**'
-      - '*.cast'
-      - '*.bin'
-      - 'LICENSE'
-      - 'NOTICE'
-      - '.gitignore'
-      - 'examples/**'
+      - "**.md"
+      - "ADR/**"
+      - "notes/**"
+      - "*.cast"
+      - "*.bin"
+      - "LICENSE"
+      - "NOTICE"
+      - ".gitignore"
+      - "examples/**"
 
 jobs:
   check:
@@ -80,3 +80,5 @@ jobs:
         run: odin test src/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
       - name: Run HTTP server tests
         run: odin test src/extensions/http/server/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
+      - name: Run Datastar SDK tests
+        run: odin test src/extensions/http/datastar/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
