@@ -3,7 +3,6 @@ package datastar
 import http ".."
 import json "core:encoding/json"
 import "core:fmt"
-import net "core:net"
 import "core:strings"
 
 Event_Type :: enum {
@@ -29,8 +28,8 @@ Element_Namespace :: enum {
 }
 
 Send_Options :: struct {
-	event_id:       string,
-	retry_duration: u32, // 0 means Datastar default: 1000ms
+	event_id:          string,
+	retry_duration_ms: u32, // 0 means Datastar default: 1000ms
 }
 
 Patch_Elements_Options :: struct {
@@ -40,13 +39,13 @@ Patch_Elements_Options :: struct {
 	view_transition_selector: string,
 	namespace:                Element_Namespace, // zero value: html
 	event_id:                 string,
-	retry_duration:           u32, // 0 means Datastar default: 1000ms
+	retry_duration_ms:        u32, // 0 means Datastar default: 1000ms
 }
 
 Patch_Signals_Options :: struct {
-	only_if_missing: bool,
-	event_id:        string,
-	retry_duration:  u32, // 0 means Datastar default: 1000ms
+	only_if_missing:   bool,
+	event_id:          string,
+	retry_duration_ms: u32, // 0 means Datastar default: 1000ms
 }
 
 Script_Auto_Remove :: enum {
@@ -56,10 +55,10 @@ Script_Auto_Remove :: enum {
 }
 
 Execute_Script_Options :: struct {
-	auto_remove:    Script_Auto_Remove, // zero value: ADR default true
-	attributes:     []string,
-	event_id:       string,
-	retry_duration: u32, // 0 means Datastar default: 1000ms
+	auto_remove:       Script_Auto_Remove, // zero value: ADR default true
+	attributes:        []string,
+	event_id:          string,
+	retry_duration_ms: u32, // 0 means Datastar default: 1000ms
 }
 
 ServerSentEventGenerator :: struct {
@@ -80,13 +79,12 @@ Read_Signals_Error :: enum {
 read_signals :: proc(request: ^http.Request, signals: ^$T) -> Read_Signals_Error {
 	#partial switch http.method(request) {
 	case .GET, .DELETE:
-		raw := http.query_value(request, "datastar")
-		if len(raw) == 0 do return .Missing_Datastar_Query
-
-		decoded, ok := decode_query_value(raw, http.request_scratch(request))
+		allocator := http.request_scratch(request)
+		decoded, ok := http.query_value_decoded(request, "datastar")
 		if !ok do return .Invalid_Percent_Encoding
+		if len(decoded) == 0 do return .Missing_Datastar_Query
 
-		if err := json.unmarshal(transmute([]u8)decoded, signals, allocator = http.request_scratch(request)); err != nil {
+		if err := json.unmarshal(decoded, signals, allocator = allocator); err != nil {
 			return .Invalid_JSON
 		}
 		return .None
@@ -102,14 +100,8 @@ read_signals :: proc(request: ^http.Request, signals: ^$T) -> Read_Signals_Error
 	return .Unsupported_Method
 }
 
-decode_query_value :: proc(raw: []u8, allocator := context.allocator) -> (decoded: string, ok: bool) {
-	encoded, _ := strings.replace_all(string(raw), "+", "%20", allocator)
-	return net.percent_decode(encoded, allocator)
-}
-
 server_sent_event_generator :: proc(request: ^http.Request, response: ^http.Response) -> ServerSentEventGenerator {
 	_ = http.header_set(response, "Cache-Control", "no-cache")
-	_ = http.header_set(response, "Connection", "keep-alive")
 	http.begin_stream(response, http.HTTP_STATUS_OK, "text/event-stream")
 	return ServerSentEventGenerator{request = request, response = response}
 }
@@ -125,12 +117,12 @@ patch_elements :: proc(generator: ^ServerSentEventGenerator, elements := "", opt
 	defer strings.builder_destroy(&lines)
 
 	append_patch_elements_data_lines(&lines, elements, options)
-	data_lines := strings.to_string(lines)
+	data_lines := split_data_lines(strings.to_string(lines), context.temp_allocator)
 	return send(
 		generator,
 		.Patch_Elements,
-		strings.split_lines(data_lines, context.temp_allocator),
-		Send_Options{event_id = options.event_id, retry_duration = options.retry_duration},
+		data_lines,
+		Send_Options{event_id = options.event_id, retry_duration_ms = options.retry_duration_ms},
 	)
 }
 
@@ -139,12 +131,12 @@ patch_signals :: proc(generator: ^ServerSentEventGenerator, signals: string, opt
 	defer strings.builder_destroy(&lines)
 
 	append_patch_signals_data_lines(&lines, signals, options)
-	data_lines := strings.to_string(lines)
+	data_lines := split_data_lines(strings.to_string(lines), context.temp_allocator)
 	return send(
 		generator,
 		.Patch_Signals,
-		strings.split_lines(data_lines, context.temp_allocator),
-		Send_Options{event_id = options.event_id, retry_duration = options.retry_duration},
+		data_lines,
+		Send_Options{event_id = options.event_id, retry_duration_ms = options.retry_duration_ms},
 	)
 }
 
@@ -154,10 +146,10 @@ execute_script :: proc(generator: ^ServerSentEventGenerator, script: string, opt
 		generator,
 		elements,
 		Patch_Elements_Options{
-			selector       = "body",
-			mode           = .Append,
-			event_id       = options.event_id,
-			retry_duration = options.retry_duration,
+			selector          = "body",
+			mode              = .Append,
+			event_id          = options.event_id,
+			retry_duration_ms = options.retry_duration_ms,
 		},
 	)
 }
@@ -179,8 +171,8 @@ append_event_frame :: proc(builder: ^strings.Builder, event_type: Event_Type, da
 		strings.write_byte(builder, '\n')
 	}
 
-	if options.retry_duration != 0 && options.retry_duration != DEFAULT_RETRY_DURATION_MS {
-		fmt.sbprintf(builder, "retry: %d\n", options.retry_duration)
+	if options.retry_duration_ms != 0 && options.retry_duration_ms != DEFAULT_RETRY_DURATION_MS {
+		fmt.sbprintf(builder, "retry: %d\n", options.retry_duration_ms)
 	}
 
 	for line in data_lines {
@@ -190,6 +182,14 @@ append_event_frame :: proc(builder: ^strings.Builder, event_type: Event_Type, da
 	}
 
 	strings.write_byte(builder, '\n')
+}
+
+split_data_lines :: proc(value: string, allocator := context.allocator) -> []string {
+	line_bytes := transmute([]u8)value
+	if line_bytes[len(line_bytes)-1] == '\n' {
+		line_bytes = line_bytes[:len(line_bytes)-1]
+	}
+	return strings.split_lines(string(line_bytes), allocator)
 }
 
 append_patch_elements_data_lines :: proc(builder: ^strings.Builder, elements: string, options := Patch_Elements_Options{}) {

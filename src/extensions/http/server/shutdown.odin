@@ -85,6 +85,7 @@ _connection_begin_keep_alive_wait :: proc(connection: ^HTTP_Connection, ctx: ^ti
 	request_state_reset(&state.request)
 	response_state_reset(&state.response)
 	parser_state_reset(&state.parser)
+	state.request_arena_region.offset = 0
 
 	state.ingress_size = 0
 	state.ingress_parsed_offset = 0

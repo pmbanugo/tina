@@ -1,6 +1,7 @@
 package http_server
 
 import tina "../../.."
+import "core:mem"
 import "core:testing"
 
 @(private = "package")
@@ -19,24 +20,10 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) 
 		return tina.Effect_Crash{reason = .Init_Failed}
 	}
 
-	working_allocator := tina.ctx_working_arena(ctx)
 	frame_size := int(runtime.server.limits.request_line_size_max) + int(runtime.server.limits.header_size_max)
 	connection.connection_state.shard_runtime = runtime
 	connection.connection_state.fd = init_args.client_fd
-	connection.connection_state.request_frame_bytes = make([]u8, frame_size, working_allocator)
-	connection.connection_state.header_views = make([]Header_View, int(runtime.server.limits.header_count_max), working_allocator)
-	connection.connection_state.buffered_body_bytes = make([]u8, int(runtime.server.buffered_body_size_max), working_allocator)
-	connection.connection_state.pipeline_tail_bytes = make([]u8, int(runtime.server.limits.pipeline_size_max), working_allocator)
-	connection.connection_state.response_header_bytes = make(
-		[]u8,
-		int(runtime.server.limits.response_header_bytes_max),
-		working_allocator,
-	)
-	connection.connection_state.route_state_bytes = make(
-		[]u8,
-		int(runtime.server.route_state_size_max),
-		working_allocator,
-	)
+	_connection_init_working_memory_regions(connection, ctx, frame_size)
 	connection.connection_state.peer = {}
 	_runtime_active_slot_add(connection, ctx)
 	_connection_begin_keep_alive_wait(connection, ctx)
@@ -47,6 +34,90 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) 
 			buffer_size_max = u32(runtime.server.limits.request_line_size_max) + u32(runtime.server.limits.header_size_max),
 		},
 	}
+}
+
+@(private = "file")
+_connection_init_working_memory_regions :: proc(
+	connection: ^HTTP_Connection,
+	ctx: ^tina.TinaContext,
+	frame_size: int,
+) {
+	state := &connection.connection_state
+	runtime := state.shard_runtime
+
+	working_bytes := _connection_working_memory_bytes(ctx)
+	working_offset := 0
+
+	state.request_frame_bytes = _connection_working_region_take(working_bytes, &working_offset, frame_size)
+	state.buffered_body_bytes = _connection_working_region_take(
+		working_bytes,
+		&working_offset,
+		int(runtime.server.buffered_body_size_max),
+	)
+	state.pipeline_tail_bytes = _connection_working_region_take(
+		working_bytes,
+		&working_offset,
+		int(runtime.server.limits.pipeline_size_max),
+	)
+
+	header_view_storage := _connection_working_region_take(
+		working_bytes,
+		&working_offset,
+		int(runtime.server.limits.header_count_max) * size_of(Header_View),
+	)
+	if len(header_view_storage) > 0 {
+		state.header_views = (cast([^]Header_View)raw_data(header_view_storage))[:int(runtime.server.limits.header_count_max)]
+	}
+
+	state.route_state_bytes = _connection_working_region_take(
+		working_bytes,
+		&working_offset,
+		int(runtime.server.route_state_size_max),
+	)
+
+	request_arena_bytes := _connection_working_region_take(
+		working_bytes,
+		&working_offset,
+		int(runtime.server.limits.request_arena_size),
+	)
+	mem.arena_init(&state.request_arena_region, request_arena_bytes)
+
+	state.response_header_bytes = _connection_working_region_take(
+		working_bytes,
+		&working_offset,
+		int(runtime.server.limits.response_header_bytes_max),
+	)
+}
+
+@(private = "file")
+_connection_working_memory_bytes :: proc(ctx: ^tina.TinaContext) -> []u8 {
+	shard := ctx._shard
+	type_id := tina.extract_type_id(ctx.self_handle)
+	slot_index := tina.extract_slot(ctx.self_handle)
+	working_stride := shard.type_descriptors[type_id].working_memory_size
+	if working_stride <= 0 {
+		return nil
+	}
+	start_index := int(slot_index) * working_stride
+	return shard.working_memory[type_id][start_index:start_index + working_stride]
+}
+
+@(private = "file")
+_connection_working_region_take :: proc(working_bytes: []u8, working_offset: ^int, region_size: int) -> []u8 {
+	if region_size <= 0 {
+		return nil
+	}
+	aligned_offset := _align_up(working_offset^)
+	aligned_size := _align_up(region_size)
+	end_offset := aligned_offset + aligned_size
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(end_offset <= len(working_bytes), "_connection_working_region_take: working memory too small")
+	}
+	if end_offset > len(working_bytes) {
+		return nil
+	}
+	working_offset^ = end_offset
+	return working_bytes[aligned_offset:][:region_size]
 }
 
 @(private = "package")

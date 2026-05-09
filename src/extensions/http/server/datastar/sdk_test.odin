@@ -24,7 +24,7 @@ test_format_event_frame_full_order :: proc(t: ^testing.T) {
 	frame := format_event_frame(
 		.Patch_Elements,
 		lines,
-		Send_Options{event_id = "123", retry_duration = 2000},
+		Send_Options{event_id = "123", retry_duration_ms = 2000},
 		allocator = context.temp_allocator,
 	)
 
@@ -61,15 +61,6 @@ test_patch_signals_data_lines :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_decode_query_value_uses_stdlib_percent_decode_and_form_spaces :: proc(t: ^testing.T) {
-	raw := "%7B%22message%22%3A%22hello+%2B+world%22%7D"
-	value, ok := decode_query_value(transmute([]u8)raw, context.temp_allocator)
-
-	testing.expect_value(t, ok, true)
-	testing.expect_value(t, value, `{"message":"hello + world"}`)
-}
-
-@(test)
 test_execute_script_builds_patch_elements_script :: proc(t: ^testing.T) {
 	elements := build_script_element("console.log('Here')", Execute_Script_Options{}, context.temp_allocator)
 	frame := format_patch_elements_for_test(
@@ -84,11 +75,11 @@ test_execute_script_builds_patch_elements_script :: proc(t: ^testing.T) {
 format_patch_elements_for_test :: proc(elements: string, options := Patch_Elements_Options{}) -> string {
 	builder := strings.builder_make(context.temp_allocator)
 	append_patch_elements_data_lines(&builder, elements, options)
-	data_lines := strings.split_lines(strings.to_string(builder), context.temp_allocator)
+	data_lines := split_data_lines(strings.to_string(builder), context.temp_allocator)
 	return format_event_frame(
 		.Patch_Elements,
 		data_lines,
-		Send_Options{event_id = options.event_id, retry_duration = options.retry_duration},
+		Send_Options{event_id = options.event_id, retry_duration_ms = options.retry_duration_ms},
 		allocator = context.temp_allocator,
 	)
 }
@@ -96,11 +87,11 @@ format_patch_elements_for_test :: proc(elements: string, options := Patch_Elemen
 format_patch_signals_for_test :: proc(signals: string, options := Patch_Signals_Options{}) -> string {
 	builder := strings.builder_make(context.temp_allocator)
 	append_patch_signals_data_lines(&builder, signals, options)
-	data_lines := strings.split_lines(strings.to_string(builder), context.temp_allocator)
+	data_lines := split_data_lines(strings.to_string(builder), context.temp_allocator)
 	return format_event_frame(
 		.Patch_Signals,
 		data_lines,
-		Send_Options{event_id = options.event_id, retry_duration = options.retry_duration},
+		Send_Options{event_id = options.event_id, retry_duration_ms = options.retry_duration_ms},
 		allocator = context.temp_allocator,
 	)
 }

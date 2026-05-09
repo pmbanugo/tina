@@ -97,6 +97,7 @@ http.path(request: ^Request) ->[]u8
 http.header(request: ^Request, name: string) ->[]u8
 http.param(request: ^Request, name: string) ->[]u8
 http.query_value(request: ^Request, name: string) -> []u8
+http.query_value_decoded(request: ^Request, name: string) -> (decoded: []u8, ok: bool)
 
 // For .Buffered routes only: returns the complete body
 http.body_buffered(request: ^Request) ->[]u8  

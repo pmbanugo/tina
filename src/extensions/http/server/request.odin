@@ -275,6 +275,47 @@ query_value :: proc "contextless" (request: ^Request, name: string) -> []u8 {
 	return nil
 }
 
+@(private = "package")
+query_value_decode :: proc(raw_value: []u8, allocator: mem.Allocator) -> (decoded: []u8, ok: bool) {
+	decode_required := false
+	for b in raw_value {
+		if b == '%' || b == '+' {
+			decode_required = true
+			break
+		}
+	}
+	if !decode_required {
+		return raw_value, true
+	}
+
+	decoded_value := make([]u8, len(raw_value), allocator)
+	decoded_size, decode_ok := percent_decode(decoded_value, transmute(string)raw_value)
+	if !decode_ok {
+		return nil, false
+	}
+	return decoded_value[:decoded_size], true
+}
+
+query_value_decoded :: proc(request: ^Request, name: string) -> (decoded: []u8, ok: bool) {
+	raw_value := query_value(request, name)
+	if raw_value == nil {
+		return nil, true
+	}
+
+	decode_required := false
+	for b in raw_value {
+		if b == '%' || b == '+' {
+			decode_required = true
+			break
+		}
+	}
+	if !decode_required {
+		return raw_value, true
+	}
+
+	return query_value_decode(raw_value, request_scratch(request))
+}
+
 expects_continue :: #force_inline proc "contextless" (request: ^Request) -> bool {
 	state := request.connection_state
 	if state == nil {
@@ -316,10 +357,10 @@ peer_address :: #force_inline proc "contextless" (request: ^Request) -> tina.Pee
 // Returns the allocator for the Connection's (Isolate) working memory
 request_arena :: proc(request: ^Request) -> mem.Allocator {
 	when tina.TINA_DEBUG_ASSERTS {
-		assert(request != nil && request.tina_context != nil, "request_arena: request context is nil")
+		assert(request != nil && request.connection_state != nil, "request_arena: request state is nil")
 	}
-	if request == nil || request.tina_context == nil do return mem.Allocator{}
-	return tina.ctx_working_arena(request.tina_context)
+	if request == nil || request.connection_state == nil do return mem.Allocator{}
+	return mem.arena_allocator(&request.connection_state.request_arena_region)
 }
 
 // Returns the allocator for the Connection's (Isolate) scratch memory
@@ -514,6 +555,43 @@ test_query_value_finds_first_match :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(value), "42")
 	missing := query_value(&request, "missing")
 	testing.expect(t, missing == nil, "missing query key should return nil")
+}
+
+@(test)
+test_query_value_decoded_borrows_plain_bytes :: proc(t: ^testing.T) {
+	query_text := "plain=hello"
+	frame := transmute([]u8)query_text
+	connection_state := HTTP_Connection_State{
+		request = Request_State {
+			query_offset = 0,
+			query_size   = u16(len(query_text)),
+		},
+	}
+	request := Request {
+		connection_state = &connection_state,
+		frame            = frame,
+	}
+
+	plain_raw := query_value(&request, "plain")
+	plain, plain_ok := query_value_decoded(&request, "plain")
+	testing.expect_value(t, plain_ok, true)
+	testing.expect_value(t, string(plain), "hello")
+	testing.expect(t, raw_data(plain) == raw_data(plain_raw), "plain query should not allocate or copy")
+}
+
+@(test)
+test_query_value_decode_decodes_percent_and_plus :: proc(t: ^testing.T) {
+	raw := `%7B%22message%22%3A%22hello+%2B+world%22%7D`
+	decoded, ok := query_value_decode(transmute([]u8)raw, context.temp_allocator)
+	testing.expect_value(t, ok, true)
+	testing.expect_value(t, string(decoded), `{"message":"hello + world"}`)
+}
+
+@(test)
+test_query_value_decode_rejects_invalid_percent_encoding :: proc(t: ^testing.T) {
+	raw := "%2G"
+	_, ok := query_value_decode(transmute([]u8)raw, context.temp_allocator)
+	testing.expect_value(t, ok, false)
 }
 
 @(test)

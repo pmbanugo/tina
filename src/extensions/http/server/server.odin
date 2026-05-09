@@ -235,6 +235,7 @@ HTTP_Connection_State :: struct {
 	response:                   Response_State,
 	request:                    Request_State,
 	header_views:                []Header_View,
+	request_arena_region:        mem.Arena,
 	response_header_bytes:       []u8,
 	route_state_bytes:           []u8,
 	request_frame_bytes:         []u8,
