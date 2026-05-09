@@ -129,6 +129,28 @@ Shard 0 and Shard 1 share no memory. Each shard is a separate OS thread with its
 | `TINA_DEMO_ECHO_CHAOS_CRASH_AFTER` | `2` | Chaos client crashes after N successful round-trips |
 
 
+## HTTP Datastar — *Backend-Driven UI with SSE*
+
+A small HTTP server that recreates Datastar's Hello World homepage demo using Tina's Datastar SDK. The page sends signals to the backend, and the backend patches DOM elements/signals over Server-Sent Events.
+
+### Run it
+
+```sh
+nix develop --command odin run examples/example_http_datastar.odin -file
+```
+
+Open `http://localhost:8080`.
+
+### What to try
+
+- Set interval to `0`, then click **Start**. The backend sends one immediate Datastar patch and cycles the message class.
+- Set interval to `400`, then click **Start**. The backend streams progressive patches for `Hello world!` and appends the network response log.
+
+### Why this matters
+
+This example demonstrates the Datastar SDK under `src/extensions/http/server/datastar`: `ReadSignals`, `PatchElements`, `PatchSignals`, and `ExecuteScript`. Application code writes backend UI updates through the SDK instead of hand-formatting Datastar SSE frames.
+
+
 ## Debug build
 
 Enable debug assertions (validates `self_as` casts, `payload_offset_of` bounds, etc.):
@@ -139,13 +161,16 @@ odin build examples/example_tcp_echo.odin -file -out:tina_echo -define:TINA_ASSE
 
 ## What each example covers
 
-| Concept | Dispatcher | Echo |
-|---------|-----------|------|
-| Ephemeral handles (stale = safe drop) | ✓ | |
-| Check-in pattern (worker re-registration) | ✓ | |
-| Typed inter-isolate messaging | ✓ | |
-| Supervision restart budgets | ✓ | ✓ |
-| Shard quarantine & recovery | ✓ | ✓ |
-| Async I/O (accept/connect/send/recv) | | ✓ |
-| FD handoff between isolates | | ✓ |
-| Blast radius containment | | ✓ |
+| Concept | Dispatcher | Echo | Datastar |
+|---------|-----------|------|----------|
+| Ephemeral handles (stale = safe drop) | ✓ | | |
+| Check-in pattern (worker re-registration) | ✓ | | |
+| Typed inter-isolate messaging | ✓ | | |
+| Supervision restart budgets | ✓ | ✓ | |
+| Shard quarantine & recovery | ✓ | ✓ | |
+| Async I/O (accept/connect/send/recv) | | ✓ | |
+| HTTP routing | | | ✓ |
+| Server-Sent Events | | | ✓ |
+| Datastar SDK usage | | | ✓ |
+| FD handoff between isolates | | ✓ | |
+| Blast radius containment | | ✓ | |
