@@ -7,8 +7,7 @@ adr-temp2
 *.bin
 *.cast
 example_*.odin.txt
-tina_dispatch
-tina_echo
+tina_*
 
 # Prerequisites
 *.d
