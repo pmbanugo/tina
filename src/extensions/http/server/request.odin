@@ -76,41 +76,60 @@ request_state_reset :: #force_inline proc "contextless" (request: ^Request_State
 	}
 }
 
-method :: #force_inline proc "contextless" (request: ^Request) -> Method {
-	return request.connection_state.request.method
-}
-
-target :: #force_inline proc "contextless" (request: ^Request) -> []u8 {
-	state := request.connection_state.request
-	if request.connection_state == nil || len(request.frame) == 0 || state.target_size == 0 {
-		return nil
+method :: #force_inline proc (request: ^Request) -> Method {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "method: request state is nil")
 	}
-	return request.frame[int(state.target_offset):][:int(state.target_size)]
-}
-
-path :: #force_inline proc "contextless" (request: ^Request) -> []u8 {
-	state := request.connection_state.request
-	if request.connection_state == nil || len(request.frame) == 0 || state.path_size == 0 {
-		return nil
-	}
-	return request.frame[int(state.path_offset):][:int(state.path_size)]
-}
-
-query :: #force_inline proc "contextless" (request: ^Request) -> []u8 {
-	state := request.connection_state.request
-	if request.connection_state == nil || len(request.frame) == 0 || state.query_size == 0 {
-		return nil
-	}
-	return request.frame[int(state.query_offset):][:int(state.query_size)]
-}
-
-body_buffered :: proc "contextless" (request: ^Request) -> []u8 {
 	state := request.connection_state
-	if state == nil || state.buffered_body_size == 0 {
+	return state.request.method
+}
+
+target :: #force_inline proc (request: ^Request) -> []u8 {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "target: request state is nil")
+	}
+	state := request.connection_state
+	if len(request.frame) == 0 || state.request.target_size == 0 {
 		return nil
 	}
-	if state.request.route_index == ROUTE_INDEX_NONE || state.shard_runtime == nil {
+	return request.frame[int(state.request.target_offset):][:int(state.request.target_size)]
+}
+
+path :: #force_inline proc (request: ^Request) -> []u8 {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "path: request state is nil")
+	}
+	state := request.connection_state
+	if len(request.frame) == 0 || state.request.path_size == 0 {
 		return nil
+	}
+	return request.frame[int(state.request.path_offset):][:int(state.request.path_size)]
+}
+
+query :: #force_inline proc (request: ^Request) -> []u8 {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "query: request state is nil")
+	}
+	state := request.connection_state
+	if len(request.frame) == 0 || state.request.query_size == 0 {
+		return nil
+	}
+	return request.frame[int(state.request.query_offset):][:int(state.request.query_size)]
+}
+
+body_buffered :: proc (request: ^Request) -> []u8 {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "body_buffered: request state is nil")
+	}
+	state := request.connection_state
+	if state.buffered_body_size == 0 {
+		return nil
+	}
+	if state.request.route_index == ROUTE_INDEX_NONE {
+		return nil
+	}
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(state.shard_runtime != nil, "body_buffered: shard_runtime is nil")
 	}
 	if state.shard_runtime.router.descriptors[state.request.route_index].body_mode != .Buffered {
 		return nil
@@ -118,14 +137,18 @@ body_buffered :: proc "contextless" (request: ^Request) -> []u8 {
 	return state.buffered_body_bytes[:int(state.buffered_body_size)]
 }
 
-header :: proc "contextless" (request: ^Request, name: string) -> []u8 {
+header :: proc (request: ^Request, name: string) -> []u8 {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "header: request state is nil")
+	}
+	state := request.connection_state
 	if len(name) == 0 || len(request.frame) == 0 {
 		return nil
 	}
 	name_bytes := transmute([]u8)name
 	target_hash := compute_header_hash(name_bytes)
-	header_views := request.connection_state.header_views
-	header_count := int(request.connection_state.request.header_count)
+	header_views := state.header_views
+	header_count := int(state.request.header_count)
 	for view in header_views[:header_count] {
 		if view.hash != target_hash {
 			continue
@@ -140,23 +163,24 @@ header :: proc "contextless" (request: ^Request, name: string) -> []u8 {
 	return nil
 }
 
-param :: proc "contextless" (request: ^Request, name: string) -> []u8 {
+param :: proc (request: ^Request, name: string) -> []u8 {
 	if len(name) == 0 {
 		return nil
 	}
-	if request == nil || request.connection_state == nil {
-		return nil
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "param: request state is nil")
 	}
-	runtime := request.connection_state.shard_runtime
-	if runtime == nil {
-		return nil
+	state := request.connection_state
+	runtime := state.shard_runtime
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(runtime != nil, "param: shard_runtime is nil")
 	}
-	if request.connection_state.request.route_index == ROUTE_INDEX_NONE {
+	if state.request.route_index == ROUTE_INDEX_NONE {
 		return nil
 	}
 
-	router_entry, ok := _router_entry_for_route_index(&runtime.router, request.connection_state.request.route_index)
-	if !ok {
+	router_entry, route_ok := _router_entry_for_route_index(&runtime.router, state.request.route_index)
+	if !route_ok {
 		return nil
 	}
 
@@ -225,7 +249,7 @@ param_decoded :: proc(request: ^Request, name: string) -> []u8 {
 	return decoded_value[:decoded_size]
 }
 
-query_value :: proc "contextless" (request: ^Request, name: string) -> []u8 {
+query_value :: proc (request: ^Request, name: string) -> []u8 {
 	query_bytes := query(request)
 	if len(query_bytes) == 0 || len(name) == 0 {
 		return nil
@@ -316,11 +340,11 @@ query_value_decoded :: proc(request: ^Request, name: string) -> (decoded: []u8, 
 	return query_value_decode(raw_value, request_scratch(request))
 }
 
-expects_continue :: #force_inline proc "contextless" (request: ^Request) -> bool {
-	state := request.connection_state
-	if state == nil {
-		return false
+expects_continue :: #force_inline proc (request: ^Request) -> bool {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "expects_continue: request state is nil")
 	}
+	state := request.connection_state
 	return .Expect_100 in state.parser.flags
 }
 
@@ -328,17 +352,20 @@ is_head :: #force_inline proc "contextless" (request: ^Request) -> bool {
 	return request.connection_state.request.method == .HEAD
 }
 
-is_upgrade_requested :: #force_inline proc "contextless" (request: ^Request) -> bool {
-	state := request.connection_state
-	if state == nil {
-		return false
+is_upgrade_requested :: #force_inline proc (request: ^Request) -> bool {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "is_upgrade_requested: request state is nil")
 	}
+	state := request.connection_state
 	return .Upgrade_Request in state.parser.flags
 }
 
 is_shutting_down :: #force_inline proc(request: ^Request) -> bool {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "is_shutting_down: request state is nil")
+	}
 	state := request.connection_state
-	if state != nil && state.shard_runtime != nil && state.shard_runtime.draining {
+	if state.shard_runtime != nil && state.shard_runtime.draining {
 		return true
 	}
 	if request.tina_context == nil {
@@ -347,11 +374,12 @@ is_shutting_down :: #force_inline proc(request: ^Request) -> bool {
 	return tina.ctx_is_shutting_down(request.tina_context)
 }
 
-peer_address :: #force_inline proc "contextless" (request: ^Request) -> tina.Peer_Address {
-	if request.connection_state == nil {
-		return {}
+peer_address :: #force_inline proc (request: ^Request) -> tina.Peer_Address {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "peer_address: request state is nil")
 	}
-	return request.connection_state.peer
+	state := request.connection_state
+	return state.peer
 }
 
 // Returns the allocator for the Connection's (Isolate) working memory
@@ -505,14 +533,11 @@ test_request_header_case_insensitive_lookup :: proc(t: ^testing.T) {
 	views := [1]Header_View{
 		{name_offset = 16, value_offset = 22, hash = compute_header_hash(transmute([]u8)string("host")), name_size = 4, value_size = 11},
 	}
-	connection_state := HTTP_Connection_State{
-		request = Request_State{header_count = 1},
-		header_views = views[:],
-	}
-	request := Request {
-		connection_state = &connection_state,
-		frame            = frame,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	fixture.connection.connection_state.request = Request_State{header_count = 1}
+	fixture.connection.connection_state.header_views = views[:]
+	request := http_test_fixture_request(&fixture, frame)
 
 	value := header(&request, "HOST")
 	testing.expect_value(t, string(value), "example.com")
@@ -524,14 +549,11 @@ test_request_header_trims_optional_whitespace :: proc(t: ^testing.T) {
 	views := [1]Header_View{
 		{name_offset = 16, value_offset = 24, hash = compute_header_hash(transmute([]u8)string("x-test")), name_size = 6, value_size = 9},
 	}
-	connection_state := HTTP_Connection_State{
-		request = Request_State{header_count = 1},
-		header_views = views[:],
-	}
-	request := Request {
-		connection_state = &connection_state,
-		frame            = frame,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	fixture.connection.connection_state.request = Request_State{header_count = 1}
+	fixture.connection.connection_state.header_views = views[:]
+	request := http_test_fixture_request(&fixture, frame)
 
 	value := header(&request, "x-test")
 	testing.expect_value(t, string(value), "value")
@@ -540,16 +562,13 @@ test_request_header_trims_optional_whitespace :: proc(t: ^testing.T) {
 @(test)
 test_query_value_finds_first_match :: proc(t: ^testing.T) {
 	frame := transmute([]u8)string("/users?id=42&mode=full&id=99")
-	connection_state := HTTP_Connection_State{
-		request = Request_State {
-			query_offset = 7,
-			query_size   = 21,
-		},
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	fixture.connection.connection_state.request = Request_State{
+		query_offset = 7,
+		query_size   = 21,
 	}
-	request := Request {
-		connection_state = &connection_state,
-		frame         = frame,
-	}
+	request := http_test_fixture_request(&fixture, frame)
 
 	value := query_value(&request, "id")
 	testing.expect_value(t, string(value), "42")
@@ -561,16 +580,13 @@ test_query_value_finds_first_match :: proc(t: ^testing.T) {
 test_query_value_decoded_borrows_plain_bytes :: proc(t: ^testing.T) {
 	query_text := "plain=hello"
 	frame := transmute([]u8)query_text
-	connection_state := HTTP_Connection_State{
-		request = Request_State {
-			query_offset = 0,
-			query_size   = u16(len(query_text)),
-		},
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	fixture.connection.connection_state.request = Request_State{
+		query_offset = 0,
+		query_size   = u16(len(query_text)),
 	}
-	request := Request {
-		connection_state = &connection_state,
-		frame            = frame,
-	}
+	request := http_test_fixture_request(&fixture, frame)
 
 	plain_raw := query_value(&request, "plain")
 	plain, plain_ok := query_value_decoded(&request, "plain")
@@ -618,15 +634,10 @@ test_param_extracts_named_segment :: proc(t: ^testing.T) {
 	testing.expect_value(t, match_result.outcome, Match_Outcome.Found)
 	request_state.route_index = match_result.route_index
 
-	runtime := HTTP_Shard_Runtime {router = router}
-	connection_state := HTTP_Connection_State {
-		shard_runtime = &runtime,
-		request       = request_state,
-	}
-	request := Request {
-		connection_state = &connection_state,
-		frame            = path_bytes,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture, router)
+	fixture.connection.connection_state.request = request_state
+	request := http_test_fixture_request(&fixture, path_bytes)
 
 	value := param(&request, "id")
 	testing.expect_value(t, string(value), "42")
@@ -636,13 +647,11 @@ test_param_extracts_named_segment :: proc(t: ^testing.T) {
 
 @(test)
 test_is_upgrade_requested_reads_parser_flag :: proc(t: ^testing.T) {
-	connection_state := HTTP_Connection_State {}
-	request := Request {
-		connection_state = &connection_state,
-		frame            = nil,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	request := http_test_fixture_request(&fixture)
 
 	testing.expect(t, !is_upgrade_requested(&request), "upgrade should be false when parser flag is unset")
-	connection_state.parser.flags += {.Upgrade_Request}
+	fixture.connection.connection_state.parser.flags += {.Upgrade_Request}
 	testing.expect(t, is_upgrade_requested(&request), "upgrade should be true when parser flag is set")
 }

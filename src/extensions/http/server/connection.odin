@@ -183,7 +183,10 @@ _http_connection_handler :: proc(
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 
 	case TAG_DRAIN_TIMEOUT:
-		if state.shard_runtime == nil || !state.shard_runtime.draining {
+		when tina.TINA_DEBUG_ASSERTS {
+			assert(state.shard_runtime != nil, "_http_connection_handler: shard runtime is nil during drain timeout")
+		}
+		if !state.shard_runtime.draining {
 			return tina.Effect_Receive{}
 		}
 		if !_connection_timeout_is_current(connection, ctx, state.deadline_ns_drain, message.correlation) {
@@ -212,7 +215,7 @@ _http_connection_handler :: proc(
 		if state.state == .Keep_Alive_Idle {
 			_connection_prepare_incoming_request(connection, ctx)
 		}
-		if state.shard_runtime != nil && state.shard_runtime.draining {
+		if state.shard_runtime.draining {
 			state.state = .Closing
 			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 		}
@@ -401,6 +404,9 @@ _connection_send_not_found :: proc(
 @(private = "file")
 _connection_handle_send_complete :: proc(connection: ^HTTP_Connection, bytes_sent: u32, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(state.shard_runtime != nil, "_connection_handle_send_complete: shard runtime is nil")
+	}
 	remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
 	if remaining > 0 {
 		sent := min(int(bytes_sent), remaining)
@@ -417,7 +423,7 @@ _connection_handle_send_complete :: proc(connection: ^HTTP_Connection, bytes_sen
 		return _connection_drive_sendfile(connection, ctx)
 	}
 
-	if state.shard_runtime != nil && state.request.route_index != ROUTE_INDEX_NONE {
+	if state.request.route_index != ROUTE_INDEX_NONE {
 		descriptor := state.shard_runtime.router.descriptors[state.request.route_index]
 		if state.response.status_code == HTTP_STATUS_CONTINUE {
 			_response_prepare_next_message(&state.response)
@@ -487,6 +493,9 @@ _connection_drive_sendfile :: proc(connection: ^HTTP_Connection, ctx: ^tina.Tina
 @(private = "file")
 _connection_finalize_flushed_response :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(state.shard_runtime != nil, "_connection_finalize_flushed_response: shard runtime is nil")
+	}
 	state.sendfile_active = false
 	state.sendfile_file_fd = tina.FD_HANDLE_NONE
 	state.sendfile_offset = 0
@@ -497,7 +506,7 @@ _connection_finalize_flushed_response :: proc(connection: ^HTTP_Connection, ctx:
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 	}
 
-	if state.shard_runtime != nil && state.shard_runtime.free_count <= state.shard_runtime.keepalive_reserve {
+	if state.shard_runtime.free_count <= state.shard_runtime.keepalive_reserve {
 		state.response.flags += {.Close_After_Send}
 		state.state = .Closing
 		_connection_release_slot(connection, ctx)
@@ -525,12 +534,15 @@ _connection_finalize_flushed_response :: proc(connection: ^HTTP_Connection, ctx:
 @(private = "file")
 _connection_continue_after_non_final_flush :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(state.shard_runtime != nil, "_connection_continue_after_non_final_flush: shard runtime is nil")
+	}
 	state.response_flush_final = false
 
 	if .Close_After_Send in state.response.flags || .In_Drain in state.response.flags || state.state == .Closing {
 		return _connection_finalize_flushed_response(connection, ctx)
 	}
-	if state.shard_runtime != nil && state.shard_runtime.free_count <= state.shard_runtime.keepalive_reserve {
+	if state.shard_runtime.free_count <= state.shard_runtime.keepalive_reserve {
 		state.response.flags += {.Close_After_Send}
 		return _connection_finalize_flushed_response(connection, ctx)
 	}
@@ -541,7 +553,7 @@ _connection_continue_after_non_final_flush :: proc(connection: ^HTTP_Connection,
 	state.response.egress_size = 0
 	state.response.egress_size_sent = 0
 
-	if state.shard_runtime != nil && state.request.route_index != ROUTE_INDEX_NONE {
+	if state.request.route_index != ROUTE_INDEX_NONE {
 		descriptor := state.shard_runtime.router.descriptors[state.request.route_index]
 		if descriptor.handler_kind == .Event {
 			request := _connection_make_request(connection, nil, ctx)
@@ -572,8 +584,11 @@ _connection_stage_canned_response :: proc(connection: ^HTTP_Connection, response
 	return tina.io_send(connection, state.fd, connection.egress_buffer[:len(response_bytes)])
 }
 
-@(private = "file")
+@(private = "package")
 _connection_make_request :: proc(connection: ^HTTP_Connection, frame: []u8, ctx: ^tina.TinaContext) -> Request {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(connection != nil, "_connection_make_request: connection is nil")
+	}
 	request_frame := frame
 	if len(request_frame) == 0 && connection.connection_state.request_frame_size > 0 {
 		request_frame = connection.connection_state.request_frame_bytes[:connection.connection_state.request_frame_size]
@@ -605,12 +620,45 @@ _connection_date_value :: proc "contextless" (connection: ^HTTP_Connection, ctx:
 	return runtime.date_cache.bytes[:int(runtime.date_cache.size)]
 }
 
-@(private = "file")
-_connection_make_response :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext = nil) -> Response {
+@(private = "package")
+_connection_make_response :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> Response {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(connection != nil, "_connection_make_response: connection is nil")
+	}
 	return Response {
 		connection   = connection,
 		tina_context = ctx,
 	}
+}
+
+@(test)
+test_connection_make_request_and_response_populate_internal_facades :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+
+	ctx := tina.TinaContext{}
+	frame := transmute([]u8)string("GET / HTTP/1.1\r\n\r\n")
+	request := _connection_make_request(&fixture.connection, frame, &ctx)
+	response := _connection_make_response(&fixture.connection, &ctx)
+
+	testing.expect(t, request.connection_state == &fixture.connection.connection_state, "request must point at the connection state")
+	testing.expect(t, response.connection == &fixture.connection, "response must point at the connection")
+	testing.expect(t, request.tina_context == &ctx, "request must keep the Tina context")
+	testing.expect(t, response.tina_context == &ctx, "response must keep the Tina context")
+	testing.expect_value(t, string(request.frame), string(frame))
+}
+
+@(test)
+test_connection_make_request_uses_retained_frame_when_frame_absent :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+
+	retained_frame := transmute([]u8)string("GET /retained HTTP/1.1\r\n\r\n")
+	copy(fixture.connection.connection_state.request_frame_bytes[:], retained_frame)
+	fixture.connection.connection_state.request_frame_size = u16(len(retained_frame))
+
+	request := _connection_make_request(&fixture.connection, nil, nil)
+	testing.expect_value(t, string(request.frame), string(retained_frame))
 }
 
 @(private = "file")
@@ -866,9 +914,8 @@ _dispatch_step :: proc(connection: ^HTTP_Connection, step: Route_Step, ctx: ^tin
 			state.state = .Closing
 			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 		}
-		if state.shard_runtime == nil {
-			state.state = .Closing
-			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+		when tina.TINA_DEBUG_ASSERTS {
+			assert(state.shard_runtime != nil, "_dispatch_step: shard runtime is nil while parking application expectation")
 		}
 		if state.application_timeout_ns > 0 {
 			tina.ctx_register_timer_with_correlation(
@@ -1153,10 +1200,13 @@ _connection_process_body_bytes :: proc(
 @(private = "file")
 _connection_release_slot :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) {
 	state := &connection.connection_state
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(state.shard_runtime != nil, "_connection_release_slot: shard runtime is nil")
+	}
 	if state.state == .Keep_Alive_Idle {
 		_idle_slot_remove(connection, ctx)
 	}
-	if state.shard_runtime != nil && state.shard_runtime.free_count < state.shard_runtime.connection_slot_count {
+	if state.shard_runtime.free_count < state.shard_runtime.connection_slot_count {
 		state.shard_runtime.free_count += 1
 	}
 }

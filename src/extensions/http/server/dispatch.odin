@@ -8,11 +8,14 @@ HTTP_INTERNAL_TAG_AWAIT_TIMEOUT :: tina.Message_Tag(0xFFFE)
 
 @(private = "package")
 _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "_dispatch_route: request state is nil")
+		assert(response != nil && response.connection != nil, "_dispatch_route: response connection is nil")
+		assert(request.connection_state == &response.connection.connection_state, "_dispatch_route: request/response connection mismatch")
+		assert(request.connection_state.shard_runtime != nil, "_dispatch_route: shard runtime is nil")
+	}
 	state := request.connection_state
 	runtime := state.shard_runtime
-	if state == nil || runtime == nil {
-		return .Close
-	}
 
 	_apply_request_connection_policy(state)
 
@@ -117,11 +120,15 @@ _dispatch_route_event :: proc(
 	route_context: Route_Context,
 	state: rawptr,
 ) -> Route_Step {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(request != nil && request.connection_state != nil, "_dispatch_route_event: request state is nil")
+		assert(response != nil && response.connection != nil, "_dispatch_route_event: response connection is nil")
+		assert(request.connection_state == route_context.connection_state, "_dispatch_route_event: route context state mismatch")
+		assert(request.connection_state == &response.connection.connection_state, "_dispatch_route_event: request/response connection mismatch")
+		assert(request.connection_state.shard_runtime != nil, "_dispatch_route_event: shard runtime is nil")
+	}
 	state_connection := request.connection_state
 	runtime := state_connection.shard_runtime
-	if state_connection == nil || runtime == nil {
-		return .Close
-	}
 	if state_connection.request.route_index == ROUTE_INDEX_NONE {
 		return .Close
 	}
@@ -184,7 +191,10 @@ _route_state_ptr :: proc "contextless" (state: ^HTTP_Connection_State) -> rawptr
 }
 
 @(private = "package")
-_make_route_context :: proc "contextless" (state: ^HTTP_Connection_State, ctx: ^tina.TinaContext) -> Route_Context {
+_make_route_context :: proc (state: ^HTTP_Connection_State, ctx: ^tina.TinaContext) -> Route_Context {
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(state != nil, "_make_route_context: state is nil")
+	}
 	return Route_Context {
 		connection_state = state,
 		tina_context     = ctx,
@@ -215,34 +225,22 @@ test_dispatch_unknown_method_missing_path_returns_not_implemented :: proc(t: ^te
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
-	response_header_storage: [128]u8
 	request_frame := transmute([]u8)string("FOO /missing HTTP/1.1\r\nHost: example\r\n\r\n")
-	runtime := HTTP_Shard_Runtime{router = router}
-	connection := HTTP_Connection{
-		connection_state = HTTP_Connection_State{
-			shard_runtime          = &runtime,
-			response_header_bytes  = response_header_storage[:],
-			request = Request_State{
-				method       = .GET,
-				path_offset  = 4,
-				path_size    = 8,
-				route_index  = ROUTE_INDEX_NONE,
-				status_flags = {.Unknown_Method},
-			},
-		},
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture, router)
+	fixture.connection.connection_state.request = Request_State{
+		method       = .GET,
+		path_offset  = 4,
+		path_size    = 8,
+		route_index  = ROUTE_INDEX_NONE,
+		status_flags = {.Unknown_Method},
 	}
-	request := Request{
-		connection_state = &connection.connection_state,
-		frame            = request_frame,
-	}
-	response := Response{
-		connection   = &connection,
-		tina_context = nil,
-	}
+	request := http_test_fixture_request(&fixture, request_frame)
+	response := http_test_fixture_response(&fixture)
 
 	step := _dispatch_route(&request, &response)
 	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect_value(t, connection.connection_state.response.status_code, HTTP_STATUS_NOT_IMPLEMENTED)
+	testing.expect_value(t, fixture.connection.connection_state.response.status_code, HTTP_STATUS_NOT_IMPLEMENTED)
 }
 
 @(private = "file")
@@ -289,37 +287,25 @@ test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^t
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
-	response_header_storage: [128]u8
 	request_frame := transmute([]u8)string("GET /x HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n")
-	runtime := HTTP_Shard_Runtime{router = router}
-	connection := HTTP_Connection{
-		connection_state = HTTP_Connection_State{
-			shard_runtime         = &runtime,
-			response_header_bytes = response_header_storage[:],
-			parser                = Parser_State{flags = {.Connection_Close}},
-			request = Request_State{
-				method      = .GET,
-				path_offset = 4,
-				path_size   = 2,
-				route_index = ROUTE_INDEX_NONE,
-			},
-		},
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture, router)
+	fixture.connection.connection_state.parser = Parser_State{flags = {.Connection_Close}}
+	fixture.connection.connection_state.request = Request_State{
+		method      = .GET,
+		path_offset = 4,
+		path_size   = 2,
+		route_index = ROUTE_INDEX_NONE,
 	}
-	request := Request{
-		connection_state = &connection.connection_state,
-		frame            = request_frame,
-	}
-	response := Response{
-		connection   = &connection,
-		tina_context = nil,
-	}
+	request := http_test_fixture_request(&fixture, request_frame)
+	response := http_test_fixture_response(&fixture)
 
 	step := _dispatch_route(&request, &response)
 	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect(t, .Close_After_Send in connection.connection_state.response.flags, "response must close after send")
+	testing.expect(t, .Close_After_Send in fixture.connection.connection_state.response.flags, "response must close after send")
 	testing.expect(
 		t,
-		strings.index(string(connection.egress_buffer[:int(connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
+		strings.index(string(fixture.connection.egress_buffer[:int(fixture.connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
 		"serialized response must advertise Connection: close",
 	)
 }
@@ -331,41 +317,29 @@ test_dispatch_none_body_route_closes_after_response_when_body_present :: proc(t:
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
-	response_header_storage: [128]u8
 	request_frame := transmute([]u8)string("POST /x HTTP/1.1\r\nHost: example\r\nContent-Length: 4\r\n\r\n")
-	runtime := HTTP_Shard_Runtime{router = router}
-	connection := HTTP_Connection{
-		connection_state = HTTP_Connection_State{
-			shard_runtime         = &runtime,
-			response_header_bytes = response_header_storage[:],
-			parser = Parser_State{
-				phase = .Body_Fixed,
-				body_size_remaining = 4,
-				flags = {.Has_Content_Length},
-			},
-			request = Request_State{
-				method      = .POST,
-				path_offset = 5,
-				path_size   = 2,
-				route_index = ROUTE_INDEX_NONE,
-			},
-		},
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture, router)
+	fixture.connection.connection_state.parser = Parser_State{
+		phase               = .Body_Fixed,
+		body_size_remaining = 4,
+		flags               = {.Has_Content_Length},
 	}
-	request := Request{
-		connection_state = &connection.connection_state,
-		frame            = request_frame,
+	fixture.connection.connection_state.request = Request_State{
+		method      = .POST,
+		path_offset = 5,
+		path_size   = 2,
+		route_index = ROUTE_INDEX_NONE,
 	}
-	response := Response{
-		connection   = &connection,
-		tina_context = nil,
-	}
+	request := http_test_fixture_request(&fixture, request_frame)
+	response := http_test_fixture_response(&fixture)
 
 	step := _dispatch_route(&request, &response)
 	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect(t, .Close_After_Send in connection.connection_state.response.flags, "unconsumed request body must close after response")
+	testing.expect(t, .Close_After_Send in fixture.connection.connection_state.response.flags, "unconsumed request body must close after response")
 	testing.expect(
 		t,
-		strings.index(string(connection.egress_buffer[:int(connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
+		strings.index(string(fixture.connection.egress_buffer[:int(fixture.connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
 		"serialized response must advertise Connection: close when body is not consumed",
 	)
 }
@@ -386,38 +360,26 @@ test_dispatch_streamed_route_final_response_before_body_closes_after_send :: pro
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
-	response_header_storage: [128]u8
 	request_frame := transmute([]u8)string("POST /x HTTP/1.1\r\nHost: example\r\nContent-Length: 4\r\n\r\n")
-	runtime := HTTP_Shard_Runtime{router = router}
-	connection := HTTP_Connection{
-		connection_state = HTTP_Connection_State{
-			shard_runtime         = &runtime,
-			response_header_bytes = response_header_storage[:],
-			parser = Parser_State{
-				phase = .Body_Fixed,
-				body_size_remaining = 4,
-				flags = {.Has_Content_Length},
-			},
-			request = Request_State{
-				method      = .POST,
-				path_offset = 5,
-				path_size   = 2,
-				route_index = ROUTE_INDEX_NONE,
-			},
-		},
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture, router)
+	fixture.connection.connection_state.parser = Parser_State{
+		phase               = .Body_Fixed,
+		body_size_remaining = 4,
+		flags               = {.Has_Content_Length},
 	}
-	request := Request{
-		connection_state = &connection.connection_state,
-		frame            = request_frame,
+	fixture.connection.connection_state.request = Request_State{
+		method      = .POST,
+		path_offset = 5,
+		path_size   = 2,
+		route_index = ROUTE_INDEX_NONE,
 	}
-	response := Response{
-		connection   = &connection,
-		tina_context = nil,
-	}
+	request := http_test_fixture_request(&fixture, request_frame)
+	response := http_test_fixture_response(&fixture)
 
 	step := _dispatch_route(&request, &response)
 	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect(t, .Close_After_Send in connection.connection_state.response.flags, "early final streamed response must close")
+	testing.expect(t, .Close_After_Send in fixture.connection.connection_state.response.flags, "early final streamed response must close")
 }
 
 @(test)
@@ -436,34 +398,22 @@ test_dispatch_streamed_route_cannot_park_before_consuming_body :: proc(t: ^testi
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
-	response_header_storage: [128]u8
 	request_frame := transmute([]u8)string("POST /x HTTP/1.1\r\nHost: example\r\nContent-Length: 4\r\n\r\n")
-	runtime := HTTP_Shard_Runtime{router = router}
-	connection := HTTP_Connection{
-		connection_state = HTTP_Connection_State{
-			shard_runtime         = &runtime,
-			response_header_bytes = response_header_storage[:],
-			parser = Parser_State{
-				phase = .Body_Fixed,
-				body_size_remaining = 4,
-				flags = {.Has_Content_Length},
-			},
-			request = Request_State{
-				method      = .POST,
-				path_offset = 5,
-				path_size   = 2,
-				route_index = ROUTE_INDEX_NONE,
-			},
-		},
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture, router)
+	fixture.connection.connection_state.parser = Parser_State{
+		phase               = .Body_Fixed,
+		body_size_remaining = 4,
+		flags               = {.Has_Content_Length},
 	}
-	request := Request{
-		connection_state = &connection.connection_state,
-		frame            = request_frame,
+	fixture.connection.connection_state.request = Request_State{
+		method      = .POST,
+		path_offset = 5,
+		path_size   = 2,
+		route_index = ROUTE_INDEX_NONE,
 	}
-	response := Response{
-		connection   = &connection,
-		tina_context = nil,
-	}
+	request := http_test_fixture_request(&fixture, request_frame)
+	response := http_test_fixture_response(&fixture)
 
 	step := _dispatch_route(&request, &response)
 	testing.expect_value(t, step, Route_Step.Close)

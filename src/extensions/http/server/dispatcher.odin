@@ -30,8 +30,9 @@ _http_dispatcher_handler :: proc(
 	ctx: ^tina.TinaContext,
 ) -> tina.Effect {
 	dispatcher := cast(^HTTP_Dispatcher)self
-	if dispatcher == nil || dispatcher.shard_runtime == nil {
-		return tina.Effect_Receive{}
+	when tina.TINA_DEBUG_ASSERTS {
+		assert(dispatcher != nil, "_http_dispatcher_handler: dispatcher is nil")
+		assert(dispatcher.shard_runtime != nil, "_http_dispatcher_handler: shard runtime is nil")
 	}
 
 	switch message.tag {

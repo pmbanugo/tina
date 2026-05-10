@@ -537,9 +537,6 @@ _response_state :: #force_inline proc "contextless" (response: ^Response) -> ^Re
 
 @(private = "file")
 _response_clear_sendfile_plan :: #force_inline proc "contextless" (response: ^Response) {
-	if response.connection == nil {
-		return
-	}
 	response.connection.connection_state.sendfile_file_fd = tina.FD_HANDLE_NONE
 	response.connection.connection_state.sendfile_offset = 0
 	response.connection.connection_state.sendfile_size_remaining = 0
@@ -710,11 +707,6 @@ respond_file :: proc "contextless" (
 	}
 
 	if state.mode == .Head_Suppressed || file_size == 0 {
-		return .Flush_Final
-	}
-
-	if response.connection == nil {
-		state.flags += {.Aborted, .Close_After_Send}
 		return .Flush_Final
 	}
 
@@ -1651,13 +1643,9 @@ test_serialize_head_suppressed_emits_content_length :: proc(t: ^testing.T) {
 
 @(test)
 test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testing.T) {
-	connection: HTTP_Connection
-	response_header_storage: [256]u8
-	connection.connection_state.response_header_bytes = response_header_storage[:]
-	response := Response{
-		connection         = &connection,
-		tina_context       = nil,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	response := http_test_fixture_response(&fixture)
 
 	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
 	state := _response_state(&response)
@@ -1665,25 +1653,21 @@ test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testi
 	testing.expect(t, .Headers_Committed in state.flags)
 	head_size := int(state.egress_size)
 	testing.expect(t, head_size > 0)
-	committed_head := string(response.connection.egress_buffer[:head_size])
+	committed_head := string(fixture.connection.egress_buffer[:head_size])
 	testing.expect(t, strings.index(committed_head, "\r\nTransfer-Encoding: chunked\r\n") >= 0)
 
 	admitted := write_bytes(&response, transmute([]u8)string("hello"))
 	testing.expect_value(t, admitted, u16(5))
 
-	wire_chunk := string(response.connection.egress_buffer[head_size:int(state.egress_size)])
+	wire_chunk := string(fixture.connection.egress_buffer[head_size:int(state.egress_size)])
 	testing.expect_value(t, wire_chunk, "5\r\nhello\r\n")
 }
 
 @(test)
 test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing.T) {
-	connection: HTTP_Connection
-	response_header_storage: [256]u8
-	connection.connection_state.response_header_bytes = response_header_storage[:]
-	response := Response{
-		connection         = &connection,
-		tina_context       = nil,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	response := http_test_fixture_response(&fixture)
 
 	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
 	_ = write_bytes(&response, transmute([]u8)string("ab"))
@@ -1695,21 +1679,17 @@ test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing
 	testing.expect(t, state.mode == .Closed)
 	testing.expect_value(
 		t,
-		string(response.connection.egress_buffer[pre_flush_size:int(state.egress_size)]),
+		string(fixture.connection.egress_buffer[pre_flush_size:int(state.egress_size)]),
 		"0\r\n\r\n",
 	)
 }
 
 @(test)
 test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) {
-	connection: HTTP_Connection
-	response_header_storage: [128]u8
-	connection.connection_state.response.mode = .Head_Suppressed
-	connection.connection_state.response_header_bytes = response_header_storage[:]
-	response := Response{
-		connection         = &connection,
-		tina_context       = nil,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	fixture.connection.connection_state.response.mode = .Head_Suppressed
+	response := http_test_fixture_response(&fixture)
 
 	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
 	state := _response_state(&response)
@@ -1723,18 +1703,14 @@ test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) 
 
 @(test)
 test_respond_file_sets_sendfile_plan_and_returns_flush :: proc(t: ^testing.T) {
-	connection: HTTP_Connection
-	response_header_storage: [256]u8
-	connection.connection_state.response_header_bytes = response_header_storage[:]
-	response := Response{
-		connection         = &connection,
-		tina_context       = nil,
-	}
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	response := http_test_fixture_response(&fixture)
 
 	step := respond_file(&response, tina.FD_Handle(42), 8192, "application/octet-stream")
 	testing.expect_value(t, step, Route_Step.Flush)
-	testing.expect_value(t, connection.connection_state.sendfile_file_fd, tina.FD_Handle(42))
-	testing.expect_value(t, connection.connection_state.sendfile_offset, u64(0))
-	testing.expect_value(t, connection.connection_state.sendfile_size_remaining, u64(8192))
-	testing.expect_value(t, connection.connection_state.sendfile_active, true)
+	testing.expect_value(t, fixture.connection.connection_state.sendfile_file_fd, tina.FD_Handle(42))
+	testing.expect_value(t, fixture.connection.connection_state.sendfile_offset, u64(0))
+	testing.expect_value(t, fixture.connection.connection_state.sendfile_size_remaining, u64(8192))
+	testing.expect_value(t, fixture.connection.connection_state.sendfile_active, true)
 }
