@@ -82,3 +82,31 @@ jobs:
         run: odin test src/extensions/http/server/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
       - name: Run Datastar SDK tests
         run: odin test src/extensions/http/datastar/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
+
+  compliance-check:
+    name: HTTP/1.1 Compliance Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-05
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Clone h1spec
+        run: git clone --depth 1 https://github.com/uNetworking/h1spec.git
+      - name: HTTP Compliance check
+        run: |
+          odin run src/extensions/http/server/compliance_check &
+          SERVER_PID=$!
+          trap "kill $SERVER_PID 2>/dev/null" EXIT
+          for i in $(seq 1 15); do
+            curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1 && break
+            sleep 1
+          done
+          cd h1spec
+          output=$(deno run --allow-net http_test.ts 127.0.0.1 8080 2>&1)
+          echo "$output"
+          [[ "$output" == *"33 out of 33 tests passed"* ]]
