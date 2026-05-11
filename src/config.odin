@@ -6,6 +6,7 @@ import "core:testing"
 
 Shard_Id :: distinct u8
 MAX_SHARD_COUNT :: 255 // Max count fits in u8. Sacrifices the 256th slot to avoid u16 counts.
+REMOTE_SHARD_COUNT_MAX :: MAX_SHARD_COUNT - 1
 MIN_RING_SIZE :: 16
 MAX_TYPE_DESCRIPTOR_ID :: 254 // 8-bit type_id, 255 (0xFF) is reserved for Supervision Groups
 CACHE_LINE_SIZE :: 128
@@ -13,6 +14,14 @@ TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
 // TINA_DEBUG_ASSERTS used to enable runtime asserts for cases that are fixed behaviour (runtime inputs don't change behaviour)
 // but needs verify invariant/structural correctness holds in a non-simulated environment
 TINA_RUNTIME_ASSERTIONS :: #config(TINA_ASSERTS, true)
+
+#assert(size_of(Shard_Id) == 1)
+#assert(MAX_SHARD_COUNT > 0)
+#assert(MAX_SHARD_COUNT == 255)
+#assert(REMOTE_SHARD_COUNT_MAX == MAX_SHARD_COUNT - 1)
+#assert(REMOTE_SHARD_COUNT_MAX > 0)
+#assert(MIN_RING_SIZE > 0)
+#assert((MIN_RING_SIZE & (MIN_RING_SIZE - 1)) == 0)
 
 Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect

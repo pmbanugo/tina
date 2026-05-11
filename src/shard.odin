@@ -181,10 +181,11 @@ Shard :: struct {
 	current_msg_slot:       u32,
 	current_slot_index:     u32,
 	id:                     Shard_Id,
+	shard_count:            u8,
 	current_type_id:        u16,
 	peer_alive_mask:        Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
 	control_signal:         Control_Signal, // Atomic, mutually exclusive signals from watchdog
-	_padding:               [5]u8,
+	_padding:               [4]u8,
 	watchdog_state_pointer: ^u8, // Points to external watchdog state (config or simulator backing)
 
 	// --- Cold / Massive Storage ---
@@ -1491,6 +1492,7 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 	defer free(shard)
 
 	shard.id = 1
+	shard.shard_count = 2
 	shard.handoff_retry_head = POOL_NONE_INDEX
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
@@ -1536,7 +1538,7 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 		prefill_envelope := Message_Envelope{source = make_handle(1, 1, 0, 1), destination = make_handle(0, 1, 0, 1)}
 		testing.expect_value(t, spsc_ring_enqueue(&ring, &prefill_envelope), Enqueue_Result.Success)
 
-		outbound_rings: [2]^SPSC_Ring
+		outbound_rings: [1]^SPSC_Ring
 		outbound_rings[0] = &ring
 		shard.outbound_rings = outbound_rings[:]
 	}

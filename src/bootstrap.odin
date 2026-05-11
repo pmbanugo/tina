@@ -24,11 +24,13 @@ Shard_Runtime_State :: struct #align (CACHE_LINE_SIZE) {
 	_padding:                 [5]u8,
 }
 
+#assert(size_of(Shard_Runtime_State) == CACHE_LINE_SIZE)
+
 // Passed to each Shard thread upon creation.
 Shard_Config :: struct {
-	// Massive inline arrays (256 * 8 = 2048 bytes each)
-	outbound_rings:    [MAX_SHARDS]^SPSC_Ring,
-	inbound_rings:     [MAX_SHARDS]^SPSC_Ring,
+	// Dense remote routes in ascending shard-id order, excluding self.
+	outbound_rings:    [REMOTE_SHARD_COUNT_MAX]^SPSC_Ring,
+	inbound_rings:     [REMOTE_SHARD_COUNT_MAX]^SPSC_Ring,
 	grand_arena_base:  []u8,
 	system_spec:       ^SystemSpec,
 	shard_spec:        ^ShardSpec,
@@ -89,6 +91,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	// 5. Initialize coordination structures
 	shard_configs := make([]Shard_Config, spec.shard_count)
 	shard_runtime_states := make([]Shard_Runtime_State, spec.shard_count)
+	remote_shard_count := int(spec.shard_count) - 1
 
 	barrier := new(sync.Barrier)
 	sync.barrier_init(barrier, int(spec.shard_count)) // Main thread does NOT wait on this
@@ -146,8 +149,17 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 			os_apply_memory_policy(raw_mem, i32(source), spec.memory_init_mode)
 			// Wire directly into the pre-allocated configs
-			shard_configs[source].outbound_rings[target] = ring
-			shard_configs[target].inbound_rings[source] = ring
+			outbound_index := remote_route_index_from_shard_id(Shard_Id(source), Shard_Id(target))
+			inbound_index := remote_route_index_from_shard_id(Shard_Id(target), Shard_Id(source))
+			shard_configs[source].outbound_rings[outbound_index] = ring
+			shard_configs[target].inbound_rings[inbound_index] = ring
+		}
+	}
+
+	for shard_index in 0 ..< spec.shard_count {
+		for route_index in 0 ..< remote_shard_count {
+			assert(shard_configs[shard_index].outbound_rings[route_index] != nil)
+			assert(shard_configs[shard_index].inbound_rings[route_index] != nil)
 		}
 	}
 
@@ -206,7 +218,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 	init_loop: for {
 		all_running := true
 		for index in 0 ..< spec.shard_count {
-			state := load_watchdog_state(&shard_runtime_states[index])
+			state := load_watchdog_state_acquire(&shard_runtime_states[index])
 			if state != .Running {
 				all_running = false
 				break
@@ -231,13 +243,32 @@ tina_start :: proc(spec: ^SystemSpec) {
 		time.sleep(10 * time.Millisecond) // Coarse polling
 	}
 
+	watchdog_shards := make([]^Shard, spec.shard_count)
+	defer delete(watchdog_shards)
+	watchdog_runtime_states := make([]^Shard_Runtime_State, spec.shard_count)
+	defer delete(watchdog_runtime_states)
+	for index in 0 ..< spec.shard_count {
+		runtime_state := &shard_runtime_states[index]
+		state := load_watchdog_state_acquire(runtime_state)
+		if state != .Running || runtime_state.shard_pointer == nil {
+			fmt.eprintfln("[FATAL] Shard %d reached watchdog startup without a published shard pointer", index)
+			os.exit(1)
+		}
+		watchdog_shards[index] = runtime_state.shard_pointer
+		watchdog_runtime_states[index] = runtime_state
+	}
+	watchdog_view := Watchdog_View {
+		shards = watchdog_shards,
+		runtime_states = watchdog_runtime_states,
+	}
+
 	// ========================================================================
 	// PHASE: RUNNING
 	// ========================================================================
 	store_process_phase(.Running)
 
 	// 10. Enter Watchdog loop (sigtimedwait / kqueue)
-	watchdog_loop(shard_runtime_states, spec)
+	watchdog_loop(&watchdog_view, spec)
 
 	// Await graceful termination
 	for t in threads {

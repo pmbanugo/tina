@@ -76,6 +76,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	runtime_state.shard_pointer = shard
 	g_current_shard_pointer = shard
 	shard.id = config.shard_id
+	shard.shard_count = config.system_spec.shard_count
 	shard.watchdog_state_pointer = &runtime_state.watchdog_state
 
 	os_pin_thread_to_core(i32(config.target_core))
@@ -103,8 +104,18 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		return
 	}
 
-	shard.outbound_rings = config.outbound_rings[:]
-	shard.inbound_rings = config.inbound_rings[:]
+	remote_shard_count := int(config.system_spec.shard_count) - 1
+	shard.outbound_rings = config.outbound_rings[:remote_shard_count]
+	shard.inbound_rings = config.inbound_rings[:remote_shard_count]
+
+	assert(len(shard.outbound_rings) == remote_shard_count)
+	assert(len(shard.inbound_rings) == remote_shard_count)
+	for ring in shard.outbound_rings {
+		assert(ring != nil)
+	}
+	for ring in shard.inbound_rings {
+		assert(ring != nil)
+	}
 
 	// S11. Install shard-level sigsetjmp recovery point
 	for {

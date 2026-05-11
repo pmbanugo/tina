@@ -20,6 +20,11 @@ load_watchdog_state :: #force_inline proc "contextless" (runtime_state: ^Shard_R
 }
 
 @(private = "package")
+load_watchdog_state_acquire :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
+	return cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Acquire)
+}
+
+@(private = "package")
 store_watchdog_state :: proc {
 	_store_watchdog_state_runtime,
 	_store_watchdog_state_shard,
