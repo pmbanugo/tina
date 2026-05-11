@@ -174,7 +174,7 @@ ctx_fd_handoff :: #force_inline proc(
 	}
 
 	deadline_tick := shard.current_tick + FD_HANDOFF_TIMEOUT_TICKS
-	handoff_ref, ok := fd_handoff_table_alloc(
+	handoff_ref, handoff_alloc_err := fd_handoff_table_alloc(
 		&shard.handoff_table,
 		to,
 		cleanup_fd,
@@ -182,7 +182,7 @@ ctx_fd_handoff :: #force_inline proc(
 		deadline_tick,
 		shard.id,
 	)
-	if !ok {
+	if handoff_alloc_err != .None {
 		_ = backend_control_close(&shard.reactor.backend, cleanup_fd)
 		shard.counters.handoff_exhaustions += 1
 		return .handoff_table_full

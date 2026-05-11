@@ -2,6 +2,14 @@ package tina
 
 import "core:testing"
 
+FD_Handoff_Table_Error :: enum u8 {
+	None,
+	Table_Full,
+	Invalid_Index,
+	Stale_Generation,
+	Invalid_State,
+}
+
 fd_handoff_table_init :: proc(table: ^FD_Handoff_Table, backing: []FD_Handoff_Entry) {
 	table.entries = backing
 	table.entry_count = u16(len(backing))
@@ -28,10 +36,10 @@ fd_handoff_table_alloc :: proc "contextless" (
 	source_shard: Shard_Id,
 ) -> (
 	FD_Handoff_Ref,
-	bool,
+	FD_Handoff_Table_Error,
 ) {
 	if table.free_head == FD_HANDOFF_NONE_INDEX {
-		return FD_HANDOFF_REF_NONE, false
+		return FD_HANDOFF_REF_NONE, .Table_Full
 	}
 
 	index := table.free_head
@@ -46,38 +54,47 @@ fd_handoff_table_alloc :: proc "contextless" (
 	entry.state = .In_Flight
 	entry.next_free_index = FD_HANDOFF_NONE_INDEX
 
-	return fd_handoff_ref_make(index, entry.generation, source_shard), true
+	return fd_handoff_ref_make(index, entry.generation, source_shard), .None
 }
 
 @(private = "package")
-fd_handoff_table_lookup :: proc "contextless" (
+fd_handoff_table_lookup_index :: proc "contextless" (
 	table: ^FD_Handoff_Table,
 	ref: FD_Handoff_Ref,
 ) -> (
-	^FD_Handoff_Entry,
-	bool,
+	u16,
+	FD_Handoff_Table_Error,
 ) {
 	if ref.handoff_index == FD_HANDOFF_NONE_INDEX || ref.handoff_index >= table.entry_count {
-		return nil, false
+		return FD_HANDOFF_NONE_INDEX, .Invalid_Index
 	}
 
 	entry := &table.entries[ref.handoff_index]
-	if entry.generation != ref.generation || entry.state != .In_Flight {
-		return nil, false
+	if entry.generation != ref.generation {
+		return FD_HANDOFF_NONE_INDEX, .Stale_Generation
+	}
+	if entry.state != .In_Flight {
+		return FD_HANDOFF_NONE_INDEX, .Invalid_State
 	}
 
-	return entry, true
+	return ref.handoff_index, .None
 }
 
 @(private = "package")
-fd_handoff_table_free :: proc "contextless" (table: ^FD_Handoff_Table, ref: FD_Handoff_Ref) -> bool {
+fd_handoff_table_free :: proc "contextless" (
+	table: ^FD_Handoff_Table,
+	ref: FD_Handoff_Ref,
+) -> FD_Handoff_Table_Error {
 	if ref.handoff_index == FD_HANDOFF_NONE_INDEX || ref.handoff_index >= table.entry_count {
-		return false
+		return .Invalid_Index
 	}
 
 	entry := &table.entries[ref.handoff_index]
-	if entry.generation != ref.generation || entry.state != .In_Flight {
-		return false
+	if entry.generation != ref.generation {
+		return .Stale_Generation
+	}
+	if entry.state != .In_Flight {
+		return .Invalid_State
 	}
 
 	entry.generation += 1
@@ -90,7 +107,7 @@ fd_handoff_table_free :: proc "contextless" (table: ^FD_Handoff_Table, ref: FD_H
 
 	table.free_head = ref.handoff_index
 	table.free_count += 1
-	return true
+	return .None
 }
 
 @(test)
@@ -99,7 +116,7 @@ test_fd_handoff_table_alloc_free :: proc(t: ^testing.T) {
 	table: FD_Handoff_Table
 	fd_handoff_table_init(&table, backing[:])
 
-	ref, ok := fd_handoff_table_alloc(
+	ref, alloc_err := fd_handoff_table_alloc(
 		&table,
 		make_handle(1, 2, 3, 4),
 		OS_FD(10),
@@ -107,17 +124,18 @@ test_fd_handoff_table_alloc_free :: proc(t: ^testing.T) {
 		42,
 		0,
 	)
-	testing.expect(t, ok, "first handoff alloc should succeed")
+	testing.expect_value(t, alloc_err, FD_Handoff_Table_Error.None)
 	testing.expect_value(t, table.free_count, u16(1))
 
-	entry, found := fd_handoff_table_lookup(&table, ref)
-	testing.expect(t, found, "handoff entry should be found")
+	entry_index, lookup_err := fd_handoff_table_lookup_index(&table, ref)
+	testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.None)
+	entry := &table.entries[entry_index]
 	testing.expect_value(t, entry.cleanup_fd, OS_FD(10))
 
-	freed := fd_handoff_table_free(&table, ref)
-	testing.expect(t, freed, "handoff entry should free successfully")
+	free_err := fd_handoff_table_free(&table, ref)
+	testing.expect_value(t, free_err, FD_Handoff_Table_Error.None)
 	testing.expect_value(t, table.free_count, u16(2))
 
-	_, found = fd_handoff_table_lookup(&table, ref)
-	testing.expect(t, !found, "stale handoff ref should not resolve after free")
+	_, lookup_err = fd_handoff_table_lookup_index(&table, ref)
+	testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.Stale_Generation)
 }

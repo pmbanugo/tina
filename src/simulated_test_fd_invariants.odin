@@ -62,8 +62,9 @@ when TINA_SIMULATION_MODE {
 		fd_handle, fd_err := fd_table_alloc(&shard.reactor.fd_table, os_fd, owner)
 		testing.expect_value(t, fd_err, FD_Table_Error.None)
 
-		entry, lookup_err := fd_table_lookup(&shard.reactor.fd_table, fd_handle)
+		entry_index, lookup_err := fd_table_lookup_index(&shard.reactor.fd_table, fd_handle)
 		testing.expect_value(t, lookup_err, FD_Table_Error.None)
+		entry := &shard.reactor.fd_table.entries[entry_index]
 		entry.os_fd = OS_FD_INVALID
 
 		testing.expect(
@@ -89,7 +90,7 @@ when TINA_SIMULATION_MODE {
 		)
 		testing.expect_value(t, sock_err, Backend_Error.None)
 
-		ref, ok := fd_handoff_table_alloc(
+		ref, alloc_err := fd_handoff_table_alloc(
 			&shard.handoff_table,
 			target_handle,
 			cleanup_fd,
@@ -97,10 +98,11 @@ when TINA_SIMULATION_MODE {
 			8,
 			shard.id,
 		)
-		testing.expect(t, ok, "handoff entry should allocate")
+		testing.expect_value(t, alloc_err, FD_Handoff_Table_Error.None)
 
-		entry, found := fd_handoff_table_lookup(&shard.handoff_table, ref)
-		testing.expect(t, found, "handoff entry should resolve")
+		entry_index, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+		testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.None)
+		entry := &shard.handoff_table.entries[entry_index]
 		entry.cleanup_fd = OS_FD_INVALID
 
 		testing.expect(

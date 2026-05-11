@@ -853,13 +853,17 @@ _dequeue :: proc "contextless" (
 
 @(private = "package")
 _fd_handoff_close_entry :: proc "contextless" (shard: ^Shard, ref: FD_Handoff_Ref) -> bool {
-	entry, ok := fd_handoff_table_lookup(&shard.handoff_table, ref)
-	if !ok {
+	entry_index, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+	if lookup_err != .None {
 		return false
 	}
+	entry := &shard.handoff_table.entries[entry_index]
 
 	cleanup_fd := entry.cleanup_fd
-	_ = fd_handoff_table_free(&shard.handoff_table, ref)
+	free_err := fd_handoff_table_free(&shard.handoff_table, ref)
+	if free_err != .None {
+		return false
+	}
 
 	if cleanup_fd != OS_FD_INVALID {
 		_ = backend_control_close(&shard.reactor.backend, cleanup_fd)
@@ -1469,7 +1473,7 @@ _alloc_handoff_test_entry :: proc(
 	cleanup_fd, sock_err := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, sock_err, Backend_Error.None)
 
-	ref, ok := fd_handoff_table_alloc(
+	ref, alloc_err := fd_handoff_table_alloc(
 		&shard.handoff_table,
 		target_handle,
 		cleanup_fd,
@@ -1477,7 +1481,7 @@ _alloc_handoff_test_entry :: proc(
 		deadline_tick,
 		shard.id,
 	)
-	testing.expect(t, ok, "handoff entry should allocate")
+	testing.expect_value(t, alloc_err, FD_Handoff_Table_Error.None)
 	return ref
 }
 
@@ -1620,13 +1624,13 @@ test_fd_handoff_peer_quarantine_closes_entries_targeting_that_shard :: proc(t: ^
 	}
 	_process_inbound_envelope(shard, 1, &quarantine_envelope)
 
-	_, found_target_1_a := fd_handoff_table_lookup(&shard.handoff_table, ref_target_1_a)
-	_, found_target_1_b := fd_handoff_table_lookup(&shard.handoff_table, ref_target_1_b)
-	_, found_target_2 := fd_handoff_table_lookup(&shard.handoff_table, ref_target_2)
+	_, lookup_err_target_1_a := fd_handoff_table_lookup_index(&shard.handoff_table, ref_target_1_a)
+	_, lookup_err_target_1_b := fd_handoff_table_lookup_index(&shard.handoff_table, ref_target_1_b)
+	_, lookup_err_target_2 := fd_handoff_table_lookup_index(&shard.handoff_table, ref_target_2)
 
-	testing.expect(t, !found_target_1_a, "quarantined target shard entries should be reclaimed")
-	testing.expect(t, !found_target_1_b, "all quarantined target shard entries should be reclaimed")
-	testing.expect(t, found_target_2, "entries to healthy shards must remain in flight")
+	testing.expect(t, lookup_err_target_1_a != .None, "quarantined target shard entries should be reclaimed")
+	testing.expect(t, lookup_err_target_1_b != .None, "all quarantined target shard entries should be reclaimed")
+	testing.expect_value(t, lookup_err_target_2, FD_Handoff_Table_Error.None)
 }
 
 @(test)
@@ -1642,11 +1646,11 @@ test_fd_handoff_close_all_entries_reclaims_all_in_flight_entries :: proc(t: ^tes
 
 	_fd_handoff_close_all_entries(shard, false)
 
-	_, found_a := fd_handoff_table_lookup(&shard.handoff_table, ref_a)
-	_, found_b := fd_handoff_table_lookup(&shard.handoff_table, ref_b)
+	_, lookup_err_a := fd_handoff_table_lookup_index(&shard.handoff_table, ref_a)
+	_, lookup_err_b := fd_handoff_table_lookup_index(&shard.handoff_table, ref_b)
 
-	testing.expect(t, !found_a, "close_all should reclaim first in-flight entry")
-	testing.expect(t, !found_b, "close_all should reclaim second in-flight entry")
+	testing.expect(t, lookup_err_a != .None, "close_all should reclaim first in-flight entry")
+	testing.expect(t, lookup_err_b != .None, "close_all should reclaim second in-flight entry")
 	testing.expect_value(t, shard.handoff_table.free_count, shard.handoff_table.entry_count)
 }
 
@@ -1663,8 +1667,9 @@ test_fd_handoff_timeout_scan_counts_but_keeps_entry :: proc(t: ^testing.T) {
 
 	_fd_handoff_timeout_scan(shard, 6)
 
-	entry, found := fd_handoff_table_lookup(&shard.handoff_table, ref)
-	testing.expect(t, found, "timed out entry must remain in-flight (FDs still live)")
+	entry_index, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+	testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.None)
+	entry := &shard.handoff_table.entries[entry_index]
 	testing.expect_value(t, entry.deadline_tick, u64(0))
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(1))
 
@@ -1685,8 +1690,8 @@ test_shard_mass_teardown_reclaims_in_flight_handoff_entries :: proc(t: ^testing.
 
 	shard_mass_teardown(shard)
 
-	_, found := fd_handoff_table_lookup(&shard.handoff_table, ref)
-	testing.expect(t, !found, "mass teardown should reclaim in-flight handoff entries")
+	_, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+	testing.expect(t, lookup_err != .None, "mass teardown should reclaim in-flight handoff entries")
 	testing.expect_value(t, shard.handoff_table.free_count, shard.handoff_table.entry_count)
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(0))
 }

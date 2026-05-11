@@ -85,30 +85,28 @@ fd_table_alloc :: proc "contextless" (
 	return fd_handle_make(index, entry.generation), .None
 }
 
-// Look up an FD entry by handle with generation check.
-// Returns nil and error if the handle is stale or invalid.
-fd_table_lookup :: proc "contextless" (
+// Look up an FD entry index by handle with generation check.
+fd_table_lookup_index :: proc "contextless" (
 	table: ^FD_Table,
 	handle: FD_Handle,
 ) -> (
-	^FD_Entry,
+	u16,
 	FD_Table_Error,
 ) {
 	if handle == FD_HANDLE_NONE {
-		return nil, .Invalid_Index
+		return FD_TABLE_NONE_INDEX, .Invalid_Index
 	}
 
 	index := fd_handle_index(handle)
 	if index >= table.slot_count {
-		return nil, .Invalid_Index
+		return FD_TABLE_NONE_INDEX, .Invalid_Index
 	}
 
-	entry := &table.entries[index]
-	if entry.generation != fd_handle_generation(handle) {
-		return nil, .Stale_Generation
+	if table.entries[index].generation != fd_handle_generation(handle) {
+		return FD_TABLE_NONE_INDEX, .Stale_Generation
 	}
 
-	return entry, .None
+	return index, .None
 }
 
 // Resolve an FD_Handle to the underlying OS_FD with generation check.
@@ -119,11 +117,11 @@ fd_table_resolve :: #force_inline proc "contextless" (
 	OS_FD,
 	FD_Table_Error,
 ) {
-	entry, err := fd_table_lookup(table, handle)
+	index, err := fd_table_lookup_index(table, handle)
 	if err != .None {
 		return OS_FD_INVALID, err
 	}
-	return entry.os_fd, .None
+	return table.entries[index].os_fd, .None
 }
 
 // Validate that `owner` has the correct direction affinity for the given operation.
@@ -155,10 +153,8 @@ fd_table_handoff :: proc "contextless" (
 	new_owner: Handle,
 	mode: Handoff_Mode,
 ) -> FD_Table_Error {
-	entry, err := fd_table_lookup(table, handle)
-	if err != .None {
-		return err
-	}
+	index := fd_table_lookup_index(table, handle) or_return
+	entry := &table.entries[index]
 
 	switch mode {
 	case .Full:
@@ -210,11 +206,8 @@ fd_table_mark_close_on_completion :: proc "contextless" (
 	table: ^FD_Table,
 	handle: FD_Handle,
 ) -> FD_Table_Error {
-	entry, err := fd_table_lookup(table, handle)
-	if err != .None {
-		return err
-	}
-	entry.flags += {.Close_On_Completion}
+	index := fd_table_lookup_index(table, handle) or_return
+	table.entries[index].flags += {.Close_On_Completion}
 	return .None
 }
 
@@ -228,10 +221,8 @@ fd_table_mark_fresh_accept :: #force_inline proc "contextless" (
 	handle: FD_Handle,
 	peer_address: Peer_Address,
 ) -> FD_Table_Error {
-	entry, err := fd_table_lookup(table, handle)
-	if err != .None {
-		return err
-	}
+	index := fd_table_lookup_index(table, handle) or_return
+	entry := &table.entries[index]
 	entry.peer_address = peer_address
 	entry.flags += {.Fresh_Accept}
 	return .None
@@ -241,10 +232,8 @@ fd_table_clear_fresh_accept :: #force_inline proc "contextless" (
 	table: ^FD_Table,
 	handle: FD_Handle,
 ) -> FD_Table_Error {
-	entry, err := fd_table_lookup(table, handle)
-	if err != .None {
-		return err
-	}
+	index := fd_table_lookup_index(table, handle) or_return
+	entry := &table.entries[index]
 	entry.flags -= {.Fresh_Accept}
 	entry.peer_address = {}
 	return .None
@@ -311,8 +300,9 @@ test_fd_table_alloc_and_lookup :: proc(t: ^testing.T) {
 	testing.expect(t, handle != FD_HANDLE_NONE, "should get a valid handle")
 	testing.expect_value(t, table.free_count, 3)
 
-	entry, lookup_err := fd_table_lookup(&table, handle)
+	entry_index, lookup_err := fd_table_lookup_index(&table, handle)
 	testing.expect_value(t, lookup_err, FD_Table_Error.None)
+	entry := &table.entries[entry_index]
 	testing.expect_value(t, entry.os_fd, OS_FD(42))
 }
 
@@ -330,7 +320,7 @@ test_fd_table_generation_check :: proc(t: ^testing.T) {
 	testing.expect_value(t, free_err, FD_Table_Error.None)
 
 	// Old handle is now stale
-	_, stale_err := fd_table_lookup(&table, handle)
+	_, stale_err := fd_table_lookup_index(&table, handle)
 	testing.expect_value(t, stale_err, FD_Table_Error.Stale_Generation)
 }
 
@@ -360,10 +350,11 @@ test_fd_table_direction_affinity :: proc(t: ^testing.T) {
 
 	// Allocate with full ownership to reader, then split
 	handle, _ := fd_table_alloc(&table, OS_FD(99), reader)
-	entry, _ := fd_table_lookup(&table, handle)
+	entry_index, _ := fd_table_lookup_index(&table, handle)
 
 	// Transfer write direction to writer
 	fd_table_handoff(&table, handle, writer, .Write_Only)
+	entry := &table.entries[entry_index]
 
 	// Reader owns read direction
 	testing.expect_value(t, fd_table_validate_read_affinity(entry, reader), FD_Table_Error.None)
@@ -391,7 +382,8 @@ test_fd_table_close_on_completion :: proc(t: ^testing.T) {
 	owner := make_handle(0, 1, 0, 0)
 	handle, _ := fd_table_alloc(&table, OS_FD(5), owner)
 
-	entry, _ := fd_table_lookup(&table, handle)
+	entry_index, _ := fd_table_lookup_index(&table, handle)
+	entry := &table.entries[entry_index]
 	testing.expect(t, !fd_table_is_close_on_completion(entry), "should not be marked initially")
 
 	fd_table_mark_close_on_completion(&table, handle)

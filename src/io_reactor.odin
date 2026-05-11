@@ -114,9 +114,9 @@ reactor_control_bind :: proc(
 	owner: Handle,
 	address: Socket_Address,
 ) -> Backend_Error {
-	entry, err := _resolve_fd(reactor, fd, owner, .Any)
+	os_fd, err := _resolve_os_fd(reactor, fd, owner, .Any)
 	if err != IO_ERR_NONE do return .Not_Found
-	return backend_control_bind(&reactor.backend, entry.os_fd, address)
+	return backend_control_bind(&reactor.backend, os_fd, address)
 }
 
 reactor_control_listen :: proc(
@@ -125,9 +125,9 @@ reactor_control_listen :: proc(
 	owner: Handle,
 	backlog: u32,
 ) -> Backend_Error {
-	entry, err := _resolve_fd(reactor, fd, owner, .Any)
+	os_fd, err := _resolve_os_fd(reactor, fd, owner, .Any)
 	if err != IO_ERR_NONE do return .Not_Found
-	return backend_control_listen(&reactor.backend, entry.os_fd, backlog)
+	return backend_control_listen(&reactor.backend, os_fd, backlog)
 }
 
 reactor_control_setsockopt :: proc(
@@ -138,9 +138,9 @@ reactor_control_setsockopt :: proc(
 	option: Socket_Option,
 	value: Socket_Option_Value,
 ) -> Backend_Error {
-	entry, err := _resolve_fd(reactor, fd, owner, .Any)
+	os_fd, err := _resolve_os_fd(reactor, fd, owner, .Any)
 	if err != IO_ERR_NONE do return .Not_Found
-	return backend_control_setsockopt(&reactor.backend, entry.os_fd, level, option, value)
+	return backend_control_setsockopt(&reactor.backend, os_fd, level, option, value)
 }
 
 reactor_control_getsockopt :: proc(
@@ -174,10 +174,10 @@ reactor_control_shutdown :: proc(
 		dir = .Any
 	}
 
-	entry, err := _resolve_fd(reactor, fd, owner, dir)
+	os_fd, err := _resolve_os_fd(reactor, fd, owner, dir)
 	if err != IO_ERR_NONE do return .Not_Found
 
-	return backend_control_shutdown(&reactor.backend, entry.os_fd, how)
+	return backend_control_shutdown(&reactor.backend, os_fd, how)
 }
 
 reactor_internal_close_fd :: proc "contextless" (reactor: ^Reactor, fd: FD_Handle) {
@@ -199,10 +199,11 @@ reactor_export_fd_handoff :: proc "contextless" (
 	Peer_Address,
 	FD_Handoff_Result,
 ) {
-	entry, err := fd_table_lookup(&reactor.fd_table, fd)
+	entry_index, err := fd_table_lookup_index(&reactor.fd_table, fd)
 	if err != .None {
 		return OS_FD_INVALID, {}, .invalid_fd_state
 	}
+	entry := &reactor.fd_table.entries[entry_index]
 	if entry.reader_isolate != owner || entry.writer_isolate != owner {
 		return OS_FD_INVALID, {}, .not_owner
 	}
@@ -262,8 +263,12 @@ _reactor_completion_close_on_completion :: proc "contextless" (
 		return
 	}
 
-	entry, err := fd_table_lookup(&reactor.fd_table, fd_handle)
-	if err != .None || !fd_table_is_close_on_completion(entry) {
+	entry_index, err := fd_table_lookup_index(&reactor.fd_table, fd_handle)
+	if err != .None {
+		return
+	}
+	entry := &reactor.fd_table.entries[entry_index]
+	if !fd_table_is_close_on_completion(entry) {
 		return
 	}
 
@@ -513,7 +518,7 @@ reactor_submit_io :: proc(
 	case IoOp_Read:
 		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_READ_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
 		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
@@ -521,7 +526,7 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Read {
-			fd     = entry.os_fd,
+			fd     = os_fd,
 			size   = op.buffer_size_max,
 			offset = op.offset,
 		}
@@ -529,7 +534,7 @@ reactor_submit_io :: proc(
 	case IoOp_Write:
 		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_WRITE_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
 		alloc_index, alloc_error := _reactor_buffer_alloc_write(
@@ -544,7 +549,7 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Write {
-			fd     = entry.os_fd,
+			fd     = os_fd,
 			size   = op.payload_size,
 			offset = op.offset,
 		}
@@ -552,26 +557,26 @@ reactor_submit_io :: proc(
 	case IoOp_Accept:
 		target_fd = op.listen_fd
 		submission_op_tag = u8(IO_TAG_ACCEPT_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.listen_fd, owner, .Read)
+		os_fd, err := _resolve_os_fd(reactor, op.listen_fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 		submission.operation = Submission_Op_Accept {
-			listen_fd = entry.os_fd,
+			listen_fd = os_fd,
 		}
 
 	case IoOp_Connect:
 		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_CONNECT_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 		submission.operation = Submission_Op_Connect {
-			fd_socket = entry.os_fd,
+			fd_socket = os_fd,
 			address   = op.address,
 		}
 
 	case IoOp_Send:
 		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_SEND_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
 		alloc_index, alloc_error := _reactor_buffer_alloc_write(
@@ -586,14 +591,14 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Send {
-			fd_socket = entry.os_fd,
+			fd_socket = os_fd,
 			size      = op.payload_size,
 		}
 
 	case IoOp_Recv:
 		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_RECV_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
 		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
@@ -601,14 +606,14 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Recv {
-			fd_socket = entry.os_fd,
+			fd_socket = os_fd,
 			size      = op.buffer_size_max,
 		}
 
 	case IoOp_Sendto:
 		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_SENDTO_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Write)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
 		alloc_index, alloc_error := _reactor_buffer_alloc_write(
@@ -623,7 +628,7 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Sendto {
-			fd_socket = entry.os_fd,
+			fd_socket = os_fd,
 			address   = op.address,
 			size      = op.payload_size,
 		}
@@ -631,7 +636,7 @@ reactor_submit_io :: proc(
 	case IoOp_Recvfrom:
 		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_RECVFROM_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Read)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
 		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
@@ -639,18 +644,18 @@ reactor_submit_io :: proc(
 		buffer_index = alloc_index
 
 		submission.operation = Submission_Op_Recvfrom {
-			fd_socket = entry.os_fd,
+			fd_socket = os_fd,
 			size      = op.buffer_size_max,
 		}
 
 	case IoOp_Close:
 		target_fd = FD_HANDLE_NONE
 		submission_op_tag = u8(IO_TAG_CLOSE_COMPLETE)
-		entry, err := _resolve_fd(reactor, op.fd, owner, .Any)
+		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Any)
 		if err != IO_ERR_NONE do return err
 
 		submission.operation = Submission_Op_Close {
-			fd = entry.os_fd,
+			fd = os_fd,
 		}
 		backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(op.fd))
 		fd_table_free(&reactor.fd_table, op.fd)
@@ -659,15 +664,15 @@ reactor_submit_io :: proc(
 		target_fd = op.fd_socket
 		submission_op_tag = u8(IO_TAG_SENDFILE_COMPLETE)
 
-		file_entry, file_err := _resolve_fd(reactor, op.fd_file, owner, .Read)
+		file_os_fd, file_err := _resolve_os_fd(reactor, op.fd_file, owner, .Read)
 		if file_err != IO_ERR_NONE do return file_err
 
-		socket_entry, socket_err := _resolve_fd(reactor, op.fd_socket, owner, .Write)
+		socket_os_fd, socket_err := _resolve_os_fd(reactor, op.fd_socket, owner, .Write)
 		if socket_err != IO_ERR_NONE do return socket_err
 
 		submission.operation = Submission_Op_Sendfile {
-			fd_file       = file_entry.os_fd,
-			fd_socket     = socket_entry.os_fd,
+			fd_file       = file_os_fd,
+			fd_socket     = socket_os_fd,
 			source_offset = op.source_offset,
 			size          = op.size,
 		}
@@ -793,30 +798,31 @@ _io_op_to_completion_tag :: #force_inline proc(op: IoOp) -> Message_Tag {
 }
 
 @(private = "file")
-_resolve_fd :: #force_inline proc(
+_resolve_os_fd :: #force_inline proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
 	owner: Handle,
 	dir: Direction_Affinity,
 ) -> (
-	^FD_Entry,
+	OS_FD,
 	IO_Error,
 ) {
-	entry, err := fd_table_lookup(&reactor.fd_table, fd)
-	if err != .None do return nil, IO_ERR_STALE_FD
+	entry_index, err := fd_table_lookup_index(&reactor.fd_table, fd)
+	if err != .None do return OS_FD_INVALID, IO_ERR_STALE_FD
+	entry := &reactor.fd_table.entries[entry_index]
 
 	switch dir {
 	case .Read:
-		if fd_table_validate_read_affinity(entry, owner) != .None do return nil, IO_ERR_AFFINITY_VIOLATION
+		if fd_table_validate_read_affinity(entry, owner) != .None do return OS_FD_INVALID, IO_ERR_AFFINITY_VIOLATION
 	case .Write:
-		if fd_table_validate_write_affinity(entry, owner) != .None do return nil, IO_ERR_AFFINITY_VIOLATION
+		if fd_table_validate_write_affinity(entry, owner) != .None do return OS_FD_INVALID, IO_ERR_AFFINITY_VIOLATION
 	case .Any:
 		if fd_table_validate_read_affinity(entry, owner) != .None &&
 		   fd_table_validate_write_affinity(entry, owner) != .None {
-			return nil, IO_ERR_AFFINITY_VIOLATION
+			return OS_FD_INVALID, IO_ERR_AFFINITY_VIOLATION
 		}
 	}
-	return entry, IO_ERR_NONE
+	return entry.os_fd, IO_ERR_NONE
 }
 
 @(private = "file")

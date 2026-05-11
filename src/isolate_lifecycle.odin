@@ -20,8 +20,9 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 
 	// 2. Validate FD Handoff Affinity
 	if spec.handoff_fd != FD_HANDLE_NONE {
-		entry, fd_err := fd_table_lookup(&shard.reactor.fd_table, spec.handoff_fd)
+		entry_index, fd_err := fd_table_lookup_index(&shard.reactor.fd_table, spec.handoff_fd)
 		if fd_err == .None {
+			entry := &shard.reactor.fd_table.entries[entry_index]
 			group: ^Supervision_Group = nil
 			if spec.group_id != SUPERVISION_GROUP_ID_NONE {
 				group = &shard.supervision_groups[u16(spec.group_id)]
