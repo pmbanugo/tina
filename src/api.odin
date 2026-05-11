@@ -6,6 +6,8 @@ MAX_INIT_ARGS_SIZE :: 64 //Fixed-Size Payload/Args for init_handler
 MAX_ISOLATES_PER_TYPE :: 1_048_575 // 20-bit slot index
 SENDFILE_ALL_BYTES: u32 : max(u32)
 
+Monotonic_Time_NS :: distinct u64
+
 Supervision_Group_Id :: distinct u16
 SUPERVISION_GROUP_ID_NONE :: Supervision_Group_Id(0xFFFF)
 SUPERVISION_GROUP_ID_ROOT :: Supervision_Group_Id(0)
@@ -125,20 +127,9 @@ Context_Flag :: enum u8 {
 }
 Context_Flags :: distinct bit_set[Context_Flag;u8]
 
-// The primary API gateway for Isolates during execution.
-// Passed into `init_handler` and `handler_fn` to provide access to messaging, spawning, and memory.
-TinaContext :: struct {
-	// Internal shard pointer. User code must treat this as framework-owned state.
-	_shard:                 ^Shard,
-	self_handle:            Handle,
-	current_message_source: Handle,
-	// Memory surfaces (initialized per handler invocation by the scheduler)
-	working_arena:          mem.Arena,
-	scratch_arena:          mem.Arena,
-	current_correlation:    Correlation_Id,
-	flags:                  Context_Flags,
-	_padding:               [3]u8,
-}
+// Scalar capability token valid only during the active Isolate callback (init & handler) invocation.
+TinaContext :: distinct u64
+TinaTickContext :: distinct u64
 
 Enqueue_Result :: enum u8 {
 	Success,
@@ -156,9 +147,9 @@ bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 
 // Retrieves the current deterministic time (in nanoseconds) from the scheduler.
 // This ensures all isolates process events using a consistent, uniform clock per tick.
-ctx_monotonic_time_ns :: #force_inline proc "contextless" (ctx: ^TinaContext) -> u64 {
-	shard := ctx._shard
-	return shard.current_tick * shard.timer_resolution_ns
+ctx_monotonic_time_ns :: #force_inline proc(ctx: TinaContext) -> Monotonic_Time_NS {
+	invocation := ctx_invocation(ctx)
+	return invocation.monotonic_time_ns
 }
 
 // Helper to safely cast an incoming message payload byte slice into a typed pointer.
@@ -177,10 +168,11 @@ init_args_of :: #force_inline proc(args: ^$T) -> (payload: [MAX_INIT_ARGS_SIZE]u
 // Debug-checked cast from rawptr to a typed Isolate pointer.
 // Validates at runtime (under TINA_DEBUG_ASSERTS) that the registered stride
 // matches the target type, catching wrong-type casts before they corrupt memory.
-self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: ^TinaContext) -> ^T {
+self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext) -> ^T {
 	when TINA_RUNTIME_ASSERTIONS {
-		shard := ctx._shard
-		type_id := extract_type_id(ctx.self_handle)
+		invocation := ctx_invocation(ctx)
+		shard := invocation.shard
+		type_id := invocation.type_id
 		registered_stride := shard.type_descriptors[type_id].stride
 		assert(
 			registered_stride == size_of(T),
@@ -291,7 +283,7 @@ ipv6 :: #force_inline proc "contextless" (
 // Returns a Send_Result immediately to provide backpressure feedback (e.g., mailbox full, dead handle).
 @(require_results)
 ctx_send_typed :: #force_inline proc(
-	ctx: ^TinaContext,
+	ctx: TinaContext,
 	to: Handle,
 	$tag: Message_Tag,
 	message: ^$T,

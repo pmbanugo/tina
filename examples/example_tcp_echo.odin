@@ -45,7 +45,7 @@ ServerListenerIsolate :: struct {
 	listen_file_descriptor: tina.FD_Handle,
 }
 
-server_listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+server_listener_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	self := tina.self_as(ServerListenerIsolate, self_raw, ctx)
 
 	file_descriptor, socket_err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
@@ -67,7 +67,7 @@ server_listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContex
 server_listener_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	self := tina.self_as(ServerListenerIsolate, self_raw, ctx)
 
@@ -113,7 +113,7 @@ ServerConnIsolate :: struct {
 	buffer:                 [128]u8,
 }
 
-server_conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+server_conn_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	self := tina.self_as(ServerConnIsolate, self_raw, ctx)
 	connection_args := tina.payload_as(ConnectionArgs, args)
 	self.client_file_descriptor = connection_args.client_file_descriptor
@@ -131,7 +131,7 @@ server_conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -
 server_conn_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	self := tina.self_as(ServerConnIsolate, self_raw, ctx)
 
@@ -179,7 +179,7 @@ ClientIsolate :: struct {
 	buffer:                 [128]u8,
 }
 
-client_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+client_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	self := tina.self_as(ClientIsolate, self_raw, ctx)
 
 	file_descriptor, socket_err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
@@ -199,7 +199,7 @@ client_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tin
 client_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	self := tina.self_as(ClientIsolate, self_raw, ctx)
 
@@ -286,7 +286,7 @@ ChaosIsolate :: struct {
 	buffer:                 [128]u8,
 }
 
-chaos_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+chaos_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	self := tina.self_as(ChaosIsolate, self_raw, ctx)
 
 	file_descriptor, socket_err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
@@ -306,7 +306,7 @@ chaos_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina
 chaos_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	self := tina.self_as(ChaosIsolate, self_raw, ctx)
 

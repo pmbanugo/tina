@@ -55,7 +55,7 @@ when TINA_SIMULATION_MODE {
 	// ======================================
 	// Coordinator (Spawns Ping and Pong)
 	// ======================================
-	coordinator_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	coordinator_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		// 1. Spawn Pong
 		pong_spec := Spawn_Spec {
 			type_id      = PONG_TYPE_ID,
@@ -85,14 +85,14 @@ when TINA_SIMULATION_MODE {
 		return Effect_Receive{}
 	}
 
-	coordinator_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	coordinator_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
 	// =================
 	// Ping Isolate
 	// =================
-	ping_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	ping_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		p := cast(^PingIsolate)self
 		init_args := payload_as(PingInitArgs, args)
 		p.pong_handle = init_args.pong_handle
@@ -106,7 +106,7 @@ when TINA_SIMULATION_MODE {
 		return Effect_Receive{}
 	}
 
-	ping_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	ping_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		using p := cast(^PingIsolate)self
 		pong := payload_as(PongMsg, message.user.payload[:])
 
@@ -127,11 +127,11 @@ when TINA_SIMULATION_MODE {
 	// ================
 	// Pong Isolate
 	// ================
-	pong_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	pong_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
-	pong_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	pong_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		ping := payload_as(PingMsg, message.user.payload[:])
 
 		msg := PongMsg {

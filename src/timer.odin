@@ -61,13 +61,14 @@ timer_wheel_reset :: proc(wheel: ^Timer_Wheel, current_tick: u64) {
 
 // Registers a timer that will enqueue a message with the specified tag back to this Isolate.
 // The duration is specified in nanoseconds.
-ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag) {
-	shard := ctx._shard
+ctx_register_timer :: proc(ctx: TinaContext, duration_ns: u64, tag: Message_Tag) {
+	invocation := ctx_invocation(ctx)
+	shard := invocation.shard
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
 		_shard_log(
-			ctx._shard,
-			ctx.self_handle,
+			shard,
+			invocation.self_handle,
 			.ERROR,
 			USER_LOG_TAG_BASE,
 			transmute([]u8)string("Timer pool exhausted"),
@@ -76,23 +77,24 @@ ctx_register_timer :: proc(ctx: ^TinaContext, duration_ns: u64, tag: Message_Tag
 	}
 	// Convert nanoseconds to ticks
 	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
-	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, ctx.self_handle, tag, CORRELATION_ID_NONE)
+	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, invocation.self_handle, tag, CORRELATION_ID_NONE)
 }
 
 // Registers a timer with an explicit correlation token so the receiver can
 // reject stale lazy-cancelled expirations in O(1).
 ctx_register_timer_with_correlation :: proc(
-	ctx: ^TinaContext,
+	ctx: TinaContext,
 	duration_ns: u64,
 	tag: Message_Tag,
 	correlation: Correlation_Id,
 ) {
-	shard := ctx._shard
+	invocation := ctx_invocation(ctx)
+	shard := invocation.shard
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
 		_shard_log(
-			ctx._shard,
-			ctx.self_handle,
+			shard,
+			invocation.self_handle,
 			.ERROR,
 			USER_LOG_TAG_BASE,
 			transmute([]u8)string("Timer pool exhausted"),
@@ -102,7 +104,7 @@ ctx_register_timer_with_correlation :: proc(
 
 	// Convert nanoseconds to ticks.
 	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
-	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, ctx.self_handle, tag, correlation)
+	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, invocation.self_handle, tag, correlation)
 }
 
 @(private = "package")

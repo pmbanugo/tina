@@ -191,7 +191,7 @@ _route_state_ptr :: proc "contextless" (state: ^HTTP_Connection_State) -> rawptr
 }
 
 @(private = "package")
-_make_route_context :: proc (state: ^HTTP_Connection_State, ctx: ^tina.TinaContext) -> Route_Context {
+_make_route_context :: proc (state: ^HTTP_Connection_State, ctx: tina.TinaContext) -> Route_Context {
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state != nil, "_make_route_context: state is nil")
 	}
@@ -235,12 +235,22 @@ test_dispatch_unknown_method_missing_path_returns_not_implemented :: proc(t: ^te
 		route_index  = ROUTE_INDEX_NONE,
 		status_flags = {.Unknown_Method},
 	}
-	request := http_test_fixture_request(&fixture, request_frame)
-	response := http_test_fixture_response(&fixture)
 
-	step := _dispatch_route(&request, &response)
-	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect_value(t, fixture.connection.connection_state.response.status_code, HTTP_STATUS_NOT_IMPLEMENTED)
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, request_frame: []u8, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, request_frame = request_frame, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
+			response := http_test_fixture_response(test_state.fixture, ctx)
+
+			step := _dispatch_route(&request, &response)
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.response.status_code, HTTP_STATUS_NOT_IMPLEMENTED)
+		},
+	)
 }
 
 @(private = "file")
@@ -297,16 +307,26 @@ test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^t
 		path_size   = 2,
 		route_index = ROUTE_INDEX_NONE,
 	}
-	request := http_test_fixture_request(&fixture, request_frame)
-	response := http_test_fixture_response(&fixture)
 
-	step := _dispatch_route(&request, &response)
-	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect(t, .Close_After_Send in fixture.connection.connection_state.response.flags, "response must close after send")
-	testing.expect(
-		t,
-		strings.index(string(fixture.connection.egress_buffer[:int(fixture.connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
-		"serialized response must advertise Connection: close",
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, request_frame: []u8, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, request_frame = request_frame, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
+			response := http_test_fixture_response(test_state.fixture, ctx)
+
+			step := _dispatch_route(&request, &response)
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			testing.expect(test_state.t, .Close_After_Send in test_state.fixture.connection.connection_state.response.flags, "response must close after send")
+			testing.expect(
+				test_state.t,
+				strings.index(string(test_state.fixture.connection.egress_buffer[:int(test_state.fixture.connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
+				"serialized response must advertise Connection: close",
+			)
+		},
 	)
 }
 
@@ -331,16 +351,26 @@ test_dispatch_none_body_route_closes_after_response_when_body_present :: proc(t:
 		path_size   = 2,
 		route_index = ROUTE_INDEX_NONE,
 	}
-	request := http_test_fixture_request(&fixture, request_frame)
-	response := http_test_fixture_response(&fixture)
 
-	step := _dispatch_route(&request, &response)
-	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect(t, .Close_After_Send in fixture.connection.connection_state.response.flags, "unconsumed request body must close after response")
-	testing.expect(
-		t,
-		strings.index(string(fixture.connection.egress_buffer[:int(fixture.connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
-		"serialized response must advertise Connection: close when body is not consumed",
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, request_frame: []u8, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, request_frame = request_frame, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
+			response := http_test_fixture_response(test_state.fixture, ctx)
+
+			step := _dispatch_route(&request, &response)
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			testing.expect(test_state.t, .Close_After_Send in test_state.fixture.connection.connection_state.response.flags, "unconsumed request body must close after response")
+			testing.expect(
+				test_state.t,
+				strings.index(string(test_state.fixture.connection.egress_buffer[:int(test_state.fixture.connection.connection_state.response.egress_size)]), "\r\nConnection: close\r\n") >= 0,
+				"serialized response must advertise Connection: close when body is not consumed",
+			)
+		},
 	)
 }
 
@@ -374,12 +404,22 @@ test_dispatch_streamed_route_final_response_before_body_closes_after_send :: pro
 		path_size   = 2,
 		route_index = ROUTE_INDEX_NONE,
 	}
-	request := http_test_fixture_request(&fixture, request_frame)
-	response := http_test_fixture_response(&fixture)
 
-	step := _dispatch_route(&request, &response)
-	testing.expect_value(t, step, Route_Step.Flush_Final)
-	testing.expect(t, .Close_After_Send in fixture.connection.connection_state.response.flags, "early final streamed response must close")
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, request_frame: []u8, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, request_frame = request_frame, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
+			response := http_test_fixture_response(test_state.fixture, ctx)
+
+			step := _dispatch_route(&request, &response)
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			testing.expect(test_state.t, .Close_After_Send in test_state.fixture.connection.connection_state.response.flags, "early final streamed response must close")
+		},
+	)
 }
 
 @(test)

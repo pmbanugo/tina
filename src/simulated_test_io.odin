@@ -29,7 +29,7 @@ when TINA_SIMULATION_MODE {
 		},
 	}
 
-	io_timeout_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	io_timeout_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		iso := cast(^IoTimeoutIsolate)self
 
 		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
@@ -40,7 +40,7 @@ when TINA_SIMULATION_MODE {
 
 		ctx_register_timer(
 			ctx,
-			2 * ctx._shard.timer_resolution_ns,
+			2 * ctx_invocation(ctx).timer_resolution_ns,
 			APP_TAG_IO_TIMEOUT,
 		)
 
@@ -48,7 +48,7 @@ when TINA_SIMULATION_MODE {
 		return Effect_Io{operation = IoOp_Recv{fd = iso.fd, buffer_size_max = 512}}
 	}
 
-	io_timeout_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	io_timeout_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		iso := cast(^IoTimeoutIsolate)self
 
 		if message.tag == APP_TAG_IO_TIMEOUT {
@@ -208,16 +208,16 @@ when TINA_SIMULATION_MODE {
 		send_buf: [32]u8,
 	}
 
-	write_crasher_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	write_crasher_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		return Effect_Yield{}
 	}
 
-	write_crasher_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
-		if ctx._shard.current_tick == 1 do return Effect_Crash{reason = .None}
+	write_crasher_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
+		if ctx_invocation(ctx).shard.current_tick == 1 do return Effect_Crash{reason = .None}
 		return Effect_Done{}
 	}
 
-	write_writer_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	write_writer_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		w := cast(^WriteWriterIsolate)self
 
 		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
@@ -234,7 +234,7 @@ when TINA_SIMULATION_MODE {
 		}
 	}
 
-	write_writer_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	write_writer_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		return Effect_Done{}
 	}
 
@@ -337,11 +337,11 @@ when TINA_SIMULATION_MODE {
 		received_count: u8,
 	}
 
-	priority_test_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	priority_test_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
-	priority_test_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	priority_test_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		iso := cast(^PriorityTestIsolate)self
 		if iso.received_count < 4 {
 			iso.received_tags[iso.received_count] = message.tag

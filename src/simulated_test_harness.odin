@@ -13,11 +13,11 @@ when TINA_SIMULATION_MODE {
 
 	HarnessNoopIsolate :: struct {}
 
-	harness_noop_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	harness_noop_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
-	harness_noop_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	harness_noop_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 

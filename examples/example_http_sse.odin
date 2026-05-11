@@ -50,7 +50,7 @@ PublisherIsolate :: struct {
 	counter:          u32,
 }
 
-publisher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+publisher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	self := tina.self_as(PublisherIsolate, self_raw, ctx)
 	self.subscriber_count = 0
 	self.counter = 0
@@ -63,7 +63,7 @@ publisher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> 
 publisher_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	self := tina.self_as(PublisherIsolate, self_raw, ctx)
 

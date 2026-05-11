@@ -149,6 +149,7 @@ when TINA_SIMULATION_MODE {
 	Sim_State_Mixin :: struct {}
 }
 
+@(private = "package")
 Shard :: struct {
 	// --- Hot Pointers & Slices (8-byte aligned) ---
 	outbound_rings:         []^SPSC_Ring,
@@ -174,6 +175,7 @@ Shard :: struct {
 	current_tick:           u64, // The current time quantized to the resolution
 	timer_resolution_ns:    u64, // E.g., 1_000_000 for 1ms ticks
 	heartbeat_tick:         u64,
+	next_context_token:     u64,
 	next_correlation_id:    Correlation_Id,
 	handoff_retry_head:     u32,
 	handoff_retry_tail:     u32,
@@ -293,7 +295,30 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 	slot_count := u32(type_descriptor.slot_count)
 
 	if type_descriptor.tick_handler != nil {
-		type_descriptor.tick_handler(shard, u16(type_id))
+		self: rawptr
+		self_handle := HANDLE_NONE
+		if slot_count > 0 && shard.metadata[type_id].state[0] != .Unallocated {
+			self = _get_isolate_ptr(shard, u16(type_id), 0)
+			self_handle = make_handle(shard.id, u16(type_id), 0, shard.metadata[type_id].generation[0])
+		}
+
+		invocation := Isolate_Type_Tick_Invocation {
+			shard             = shard,
+			context_token     = make_tina_tick_context_token(shard),
+			self_handle       = self_handle,
+			monotonic_time_ns = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
+			current_tick      = shard.current_tick,
+			type_id           = u16(type_id),
+			shard_id          = shard.id,
+		}
+
+		previous_allocator := context.allocator
+		previous_temp_allocator := context.temp_allocator
+		g_current_isolate_type_tick_invocation = &invocation
+		type_descriptor.tick_handler(self, invocation.context_token)
+		g_current_isolate_type_tick_invocation = nil
+		context.allocator = previous_allocator
+		context.temp_allocator = previous_temp_allocator
 	}
 
 	// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop.
@@ -422,8 +447,10 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 		ctx_flags: Context_Flags
 		if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
 
-		ctx := TinaContext {
-			_shard                 = shard,
+		invocation := Isolate_Invocation {
+			previous               = g_current_isolate_invocation,
+			shard                  = shard,
+			context_token          = make_tina_context_token(shard),
 			self_handle            = make_handle(
 				shard.id,
 				u16(type_id),
@@ -433,24 +460,27 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 			current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : HANDLE_NONE,
 			current_correlation    = correlation,
 			flags                  = ctx_flags,
+			monotonic_time_ns      = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
+			timer_resolution_ns    = shard.timer_resolution_ns,
+			type_id                = u16(type_id),
+			slot_index             = slot_index,
+			shard_id               = shard.id,
 		}
+		ctx := invocation.context_token
 
-		mem.arena_init(&ctx.scratch_arena, shard.scratch_memory)
+		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
 
 		working_stride := type_descriptor.working_memory_size
 		if working_stride > 0 {
 			start_index := int(slot_index) * working_stride
 			working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
-			ctx.working_arena = mem.Arena {
+			invocation.working_arena = mem.Arena {
 				data   = working_slice,
 				offset = int(working_arena_offsets[slot_index]),
 			}
 		}
 
 		isolate_pointer := _get_isolate_ptr(shard, u16(type_id), slot_index)
-
-		context.allocator = mem.arena_allocator(&ctx.scratch_arena)
-		context.temp_allocator = mem.arena_allocator(&ctx.scratch_arena)
 
 		when TINA_SIMULATION_MODE {
 			if ratio_chance(
@@ -466,10 +496,20 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 			}
 		}
 
-		effect := type_descriptor.handler_fn(isolate_pointer, message_pointer, &ctx)
+		previous_allocator := context.allocator
+		previous_temp_allocator := context.temp_allocator
+		g_current_isolate_invocation = &invocation
+		context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
+
+		effect := type_descriptor.handler_fn(isolate_pointer, message_pointer, ctx)
+
+		context.allocator = previous_allocator
+		context.temp_allocator = previous_temp_allocator
+		g_current_isolate_invocation = invocation.previous
 
 		if working_stride > 0 {
-			working_arena_offsets[slot_index] = u32(ctx.working_arena.offset)
+			working_arena_offsets[slot_index] = u32(invocation.working_arena.offset)
 		}
 
 		if is_io_completion {
@@ -491,7 +531,7 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 			shard.current_msg_slot = POOL_NONE_INDEX
 		}
 
-		_interpret_effect(shard, u16(type_id), slot_index, effect, &ctx)
+		_interpret_effect(shard, u16(type_id), slot_index, effect, &invocation)
 	}
 
 	if dispatched_count < dispatch_budget {
@@ -566,7 +606,7 @@ _interpret_effect :: proc(
 	type_id: u16,
 	slot: u32,
 	effect: Effect,
-	ctx: ^TinaContext,
+	invocation: ^Isolate_Invocation,
 ) {
 	soa_meta := shard.metadata[type_id]
 	switch e in effect {
@@ -580,7 +620,7 @@ _interpret_effect :: proc(
 		reason_str := CRASH_REASONS_INTERPRETED[e.reason]
 		_shard_log(
 			shard,
-			ctx.self_handle,
+			invocation.self_handle,
 			.ERROR,
 			LOG_TAG_ISOLATE_CRASHED,
 			transmute([]u8)reason_str,
@@ -602,11 +642,11 @@ _interpret_effect :: proc(
 			// Target is dead. Abort .call setup and fast-fail with an immediate timeout.
 			timeout_env: Message_Envelope
 			timeout_env.source = HANDLE_NONE
-			timeout_env.destination = ctx.self_handle
+			timeout_env.destination = invocation.self_handle
 			timeout_env.tag = TAG_CALL_TIMEOUT
 			timeout_env.correlation = correlation_id
 
-			_enqueue_system_msg(shard, ctx.self_handle, &timeout_env)
+			_enqueue_system_msg(shard, invocation.self_handle, &timeout_env)
 			shard.counters.quarantine_drops += 1
 			return
 		}
@@ -614,7 +654,7 @@ _interpret_effect :: proc(
 		timeout_ticks := (e.timeout + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
 		_register_system_timer(
 			shard,
-			ctx.self_handle,
+			invocation.self_handle,
 			timeout_ticks,
 			TAG_CALL_TIMEOUT,
 			correlation_id,
@@ -622,7 +662,7 @@ _interpret_effect :: proc(
 
 		local_msg := e.message // Make "e.message" it addressable
 		envelope: Message_Envelope
-		envelope.source = ctx.self_handle
+		envelope.source = invocation.self_handle
 		envelope.destination = e.to
 		envelope.correlation = correlation_id
 		envelope.flags += {.Is_Call}
@@ -633,11 +673,11 @@ _interpret_effect :: proc(
 		_route_envelope_user(shard, e.to, &envelope)
 
 	case Effect_Reply:
-		if .Is_Call not_in ctx.flags {
+		if .Is_Call not_in invocation.flags {
 			// if !(.Is_Call in ctx.flags) {
 			_shard_log(
 				shard,
-				ctx.self_handle,
+				invocation.self_handle,
 				.ERROR,
 				LOG_TAG_ISOLATE_CRASHED,
 				transmute([]u8)string("Reply effect without call context"),
@@ -649,18 +689,18 @@ _interpret_effect :: proc(
 
 		local_msg := e.message // Make "e.message" it addressable
 		envelope: Message_Envelope
-		envelope.source = ctx.self_handle
-		envelope.destination = ctx.current_message_source
-		envelope.correlation = ctx.current_correlation
+		envelope.source = invocation.self_handle
+		envelope.destination = invocation.current_message_source
+		envelope.correlation = invocation.current_correlation
 		envelope.flags += {.Is_Reply}
 		envelope.tag = local_msg.tag
 		envelope.payload_size = local_msg.user.payload_size
 		copy(envelope.payload[:], local_msg.user.payload[:])
 
-		_route_envelope_user(shard, ctx.current_message_source, &envelope)
+		_route_envelope_user(shard, invocation.current_message_source, &envelope)
 
 	case Effect_Io:
-		err := reactor_submit_io(&shard.reactor, shard, ctx.self_handle, e.operation)
+		err := reactor_submit_io(&shard.reactor, shard, invocation.self_handle, e.operation)
 		if err != IO_ERR_NONE {
 			if err == IO_ERR_RESOURCE_EXHAUSTED do shard.counters.io_buffer_exhaustions += 1
 			soa_meta[slot].io_completion_tag = _io_op_to_completion_tag(e.operation)

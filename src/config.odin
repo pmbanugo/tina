@@ -23,9 +23,9 @@ TINA_RUNTIME_ASSERTIONS :: #config(TINA_ASSERTS, true)
 #assert(MIN_RING_SIZE > 0)
 #assert((MIN_RING_SIZE & (MIN_RING_SIZE - 1)) == 0)
 
-Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
-Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
-Tick_Handler :: #type proc(shard: ^Shard, type_id: u16)
+Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect
+Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect
+Tick_Handler :: #type proc(self: rawptr, ctx: TinaTickContext)
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 TypeDescriptor :: struct {

@@ -17,7 +17,7 @@ when TINA_SIMULATION_MODE {
 		run_count: u32,
 	}
 
-	starvation_coord_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	starvation_coord_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		// Spawn 300 workers to exceed the 256 DISPATCH_QUOTA_PER_WEIGHT
 		for i in 0 ..< 300 {
 			spec := Spawn_Spec {
@@ -33,19 +33,19 @@ when TINA_SIMULATION_MODE {
 	starvation_coord_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: ^TinaContext,
+		ctx: TinaContext,
 	) -> Effect {
 		return Effect_Receive{}
 	}
 
-	starvation_worker_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	starvation_worker_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		return Effect_Yield{}
 	}
 
 	starvation_worker_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: ^TinaContext,
+		ctx: TinaContext,
 	) -> Effect {
 		w := cast(^StarvationWorker)self
 		w.run_count += 1

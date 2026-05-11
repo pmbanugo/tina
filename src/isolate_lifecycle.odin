@@ -92,18 +92,26 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		mem.zero(isolate_pointer, stride)
 	}
 
-	child_ctx := TinaContext {
-		_shard      = shard,
-		self_handle = child_handle,
+	child_invocation := Isolate_Invocation {
+		previous            = g_current_isolate_invocation,
+		shard               = shard,
+		context_token       = make_tina_context_token(shard),
+		self_handle         = child_handle,
+		type_id             = type_id,
+		slot_index          = slot,
+		shard_id            = shard.id,
+		monotonic_time_ns   = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
+		timer_resolution_ns = shard.timer_resolution_ns,
 	}
+	child_ctx := child_invocation.context_token
 
-	mem.arena_init(&child_ctx.scratch_arena, shard.scratch_memory)
+	mem.arena_init(&child_invocation.scratch_arena, shard.scratch_memory)
 
 	working_stride := shard.type_descriptors[type_id].working_memory_size
 	if working_stride > 0 {
 		start_index := int(slot) * working_stride
 		working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
-		mem.arena_init(&child_ctx.working_arena, working_slice)
+		mem.arena_init(&child_invocation.working_arena, working_slice)
 	}
 
 	// 4. Execute init_handler
@@ -121,18 +129,25 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		}
 	}
 
-	// Set up the implicit context for the user init_handler
-	context.allocator = mem.arena_allocator(&child_ctx.scratch_arena)
-	context.temp_allocator = mem.arena_allocator(&child_ctx.scratch_arena)
+	previous_allocator := context.allocator
+	previous_temp_allocator := context.temp_allocator
+	g_current_isolate_invocation = &child_invocation
+	context.allocator = mem.arena_allocator(&child_invocation.scratch_arena)
+	context.temp_allocator = mem.arena_allocator(&child_invocation.scratch_arena)
 
 	effect := shard.type_descriptors[type_id].init_handler(
 		isolate_pointer,
 		local_spec.args_payload[:local_spec.args_size],
-		&child_ctx,
+		child_ctx,
 	)
+	child_shutdown_pending := ctx_is_shutting_down(child_ctx)
+
+	context.allocator = previous_allocator
+	context.temp_allocator = previous_temp_allocator
+	g_current_isolate_invocation = child_invocation.previous
 
 	if working_stride > 0 {
-		soa_meta[slot].working_arena_offset = u32(child_ctx.working_arena.offset)
+		soa_meta[slot].working_arena_offset = u32(child_invocation.working_arena.offset)
 	}
 
 	_, is_crash := effect.(Effect_Crash)
@@ -151,11 +166,11 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	}
 
 	// §11: Spawns during shutdown
-	if ctx_is_shutting_down(&child_ctx) {
+	if child_shutdown_pending {
 		soa_meta[slot].flags += {.Shutdown_Pending}
 	}
 
-	_interpret_effect(shard, type_id, slot, effect, &child_ctx)
+	_interpret_effect(shard, type_id, slot, effect, &child_invocation)
 	return child_handle
 }
 

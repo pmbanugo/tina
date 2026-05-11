@@ -71,9 +71,6 @@ Server_Runtime :: struct {
 	route_state_size_max:   u16,
 }
 
-// Strictly monotonic shard tick clock. Derived from `ctx_monotonic_time_ns`.
-@(private = "package")
-Monotonic_Time_NS :: distinct u64
 
 // Per-request opaque token stamped at request_start. Exposed to handlers via
 // `route_request_token` and intended to be embedded in pub/sub payloads so
@@ -152,10 +149,11 @@ HTTP_Shard_Runtime :: struct {
 	connection_type_id:    u8,
 	date_cache:           Date_Cache,
 	draining:             bool,
-	deadline_ns_drain:    Monotonic_Time_NS,
+	deadline_ns_drain:    tina.Monotonic_Time_NS,
 	next_request_token:   Request_Token, // monotonic across the shard
 	keepalive_reserve:    u16, // mirrors Keepalive_Config.reserve_slots
 	active_slot_indices:   []u16, // dense swap-and-pop tracker for allocated connections
+	active_connections:    []^HTTP_Connection,
 	active_slot_positions: []u16,
 	active_count:          Active_Array_Count,
 	idle_slot_indices:    []u16, // dense swap-and-pop tracker
@@ -199,11 +197,11 @@ HTTP_Dispatcher :: struct {
 HTTP_Connection_State :: struct {
 	// --- scheduler hot path ---
 	shard_runtime:              ^HTTP_Shard_Runtime,
-	deadline_ns_idle:           Monotonic_Time_NS,
-	deadline_ns_header:         Monotonic_Time_NS,
-	deadline_ns_body:           Monotonic_Time_NS,
-	deadline_ns_send:           Monotonic_Time_NS,
-	deadline_ns_drain:          Monotonic_Time_NS,
+	deadline_ns_idle:           tina.Monotonic_Time_NS,
+	deadline_ns_header:         tina.Monotonic_Time_NS,
+	deadline_ns_body:           tina.Monotonic_Time_NS,
+	deadline_ns_send:           tina.Monotonic_Time_NS,
+	deadline_ns_drain:          tina.Monotonic_Time_NS,
 	fd:                         tina.FD_Handle,
 	request_token:              Request_Token,
 	application_expectation_kind: Application_Expectation_Kind,
@@ -212,6 +210,7 @@ HTTP_Connection_State :: struct {
 	application_correlation_id:  tina.Correlation_Id,
 	application_timeout_ns:      u64,
 	application_pending_message:  Application_Pending_Message,
+	self_handle:                 tina.Handle,
 	request_body_size_received:   u64,
 	sendfile_offset:             u64,
 	sendfile_size_remaining:     u64,
@@ -802,6 +801,7 @@ _listener_working_memory_size :: #force_inline proc "contextless" (
 ) -> int {
 	return _align_up(size_of(HTTP_Shard_Runtime)) +
 		_align_up(connection_slot_count * size_of(u16)) +
+		_align_up(connection_slot_count * size_of(^HTTP_Connection)) +
 		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(tina.Handle)) +
@@ -818,6 +818,7 @@ _make_shard_runtime :: proc(
 ) -> ^HTTP_Shard_Runtime {
 	runtime_storage := make([]HTTP_Shard_Runtime, 1, allocator)
 	active_slot_indices := make([]u16, int(connection_slot_count), allocator)
+	active_connections := make([]^HTTP_Connection, int(connection_slot_count), allocator)
 	active_slot_positions := make([]u16, int(connection_slot_count), allocator)
 	idle_slot_indices := make([]u16, int(connection_slot_count), allocator)
 	idle_slot_handles := make([]tina.Handle, int(connection_slot_count), allocator)
@@ -836,6 +837,7 @@ _make_shard_runtime :: proc(
 		connection_type_id    = connection_type_id,
 		keepalive_reserve     = server.keepalive_reserve_slots,
 		active_slot_indices   = active_slot_indices,
+		active_connections    = active_connections,
 		active_slot_positions = active_slot_positions,
 		active_count          = 0,
 		idle_slot_indices     = idle_slot_indices,
@@ -1241,10 +1243,10 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 
 	// Build a single-shard spec by hand and pre-register one external type at
 	// id 0 so HTTP types cannot land at offset 0.
-	stub_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+	stub_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 		return tina.Effect_Receive{}
 	}
-	stub_handler :: proc(self: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
+	stub_handler :: proc(self: rawptr, message: ^tina.Message, ctx: tina.TinaContext) -> tina.Effect {
 		return tina.Effect_Receive{}
 	}
 	external_types := []tina.TypeDescriptor {

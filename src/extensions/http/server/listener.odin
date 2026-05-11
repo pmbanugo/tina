@@ -13,7 +13,7 @@ Listener_Dispatch_Result :: enum u8 {
 }
 
 @(private = "package")
-_http_listener_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+_http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	listener := cast(^HTTP_Listener)self
 	if len(args) < size_of(HTTP_Listener_Init_Args) {
 		return tina.Effect_Crash{reason = .Init_Failed}
@@ -55,7 +55,7 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) ->
 _http_listener_handler :: proc(
 	self: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	listener := cast(^HTTP_Listener)self
 	when tina.TINA_RUNTIME_ASSERTIONS {
@@ -66,7 +66,7 @@ _http_listener_handler :: proc(
 	switch message.tag {
 	case tina.TAG_SHUTDOWN:
 		listener.shard_runtime.draining = true
-		listener.shard_runtime.deadline_ns_drain = Monotonic_Time_NS(
+		listener.shard_runtime.deadline_ns_drain = tina.Monotonic_Time_NS(
 			u64(tina.ctx_monotonic_time_ns(ctx)) + u64(listener.shard_runtime.server.graceful_drain_ms) * 1_000_000,
 		)
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = listener.listen_fd}}
@@ -139,7 +139,7 @@ _http_listener_handler :: proc(
 }
 
 @(private = "package")
-_spawn_connection_local :: proc(runtime: ^HTTP_Shard_Runtime, ctx: ^tina.TinaContext, client_fd: tina.FD_Handle) -> bool {
+_spawn_connection_local :: proc(runtime: ^HTTP_Shard_Runtime, ctx: tina.TinaContext, client_fd: tina.FD_Handle) -> bool {
 	if runtime == nil {
 		return false
 	}
@@ -172,7 +172,7 @@ _spawn_connection_local :: proc(runtime: ^HTTP_Shard_Runtime, ctx: ^tina.TinaCon
 @(private = "file")
 _listener_dispatch_connection :: proc(
 	listener: ^HTTP_Listener,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 	client_fd: tina.FD_Handle,
 ) -> Listener_Dispatch_Result {
 	if len(listener.dispatcher_handles) == 0 {
@@ -190,7 +190,7 @@ _listener_dispatch_connection :: proc(
 	}
 	listener.next_dispatcher_shard_index = u8(target_index)
 
-	if tina.extract_shard_id(target_handle) == tina.extract_shard_id(ctx.self_handle) {
+	if tina.extract_shard_id(target_handle) == tina.extract_shard_id(tina.ctx_self_handle(ctx)) {
 		if _spawn_connection_local(listener.shard_runtime, ctx, client_fd) {
 			return .Local_Spawned
 		}
@@ -216,7 +216,7 @@ _listener_dispatch_connection :: proc(
 }
 
 @(private = "file")
-_listener_open_listen_socket :: proc(ctx: ^tina.TinaContext, runtime: ^HTTP_Shard_Runtime) -> tina.FD_Handle {
+_listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard_Runtime) -> tina.FD_Handle {
 	server := &runtime.server
 	domain := tina.Socket_Domain.AF_INET
 	#partial switch address in server.address {

@@ -613,7 +613,7 @@ header_add :: #force_inline proc "contextless" (
 	)
 }
 
-respond_text :: #force_inline proc "contextless" (
+respond_text :: #force_inline proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	body: string,
@@ -621,7 +621,7 @@ respond_text :: #force_inline proc "contextless" (
 	return _respond_bytes(response, status_code, "text/plain; charset=utf-8", transmute([]u8)body)
 }
 
-respond_json :: #force_inline proc "contextless" (
+respond_json :: #force_inline proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	body: string,
@@ -629,7 +629,7 @@ respond_json :: #force_inline proc "contextless" (
 	return _respond_bytes(response, status_code, "application/json", transmute([]u8)body)
 }
 
-respond_bytes :: #force_inline proc "contextless" (
+respond_bytes :: #force_inline proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	content_type: string,
@@ -638,7 +638,7 @@ respond_bytes :: #force_inline proc "contextless" (
 	return _respond_bytes(response, status_code, content_type, body)
 }
 
-begin_stream :: #force_inline proc "contextless" (
+begin_stream :: #force_inline proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	content_type: string,
@@ -660,7 +660,7 @@ begin_stream :: #force_inline proc "contextless" (
 	}
 }
 
-begin_fixed_stream :: #force_inline proc "contextless" (
+begin_fixed_stream :: #force_inline proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	content_type: string,
@@ -683,7 +683,7 @@ begin_fixed_stream :: #force_inline proc "contextless" (
 	}
 }
 
-respond_file :: proc "contextless" (
+respond_file :: proc(
 	response: ^Response,
 	fd_file: tina.FD_Handle,
 	file_size: u64,
@@ -717,7 +717,7 @@ respond_file :: proc "contextless" (
 	return .Flush
 }
 
-continue_100 :: proc "contextless" (response: ^Response) {
+continue_100 :: proc(response: ^Response) {
 	state := _response_state(response)
 	if .Interim_100_Sent in state.flags {
 		return
@@ -840,7 +840,7 @@ _response_append_chunked_terminator :: proc "contextless" (
 }
 
 @(private = "package")
-_response_commit_headers :: proc "contextless" (response: ^Response) -> bool {
+_response_commit_headers :: proc(response: ^Response) -> bool {
 	state := _response_state(response)
 	if .Headers_Committed in state.flags {
 		return true
@@ -864,7 +864,7 @@ _response_commit_headers :: proc "contextless" (response: ^Response) -> bool {
 }
 
 @(private = "package")
-_response_prepare_flush :: proc "contextless" (response: ^Response, final: bool) -> bool {
+_response_prepare_flush :: proc(response: ^Response, final: bool) -> bool {
 	state := _response_state(response)
 	if !_response_commit_headers(response) {
 		return false
@@ -961,7 +961,7 @@ expect_notification :: proc(
 }
 
 @(private = "file")
-_respond_bytes :: proc "contextless" (
+_respond_bytes :: proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	content_type: string,
@@ -1645,42 +1645,62 @@ test_serialize_head_suppressed_emits_content_length :: proc(t: ^testing.T) {
 test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testing.T) {
 	fixture: HTTP_Test_Fixture
 	http_test_fixture_init(&fixture)
-	response := http_test_fixture_response(&fixture)
 
-	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
-	state := _response_state(&response)
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture, ctx)
 
-	testing.expect(t, .Headers_Committed in state.flags)
-	head_size := int(state.egress_size)
-	testing.expect(t, head_size > 0)
-	committed_head := string(fixture.connection.egress_buffer[:head_size])
-	testing.expect(t, strings.index(committed_head, "\r\nTransfer-Encoding: chunked\r\n") >= 0)
+			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			state := _response_state(&response)
 
-	admitted := write_bytes(&response, transmute([]u8)string("hello"))
-	testing.expect_value(t, admitted, u16(5))
+			testing.expect(test_state.t, .Headers_Committed in state.flags)
+			head_size := int(state.egress_size)
+			testing.expect(test_state.t, head_size > 0)
+			committed_head := string(test_state.fixture.connection.egress_buffer[:head_size])
+			testing.expect(test_state.t, strings.index(committed_head, "\r\nTransfer-Encoding: chunked\r\n") >= 0)
 
-	wire_chunk := string(fixture.connection.egress_buffer[head_size:int(state.egress_size)])
-	testing.expect_value(t, wire_chunk, "5\r\nhello\r\n")
+			admitted := write_bytes(&response, transmute([]u8)string("hello"))
+			testing.expect_value(test_state.t, admitted, u16(5))
+
+			wire_chunk := string(test_state.fixture.connection.egress_buffer[head_size:int(state.egress_size)])
+			testing.expect_value(test_state.t, wire_chunk, "5\r\nhello\r\n")
+		},
+	)
 }
 
 @(test)
 test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing.T) {
 	fixture: HTTP_Test_Fixture
 	http_test_fixture_init(&fixture)
-	response := http_test_fixture_response(&fixture)
 
-	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
-	_ = write_bytes(&response, transmute([]u8)string("ab"))
-	state := _response_state(&response)
-	pre_flush_size := int(state.egress_size)
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture, ctx)
 
-	ok := _response_prepare_flush(&response, true)
-	testing.expect(t, ok)
-	testing.expect(t, state.mode == .Closed)
-	testing.expect_value(
-		t,
-		string(fixture.connection.egress_buffer[pre_flush_size:int(state.egress_size)]),
-		"0\r\n\r\n",
+			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			_ = write_bytes(&response, transmute([]u8)string("ab"))
+			state := _response_state(&response)
+			pre_flush_size := int(state.egress_size)
+
+			ok := _response_prepare_flush(&response, true)
+			testing.expect(test_state.t, ok)
+			testing.expect(test_state.t, state.mode == .Closed)
+			testing.expect_value(
+				test_state.t,
+				string(test_state.fixture.connection.egress_buffer[pre_flush_size:int(state.egress_size)]),
+				"0\r\n\r\n",
+			)
+		},
 	)
 }
 
@@ -1689,28 +1709,48 @@ test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) 
 	fixture: HTTP_Test_Fixture
 	http_test_fixture_init(&fixture)
 	fixture.connection.connection_state.response.mode = .Head_Suppressed
-	response := http_test_fixture_response(&fixture)
 
-	begin_stream(&response, HTTP_STATUS_OK, "text/plain")
-	state := _response_state(&response)
-	header_size := int(state.egress_size)
-	accepted := write_bytes(&response, transmute([]u8)string("payload"))
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture, ctx)
 
-	testing.expect_value(t, accepted, u16(7))
-	testing.expect_value(t, int(state.egress_size), header_size)
-	testing.expect_value(t, state.body_size_sent, u64(7))
+			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			state := _response_state(&response)
+			header_size := int(state.egress_size)
+			accepted := write_bytes(&response, transmute([]u8)string("payload"))
+
+			testing.expect_value(test_state.t, accepted, u16(7))
+			testing.expect_value(test_state.t, int(state.egress_size), header_size)
+			testing.expect_value(test_state.t, state.body_size_sent, u64(7))
+		},
+	)
 }
 
 @(test)
 test_respond_file_sets_sendfile_plan_and_returns_flush :: proc(t: ^testing.T) {
 	fixture: HTTP_Test_Fixture
 	http_test_fixture_init(&fixture)
-	response := http_test_fixture_response(&fixture)
 
-	step := respond_file(&response, tina.FD_Handle(42), 8192, "application/octet-stream")
-	testing.expect_value(t, step, Route_Step.Flush)
-	testing.expect_value(t, fixture.connection.connection_state.sendfile_file_fd, tina.FD_Handle(42))
-	testing.expect_value(t, fixture.connection.connection_state.sendfile_offset, u64(0))
-	testing.expect_value(t, fixture.connection.connection_state.sendfile_size_remaining, u64(8192))
-	testing.expect_value(t, fixture.connection.connection_state.sendfile_active, true)
+	Test_State :: struct { fixture: ^HTTP_Test_Fixture, t: ^testing.T }
+	test_state := Test_State { fixture = &fixture, t = t }
+	tina.test_with_context(
+		tina.Test_Context_Config { timer_resolution_ns = 1 },
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture, ctx)
+
+			step := respond_file(&response, tina.FD_Handle(42), 8192, "application/octet-stream")
+			testing.expect_value(test_state.t, step, Route_Step.Flush)
+			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_file_fd, tina.FD_Handle(42))
+			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_offset, u64(0))
+			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_size_remaining, u64(8192))
+			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_active, true)
+		},
+	)
 }

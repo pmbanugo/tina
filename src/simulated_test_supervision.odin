@@ -8,7 +8,7 @@ when TINA_SIMULATION_MODE {
 	Exiter :: struct {}
 	Bystander :: struct {}
 
-	supervisor_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	supervisor_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		bystander_spec := Spawn_Spec {
 			type_id      = BYSTANDER_TYPE_ID,
 			group_id     = ctx_supervision_group_id(ctx),
@@ -26,23 +26,23 @@ when TINA_SIMULATION_MODE {
 		return Effect_Receive{}
 	}
 
-	supervisor_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	supervisor_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
-	exiter_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	exiter_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
-	exiter_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	exiter_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		return Effect_Done{}
 	}
 
-	bystander_init :: proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect {
+	bystander_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
-	bystander_handler :: proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect {
+	bystander_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
 		return Effect_Receive{}
 	}
 
@@ -153,11 +153,14 @@ when TINA_SIMULATION_MODE {
 			0,
 			shard.metadata[EXITER_TYPE_ID].generation[0],
 		)
-		ctx := TinaContext {
-			_shard      = shard,
-			self_handle = HANDLE_NONE,
+		envelope := Message_Envelope {
+			source       = HANDLE_NONE,
+			destination  = exiter_handle,
+			tag          = APP_TAG_PING,
+			payload_size = size_of(PingMsg),
 		}
-		_ = ctx_send(&ctx, exiter_handle, APP_TAG_PING, &PingMsg{seq = 0})
+		(cast(^PingMsg)&envelope.payload[0])^ = PingMsg{seq = 0}
+		_ = _route_envelope_user(shard, exiter_handle, &envelope)
 
 		simulator_run(&sim)
 
@@ -297,11 +300,14 @@ when TINA_SIMULATION_MODE {
 			0,
 			shard.metadata[EXITER_TYPE_ID].generation[0],
 		)
-		ctx := TinaContext {
-			_shard      = shard,
-			self_handle = HANDLE_NONE,
+		envelope := Message_Envelope {
+			source       = HANDLE_NONE,
+			destination  = exiter_handle,
+			tag          = APP_TAG_PING,
+			payload_size = size_of(PingMsg),
 		}
-		_ = ctx_send(&ctx, exiter_handle, APP_TAG_PING, &PingMsg{seq = 0})
+		(cast(^PingMsg)&envelope.payload[0])^ = PingMsg{seq = 0}
+		_ = _route_envelope_user(shard, exiter_handle, &envelope)
 
 		simulator_run(&sim)
 

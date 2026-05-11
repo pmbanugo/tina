@@ -56,7 +56,7 @@ WorkerIsolate :: struct {
 	dispatcher: tina.Handle,
 }
 
-worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	self := tina.self_as(WorkerIsolate, self_raw, ctx)
 
 	// 1. Parse the initialization arguments
@@ -91,7 +91,7 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tin
 worker_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	using self := tina.self_as(WorkerIsolate, self_raw, ctx)
 	// log_buf: [128]u8
@@ -142,7 +142,7 @@ DispatcherIsolate :: struct {
 	job_counter: u32,
 }
 
-dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
 	self := tina.self_as(DispatcherIsolate, self_raw, ctx)
 
 	tina.ctx_log(
@@ -181,7 +181,7 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) ->
 dispatcher_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: ^tina.TinaContext,
+	ctx: tina.TinaContext,
 ) -> tina.Effect {
 	using self := tina.self_as(DispatcherIsolate, self_raw, ctx)
 	log_buf: [128]u8

@@ -1,0 +1,158 @@
+package tina
+
+import "core:mem"
+
+when ODIN_TEST {
+	Test_Context_Proc :: #type proc(user_data: rawptr, ctx: TinaContext)
+	Test_Tick_Context_Proc :: #type proc(user_data: rawptr, ctx: TinaTickContext)
+
+	Test_Context_Config :: struct {
+		self_handle:         Handle,
+		message_source:      Handle,
+		correlation_id:      Correlation_Id,
+		flags:               Context_Flags,
+		monotonic_time_ns:   Monotonic_Time_NS,
+		timer_resolution_ns: u64,
+		shutting_down:       bool,
+	}
+
+	Test_Local_Tick_Config :: struct {
+		self_handle:             Handle,
+		target_handle:           Handle,
+		monotonic_time_ns:       Monotonic_Time_NS,
+		current_tick:            u64,
+		timer_resolution_ns:     u64,
+		target_mailbox_capacity: u32,
+		target_state:            Isolate_State,
+	}
+
+	test_with_context :: proc(config: Test_Context_Config, user_data: rawptr, callback: Test_Context_Proc) {
+		watchdog_state := u8(Shard_State.Running)
+		if config.shutting_down {
+			watchdog_state = u8(Shard_State.Shutting_Down)
+		}
+
+		shard := Shard {
+			id                    = extract_shard_id(config.self_handle),
+			timer_resolution_ns   = config.timer_resolution_ns,
+			watchdog_state_pointer = &watchdog_state,
+		}
+		if shard.timer_resolution_ns == 0 {
+			shard.timer_resolution_ns = 1
+		}
+
+		spokes := make([]u32, 8)
+		defer delete(spokes)
+		entries := make([]Timer_Entry, 16)
+		defer delete(entries)
+		timer_wheel_init(&shard.timer_wheel, spokes, entries, 0)
+
+		scratch_bytes := make([]u8, 4096)
+		defer delete(scratch_bytes)
+
+		invocation := Isolate_Invocation {
+			previous               = g_current_isolate_invocation,
+			shard                  = &shard,
+			context_token          = make_tina_context_token(&shard),
+			self_handle            = config.self_handle,
+			current_message_source = config.message_source,
+			current_correlation    = config.correlation_id,
+			flags                  = config.flags,
+			monotonic_time_ns      = config.monotonic_time_ns,
+			timer_resolution_ns    = shard.timer_resolution_ns,
+			type_id                = extract_type_id(config.self_handle),
+			slot_index             = extract_slot(config.self_handle),
+			shard_id               = shard.id,
+		}
+		mem.arena_init(&invocation.scratch_arena, scratch_bytes)
+
+		previous_allocator := context.allocator
+		previous_temp_allocator := context.temp_allocator
+		g_current_isolate_invocation = &invocation
+		context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
+
+		callback(user_data, invocation.context_token)
+
+		context.allocator = previous_allocator
+		context.temp_allocator = previous_temp_allocator
+		g_current_isolate_invocation = invocation.previous
+	}
+
+	test_with_local_tick_context :: proc(
+		config: Test_Local_Tick_Config,
+		user_data: rawptr,
+		callback: Test_Tick_Context_Proc,
+	) -> (message_count: u16, message: Message) {
+		watchdog_state := u8(Shard_State.Running)
+		shard := Shard {
+			id                    = extract_shard_id(config.target_handle),
+			timer_resolution_ns   = config.timer_resolution_ns,
+			current_tick          = config.current_tick,
+			watchdog_state_pointer = &watchdog_state,
+		}
+		if shard.timer_resolution_ns == 0 {
+			shard.timer_resolution_ns = 1
+		}
+
+		pool_backing := make([]u8, MESSAGE_ENVELOPE_SIZE * 8)
+		defer delete(pool_backing)
+		pool_init(&shard.message_pool, pool_backing, MESSAGE_ENVELOPE_SIZE)
+
+		type_count := max(int(extract_type_id(config.self_handle)), int(extract_type_id(config.target_handle))) + 1
+		shard.type_descriptors = make([]TypeDescriptor, type_count)
+		defer delete(shard.type_descriptors)
+		shard.metadata = make([]#soa[]Isolate_Metadata, type_count)
+		defer delete(shard.metadata)
+
+		target_type_id := extract_type_id(config.target_handle)
+		target_slot_index := extract_slot(config.target_handle)
+		target_slot_count := int(target_slot_index) + 1
+		shard.metadata[target_type_id] = make(#soa[]Isolate_Metadata, target_slot_count)
+		defer delete(shard.metadata[target_type_id])
+
+		mailbox_capacity := config.target_mailbox_capacity
+		if mailbox_capacity == 0 {
+			mailbox_capacity = 8
+		}
+		shard.type_descriptors[target_type_id].mailbox_capacity = u16(mailbox_capacity)
+		shard.metadata[target_type_id][target_slot_index].generation = extract_generation(config.target_handle)
+		shard.metadata[target_type_id][target_slot_index].state = config.target_state
+
+		invocation := Isolate_Type_Tick_Invocation {
+			shard             = &shard,
+			context_token     = make_tina_tick_context_token(&shard),
+			self_handle       = config.self_handle,
+			monotonic_time_ns = config.monotonic_time_ns,
+			current_tick      = config.current_tick,
+			type_id           = extract_type_id(config.self_handle),
+			shard_id          = shard.id,
+		}
+
+		previous_allocator := context.allocator
+		previous_temp_allocator := context.temp_allocator
+		g_current_isolate_type_tick_invocation = &invocation
+
+		callback(user_data, invocation.context_token)
+
+		g_current_isolate_type_tick_invocation = nil
+		context.allocator = previous_allocator
+		context.temp_allocator = previous_temp_allocator
+
+		soa_meta := shard.metadata[target_type_id]
+		message_count = soa_meta[target_slot_index].inbox_count
+		if message_count == 0 {
+			return
+		}
+
+		envelope := pool_get_ptr_unchecked(&shard.message_pool, soa_meta[target_slot_index].inbox_head)
+		message.tag = envelope.tag
+		message.correlation = envelope.correlation
+		message.user.source = envelope.source
+		message.user.payload_size = envelope.payload_size
+		if envelope.payload_size > 0 {
+			copy(message.user.payload[:], envelope.payload[:int(envelope.payload_size)])
+		}
+		return
+	}
+}
