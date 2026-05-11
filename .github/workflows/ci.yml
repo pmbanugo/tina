@@ -65,7 +65,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: dev-2026-05
       - name: Run platform tests
-        run: odin test src/ -define:TINA_ASSERTS=true
+        run: odin test tests/ -all-packages
 
   test-simulation:
     name: Simulation tests
@@ -77,11 +77,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: dev-2026-05
       - name: Run simulation tests
-        run: odin test src/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
-      - name: Run HTTP server tests
-        run: odin test src/extensions/http/server/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
-      - name: Run Datastar SDK tests
-        run: odin test src/extensions/http/datastar/ -define:TINA_SIM=true -define:TINA_ASSERTS=true
+        run: odin test tests/ -all-packages -define:TINA_SIM=true
 
   compliance-check:
     name: HTTP/1.1 Compliance Check
