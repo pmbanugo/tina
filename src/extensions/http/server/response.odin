@@ -915,7 +915,7 @@ expect_reply :: proc(
 	payload_bytes: []u8,
 	timeout_ns: u64,
 ) -> tina.Send_Result {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(timeout_ns > 0, "expect_reply: timeout_ns must be > 0")
 	}
 	correlation_id := tina.ctx_reserve_correlation_id(route_context.tina_context)
@@ -945,7 +945,7 @@ expect_notification :: proc(
 	source_handle: tina.Handle = tina.HANDLE_NONE,
 	message_tag: Message_Tag = Message_Tag(0),
 ) -> Route_Step {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(timeout_ns > 0, "expect_notification: timeout_ns must be > 0")
 	}
 	correlation_id := tina.ctx_reserve_correlation_id(route_context.tina_context)

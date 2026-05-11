@@ -492,7 +492,7 @@ reactor_submit_io :: proc(
 	// already in WAITING_FOR_IO. The io_sequence mechanism assumes at most one
 	// in-flight operation per Isolate — if two were in flight, bumping the
 	// sequence would only invalidate one, leaving the other to corrupt state.
-	when TINA_DEBUG_ASSERTS {
+	when TINA_RUNTIME_ASSERTIONS {
 		assert(
 			soa_meta[slot_index].state != .Waiting_For_Io,
 			"One-in-flight I/O invariant violated: Isolate submitted while WAITING_FOR_IO",

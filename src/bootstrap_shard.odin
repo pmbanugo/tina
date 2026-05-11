@@ -218,7 +218,7 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		if load_watchdog_state(runtime_state) != .Running do break
 	}
 
-	when TINA_DEBUG_ASSERTS {
+	when TINA_RUNTIME_ASSERTIONS {
 		// Clean exit after graceful drain.
 		// After all Isolates returned .done and the last scheduler_tick drained
 		// any remaining stale I/O completions, every reactor buffer should be back

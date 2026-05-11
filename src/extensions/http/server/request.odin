@@ -77,7 +77,7 @@ request_state_reset :: #force_inline proc "contextless" (request: ^Request_State
 }
 
 method :: #force_inline proc (request: ^Request) -> Method {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "method: request state is nil")
 	}
 	state := request.connection_state
@@ -85,7 +85,7 @@ method :: #force_inline proc (request: ^Request) -> Method {
 }
 
 target :: #force_inline proc (request: ^Request) -> []u8 {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "target: request state is nil")
 	}
 	state := request.connection_state
@@ -96,7 +96,7 @@ target :: #force_inline proc (request: ^Request) -> []u8 {
 }
 
 path :: #force_inline proc (request: ^Request) -> []u8 {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "path: request state is nil")
 	}
 	state := request.connection_state
@@ -107,7 +107,7 @@ path :: #force_inline proc (request: ^Request) -> []u8 {
 }
 
 query :: #force_inline proc (request: ^Request) -> []u8 {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "query: request state is nil")
 	}
 	state := request.connection_state
@@ -118,7 +118,7 @@ query :: #force_inline proc (request: ^Request) -> []u8 {
 }
 
 body_buffered :: proc (request: ^Request) -> []u8 {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "body_buffered: request state is nil")
 	}
 	state := request.connection_state
@@ -128,7 +128,7 @@ body_buffered :: proc (request: ^Request) -> []u8 {
 	if state.request.route_index == ROUTE_INDEX_NONE {
 		return nil
 	}
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state.shard_runtime != nil, "body_buffered: shard_runtime is nil")
 	}
 	if state.shard_runtime.router.descriptors[state.request.route_index].body_mode != .Buffered {
@@ -138,7 +138,7 @@ body_buffered :: proc (request: ^Request) -> []u8 {
 }
 
 header :: proc (request: ^Request, name: string) -> []u8 {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "header: request state is nil")
 	}
 	state := request.connection_state
@@ -167,12 +167,12 @@ param :: proc (request: ^Request, name: string) -> []u8 {
 	if len(name) == 0 {
 		return nil
 	}
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "param: request state is nil")
 	}
 	state := request.connection_state
 	runtime := state.shard_runtime
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(runtime != nil, "param: shard_runtime is nil")
 	}
 	if state.request.route_index == ROUTE_INDEX_NONE {
@@ -341,7 +341,7 @@ query_value_decoded :: proc(request: ^Request, name: string) -> (decoded: []u8, 
 }
 
 expects_continue :: #force_inline proc (request: ^Request) -> bool {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "expects_continue: request state is nil")
 	}
 	state := request.connection_state
@@ -353,7 +353,7 @@ is_head :: #force_inline proc "contextless" (request: ^Request) -> bool {
 }
 
 is_upgrade_requested :: #force_inline proc (request: ^Request) -> bool {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "is_upgrade_requested: request state is nil")
 	}
 	state := request.connection_state
@@ -361,7 +361,7 @@ is_upgrade_requested :: #force_inline proc (request: ^Request) -> bool {
 }
 
 is_shutting_down :: #force_inline proc(request: ^Request) -> bool {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "is_shutting_down: request state is nil")
 	}
 	state := request.connection_state
@@ -375,7 +375,7 @@ is_shutting_down :: #force_inline proc(request: ^Request) -> bool {
 }
 
 peer_address :: #force_inline proc (request: ^Request) -> tina.Peer_Address {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "peer_address: request state is nil")
 	}
 	state := request.connection_state
@@ -384,7 +384,7 @@ peer_address :: #force_inline proc (request: ^Request) -> tina.Peer_Address {
 
 // Returns the allocator for the Connection's (Isolate) working memory
 request_arena :: proc(request: ^Request) -> mem.Allocator {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "request_arena: request state is nil")
 	}
 	if request == nil || request.connection_state == nil do return mem.Allocator{}
@@ -393,7 +393,7 @@ request_arena :: proc(request: ^Request) -> mem.Allocator {
 
 // Returns the allocator for the Connection's (Isolate) scratch memory
 request_scratch :: proc(request: ^Request) -> mem.Allocator {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.tina_context != nil, "request_scratch: request context is nil")
 	}
 	if request == nil || request.tina_context == nil do return mem.Allocator{}

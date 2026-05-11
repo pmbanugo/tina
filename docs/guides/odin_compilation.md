@@ -30,7 +30,7 @@ Tina includes internal, framework-level assertions to validate structural invari
 *   **Development/Testing:** Compile with `-define:TINA_ASSERTS=true`. This enables rigorous sanity checks that fail fast during local development.
 *   **Production:** Compile without this flag. The framework assumes the developer has validated the structural logic via Deterministic Simulation Testing (DST) prior to deployment. 
 
-> Note: `TINA_ASSERTS` controls framework-internal sanity checks. It does **not** disable Odin's standard bounds-checking, which must remain active in production.
+> Note: `TINA_ASSERTS` controls framework-internal sanity checks. It does **not** disable Odin's standard bounds-checking, which must remain active in production. By default this is set to true
 
 ## Tradeoffs Accepted
 

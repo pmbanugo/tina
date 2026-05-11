@@ -10,7 +10,7 @@ Build_Result :: enum u8 {
 
 @(private = "package")
 _assert_group_layout :: #force_inline proc(group: ^Supervision_Group) {
-	when TINA_DEBUG_ASSERTS {
+	when TINA_RUNTIME_ASSERTIONS {
 		assert(
 			group.child_count_static == u16(len(group.boot_spec.children)),
 			"child_count_static must match boot_spec child count",

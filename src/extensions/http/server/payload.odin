@@ -5,7 +5,7 @@ import "core:mem"
 import "core:testing"
 
 payload_view_as :: proc($T: typeid, payload: []u8) -> ^T {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(size_of(T) > 0, "payload_view_as: zero-sized types are not supported")
 		assert(len(payload) >= size_of(T), "payload_view_as: payload smaller than requested type")
 		assert(uintptr(raw_data(payload)) % align_of(T) == 0, "payload_view_as: payload alignment mismatch")
@@ -17,7 +17,7 @@ payload_view_as :: proc($T: typeid, payload: []u8) -> ^T {
 }
 
 payload_copy_as :: proc($T: typeid, payload: []u8) -> T {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(size_of(T) > 0, "payload_copy_as: zero-sized types are not supported")
 		assert(len(payload) >= size_of(T), "payload_copy_as: payload smaller than requested type")
 	}

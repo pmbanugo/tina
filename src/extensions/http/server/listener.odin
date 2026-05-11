@@ -58,7 +58,7 @@ _http_listener_handler :: proc(
 	ctx: ^tina.TinaContext,
 ) -> tina.Effect {
 	listener := cast(^HTTP_Listener)self
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(listener != nil, "_http_listener_handler: listener is nil")
 		assert(listener.shard_runtime != nil, "_http_listener_handler: shard runtime is nil")
 	}

@@ -8,7 +8,7 @@ HTTP_INTERNAL_TAG_AWAIT_TIMEOUT :: tina.Message_Tag(0xFFFE)
 
 @(private = "package")
 _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "_dispatch_route: request state is nil")
 		assert(response != nil && response.connection != nil, "_dispatch_route: response connection is nil")
 		assert(request.connection_state == &response.connection.connection_state, "_dispatch_route: request/response connection mismatch")
@@ -120,7 +120,7 @@ _dispatch_route_event :: proc(
 	route_context: Route_Context,
 	state: rawptr,
 ) -> Route_Step {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(request != nil && request.connection_state != nil, "_dispatch_route_event: request state is nil")
 		assert(response != nil && response.connection != nil, "_dispatch_route_event: response connection is nil")
 		assert(request.connection_state == route_context.connection_state, "_dispatch_route_event: route context state mismatch")
@@ -192,7 +192,7 @@ _route_state_ptr :: proc "contextless" (state: ^HTTP_Connection_State) -> rawptr
 
 @(private = "package")
 _make_route_context :: proc (state: ^HTTP_Connection_State, ctx: ^tina.TinaContext) -> Route_Context {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state != nil, "_make_route_context: state is nil")
 	}
 	return Route_Context {

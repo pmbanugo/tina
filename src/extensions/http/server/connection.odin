@@ -110,7 +110,7 @@ _connection_working_region_take :: proc(working_bytes: []u8, working_offset: ^in
 	aligned_offset := _align_up(working_offset^)
 	aligned_size := _align_up(region_size)
 	end_offset := aligned_offset + aligned_size
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(end_offset <= len(working_bytes), "_connection_working_region_take: working memory too small")
 	}
 	if end_offset > len(working_bytes) {
@@ -183,7 +183,7 @@ _http_connection_handler :: proc(
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 
 	case TAG_DRAIN_TIMEOUT:
-		when tina.TINA_DEBUG_ASSERTS {
+		when tina.TINA_RUNTIME_ASSERTIONS {
 			assert(state.shard_runtime != nil, "_http_connection_handler: shard runtime is nil during drain timeout")
 		}
 		if !state.shard_runtime.draining {
@@ -404,7 +404,7 @@ _connection_send_not_found :: proc(
 @(private = "file")
 _connection_handle_send_complete :: proc(connection: ^HTTP_Connection, bytes_sent: u32, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state.shard_runtime != nil, "_connection_handle_send_complete: shard runtime is nil")
 	}
 	remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
@@ -493,7 +493,7 @@ _connection_drive_sendfile :: proc(connection: ^HTTP_Connection, ctx: ^tina.Tina
 @(private = "file")
 _connection_finalize_flushed_response :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state.shard_runtime != nil, "_connection_finalize_flushed_response: shard runtime is nil")
 	}
 	state.sendfile_active = false
@@ -534,7 +534,7 @@ _connection_finalize_flushed_response :: proc(connection: ^HTTP_Connection, ctx:
 @(private = "file")
 _connection_continue_after_non_final_flush :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> tina.Effect {
 	state := &connection.connection_state
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state.shard_runtime != nil, "_connection_continue_after_non_final_flush: shard runtime is nil")
 	}
 	state.response_flush_final = false
@@ -586,7 +586,7 @@ _connection_stage_canned_response :: proc(connection: ^HTTP_Connection, response
 
 @(private = "package")
 _connection_make_request :: proc(connection: ^HTTP_Connection, frame: []u8, ctx: ^tina.TinaContext) -> Request {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(connection != nil, "_connection_make_request: connection is nil")
 	}
 	request_frame := frame
@@ -622,7 +622,7 @@ _connection_date_value :: proc "contextless" (connection: ^HTTP_Connection, ctx:
 
 @(private = "package")
 _connection_make_response :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) -> Response {
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(connection != nil, "_connection_make_response: connection is nil")
 	}
 	return Response {
@@ -904,7 +904,7 @@ _dispatch_step :: proc(connection: ^HTTP_Connection, step: Route_Step, ctx: ^tin
 		return _connection_continue_after_non_final_flush(connection, ctx)
 
 	case .Expect_Application:
-		when tina.TINA_DEBUG_ASSERTS {
+		when tina.TINA_RUNTIME_ASSERTIONS {
 			assert(
 				int(state.response.egress_size) == int(state.response.egress_size_sent),
 				"Cannot park with unsent HTTP bytes. Call flush() first; on Send_Ready, then expect_*().",
@@ -914,7 +914,7 @@ _dispatch_step :: proc(connection: ^HTTP_Connection, step: Route_Step, ctx: ^tin
 			state.state = .Closing
 			return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
 		}
-		when tina.TINA_DEBUG_ASSERTS {
+		when tina.TINA_RUNTIME_ASSERTIONS {
 			assert(state.shard_runtime != nil, "_dispatch_step: shard runtime is nil while parking application expectation")
 		}
 		if state.application_timeout_ns > 0 {
@@ -1200,7 +1200,7 @@ _connection_process_body_bytes :: proc(
 @(private = "file")
 _connection_release_slot :: proc(connection: ^HTTP_Connection, ctx: ^tina.TinaContext) {
 	state := &connection.connection_state
-	when tina.TINA_DEBUG_ASSERTS {
+	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state.shard_runtime != nil, "_connection_release_slot: shard runtime is nil")
 	}
 	if state.state == .Keep_Alive_Idle {

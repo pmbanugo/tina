@@ -49,7 +49,7 @@ ctx_send_with_correlation :: #force_inline proc(
 		tag >= USER_MESSAGE_TAG_BASE,
 		"ctx_send_with_correlation: Cannot forge system messages. Tag must be >= 0x0040.",
 	)
-	when TINA_DEBUG_ASSERTS {
+	when TINA_RUNTIME_ASSERTIONS {
 		assert(
 			len(payload) <= MAX_PAYLOAD_SIZE,
 			"ctx_send_with_correlation payload exceeds MAX_PAYLOAD_SIZE",
@@ -298,7 +298,7 @@ ctx_transfer_read :: #force_inline proc(
 	// Track auto-free lifecycle.
 	type_id := extract_type_id(ctx.self_handle)
 	slot := extract_slot(ctx.self_handle)
-	when TINA_DEBUG_ASSERTS {
+	when TINA_RUNTIME_ASSERTIONS {
 		assert(
 			shard.metadata[type_id][slot].pending_transfer_read == TRANSFER_HANDLE_NONE,
 			"ctx_transfer_read can only be called ONCE per handler invocation to prevent buffer leaks.",

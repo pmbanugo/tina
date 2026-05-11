@@ -178,7 +178,7 @@ init_args_of :: #force_inline proc(args: ^$T) -> (payload: [MAX_INIT_ARGS_SIZE]u
 // Validates at runtime (under TINA_DEBUG_ASSERTS) that the registered stride
 // matches the target type, catching wrong-type casts before they corrupt memory.
 self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: ^TinaContext) -> ^T {
-	when TINA_DEBUG_ASSERTS {
+	when TINA_RUNTIME_ASSERTIONS {
 		shard := ctx._shard
 		type_id := extract_type_id(ctx.self_handle)
 		registered_stride := shard.type_descriptors[type_id].stride
@@ -195,7 +195,7 @@ self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: ^TinaContext) -
 payload_offset_of :: #force_inline proc(self: ^$Isolate, buffer: []u8) -> u16 {
 	base := uintptr(self)
 	buf_start := uintptr(raw_data(buffer))
-	when TINA_DEBUG_ASSERTS {
+	when TINA_RUNTIME_ASSERTIONS {
 		assert(buf_start >= base, "payload_offset_of: buffer starts before isolate base")
 		assert(
 			buf_start + uintptr(len(buffer)) <= base + size_of(Isolate),

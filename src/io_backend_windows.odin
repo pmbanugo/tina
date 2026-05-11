@@ -593,7 +593,7 @@ when !TINA_SIMULATION_MODE {
 				// Handle operation-specific completion data
 				switch _ in entry.operation {
 				case Submission_Op_Accept:
-					when TINA_DEBUG_ASSERTS { _, da_ok := entry.operation.(Submission_Op_Accept); assert(da_ok, "Win_Op_Data.accept variant read on non-Accept entry — raw union would return corrupt client_fd/sockaddr from overlapping Recvfrom memory") }
+					when TINA_RUNTIME_ASSERTIONS { _, da_ok := entry.operation.(Submission_Op_Accept); assert(da_ok, "Win_Op_Data.accept variant read on non-Accept entry — raw union would return corrupt client_fd/sockaddr from overlapping Recvfrom memory") }
 					op := entry.operation.(Submission_Op_Accept)
 					if bytes_transferred >= 0 {
 						accept_fd := entry.op_data.accept.client_fd
@@ -651,7 +651,7 @@ when !TINA_SIMULATION_MODE {
 					raw.result = 0
 
 				case Submission_Op_Recvfrom:
-					when TINA_DEBUG_ASSERTS { _, dr_ok := entry.operation.(Submission_Op_Recvfrom); assert(dr_ok, "Win_Op_Data.recvfrom variant read on non-Recvfrom entry — raw union would return corrupt peer_address from overlapping Accept memory") }
+					when TINA_RUNTIME_ASSERTIONS { _, dr_ok := entry.operation.(Submission_Op_Recvfrom); assert(dr_ok, "Win_Op_Data.recvfrom variant read on non-Recvfrom entry — raw union would return corrupt peer_address from overlapping Accept memory") }
 					if bytes_transferred >= 0 {
 						raw.extra = Completion_Extra_Recvfrom {
 							peer_address = _win_sockaddr_to_socket_address(
