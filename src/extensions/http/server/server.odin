@@ -71,7 +71,6 @@ Server_Runtime :: struct {
 	route_state_size_max:   u16,
 }
 
-
 // Per-request opaque token stamped at request_start. Exposed to handlers via
 // `route_request_token` and intended to be embedded in pub/sub payloads so
 // subscribers can detect stale notifications targeting a previous request on

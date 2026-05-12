@@ -127,9 +127,8 @@ Context_Flag :: enum u8 {
 }
 Context_Flags :: distinct bit_set[Context_Flag;u8]
 
-// Scalar capability token valid only during the active Isolate callback (init & handler) invocation.
+// Scalar capability token valid only during the active Isolate handler invocation.
 TinaContext :: distinct u64
-TinaTickContext :: distinct u64
 
 Enqueue_Result :: enum u8 {
 	Success,

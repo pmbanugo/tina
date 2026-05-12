@@ -741,9 +741,9 @@ _connection_date_value :: proc(connection: ^HTTP_Connection, ctx: tina.TinaConte
 		return nil
 	}
 
-	monotonic_ns := u64(tina.ctx_monotonic_time_ns(ctx))
+	monotonic_ns := tina.ctx_monotonic_time_ns(ctx)
 	if monotonic_ns >= runtime.date_cache.next_second_threshold_ns {
-		unix_epoch_ns := wall_clock_unix_epoch_ns(monotonic_ns)
+		unix_epoch_ns := wall_clock_unix_epoch_ns(u64(monotonic_ns))
 		update_date_cache(&runtime.date_cache, monotonic_ns, unix_epoch_ns)
 	}
 
@@ -2118,30 +2118,15 @@ test_dispatch_step_flush_non_final_dispatches_send_ready_without_io :: proc(t: ^
 	connection.connection_state.response.flags += {.Headers_Committed}
 	connection.connection_state.response.egress_size = 0
 	connection.connection_state.response.egress_size_sent = 0
+	connection.connection_state.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
 
-	connection.connection_state.self_handle = tina.make_handle(
-		0,
-		u16(HTTP_TYPE_OFFSET_CONNECTION),
-		0,
-		1,
-	)
-
-	Test_State :: struct {
-		connection: ^HTTP_Connection,
-		t:          ^testing.T,
-	}
-	test_state := Test_State {
-		connection = &connection,
-		t          = t,
-	}
+	Dispatch_Flush_Test_State :: struct {connection: ^HTTP_Connection, t: ^testing.T}
+	dispatch_flush_test_state := Dispatch_Flush_Test_State {connection = &connection, t = t}
 	tina.test_with_context(
-		tina.Test_Context_Config {
-			self_handle = connection.connection_state.self_handle,
-			timer_resolution_ns = 1,
-		},
-		rawptr(&test_state),
+		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&dispatch_flush_test_state),
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Test_State)user_data
+			test_state := cast(^Dispatch_Flush_Test_State)user_data
 			effect := _dispatch_step(test_state.connection, .Flush, ctx)
 			#partial switch _ in effect {
 			case tina.Effect_Io:
@@ -2200,45 +2185,16 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 	connection.connection_state.response.egress_size = 0
 	connection.connection_state.response.egress_size_sent = 0
 
-	connection.connection_state.self_handle = tina.make_handle(
-		0,
-		u16(HTTP_TYPE_OFFSET_CONNECTION),
-		0,
-		1,
-	)
-
-	Test_State :: struct {
-		connection: ^HTTP_Connection,
-		t:          ^testing.T,
+	effect := _dispatch_step(&connection, .Flush_Final, 0)
+	#partial switch _ in effect {
+	case tina.Effect_Io:
+		operation := effect.(tina.Effect_Io).operation
+		if _, ok := operation.(tina.IoOp_Close); !ok {
+			testing.expect(t, false, "final flush with close-after-send should close")
+		}
+	case:
+		testing.expect(t, false, "expected close effect")
 	}
-	test_state := Test_State {
-		connection = &connection,
-		t          = t,
-	}
-	tina.test_with_context(
-		tina.Test_Context_Config {
-			self_handle = connection.connection_state.self_handle,
-			timer_resolution_ns = 1,
-		},
-		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Test_State)user_data
-			effect := _dispatch_step(test_state.connection, .Flush_Final, ctx)
-			#partial switch _ in effect {
-			case tina.Effect_Io:
-				operation := effect.(tina.Effect_Io).operation
-				if _, ok := operation.(tina.IoOp_Close); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"final flush with close-after-send should close",
-					)
-				}
-			case:
-				testing.expect(test_state.t, false, "expected close effect")
-			}
-		},
-	)
 	testing.expect_value(t, route_state_storage[0].send_ready_count, u32(0))
 }
 
@@ -2266,30 +2222,15 @@ test_send_complete_with_sendfile_plan_transitions_to_sendfile_io :: proc(t: ^tes
 	connection.connection_state.sendfile_file_fd = tina.FD_Handle(22)
 	connection.connection_state.sendfile_size_remaining = 4096
 	connection.connection_state.sendfile_offset = 0
+	connection.connection_state.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
 
-	connection.connection_state.self_handle = tina.make_handle(
-		0,
-		u16(HTTP_TYPE_OFFSET_CONNECTION),
-		0,
-		1,
-	)
-
-	Test_State :: struct {
-		connection: ^HTTP_Connection,
-		t:          ^testing.T,
-	}
-	test_state := Test_State {
-		connection = &connection,
-		t          = t,
-	}
+	Send_Complete_Test_State :: struct {connection: ^HTTP_Connection, t: ^testing.T}
+	send_complete_test_state := Send_Complete_Test_State {connection = &connection, t = t}
 	tina.test_with_context(
-		tina.Test_Context_Config {
-			self_handle = connection.connection_state.self_handle,
-			timer_resolution_ns = 1,
-		},
-		rawptr(&test_state),
+		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&send_complete_test_state),
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Test_State)user_data
+			test_state := cast(^Send_Complete_Test_State)user_data
 			effect := _connection_handle_send_complete(test_state.connection, 0, ctx)
 			#partial switch io_effect in effect {
 			case tina.Effect_Io:
@@ -2345,43 +2286,12 @@ test_send_complete_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.
 	connection.connection_state.request.route_index = Route_Index(0)
 	connection.connection_state.response_header_bytes = response_header_storage[:]
 	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
-	connection.connection_state.self_handle = tina.make_handle(
-		0,
-		u16(HTTP_TYPE_OFFSET_CONNECTION),
-		0,
-		1,
-	)
 
 	message: tina.Message
 	message.tag = tina.IO_TAG_SEND_COMPLETE
 	message.io.result = -1
 
-	Test_State :: struct {
-		connection: ^HTTP_Connection,
-		message:    ^tina.Message,
-		effect:     tina.Effect,
-	}
-	test_state := Test_State {
-		connection = &connection,
-		message    = &message,
-	}
-
-	tina.test_with_context(
-		tina.Test_Context_Config {
-			self_handle = connection.connection_state.self_handle,
-			timer_resolution_ns = 1,
-		},
-		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Test_State)user_data
-			test_state.effect = _http_connection_handler(
-				rawptr(test_state.connection),
-				test_state.message,
-				ctx,
-			)
-		},
-	)
-	effect := test_state.effect
+	effect := _http_connection_handler(rawptr(&connection), &message, 0)
 	#partial switch io_effect in effect {
 	case tina.Effect_Io:
 		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
@@ -2432,43 +2342,12 @@ test_sendfile_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
 	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
 	connection.connection_state.sendfile_active = true
 	connection.connection_state.sendfile_size_remaining = 4096
-	connection.connection_state.self_handle = tina.make_handle(
-		0,
-		u16(HTTP_TYPE_OFFSET_CONNECTION),
-		0,
-		1,
-	)
 
 	message: tina.Message
 	message.tag = tina.IO_TAG_SENDFILE_COMPLETE
 	message.io.result = -1
 
-	Test_State :: struct {
-		connection: ^HTTP_Connection,
-		message:    ^tina.Message,
-		effect:     tina.Effect,
-	}
-	test_state := Test_State {
-		connection = &connection,
-		message    = &message,
-	}
-
-	tina.test_with_context(
-		tina.Test_Context_Config {
-			self_handle = connection.connection_state.self_handle,
-			timer_resolution_ns = 1,
-		},
-		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Test_State)user_data
-			test_state.effect = _http_connection_handler(
-				rawptr(test_state.connection),
-				test_state.message,
-				ctx,
-			)
-		},
-	)
-	effect := test_state.effect
+	effect := _http_connection_handler(rawptr(&connection), &message, 0)
 	#partial switch io_effect in effect {
 	case tina.Effect_Io:
 		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
@@ -2515,52 +2394,35 @@ test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T)
 		"GET /first HTTP/1.1\r\nHost: example\r\n\r\nGET /second HTTP/1.1\r\nHost: example\r\n\r\n",
 	)
 
-	Test_State :: struct {
-		connection:          ^HTTP_Connection,
-		combined:            []u8,
-		second_request_size: int,
-		t:                   ^testing.T,
-	}
-	test_state := Test_State {
-		connection          = &connection,
-		combined            = combined,
-		second_request_size = len(second_request),
-		t                   = t,
+	Process_Header_Test_State :: struct {connection: ^HTTP_Connection, input: []u8, t: ^testing.T}
+	process_header_test_state := Process_Header_Test_State {
+		connection = &connection,
+		input      = combined,
+		t          = t,
 	}
 	tina.test_with_context(
-		tina.Test_Context_Config {
-			self_handle = connection.connection_state.self_handle,
-			timer_resolution_ns = 1,
-		},
-		rawptr(&test_state),
+		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&process_header_test_state),
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Test_State)user_data
-			effect := _connection_process_header_bytes(
-				test_state.connection,
-				test_state.combined,
-				ctx,
-			)
+			test_state := cast(^Process_Header_Test_State)user_data
+			effect := _connection_process_header_bytes(test_state.connection, test_state.input, ctx)
 			#partial switch io_effect in effect {
 			case tina.Effect_Io:
 				if _, ok := io_effect.operation.(tina.IoOp_Send); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"simple request should stage and send a response",
-					)
+					testing.expect(test_state.t, false, "simple request should stage and send a response")
 				}
 			case:
 				testing.expect(test_state.t, false, "expected send effect for simple request")
 			}
-
-			testing.expect_value(
-				test_state.t,
-				int(test_state.connection.connection_state.pipeline_tail_size),
-				test_state.second_request_size,
-			)
 		},
 	)
 
+	second_request_size := len(second_request)
+	testing.expect_value(
+		t,
+		int(connection.connection_state.pipeline_tail_size),
+		second_request_size,
+	)
 	retained_tail := string(
 		connection.connection_state.pipeline_tail_bytes[:int(
 			connection.connection_state.pipeline_tail_size,
@@ -2682,38 +2544,21 @@ test_finalize_flushed_response_processes_pipeline_tail_before_recv :: proc(t: ^t
 	copy(connection.connection_state.pipeline_tail_bytes, transmute([]u8)string(pipelined_request))
 	connection.connection_state.pipeline_tail_size = u16(len(pipelined_request))
 
-	Test_State :: struct {
-		connection: ^HTTP_Connection,
-		t:          ^testing.T,
-	}
-	test_state := Test_State {
-		connection = &connection,
-		t          = t,
-	}
+	Finalize_Flush_Test_State :: struct {connection: ^HTTP_Connection, t: ^testing.T}
+	finalize_flush_test_state := Finalize_Flush_Test_State {connection = &connection, t = t}
 	tina.test_with_context(
-		tina.Test_Context_Config {
-			self_handle = connection.connection_state.self_handle,
-			timer_resolution_ns = 1,
-		},
-		rawptr(&test_state),
+		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&finalize_flush_test_state),
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Test_State)user_data
+			test_state := cast(^Finalize_Flush_Test_State)user_data
 			effect := _connection_finalize_flushed_response(test_state.connection, ctx)
 			#partial switch io_effect in effect {
 			case tina.Effect_Io:
 				if _, ok := io_effect.operation.(tina.IoOp_Send); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"pipeline tail should be parsed and dispatched before recv",
-					)
+					testing.expect(test_state.t, false, "pipeline tail should be parsed and dispatched before recv")
 				}
 			case:
-				testing.expect(
-					test_state.t,
-					false,
-					"expected immediate send effect from retained pipeline request",
-				)
+				testing.expect(test_state.t, false, "expected immediate send effect from retained pipeline request")
 			}
 		},
 	)

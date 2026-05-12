@@ -62,7 +62,7 @@ timer_wheel_reset :: proc(wheel: ^Timer_Wheel, current_tick: u64) {
 // Registers a timer that will enqueue a message with the specified tag back to this Isolate.
 // The duration is specified in nanoseconds.
 ctx_register_timer :: proc(ctx: TinaContext, duration_ns: u64, tag: Message_Tag) {
-	invocation := ctx_invocation(ctx)
+	invocation := ctx_invocation_require_self_handle(ctx)
 	shard := invocation.shard
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
@@ -88,7 +88,7 @@ ctx_register_timer_with_correlation :: proc(
 	tag: Message_Tag,
 	correlation: Correlation_Id,
 ) {
-	invocation := ctx_invocation(ctx)
+	invocation := ctx_invocation_require_self_handle(ctx)
 	shard := invocation.shard
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {

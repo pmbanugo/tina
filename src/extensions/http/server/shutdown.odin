@@ -4,14 +4,10 @@ import tina "../../.."
 import "core:testing"
 import "core:mem"
 
-
-
 @(private = "package")
 _timeout_duration_ns :: #force_inline proc "contextless" (timeout_ms: u32) -> u64 {
 	return u64(timeout_ms) * 1_000_000
 }
-
-
 
 @(private = "package")
 _connection_should_drain :: #force_inline proc(
@@ -20,8 +16,6 @@ _connection_should_drain :: #force_inline proc(
 ) -> bool {
 	return(runtime != nil && runtime.draining) || tina.ctx_is_shutting_down(ctx)
 }
-
-
 
 @(private = "package")
 _idle_slot_push :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext) {

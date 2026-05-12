@@ -4,7 +4,6 @@ import "core:mem"
 
 
 Test_Context_Proc :: #type proc(user_data: rawptr, ctx: TinaContext)
-Test_Tick_Context_Proc :: #type proc(user_data: rawptr, ctx: TinaTickContext)
 
 Test_Context_Config :: struct {
 	self_handle:         Handle,
@@ -16,7 +15,7 @@ Test_Context_Config :: struct {
 	shutting_down:       bool,
 }
 
-Test_Local_Tick_Config :: struct {
+Test_Local_Context_Config :: struct {
 	self_handle:             Handle,
 	target_handle:           Handle,
 	monotonic_time_ns:       Monotonic_Time_NS,
@@ -83,10 +82,10 @@ test_with_context :: proc(
 	g_current_isolate_invocation = invocation.previous
 }
 
-test_with_local_tick_context :: proc(
-	config: Test_Local_Tick_Config,
+test_with_local_context :: proc(
+	config: Test_Local_Context_Config,
 	user_data: rawptr,
-	callback: Test_Tick_Context_Proc,
+	callback: Test_Context_Proc,
 ) -> (
 	message_count: u16,
 	message: Message,
@@ -130,25 +129,36 @@ test_with_local_tick_context :: proc(
 	)
 	shard.metadata[target_type_id][target_slot_index].state = config.target_state
 
-	invocation := Isolate_Type_Tick_Invocation {
-		shard             = &shard,
-		context_token     = make_tina_tick_context_token(&shard),
-		self_handle       = config.self_handle,
-		monotonic_time_ns = config.monotonic_time_ns,
-		current_tick      = config.current_tick,
-		type_id           = extract_type_id(config.self_handle),
-		shard_id          = shard.id,
+	scratch_bytes := make([]u8, 4096)
+	defer delete(scratch_bytes)
+
+	invocation := Isolate_Invocation {
+		previous               = g_current_isolate_invocation,
+		shard                  = &shard,
+		context_token          = make_tina_context_token(&shard),
+		self_handle            = config.self_handle,
+		current_message_source = HANDLE_NONE,
+		current_correlation    = CORRELATION_ID_NONE,
+		flags                  = {},
+		monotonic_time_ns      = config.monotonic_time_ns,
+		timer_resolution_ns    = shard.timer_resolution_ns,
+		type_id                = extract_type_id(config.self_handle),
+		slot_index             = extract_slot(config.self_handle),
+		shard_id               = shard.id,
 	}
+	mem.arena_init(&invocation.scratch_arena, scratch_bytes)
 
 	previous_allocator := context.allocator
 	previous_temp_allocator := context.temp_allocator
-	g_current_isolate_type_tick_invocation = &invocation
+	g_current_isolate_invocation = &invocation
+	context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+	context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
 	callback(user_data, invocation.context_token)
 
-	g_current_isolate_type_tick_invocation = nil
 	context.allocator = previous_allocator
 	context.temp_allocator = previous_temp_allocator
+	g_current_isolate_invocation = invocation.previous
 
 	soa_meta := shard.metadata[target_type_id]
 	message_count = soa_meta[target_slot_index].inbox_count

@@ -92,7 +92,7 @@ _connection_timeout_tag :: proc(
 @(private = "file")
 _runtime_enqueue_timeout :: proc(
 	runtime: ^HTTP_Shard_Runtime,
-	ctx: tina.TinaTickContext,
+	ctx: tina.TinaContext,
 	slot_index: u16,
 	handle: tina.Handle,
 	tag: tina.Message_Tag,
@@ -103,11 +103,11 @@ _runtime_enqueue_timeout :: proc(
 		return false
 	}
 	empty_payload: []u8
-	return tina.ctx_tick_send_local(ctx, handle, tag, empty_payload, correlation) == .ok
+	return tina.ctx_send_local_bypass(ctx, handle, tag, empty_payload, correlation) == .ok
 }
 
 @(private = "file")
-_runtime_scan_deadlines :: proc(runtime: ^HTTP_Shard_Runtime, ctx: tina.TinaTickContext, now_ns: tina.Monotonic_Time_NS) {
+_runtime_scan_deadlines :: proc(runtime: ^HTTP_Shard_Runtime, ctx: tina.TinaContext, now_ns: tina.Monotonic_Time_NS) {
 	active_index := 0
 	for active_index < int(runtime.active_count) {
 		slot_index := runtime.active_slot_indices[active_index]
@@ -128,12 +128,12 @@ _runtime_scan_deadlines :: proc(runtime: ^HTTP_Shard_Runtime, ctx: tina.TinaTick
 }
 
 @(private = "package")
-_http_runtime_tick :: proc(self: rawptr, ctx: tina.TinaTickContext) {
+_http_runtime_tick :: proc(self: rawptr, ctx: tina.TinaContext) {
 	if self == nil {
 		return
 	}
 	runtime: ^HTTP_Shard_Runtime
-	type_id := tina.ctx_tick_type_id(ctx)
+	type_id := tina.ctx_isolate_type_id(ctx)
 	if type_id == u16(HTTP_TYPE_OFFSET_LISTENER) {
 		runtime = (cast(^HTTP_Listener)self).shard_runtime
 	} else {
@@ -143,7 +143,7 @@ _http_runtime_tick :: proc(self: rawptr, ctx: tina.TinaTickContext) {
 		return
 	}
 
-	_runtime_scan_deadlines(runtime, ctx, tina.ctx_tick_monotonic_time_ns(ctx))
+	_runtime_scan_deadlines(runtime, ctx, tina.ctx_monotonic_time_ns(ctx))
 }
 
 @(test)
@@ -230,8 +230,8 @@ test_runtime_scan_deadlines_wakes_waiting_connection :: proc(t: ^testing.T) {
 	Deadline_Scan_Test_State :: struct {runtime: ^HTTP_Shard_Runtime}
 	deadline_scan_test_state := Deadline_Scan_Test_State {runtime = &runtime}
 
-	message_count, message := tina.test_with_local_tick_context(
-		tina.Test_Local_Tick_Config {
+	message_count, message := tina.test_with_local_context(
+		tina.Test_Local_Context_Config {
 			self_handle         = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_LISTENER), 0, 1),
 			target_handle       = connection.connection_state.self_handle,
 			monotonic_time_ns   = tina.Monotonic_Time_NS(10),
@@ -240,7 +240,7 @@ test_runtime_scan_deadlines_wakes_waiting_connection :: proc(t: ^testing.T) {
 			target_state        = .Waiting_For_Io,
 		},
 		rawptr(&deadline_scan_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaTickContext) {
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
 			test_state := cast(^Deadline_Scan_Test_State)user_data
 			_runtime_scan_deadlines(test_state.runtime, ctx, tina.Monotonic_Time_NS(10))
 		},

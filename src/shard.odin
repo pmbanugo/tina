@@ -294,6 +294,22 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 	type_id := type_descriptor.id
 	slot_count := u32(type_descriptor.slot_count)
 
+	// Hoisted
+	invocation := Isolate_Invocation {
+		previous               = g_current_isolate_invocation,
+		shard                  = shard,
+		context_token          = 0, // Assigned per invocation
+		self_handle            = HANDLE_NONE, // Assigned per invocation
+		current_message_source = HANDLE_NONE, // Assigned per invocation
+		current_correlation    = CORRELATION_ID_NONE, // Assigned per invocation
+		flags                  = {}, // Assigned per invocation
+		monotonic_time_ns      = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
+		timer_resolution_ns    = shard.timer_resolution_ns,
+		type_id                = u16(type_id),
+		slot_index             = 0, // Assigned per invocation
+		shard_id               = shard.id,
+	}
+
 	if type_descriptor.tick_handler != nil {
 		self: rawptr
 		self_handle := HANDLE_NONE
@@ -302,23 +318,42 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 			self_handle = make_handle(shard.id, u16(type_id), 0, shard.metadata[type_id].generation[0])
 		}
 
-		invocation := Isolate_Type_Tick_Invocation {
-			shard             = shard,
-			context_token     = make_tina_tick_context_token(shard),
-			self_handle       = self_handle,
-			monotonic_time_ns = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
-			current_tick      = shard.current_tick,
-			type_id           = u16(type_id),
-			shard_id          = shard.id,
+		// Explicitly reset variant state before dispatching
+		invocation.context_token = make_tina_context_token(shard)
+		invocation.self_handle = self_handle
+		invocation.current_message_source = HANDLE_NONE
+		invocation.current_correlation = CORRELATION_ID_NONE
+		invocation.flags = {}
+		invocation.slot_index = 0
+
+		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
+
+		working_stride := type_descriptor.working_memory_size
+		if working_stride > 0 && self_handle != HANDLE_NONE {
+			working_slice := shard.working_memory[type_id][0:working_stride]
+			invocation.working_arena = mem.Arena {
+				data   = working_slice,
+				offset = int(shard.metadata[type_id].working_arena_offset[0]),
+			}
+		} else {
+			invocation.working_arena = {}
 		}
 
 		previous_allocator := context.allocator
 		previous_temp_allocator := context.temp_allocator
-		g_current_isolate_type_tick_invocation = &invocation
+		g_current_isolate_invocation = &invocation
+		context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
+
 		type_descriptor.tick_handler(self, invocation.context_token)
-		g_current_isolate_type_tick_invocation = nil
+
 		context.allocator = previous_allocator
 		context.temp_allocator = previous_temp_allocator
+		g_current_isolate_invocation = invocation.previous
+
+		if working_stride > 0 && self_handle != HANDLE_NONE {
+			shard.metadata[type_id].working_arena_offset[0] = u32(invocation.working_arena.offset)
+		}
 	}
 
 	// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop.
@@ -447,25 +482,17 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 		ctx_flags: Context_Flags
 		if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
 
-		invocation := Isolate_Invocation {
-			previous               = g_current_isolate_invocation,
-			shard                  = shard,
-			context_token          = make_tina_context_token(shard),
-			self_handle            = make_handle(
-				shard.id,
-				u16(type_id),
-				slot_index,
-				generations[slot_index],
-			),
-			current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : HANDLE_NONE,
-			current_correlation    = correlation,
-			flags                  = ctx_flags,
-			monotonic_time_ns      = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
-			timer_resolution_ns    = shard.timer_resolution_ns,
-			type_id                = u16(type_id),
-			slot_index             = slot_index,
-			shard_id               = shard.id,
-		}
+		invocation.context_token = make_tina_context_token(shard)
+		invocation.self_handle = make_handle(
+			shard.id,
+			u16(type_id),
+			slot_index,
+			generations[slot_index],
+		)
+		invocation.current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : HANDLE_NONE
+		invocation.current_correlation = correlation
+		invocation.flags = ctx_flags
+		invocation.slot_index = slot_index
 		ctx := invocation.context_token
 
 		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
@@ -478,6 +505,8 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 				data   = working_slice,
 				offset = int(working_arena_offsets[slot_index]),
 			}
+		} else {
+			invocation.working_arena = {}
 		}
 
 		isolate_pointer := _get_isolate_ptr(shard, u16(type_id), slot_index)

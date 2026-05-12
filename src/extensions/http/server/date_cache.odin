@@ -1,5 +1,6 @@
 package http_server
 
+import tina "../../.."
 import "core:time"
 import "core:testing"
 
@@ -9,7 +10,7 @@ import "core:testing"
 // Uses monotonic time for fast checking and unix time for actual formatting.
 
 Date_Cache :: struct {
-	next_second_threshold_ns: u64,    // monotonic_ns at which the cache must reformat (DR-16)
+	next_second_threshold_ns: tina.Monotonic_Time_NS, // monotonic_ns at which the cache must reformat (DR-16)
 	size:                     u8,
 	bytes:                    [29]u8, // RFC 7231 Date, e.g. "Sun, 06 Nov 1994 08:49:37 GMT"
 }
@@ -55,7 +56,7 @@ write_four_digits :: #force_inline proc "contextless" (target: []u8, offset: int
 // crosses the next_second_threshold_ns threshold.
 update_date_cache :: #force_inline proc "contextless" (
 	cache: ^Date_Cache,
-	monotonic_ns: u64,
+	monotonic_ns: tina.Monotonic_Time_NS,
 	unix_epoch_ns: u64,
 ) {
 	// Fast path check.
@@ -108,7 +109,9 @@ update_date_cache :: #force_inline proc "contextless" (
 	// The simplest way without drifting is just to add the remaining nanoseconds 
 	// in the current wall clock second to the current monotonic time.
 	fraction_ns := unix_epoch_ns % NANOSECONDS_PER_SECOND
-	cache.next_second_threshold_ns = monotonic_ns + (NANOSECONDS_PER_SECOND - fraction_ns)
+	cache.next_second_threshold_ns = tina.Monotonic_Time_NS(
+		u64(monotonic_ns) + (NANOSECONDS_PER_SECOND - fraction_ns),
+	)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -126,7 +129,7 @@ test_date_cache_formatting :: proc(t: ^testing.T) {
 	known_time, _ := time.components_to_time(1994, 11, 6, 8, 49, 37)
 	unix_ns := u64(time.to_unix_nanoseconds(known_time))
 	
-	monotonic_ns := u64(10_000_000_000)
+	monotonic_ns := tina.Monotonic_Time_NS(10_000_000_000)
 	update_date_cache(&cache, monotonic_ns, unix_ns)
 	
 	testing.expect_value(t, cache.size, 29)
@@ -134,22 +137,24 @@ test_date_cache_formatting :: proc(t: ^testing.T) {
 	
 	// Threshold should be monotonic + remaining ns
 	fraction_ns := unix_ns % NANOSECONDS_PER_SECOND
-	expected_threshold := monotonic_ns + (NANOSECONDS_PER_SECOND - fraction_ns)
+	expected_threshold := tina.Monotonic_Time_NS(
+		u64(monotonic_ns) + (NANOSECONDS_PER_SECOND - fraction_ns),
+	)
 	testing.expect_value(t, cache.next_second_threshold_ns, expected_threshold)
 }
 
 @(test)
-test_date_cache_skips_when_under_threshold :: proc(t: ^testing.T) {
+	test_date_cache_skips_when_under_threshold :: proc(t: ^testing.T) {
 	cache := Date_Cache{}
-	cache.next_second_threshold_ns = 5000
+	cache.next_second_threshold_ns = tina.Monotonic_Time_NS(5000)
 	
 	// Should do nothing because 4000 < 5000
-	update_date_cache(&cache, 4000, 0)
+	update_date_cache(&cache, tina.Monotonic_Time_NS(4000), 0)
 	testing.expect_value(t, cache.size, 0)
 	
 	// Should update because 5000 >= 5000
 	known_time, _ := time.components_to_time(2026, 1, 1, 0, 0, 0)
 	unix_ns := u64(time.to_unix_nanoseconds(known_time))
-	update_date_cache(&cache, 5000, unix_ns)
+	update_date_cache(&cache, tina.Monotonic_Time_NS(5000), unix_ns)
 	testing.expect_value(t, cache.size, 29)
 }

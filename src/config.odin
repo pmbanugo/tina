@@ -25,7 +25,7 @@ TINA_RUNTIME_ASSERTIONS :: #config(TINA_ASSERTS, true)
 
 Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect
-Tick_Handler :: #type proc(self: rawptr, ctx: TinaTickContext)
+Tick_Handler :: #type proc(self: rawptr, ctx: TinaContext)
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 TypeDescriptor :: struct {
