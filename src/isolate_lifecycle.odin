@@ -132,7 +132,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	previous_allocator := context.allocator
 	previous_temp_allocator := context.temp_allocator
 	g_current_isolate_invocation = &child_invocation
-	context.allocator = mem.arena_allocator(&child_invocation.scratch_arena)
+	context.allocator = mem.arena_allocator(&child_invocation.working_arena)
 	context.temp_allocator = mem.arena_allocator(&child_invocation.scratch_arena)
 
 	effect := shard.type_descriptors[type_id].init_handler(

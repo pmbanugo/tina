@@ -13,6 +13,7 @@ Test_Context_Config :: struct {
 	monotonic_time_ns:   Monotonic_Time_NS,
 	timer_resolution_ns: u64,
 	shutting_down:       bool,
+	working_memory_size: int,
 }
 
 Test_Local_Context_Config :: struct {
@@ -23,6 +24,7 @@ Test_Local_Context_Config :: struct {
 	timer_resolution_ns:     u64,
 	target_mailbox_capacity: u32,
 	target_state:            Isolate_State,
+	working_memory_size:     int,
 }
 
 test_with_context :: proc(
@@ -53,6 +55,11 @@ test_with_context :: proc(
 	scratch_bytes := make([]u8, 4096)
 	defer delete(scratch_bytes)
 
+	working_size := config.working_memory_size
+	if working_size == 0 do working_size = 4096
+	working_bytes := make([]u8, working_size)
+	defer delete(working_bytes)
+
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
 		shard                  = &shard,
@@ -68,11 +75,12 @@ test_with_context :: proc(
 		shard_id               = shard.id,
 	}
 	mem.arena_init(&invocation.scratch_arena, scratch_bytes)
+	mem.arena_init(&invocation.working_arena, working_bytes)
 
 	previous_allocator := context.allocator
 	previous_temp_allocator := context.temp_allocator
 	g_current_isolate_invocation = &invocation
-	context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+	context.allocator = mem.arena_allocator(&invocation.working_arena)
 	context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
 	callback(user_data, invocation.context_token)
@@ -132,6 +140,11 @@ test_with_local_context :: proc(
 	scratch_bytes := make([]u8, 4096)
 	defer delete(scratch_bytes)
 
+	working_size := config.working_memory_size
+	if working_size == 0 do working_size = 4096
+	working_bytes := make([]u8, working_size)
+	defer delete(working_bytes)
+
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
 		shard                  = &shard,
@@ -147,11 +160,12 @@ test_with_local_context :: proc(
 		shard_id               = shard.id,
 	}
 	mem.arena_init(&invocation.scratch_arena, scratch_bytes)
+	mem.arena_init(&invocation.working_arena, working_bytes)
 
 	previous_allocator := context.allocator
 	previous_temp_allocator := context.temp_allocator
 	g_current_isolate_invocation = &invocation
-	context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+	context.allocator = mem.arena_allocator(&invocation.working_arena)
 	context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
 	callback(user_data, invocation.context_token)

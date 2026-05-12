@@ -342,7 +342,7 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 		previous_allocator := context.allocator
 		previous_temp_allocator := context.temp_allocator
 		g_current_isolate_invocation = &invocation
-		context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+		context.allocator = mem.arena_allocator(&invocation.working_arena)
 		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
 		type_descriptor.tick_handler(self, invocation.context_token)
@@ -528,7 +528,7 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 		previous_allocator := context.allocator
 		previous_temp_allocator := context.temp_allocator
 		g_current_isolate_invocation = &invocation
-		context.allocator = mem.arena_allocator(&invocation.scratch_arena)
+		context.allocator = mem.arena_allocator(&invocation.working_arena)
 		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
 		effect := type_descriptor.handler_fn(isolate_pointer, message_pointer, ctx)
