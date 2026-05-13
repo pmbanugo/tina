@@ -105,8 +105,6 @@ This layout has four properties the hardware rewards:
 - **Type-pure iteration.** When the scheduler dispatches all Session Isolates, it touches only Session memory. Timer and Listener data stays out of the cache.
 - **Instruction cache efficiency.** Processing all Session Isolates in sequence keeps the Session handler function hot in L1i. The scheduler batches by type for exactly this reason.
 
-Isolate metadata (state, generation, mailbox head/tail, I/O completion tags) is stored in a parallel **SOA (Structure of Arrays)** layout, separate from the user-facing Isolate struct. This lets the scheduler scan metadata arrays (e.g. checking which Isolates have pending work) without pulling any user data into the cache.
-
 ## No General-Purpose Malloc
 
 There is no `ctx_alloc(size)` that returns arbitrary memory with arbitrary lifetime. Every allocation goes through one of the three generations:
