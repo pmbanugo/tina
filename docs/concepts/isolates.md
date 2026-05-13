@@ -85,7 +85,7 @@ Handle (u64):
 
 The **generation** is the key to safety. When an Isolate is torn down, its arena slot's generation counter increments. Any Handle still referencing the old generation is now **stale** — sends to it return `.stale_handle` instead of delivering to whatever new Isolate now occupies that slot.
 
-This eliminates dangling pointers, use-after-free, and the ABA problem — structurally, without reference counting, garbage collection, or borrow checking. It's the same technique used in game engines (entity handles in ECS), Rust's `slotmap`, and generational arena allocators.
+This eliminates dangling pointers, use-after-free, and the ABA problem — structurally, without reference counting, garbage collection, or borrow checking.
 
 **HANDLE_NONE** (`0`) is the null sentinel. It always fails validation.
 
@@ -107,8 +107,6 @@ Every message is a fixed-size **128-byte envelope**:
 | `correlation` | 4 bytes | For `.call` request-response matching |
 | `_reserved` | 4 bytes | Mailbox queue linkage (scheduler-internal) |
 | `payload` | 96 bytes | Inline message data |
-
-128 bytes = two x86 cache lines = one Apple Silicon cache line. This alignment is deliberate: the L2 spatial prefetcher on Intel fetches 128-byte pairs, so every prefetch brings data from the same message, not an unrelated one.
 
 For payloads larger than 96 bytes, use the **Transfer Buffer Pool** — allocate via `ctx_transfer_alloc()`, write via `ctx_transfer_write()`, send a small reference message, receiver reads via `ctx_transfer_read()`.
 
@@ -173,12 +171,12 @@ result := tina.ctx_spawn(ctx, spec)
 
 ## Tradeoffs Accepted
 
-**No selective receive.** The handler always gets the HEAD message from its mailbox. If you need to process messages out of order, you store them in the Isolate's state and replay them later. This keeps the mailbox a simple FIFO queue — no scan, no pattern matching overhead, no complexity.
+**No selective receive.** The handler always gets the first message from its mailbox. If you need to process messages out of order, you store them in the Isolate's state and replay them later. This keeps the mailbox a simple FIFO queue — no scan, no pattern matching overhead, no complexity.
 
 **No location transparency.** A Handle encodes the Shard ID. The sender knows (structurally) whether the target is local or remote. There is no naming service, no registry, no distributed Handle resolution. If you need a name service, build it as an Isolate.
 
-**Fixed-size envelopes limit inline payloads to 96 bytes.** Most messages fit easily (a Handle is 8 bytes, a typical request struct is 20–60 bytes). For larger payloads, the Transfer Buffer Pool provides a reference-passing mechanism. This keeps the common path — allocate one pool slot, copy 128 bytes — cache-optimal.
+**Fixed-size envelopes limit inline payloads to 96 bytes.** Most messages fit easily (a Handle is 8 bytes, a typical request struct is 20–60 bytes). For larger payloads, the Transfer Buffer Pool provides a reference-passing mechanism. This keeps the common path cache-optimal.
 
-**One outstanding `.call` per Isolate.** An Isolate can have at most one pending `.call` at a time (structural consequence: the handler returns one Effect). If you need scatter-gather (multiple concurrent requests), decompose into multiple cooperating Isolates — one per concurrent call.
+**One outstanding `.call` per Isolate.** An Isolate can have at most one pending `.call` at a time (structural consequence: the handler returns one Effect). If you need scatter-gather (multiple concurrent requests), decompose into multiple cooperating Isolates — one per concurrent call. However, you can build your own request-response protocol on top of the async messaging.
 
 **Init args are limited to 64 bytes.** Serialized into a fixed-size buffer on the `Spawn_Spec`. If you need to pass more state to a newly spawned Isolate, send a follow-up message after spawn. This keeps the spawn path allocation-free.
