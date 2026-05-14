@@ -106,7 +106,7 @@ grand_arena_allocator_proc :: proc(
 	case .Alloc:
 		// Enforce cache-line alignment to ensure clean hardware prefetching and
 		// prevent cache-line splits on dense array iteration.
-		// over-padded: The 48 bytes wasted on dispatch_cursors/isolate_free_heads
+		// over-padded: The bytes wasted on dispatch_cursors/dispatch_credit_counts/isolate_free_heads
 		// is a harmless casualty of a blunt, safe default.
 		//
 		// Switching to e.g. Bimodal Alignment,
@@ -116,7 +116,7 @@ grand_arena_allocator_proc :: proc(
 		// Bimodal Alignment (rough idea):
 		// massive chunks of memory (Message Pools, Reactor Buffers, Typed Arenas)
 		// should be cache-line aligned for prefetching and SIMD efficiency.
-		// But tiny metadata slices (Slice Headers, dispatch_cursors, isolate_free_heads)
+		// But tiny metadata slices (Slice Headers, dispatch_cursors, dispatch_credit_counts, isolate_free_heads)
 		// should be tightly packed.
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
 		ptr, err := grand_arena_alloc_named(data.arena, data.current_name, size, actual_alignment)
@@ -184,9 +184,16 @@ hydrate_shard :: proc(
 	shard.working_memory = make([][]u8, types_count, alloc)
 	shard.metadata = make([]#soa[]Isolate_Metadata, types_count, alloc)
 	shard.isolate_free_heads = make([]u32, types_count, alloc)
+	if spec.maintenance_task_count_max > 0 {
+		alloc_data.current_name = "Maintenance_Tasks"
+		shard.maintenance_tasks = make([]Shard_Maintenance_Task, spec.maintenance_task_count_max, alloc)
+	}
 
 	alloc_data.current_name = "Dispatch_Cursors"
 	shard.dispatch_cursors = make([]u32, types_count, alloc)
+
+	alloc_data.current_name = "Dispatch_Credit_Counts"
+	shard.dispatch_credit_counts = make([]Scheduler_Credit_Count, types_count, alloc)
 
 	// 3. Allocate Type-Specific Data (Inner slices)
 	for t, i in spec.types {
@@ -291,7 +298,7 @@ hydrate_shard :: proc(
 	) or_return
 
 	backend_config := Backend_Config {
-		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
+		queue_size = REACTOR_SUBMISSION_BATCH_COUNT,
 	}
 	when TINA_SIMULATION_MODE {
 		if spec.simulation != nil {

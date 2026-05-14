@@ -6,8 +6,6 @@ import "core:os"
 import "core:sync"
 import "core:testing"
 
-DISPATCH_QUOTA_PER_WEIGHT :: 256 // Baseline message processing limit per tick, per priority weight
-
 RECOVERY_TIER_3 :: 1
 RECOVERY_WATCHDOG :: 2
 RECOVERY_ROOT_ESCALATE :: 3
@@ -157,12 +155,14 @@ Shard :: struct {
 	type_descriptors:       []TypeDescriptor,
 	isolate_free_heads:     []u32, // free list heads per Isolate Type
 	dispatch_cursors:       []u32, // Resumption index for budgeted dispatch
+	dispatch_credit_counts: []Scheduler_Credit_Count,
 	isolate_memory:         [][]u8,
 	working_memory:         [][]u8, // Base slices for working memory
 	scratch_memory:         []u8, // Base slice for scratch arena
 	transfer_generations:   []u16,
 	metadata:               []#soa[]Isolate_Metadata,
 	supervision_groups:     []Supervision_Group,
+	maintenance_tasks:      []Shard_Maintenance_Task,
 	handoff_table:          FD_Handoff_Table,
 
 	// --- Hot Embedded Structs (8-byte aligned) ---
@@ -180,8 +180,10 @@ Shard :: struct {
 	handoff_retry_head:     u32,
 	handoff_retry_tail:     u32,
 	handoff_retry_count:    u32,
+	maintenance_task_count: u16,
 	current_msg_slot:       u32,
 	current_slot_index:     u32,
+	dispatch_type_cursor:   u32,
 	id:                     Shard_Id,
 	shard_count:            u8,
 	current_type_id:        u16,
@@ -290,7 +292,15 @@ _dispatch_kind_for_slot :: #force_inline proc "contextless" (
 }
 
 @(private = "file")
-_dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
+_dispatch_type_batch :: proc(
+	shard: ^Shard,
+	type_descriptor: TypeDescriptor,
+	work_budget_count: Scheduler_Work_Count,
+) -> Scheduler_Work_Count {
+	if work_budget_count == 0 {
+		return 0
+	}
+
 	type_id := type_descriptor.id
 	slot_count := u32(type_descriptor.slot_count)
 
@@ -305,55 +315,10 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 		flags                  = {}, // Assigned per invocation
 		monotonic_time_ns      = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
 		timer_resolution_ns    = shard.timer_resolution_ns,
+		current_tick           = shard.current_tick,
 		type_id                = u16(type_id),
 		slot_index             = 0, // Assigned per invocation
 		shard_id               = shard.id,
-	}
-
-	if type_descriptor.tick_handler != nil {
-		self: rawptr
-		self_handle := HANDLE_NONE
-		if slot_count > 0 && shard.metadata[type_id].state[0] != .Unallocated {
-			self = _get_isolate_ptr(shard, u16(type_id), 0)
-			self_handle = make_handle(shard.id, u16(type_id), 0, shard.metadata[type_id].generation[0])
-		}
-
-		// Explicitly reset variant state before dispatching
-		invocation.context_token = make_tina_context_token(shard)
-		invocation.self_handle = self_handle
-		invocation.current_message_source = HANDLE_NONE
-		invocation.current_correlation = CORRELATION_ID_NONE
-		invocation.flags = {}
-		invocation.slot_index = 0
-
-		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
-
-		working_stride := type_descriptor.working_memory_size
-		if working_stride > 0 && self_handle != HANDLE_NONE {
-			working_slice := shard.working_memory[type_id][0:working_stride]
-			invocation.working_arena = mem.Arena {
-				data   = working_slice,
-				offset = int(shard.metadata[type_id].working_arena_offset[0]),
-			}
-		} else {
-			invocation.working_arena = {}
-		}
-
-		previous_allocator := context.allocator
-		previous_temp_allocator := context.temp_allocator
-		g_current_isolate_invocation = &invocation
-		context.allocator = mem.arena_allocator(&invocation.working_arena)
-		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
-
-		type_descriptor.tick_handler(self, invocation.context_token)
-
-		context.allocator = previous_allocator
-		context.temp_allocator = previous_temp_allocator
-		g_current_isolate_invocation = invocation.previous
-
-		if working_stride > 0 && self_handle != HANDLE_NONE {
-			shard.metadata[type_id].working_arena_offset[0] = u32(invocation.working_arena.offset)
-		}
 	}
 
 	// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop.
@@ -369,7 +334,7 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 	working_arena_offsets := shard.metadata[type_id].working_arena_offset[:]
 	pending_transfer_reads := shard.metadata[type_id].pending_transfer_read[:]
 
-	dispatch_budget := u32(type_descriptor.budget_weight) * DISPATCH_QUOTA_PER_WEIGHT
+	dispatch_budget := u32(work_budget_count)
 	dispatched_count: u32 = 0
 
 	shard.current_type_id = u16(type_id)
@@ -566,9 +531,164 @@ _dispatch_type_batch :: proc(shard: ^Shard, type_descriptor: TypeDescriptor) {
 	if dispatched_count < dispatch_budget {
 		shard.dispatch_cursors[type_id] = 0
 	}
+
+	return Scheduler_Work_Count(dispatched_count)
 }
 
 // --- Scheduler Loop ---
+
+@(private = "file")
+_scheduler_run_maintenance_tasks :: proc(shard: ^Shard) {
+	if shard.maintenance_task_count == 0 {
+		return
+	}
+
+	invocation := Isolate_Invocation {
+		previous               = g_current_isolate_invocation,
+		shard                  = shard,
+		context_token          = 0,
+		self_handle            = HANDLE_NONE,
+		current_message_source = HANDLE_NONE,
+		current_correlation    = CORRELATION_ID_NONE,
+		flags                  = {.Maintenance},
+		monotonic_time_ns      = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
+		timer_resolution_ns    = shard.timer_resolution_ns,
+		current_tick           = shard.current_tick,
+		type_id                = 0,
+		slot_index             = 0,
+		shard_id               = shard.id,
+	}
+
+	for task_index in 0 ..< int(shard.maintenance_task_count) {
+		task := &shard.maintenance_tasks[task_index]
+		if task.handler == nil || shard.current_tick < task.next_tick {
+			continue
+		}
+
+		work_budget_count := u32(task.work_budget_count_max)
+		weight_count := u32(task.budget_weight)
+		if weight_count == 0 do weight_count = 1
+		if work_budget_count == 0 do work_budget_count = u32(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX)
+		work_budget_count *= weight_count
+
+		invocation.context_token = make_tina_context_token(shard)
+		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
+
+		previous_allocator := context.allocator
+		previous_temp_allocator := context.temp_allocator
+		g_current_isolate_invocation = &invocation
+		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
+
+		result := task.handler(
+			task.state,
+			Shard_Maintenance_Context(invocation.context_token),
+			Scheduler_Work_Count(work_budget_count),
+		)
+
+		context.allocator = previous_allocator
+		context.temp_allocator = previous_temp_allocator
+		g_current_isolate_invocation = invocation.previous
+
+		if result.wants_reschedule {
+			if result.work_count >= Scheduler_Work_Count(work_budget_count) {
+				task.next_tick = shard.current_tick
+			} else {
+				task.next_tick = shard.current_tick + u64(task.cadence_tick_count)
+			}
+		} else {
+			task.next_tick = max(u64)
+		}
+	}
+}
+
+@(private = "file")
+_scheduler_dispatch_batch_count_limit :: #force_inline proc "contextless" (
+	credit_count: u32,
+	turn_work_budget_count: u32,
+	dispatch_since_io_service_count: u32,
+) -> u32 {
+	type_dispatch_batch_count_max := u32(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX)
+	io_service_interval_count := u32(SCHEDULER_IO_SERVICE_INTERVAL_COUNT)
+	io_service_remaining_count := io_service_interval_count - dispatch_since_io_service_count
+
+	batch_count := min(credit_count, type_dispatch_batch_count_max)
+	batch_count = min(batch_count, turn_work_budget_count)
+	batch_count = min(batch_count, io_service_remaining_count)
+	return batch_count
+}
+
+@(private = "file")
+_scheduler_replenish_dispatch_credits :: proc(shard: ^Shard) {
+	credit_count_max := u32(SCHEDULER_CREDIT_COUNT_MAX)
+	credit_per_weight_count := u32(SCHEDULER_CREDIT_PER_WEIGHT_COUNT)
+
+	for type_descriptor, type_index in shard.type_descriptors {
+		weight_count := u32(type_descriptor.budget_weight)
+		if weight_count == 0 do weight_count = 1
+
+		credit_count := u32(shard.dispatch_credit_counts[type_index])
+		credit_count += weight_count * credit_per_weight_count
+		if credit_count > credit_count_max do credit_count = credit_count_max
+		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(credit_count)
+	}
+}
+
+@(private = "file")
+_scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
+	type_count := u32(len(shard.type_descriptors))
+	if type_count == 0 {
+		return
+	}
+
+	turn_work_budget_count := u32(SCHEDULER_TURN_WORK_BUDGET_COUNT)
+	io_service_interval_count := u32(SCHEDULER_IO_SERVICE_INTERVAL_COUNT)
+	dispatch_since_io_service_count: u32 = 0
+	idle_type_count: u32 = 0
+
+	for turn_work_budget_count > 0 && idle_type_count < type_count {
+		if dispatch_since_io_service_count >= io_service_interval_count {
+			reactor_service_nonblocking(&shard.reactor, shard)
+			dispatch_since_io_service_count = 0
+		}
+
+		type_index := shard.dispatch_type_cursor
+		shard.dispatch_type_cursor += 1
+		if shard.dispatch_type_cursor >= type_count do shard.dispatch_type_cursor = 0
+
+		credit_count := u32(shard.dispatch_credit_counts[type_index])
+		if credit_count == 0 {
+			idle_type_count += 1
+			continue
+		}
+
+		type_work_budget_count := _scheduler_dispatch_batch_count_limit(
+			credit_count,
+			turn_work_budget_count,
+			dispatch_since_io_service_count,
+		)
+
+		dispatched_count := u32(_dispatch_type_batch(
+			shard,
+			shard.type_descriptors[type_index],
+			Scheduler_Work_Count(type_work_budget_count),
+		))
+
+		if dispatched_count == 0 {
+			idle_type_count += 1
+			continue
+		}
+
+		idle_type_count = 0
+		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(credit_count - dispatched_count)
+		turn_work_budget_count -= dispatched_count
+		dispatch_since_io_service_count += dispatched_count
+
+		if dispatch_since_io_service_count >= io_service_interval_count {
+			reactor_service_nonblocking(&shard.reactor, shard)
+			dispatch_since_io_service_count = 0
+		}
+	}
+}
 
 scheduler_tick :: proc(shard: ^Shard) {
 	_handle_shard_control_signal(shard)
@@ -583,6 +703,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 		sync.atomic_store_explicit(&shard.heartbeat_tick, shard.current_tick, .Relaxed)
 	}
 	now := shard.current_tick
+	backend_set_current_tick(&shard.reactor.backend, now)
 
 	// ========================================================================
 	// Step 1: Drain inbound cross-shard rings → deliver to local mailboxes
@@ -590,21 +711,22 @@ scheduler_tick :: proc(shard: ^Shard) {
 	transport_drain_inbound(shard, now)
 
 	// ========================================================================
-	// Step 2: Collect I/O completions
+	// Step 2: Initial nonblocking I/O service point
 	// ========================================================================
-	reactor_collect_completions(&shard.reactor, shard, 0)
+	reactor_service_nonblocking(&shard.reactor, shard)
 
 	// ========================================================================
-	// Step 3: Isolate Dispatch (Budget-limited by type)
+	// Step 3: Shard maintenance and weighted dispatch
 	// ========================================================================
-	for type_descriptor in shard.type_descriptors {
-		_dispatch_type_batch(shard, type_descriptor)
-	}
+	_scheduler_run_maintenance_tasks(shard)
+	_scheduler_replenish_dispatch_credits(shard)
+	_scheduler_run_dispatch_turn(shard)
 
 	// ========================================================================
-	// Step 4: Flush I/O submissions
+	// Step 4: Final I/O service point and handoff scans
 	// ========================================================================
 	reactor_flush_submissions(&shard.reactor, shard)
+	reactor_service_nonblocking(&shard.reactor, shard)
 	_fd_handoff_retry_scan(shard)
 	_fd_handoff_timeout_scan(shard, now)
 
@@ -1746,6 +1868,23 @@ test_fd_handoff_timeout_scan_counts_but_keeps_entry :: proc(t: ^testing.T) {
 
 	_fd_handoff_timeout_scan(shard, 100)
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(1))
+}
+
+@(test)
+test_scheduler_dispatch_batch_count_limit_respects_io_service_interval :: proc(t: ^testing.T) {
+	limit_start := _scheduler_dispatch_batch_count_limit(1024, 1024, 0)
+	expected_start := min(
+		u32(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX),
+		u32(SCHEDULER_IO_SERVICE_INTERVAL_COUNT),
+	)
+	testing.expect_value(t, limit_start, expected_start)
+
+	limit_edge := _scheduler_dispatch_batch_count_limit(
+		1024,
+		1024,
+		u32(SCHEDULER_IO_SERVICE_INTERVAL_COUNT) - 1,
+	)
+	testing.expect_value(t, limit_edge, u32(1))
 }
 
 @(test)

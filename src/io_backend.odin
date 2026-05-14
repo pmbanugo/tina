@@ -115,6 +115,10 @@ backend_collect :: proc(
 	return _backend_collect(backend, completions, timeout_ns)
 }
 
+backend_set_current_tick :: #force_inline proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {
+	_backend_set_current_tick(backend, tick_count)
+}
+
 // Best-effort cancellation. Correctness does not depend on cancel succeeding.
 backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
 	return _backend_cancel(backend, token)

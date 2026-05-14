@@ -23,12 +23,17 @@ when !TINA_SIMULATION_MODE {
 
 	MAX_WIN_OVERLAPPED :: 512
 
-	// Derivation: MAX_WIN_OVERLAPPED (512) synchronous completions from submit
-	// + 128 IOCP events dequeued per GetQueuedCompletionStatusEx call = 640.
+	// Derivation: up to REACTOR_SUBMISSION_BATCH_COUNT completions may arrive
+	// synchronously during submit, and one IOCP harvest can dequeue up to
+	// REACTOR_COMPLETION_BATCH_COUNT entries. Keep the staging capacity derived from
+	// those configured bounds so the backend does not silently clamp the reactor.
 	// The overflow path in _backend_collect buffers excess completions here when the
 	// caller's output slice is smaller than the IOCP batch.
 	// TODO: Consider exposing via Backend_Config if workloads require larger bursts.
-	MAX_WIN_COMPLETED :: 640
+	MAX_WIN_COMPLETED :: REACTOR_SUBMISSION_BATCH_COUNT + REACTOR_COMPLETION_BATCH_COUNT
+	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_WIN_OVERLAPPED)
+	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_WIN_COMPLETED)
+	#assert(REACTOR_COMPLETION_BATCH_COUNT <= MAX_WIN_COMPLETED)
 
 	// TransmitFile (sendfile) — not in core:sys/windows, define locally.
 	WSAID_TRANSMITFILE :: win.GUID{0xb5367df0, 0xcbac, 0x11cf, {0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92}}
@@ -548,7 +553,7 @@ when !TINA_SIMULATION_MODE {
 			timeout_ms = win.INFINITE
 		}
 
-		events: [128]win.OVERLAPPED_ENTRY
+		events: [REACTOR_COMPLETION_BATCH_COUNT]win.OVERLAPPED_ENTRY
 		entries_removed: win.ULONG
 		if !win.GetQueuedCompletionStatusEx(
 			backend.iocp,
@@ -682,6 +687,9 @@ when !TINA_SIMULATION_MODE {
 
 		return count, .None
 	}
+
+	@(private = "package")
+	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
 
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {

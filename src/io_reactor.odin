@@ -3,7 +3,11 @@ package tina
 
 import "core:testing"
 
-MAX_REACTOR_BATCH :: DEFAULT_BACKEND_QUEUE_SIZE
+MAX_REACTOR_SUBMISSION_BATCH :: REACTOR_SUBMISSION_BATCH_COUNT
+MAX_REACTOR_COMPLETION_BATCH :: REACTOR_COMPLETION_BATCH_COUNT
+
+#assert(MAX_REACTOR_SUBMISSION_BATCH <= int(max(u16)))
+#assert(MAX_REACTOR_COMPLETION_BATCH <= int(max(u16)))
 
 Reactor_Socket_Error :: enum u8 {
 	None,
@@ -26,11 +30,11 @@ FD_HANDOFF_TIMEOUT_TICKS :: u64(16)
 //
 // Bridges the Platform_Backend with the Shard's Isolate handles and memory.
 // It manages the FD table, the buffer pool, and accumulates I/O submissions
-// for a single tick-wide flush.
+// for budgeted scheduler service points.
 
 Reactor :: struct {
 	backend:             Platform_Backend,
-	pending_submissions: [MAX_REACTOR_BATCH]Submission,
+	pending_submissions: [MAX_REACTOR_SUBMISSION_BATCH]Submission,
 
 	// Core Data Structures
 	fd_table:            FD_Table,
@@ -375,7 +379,7 @@ _reactor_completion_apply_recvfrom :: proc (
 }
 
 reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns: i64) {
-	completions: [MAX_REACTOR_BATCH]Raw_Completion
+	completions: [MAX_REACTOR_COMPLETION_BATCH]Raw_Completion
 
 	count, err := backend_collect(&reactor.backend, completions[:], timeout_ns)
 	if err != .None || count == 0 do return
@@ -432,15 +436,20 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 	}
 }
 
-reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) {
-	if reactor.pending_count == 0 do return
+reactor_service_nonblocking :: proc(reactor: ^Reactor, shard: ^Shard) {
+	reactor_collect_completions(reactor, shard, 0)
+	reactor_flush_submissions_if_needed(reactor, shard)
+}
+
+reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_Error {
+	if reactor.pending_count == 0 do return .None
 
 	err := backend_submit(&reactor.backend, reactor.pending_submissions[:reactor.pending_count])
 
 	// Fast-return on success
 	if err == .None {
 		reactor.pending_count = 0
-		return
+		return .None
 	}
 
 	// Error Path: Backend Queue Full
@@ -472,6 +481,14 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) {
 	}
 
 	reactor.pending_count = 0
+	return err
+}
+
+reactor_flush_submissions_if_needed :: proc(reactor: ^Reactor, shard: ^Shard) {
+	if reactor.pending_count < u16(REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT) {
+		return
+	}
+	reactor_flush_submissions(reactor, shard)
 }
 
 // ============================================================================
@@ -485,8 +502,15 @@ reactor_submit_io :: proc(
 	owner: Handle,
 	io_op: IoOp,
 ) -> IO_Error {
-	if reactor.pending_count >= MAX_REACTOR_BATCH {
-		return IO_ERR_SUBMISSION_FULL
+	if reactor.pending_count >= MAX_REACTOR_SUBMISSION_BATCH {
+		flush_err := reactor_flush_submissions(reactor, shard)
+		if flush_err != .None {
+			return IO_ERR_SUBMISSION_FULL
+		}
+		reactor_service_nonblocking(reactor, shard)
+		if reactor.pending_count >= MAX_REACTOR_SUBMISSION_BATCH {
+			return IO_ERR_SUBMISSION_FULL
+		}
 	}
 
 	type_index := extract_type_id(owner)

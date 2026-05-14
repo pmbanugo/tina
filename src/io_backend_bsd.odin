@@ -31,13 +31,16 @@ when !TINA_SIMULATION_MODE {
 
 	MAX_POSIX_PENDING :: 1024
 
-	// Derivation: up to MAX_POSIX_PENDING (1024) submissions may complete immediately
-	// during _backend_submit, but the all-or-error pre-check caps each batch to
-	// available completed slots. The overflow risk is in _backend_collect: kevent
-	// returns up to 128 events, each producing a completion. 256 (submit headroom)
-	// + 128 (kevent batch) = 384.
+	// Derivation: up to REACTOR_SUBMISSION_BATCH_COUNT submissions may complete
+	// immediately during _backend_submit, and one collect pass may harvest up to
+	// REACTOR_COMPLETION_BATCH_COUNT readiness events. Size the completion staging
+	// explicitly from those configured reactor bounds so the backend never silently
+	// truncates the configured batch size.
 	// TODO: Consider exposing via Backend_Config if workloads require larger bursts.
-	MAX_POSIX_COMPLETED :: 384
+	MAX_POSIX_COMPLETED :: REACTOR_SUBMISSION_BATCH_COUNT + REACTOR_COMPLETION_BATCH_COUNT
+	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_POSIX_PENDING)
+	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_POSIX_COMPLETED)
+	#assert(REACTOR_COMPLETION_BATCH_COUNT <= MAX_POSIX_COMPLETED)
 	POSIX_WAKE_IDENT :: 69
 
 	// SO_NOSIGPIPE suppresses SIGPIPE on a per-socket basis.
@@ -242,7 +245,7 @@ when !TINA_SIMULATION_MODE {
 			time_spec_pointer = &time_spec
 		}
 
-		events_buf: [128]kq.KEvent
+		events_buf: [REACTOR_COMPLETION_BATCH_COUNT]kq.KEvent
 
 		n, kerr := kq.kevent(kq.KQ(backend.kq_fd), nil, events_buf[:], time_spec_pointer)
 		if kerr != nil {
@@ -356,6 +359,9 @@ when !TINA_SIMULATION_MODE {
 
 		return out, .None
 	}
+
+	@(private = "package")
+	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
 
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {

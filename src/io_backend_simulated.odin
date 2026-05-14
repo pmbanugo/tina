@@ -17,6 +17,7 @@ when TINA_SIMULATION_MODE {
 	MAX_SIMULATED_PENDING :: 1024
 	MAX_SIMULATED_DESCRIPTORS :: 4096
 	MAX_SIMULATED_OBJECTS :: 4096
+	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_SIMULATED_PENDING)
 	SIM_DESCRIPTOR_NONE_INDEX :: u16(0xFFFF)
 	SIM_OBJECT_NONE_INDEX :: u16(0xFFFF)
 	SIM_ERR_BADF :: i32(-9)
@@ -73,6 +74,8 @@ when TINA_SIMULATION_MODE {
 		prng:          Prng, // used only for reordering (order-dependent is OK)
 		seed:          u64, // original seed for per-op deterministic derivation
 		tick_count:    u64,
+		time_controlled: bool,
+		_padding:        [7]u8,
 		config:        Simulation_IO_Config,
 	}
 
@@ -80,6 +83,7 @@ when TINA_SIMULATION_MODE {
 	_backend_init :: proc(backend: ^Platform_Backend, config: Backend_Config) -> Backend_Error {
 		backend.pending_count = 0
 		backend.tick_count = 0
+		backend.time_controlled = false
 		backend.config = config.sim_config
 		if g_sim_fd_state.active_backend_count == 0 {
 			_sim_fd_state_reset()
@@ -175,7 +179,9 @@ when TINA_SIMULATION_MODE {
 		u32,
 		Backend_Error,
 	) {
-		backend.tick_count += 1
+		if !backend.time_controlled {
+			backend.tick_count += 1
+		}
 		completed_count: u32 = 0
 
 		// Scan pending for operations whose delay has elapsed
@@ -247,6 +253,12 @@ when TINA_SIMULATION_MODE {
 		}
 
 		return completed_count, .None
+	}
+
+	@(private = "package")
+	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {
+		backend.tick_count = tick_count
+		backend.time_controlled = true
 	}
 
 	@(private = "package")
@@ -867,6 +879,53 @@ when TINA_SIMULATION_MODE {
 			testing.expect_value(t, result1[i].token, result2[i].token)
 			testing.expect_value(t, result1[i].result, result2[i].result)
 		}
+	}
+
+	@(test)
+	test_simulated_backend_collect_uses_shard_controlled_time :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			sim_config = Simulation_IO_Config {
+				delay_range_ticks = {1, 1},
+				seed              = t.seed,
+			},
+		}
+		backend_init(&backend, config)
+		defer backend_deinit(&backend)
+
+		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_err, Backend_Error.None)
+
+		backend_set_current_tick(&backend, 7)
+
+		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, 5)
+		submissions := [1]Submission {
+			{
+				token = token,
+				operation = Submission_Op_Recv {
+					fd_socket = fd,
+					size      = 256,
+				},
+			},
+		}
+		sub_err := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_err, Backend_Error.None)
+
+		completions: [1]Raw_Completion
+		count_first, collect_err_first := backend_collect(&backend, completions[:], 0)
+		testing.expect_value(t, collect_err_first, Backend_Error.None)
+		testing.expect_value(t, count_first, u32(0))
+
+		count_second, collect_err_second := backend_collect(&backend, completions[:], 0)
+		testing.expect_value(t, collect_err_second, Backend_Error.None)
+		testing.expect_value(t, count_second, u32(0))
+		testing.expect_value(t, backend.tick_count, u64(7))
+
+		backend_set_current_tick(&backend, 8)
+		count_third, collect_err_third := backend_collect(&backend, completions[:], 0)
+		testing.expect_value(t, collect_err_third, Backend_Error.None)
+		testing.expect_value(t, count_third, u32(1))
+		testing.expect_value(t, completions[0].token, token)
 	}
 
 	@(test)

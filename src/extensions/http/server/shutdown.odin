@@ -96,12 +96,14 @@ _connection_begin_keep_alive_wait :: proc(connection: ^HTTP_Connection, ctx: tin
 	state.request_token += 1
 	if state.request_token == 0 do state.request_token = 1
 
-	now_ns := tina.ctx_monotonic_time_ns(ctx)
-	state.deadline_ns_idle = tina.Monotonic_Time_NS(u64(now_ns) + _timeout_duration_ns(runtime.server.timeouts.timeout_ms_idle))
-	state.deadline_ns_header = 0
-	state.deadline_ns_body = 0
-	state.deadline_ns_send = 0
-	state.deadline_ns_drain = 0
+	_deadline_arm(
+		runtime,
+		ctx,
+		connection,
+		_timeout_duration_ns(runtime.server.timeouts.timeout_ms_idle),
+		TAG_IDLE_TIMEOUT,
+		tina.Correlation_Id(state.request_token),
+	)
 
 	_idle_slot_push(connection, ctx)
 }
@@ -115,9 +117,13 @@ _connection_prepare_incoming_request :: proc(connection: ^HTTP_Connection, ctx: 
 
 	_idle_slot_remove(connection, ctx)
 	state.state = .Recv_Headers
-	state.deadline_ns_idle = 0
-	state.deadline_ns_header = tina.Monotonic_Time_NS(
-		u64(tina.ctx_monotonic_time_ns(ctx)) + _timeout_duration_ns(state.shard_runtime.server.timeouts.timeout_ms_header),
+	_deadline_arm(
+		state.shard_runtime,
+		ctx,
+		connection,
+		_timeout_duration_ns(state.shard_runtime.server.timeouts.timeout_ms_header),
+		TAG_HEADER_TIMEOUT,
+		tina.Correlation_Id(state.request_token),
 	)
 }
 
@@ -126,8 +132,13 @@ _connection_arm_send_timeout :: proc(connection: ^HTTP_Connection, ctx: tina.Tin
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil do return
-	state.deadline_ns_send = tina.Monotonic_Time_NS(
-		u64(tina.ctx_monotonic_time_ns(ctx)) + _timeout_duration_ns(runtime.server.timeouts.timeout_ms_send),
+	_deadline_arm(
+		runtime,
+		ctx,
+		connection,
+		_timeout_duration_ns(runtime.server.timeouts.timeout_ms_send),
+		TAG_SEND_TIMEOUT,
+		tina.Correlation_Id(state.request_token),
 	)
 }
 
@@ -136,8 +147,13 @@ _connection_arm_body_timeout :: proc(connection: ^HTTP_Connection, ctx: tina.Tin
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil do return
-	state.deadline_ns_body = tina.Monotonic_Time_NS(
-		u64(tina.ctx_monotonic_time_ns(ctx)) + _timeout_duration_ns(runtime.server.timeouts.timeout_ms_body),
+	_deadline_arm(
+		runtime,
+		ctx,
+		connection,
+		_timeout_duration_ns(runtime.server.timeouts.timeout_ms_body),
+		TAG_BODY_TIMEOUT,
+		tina.Correlation_Id(state.request_token),
 	)
 }
 
@@ -146,8 +162,13 @@ _connection_arm_drain_timeout :: proc(connection: ^HTTP_Connection, ctx: tina.Ti
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil do return
-	state.deadline_ns_drain = tina.Monotonic_Time_NS(
-		u64(tina.ctx_monotonic_time_ns(ctx)) + _timeout_duration_ns(runtime.server.graceful_drain_ms),
+	_deadline_arm(
+		runtime,
+		ctx,
+		connection,
+		_timeout_duration_ns(runtime.server.graceful_drain_ms),
+		TAG_DRAIN_TIMEOUT,
+		tina.Correlation_Id(state.request_token),
 	)
 }
 

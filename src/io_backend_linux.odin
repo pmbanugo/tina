@@ -26,6 +26,7 @@ when !TINA_SIMULATION_MODE {
 	MAX_LINUX_UNQUEUED :: 256
 	MAX_LINUX_PENDING_ADDRS :: 64
 	MAX_LINUX_SENDFILE_ENTRIES :: 16
+	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_LINUX_UNQUEUED)
 
 	// Persistent storage for io_uring operations that need stable pointers
 	// (accept, connect, sendto, recvfrom). Allocated on submit, freed on CQE.
@@ -262,13 +263,10 @@ when !TINA_SIMULATION_MODE {
 			return 0, .System_Error
 		}
 
-		// Harvest CQEs
-		cqes_max := u32(len(completions))
-		if cqes_max > 256 {
-			cqes_max = 256
-		}
-		cqes: [256]linux.IO_Uring_CQE = ---
-		completed, cqe_err := uring.copy_cqes(&backend.ring, cqes[:cqes_max], 0)
+		// Harvest CQEs. Keep the temporary harvest buffer aligned with the reactor
+		// completion batch configuration so higher batch counts do not silently clamp.
+		cqes: [REACTOR_COMPLETION_BATCH_COUNT]linux.IO_Uring_CQE = ---
+		completed, cqe_err := uring.copy_cqes(&backend.ring, cqes[:], 0)
 		if cqe_err != nil && cqe_err != .NONE && cqe_err != .EINTR {
 			return 0, .System_Error
 		}
@@ -331,6 +329,9 @@ when !TINA_SIMULATION_MODE {
 
 		return count, .None
 	}
+
+	@(private = "package")
+	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
 
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {

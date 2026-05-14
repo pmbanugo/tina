@@ -29,6 +29,9 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 		init_args.connection_slot_count,
 		init_args.connection_type_id,
 	)
+	if !_http_register_deadline_maintenance_task(listener.shard_runtime, ctx) {
+		return tina.Effect_Crash{reason = .Init_Failed}
+	}
 
 	if init_args.server.distribution == .Coordinator && init_args.dispatcher_shard_count > 1 {
 		dispatcher_handles := make([]tina.Handle, int(init_args.dispatcher_shard_count), runtime_allocator)
@@ -66,9 +69,6 @@ _http_listener_handler :: proc(
 	switch message.tag {
 	case tina.TAG_SHUTDOWN:
 		listener.shard_runtime.draining = true
-		listener.shard_runtime.deadline_ns_drain = tina.Monotonic_Time_NS(
-			u64(tina.ctx_monotonic_time_ns(ctx)) + u64(listener.shard_runtime.server.graceful_drain_ms) * 1_000_000,
-		)
 		return tina.Effect_Io{operation = tina.IoOp_Close{fd = listener.listen_fd}}
 
 	case tina.IO_TAG_ACCEPT_COMPLETE:

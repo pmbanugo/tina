@@ -21,6 +21,7 @@ Test_Local_Context_Config :: struct {
 	target_handle:           Handle,
 	monotonic_time_ns:       Monotonic_Time_NS,
 	current_tick:            u64,
+	flags:                   Context_Flags,
 	timer_resolution_ns:     u64,
 	target_mailbox_capacity: u32,
 	target_state:            Isolate_State,
@@ -37,7 +38,9 @@ test_with_context :: proc(
 		watchdog_state = u8(Shard_State.Shutting_Down)
 	}
 
-	shard := Shard {
+	shard := new(Shard)
+	defer free(shard)
+	shard^ = Shard {
 		id                     = extract_shard_id(config.self_handle),
 		timer_resolution_ns    = config.timer_resolution_ns,
 		watchdog_state_pointer = &watchdog_state,
@@ -62,14 +65,15 @@ test_with_context :: proc(
 
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
-		shard                  = &shard,
-		context_token          = make_tina_context_token(&shard),
+		shard                  = shard,
+		context_token          = make_tina_context_token(shard),
 		self_handle            = config.self_handle,
 		current_message_source = config.message_source,
 		current_correlation    = config.correlation_id,
 		flags                  = config.flags,
 		monotonic_time_ns      = config.monotonic_time_ns,
 		timer_resolution_ns    = shard.timer_resolution_ns,
+		current_tick           = u64(config.monotonic_time_ns) / shard.timer_resolution_ns,
 		type_id                = extract_type_id(config.self_handle),
 		slot_index             = extract_slot(config.self_handle),
 		shard_id               = shard.id,
@@ -99,7 +103,9 @@ test_with_local_context :: proc(
 	message: Message,
 ) {
 	watchdog_state := u8(Shard_State.Running)
-	shard := Shard {
+	shard := new(Shard)
+	defer free(shard)
+	shard^ = Shard {
 		id                     = extract_shard_id(config.target_handle),
 		timer_resolution_ns    = config.timer_resolution_ns,
 		current_tick           = config.current_tick,
@@ -147,14 +153,15 @@ test_with_local_context :: proc(
 
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
-		shard                  = &shard,
-		context_token          = make_tina_context_token(&shard),
+		shard                  = shard,
+		context_token          = make_tina_context_token(shard),
 		self_handle            = config.self_handle,
 		current_message_source = HANDLE_NONE,
 		current_correlation    = CORRELATION_ID_NONE,
-		flags                  = {},
+		flags                  = config.flags,
 		monotonic_time_ns      = config.monotonic_time_ns,
 		timer_resolution_ns    = shard.timer_resolution_ns,
+		current_tick           = config.current_tick,
 		type_id                = extract_type_id(config.self_handle),
 		slot_index             = extract_slot(config.self_handle),
 		shard_id               = shard.id,

@@ -3,9 +3,9 @@
 
 package main
 
-import "core:os"
 import tina "../src"
 import http "../src/extensions/http/server"
+import "core:os"
 
 health :: proc(request: ^http.Request, response: ^http.Response) -> http.Route_Step {
 	return http.respond_text(response, http.HTTP_STATUS_OK, "ok")
@@ -35,6 +35,6 @@ main :: proc() {
 
 	// The installer's timer sizing now tracks sparse waits; hot HTTP transport
 	// deadlines are bounded by the connection slots below.
-	spec := http.install(&server, 1, 512)
+	spec := http.install(&server, 4, 1024)
 	tina.tina_start(&spec)
 }

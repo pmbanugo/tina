@@ -1440,6 +1440,7 @@ _connection_release_slot :: proc(connection: ^HTTP_Connection, ctx: tina.TinaCon
 	if state.state == .Keep_Alive_Idle {
 		_idle_slot_remove(connection, ctx)
 	}
+	_deadline_disarm(state.shard_runtime, connection)
 	if state.shard_runtime.free_count < state.shard_runtime.connection_slot_count {
 		state.shard_runtime.free_count += 1
 	}

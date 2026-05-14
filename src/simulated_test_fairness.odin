@@ -18,7 +18,7 @@ when TINA_SIMULATION_MODE {
 	}
 
 	starvation_coord_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		// Spawn 300 workers to exceed the 256 DISPATCH_QUOTA_PER_WEIGHT
+		// Spawn 300 workers to exceed one same-type dispatch batch.
 		for i in 0 ..< 300 {
 			spec := Spawn_Spec {
 				type_id      = STARVATION_WORKER_ID,
@@ -73,7 +73,7 @@ when TINA_SIMULATION_MODE {
 				soa_metadata_size = size_of(Isolate_Metadata),
 				init_handler      = starvation_worker_init,
 				handler_fn        = starvation_worker_handler,
-				budget_weight     = 1, // Quota = 1 * 256 = 256 dispatches per tick
+				budget_weight     = 1,
 			},
 		}
 
@@ -93,7 +93,7 @@ when TINA_SIMULATION_MODE {
 
 		sim_config := SimulationConfig {
 			seed                   = t.seed,
-			ticks_max              = 10, // Exactly 10 ticks. 10 * 256 budget = 2560 dispatches
+			ticks_max              = 10, // Exactly 10 ticks. One weight earns 256 credits per tick by default.
 			terminate_on_quiescent = false, // Never quiescent because workers always yield
 			builtin_checkers       = CHECKER_FLAGS_ALL,
 			checker_interval_ticks = 10,

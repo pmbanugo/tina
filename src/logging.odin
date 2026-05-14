@@ -120,6 +120,46 @@ ctx_log :: proc {
 	ctx_log_typed,
 }
 
+shard_maintenance_log_raw :: #force_inline proc(
+	ctx: Shard_Maintenance_Context,
+	level: Log_Level,
+	$tag: Log_Tag,
+	payload: []u8,
+) {
+	#assert(
+		tag >= USER_LOG_TAG_BASE,
+		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
+	)
+	invocation := shard_maintenance_invocation(ctx)
+	_shard_log(invocation.shard, HANDLE_NONE, level, tag, payload)
+}
+
+shard_maintenance_log_typed :: #force_inline proc(
+	ctx: Shard_Maintenance_Context,
+	level: Log_Level,
+	$tag: Log_Tag,
+	message: ^$T,
+) where size_of(T) <=
+	MAX_PAYLOAD_SIZE {
+	#assert(
+		tag >= USER_LOG_TAG_BASE,
+		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
+	)
+	invocation := shard_maintenance_invocation(ctx)
+	_shard_log(
+		invocation.shard,
+		HANDLE_NONE,
+		level,
+		tag,
+		mem.byte_slice(message, size_of(T)),
+	)
+}
+
+shard_maintenance_log :: proc {
+	shard_maintenance_log_raw,
+	shard_maintenance_log_typed,
+}
+
 // The internal logging primitive
 @(private = "package")
 _shard_log :: #force_inline proc "contextless" (

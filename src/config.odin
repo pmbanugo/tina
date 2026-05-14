@@ -14,6 +14,55 @@ TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
 // TINA_DEBUG_ASSERTS used to enable runtime asserts for cases that are fixed behaviour (runtime inputs don't change behaviour)
 // but needs verify invariant/structural correctness holds in a non-simulated environment
 TINA_RUNTIME_ASSERTIONS :: #config(TINA_ASSERTS, true)
+TINA_ODIN_DEV :: #config(ODIN_DEV, false)
+
+Scheduler_Work_Count :: distinct u32
+Scheduler_Credit_Count :: distinct u32
+Scheduler_Weight_Count :: distinct u16
+Scheduler_Type_Index :: distinct u16
+Maintenance_Task_Index :: distinct u16
+Reactor_Batch_Count :: distinct u16
+
+MAINTENANCE_TASK_INDEX_NONE :: Maintenance_Task_Index(0xFFFF)
+
+when TINA_ODIN_DEV {
+	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT :: 512
+	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT :: 64
+	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT :: 64
+	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT :: 256
+	SCHEDULER_IO_SERVICE_INTERVAL_COUNT_DEFAULT :: 64
+} else {
+	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT :: 2048
+	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT :: 256
+	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT :: 256
+	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT :: 1024
+	SCHEDULER_IO_SERVICE_INTERVAL_COUNT_DEFAULT :: 128
+}
+
+SCHEDULER_TURN_WORK_BUDGET_COUNT :: #config(
+	TINA_SCHEDULER_TURN_WORK_BUDGET_COUNT,
+	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT,
+)
+SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX :: #config(
+	TINA_SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX,
+	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT,
+)
+SCHEDULER_CREDIT_PER_WEIGHT_COUNT :: #config(
+	TINA_SCHEDULER_CREDIT_PER_WEIGHT_COUNT,
+	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT,
+)
+SCHEDULER_CREDIT_COUNT_MAX :: #config(
+	TINA_SCHEDULER_CREDIT_COUNT_MAX,
+	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT,
+)
+SCHEDULER_IO_SERVICE_INTERVAL_COUNT :: #config(
+	TINA_SCHEDULER_IO_SERVICE_INTERVAL_COUNT,
+	SCHEDULER_IO_SERVICE_INTERVAL_COUNT_DEFAULT,
+)
+
+REACTOR_SUBMISSION_BATCH_COUNT :: #config(TINA_REACTOR_SUBMISSION_BATCH_COUNT, 256)
+REACTOR_COMPLETION_BATCH_COUNT :: #config(TINA_REACTOR_COMPLETION_BATCH_COUNT, 256)
+REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT :: #config(TINA_REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT, 192)
 
 #assert(size_of(Shard_Id) == 1)
 #assert(MAX_SHARD_COUNT > 0)
@@ -22,10 +71,55 @@ TINA_RUNTIME_ASSERTIONS :: #config(TINA_ASSERTS, true)
 #assert(REMOTE_SHARD_COUNT_MAX > 0)
 #assert(MIN_RING_SIZE > 0)
 #assert((MIN_RING_SIZE & (MIN_RING_SIZE - 1)) == 0)
+#assert(SCHEDULER_TURN_WORK_BUDGET_COUNT > 0)
+#assert(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX > 0)
+#assert(SCHEDULER_CREDIT_PER_WEIGHT_COUNT > 0)
+#assert(SCHEDULER_CREDIT_COUNT_MAX > 0)
+#assert(SCHEDULER_IO_SERVICE_INTERVAL_COUNT > 0)
+#assert(SCHEDULER_TURN_WORK_BUDGET_COUNT <= int(max(u32)))
+#assert(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX <= int(max(u32)))
+#assert(SCHEDULER_CREDIT_PER_WEIGHT_COUNT <= int(max(u32)))
+#assert(SCHEDULER_CREDIT_COUNT_MAX <= int(max(u32)))
+#assert(SCHEDULER_IO_SERVICE_INTERVAL_COUNT <= int(max(u32)))
+#assert(REACTOR_SUBMISSION_BATCH_COUNT > 0)
+#assert(REACTOR_COMPLETION_BATCH_COUNT > 0)
+#assert(REACTOR_SUBMISSION_BATCH_COUNT <= int(max(u16)))
+#assert(REACTOR_COMPLETION_BATCH_COUNT <= int(max(u16)))
+#assert(REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT > 0)
+#assert(REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT <= REACTOR_SUBMISSION_BATCH_COUNT)
 
 Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect
-Tick_Handler :: #type proc(self: rawptr, ctx: TinaContext)
+
+Shard_Maintenance_Result :: struct {
+	work_count:         Scheduler_Work_Count,
+	wants_reschedule:   bool,
+	_padding:           [3]u8,
+}
+
+Shard_Maintenance_Handler :: #type proc(
+	state: rawptr,
+	ctx: Shard_Maintenance_Context,
+	work_budget_count: Scheduler_Work_Count,
+) -> Shard_Maintenance_Result
+
+Shard_Maintenance_Descriptor :: struct {
+	state:                 rawptr,
+	handler:               Shard_Maintenance_Handler,
+	cadence_tick_count:    u32,
+	budget_weight:         Scheduler_Weight_Count,
+	work_budget_count_max: Scheduler_Work_Count,
+}
+
+@(private = "package")
+Shard_Maintenance_Task :: struct {
+	state:                 rawptr,
+	handler:               Shard_Maintenance_Handler,
+	next_tick:             u64,
+	cadence_tick_count:    u32,
+	budget_weight:         Scheduler_Weight_Count,
+	work_budget_count_max: Scheduler_Work_Count,
+}
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 TypeDescriptor :: struct {
@@ -39,7 +133,6 @@ TypeDescriptor :: struct {
 	budget_weight:           u16, // (default: 1)
 	init_handler:            Init_Handler,
 	handler_fn:              Handler_Fn,
-	tick_handler:            Tick_Handler,
 }
 
 Memory_Init_Mode :: enum u8 {
@@ -111,6 +204,7 @@ SystemSpec :: struct {
 	fd_entry_size:             int,
 	log_ring_size:             int,
 	supervision_groups_max:    int,
+	maintenance_task_count_max: int,
 	scratch_arena_size:        int,
 	shard_count:               u8,
 	default_ring_size:         u32,
@@ -284,6 +378,16 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 			"[FATAL] fd_handoff_entry_count (%v) must be 0-%v",
 			spec.fd_handoff_entry_count,
 			int(FD_HANDOFF_NONE_INDEX) - 1,
+		)
+		return .ValueOutOfBounds
+	}
+
+	if spec.maintenance_task_count_max < 0 ||
+	   spec.maintenance_task_count_max > int(max(u16)) {
+		fmt.eprintfln(
+			"[FATAL] maintenance_task_count_max (%v) must be 0-%v",
+			spec.maintenance_task_count_max,
+			int(max(u16)),
 		)
 		return .ValueOutOfBounds
 	}
@@ -571,23 +675,26 @@ _validate_dio_config :: proc(spec: ^SystemSpec) -> SystemSpecError {
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
 	// 3 per type (Typed Arena, Isolate Metadata, Working Memory)
-	// + 11 static framework regions
-	// + 1 for the SubRegion tracker array itself
-	// + 2 for the Slice Headers and Dispatch Cursors tracking
-	return (types_count * 3) + 11 + 1 + 2
+	// + 21 static framework regions, including the SubRegion tracker array.
+	return (types_count * 3) + 21
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
-	// 2. Message Pool
-	// 3. Reactor Buffer Pool
-	// 4. Transfer Buffer Pool
-	// 5. Transfer Generations
-	// 6. FD Handoff Table
-	// 7. Timer Wheel Spokes
-	// 8. Timer Wheel Entries
-	// 9. FD Table
-	// 10. Log Ring Buffer
-	// 11. Supervision Group Table
-	// 12. Scratch Arena
+	// 2-6. Slice headers for TypeDescriptor/isolate/working/metadata/free-head arrays
+	// 7. Maintenance Tasks
+	// 8. Dispatch Cursors
+	// 9. Dispatch Credit Counts
+	// 10. Message Pool
+	// 11. Transfer Buffer Pool
+	// 12. Transfer Generations
+	// 13. FD Handoff Table
+	// 14. Timer Wheel Spokes
+	// 15. Timer Wheel Entries
+	// 16. Log Ring Buffer
+	// 17. Supervision Group Table
+	// 18. Scratch Arena
+	// 19. FD Table
+	// 20. Reactor Buffer Pool
+	// 21. Spare fixed region for optional platform/runtime allocation
 }
 
 // Computes an upper-bound capacity aligned to a multiple of 8.
@@ -645,6 +752,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.fd_table_slot_count * spec.fd_entry_size
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)
+	total += spec.maintenance_task_count_max * size_of(Shard_Maintenance_Task)
 	total += spec.scratch_arena_size
 	total += regions_max * size_of(SubRegion)
 
@@ -653,8 +761,9 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 		types_count *
 		(size_of(TypeDescriptor) + size_of([]u8) * 2 + size_of(#soa[]Isolate_Metadata))
 	total += slice_headers_overhead
-	// Account for the bytes of BOTH u32 arrays: isolate_free_heads AND dispatch_cursors
+	// Account for scheduler/type arrays: isolate_free_heads, dispatch_cursors, and dispatch_credit_counts.
 	total += types_count * size_of(u32) * 2
+	total += types_count * size_of(Scheduler_Credit_Count)
 
 	// Find the largest supervision tree across all shards and budget for its arrays
 	tree_memory_max := 0

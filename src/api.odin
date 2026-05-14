@@ -123,12 +123,14 @@ Spawn_Spec :: struct {
 
 Context_Flag :: enum u8 {
 	Is_Call,
+	Maintenance,
 	// Future flags would come here.
 }
 Context_Flags :: distinct bit_set[Context_Flag;u8]
 
 // Scalar capability token valid only during the active Isolate handler invocation.
 TinaContext :: distinct u64
+Shard_Maintenance_Context :: distinct u64
 
 Enqueue_Result :: enum u8 {
 	Success,
@@ -149,6 +151,34 @@ bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 ctx_monotonic_time_ns :: #force_inline proc(ctx: TinaContext) -> Monotonic_Time_NS {
 	invocation := ctx_invocation(ctx)
 	return invocation.monotonic_time_ns
+}
+
+ctx_timer_resolution_ns :: #force_inline proc(ctx: TinaContext) -> u64 {
+	return ctx_invocation(ctx).timer_resolution_ns
+}
+
+ctx_current_tick :: #force_inline proc(ctx: TinaContext) -> u64 {
+	return ctx_invocation(ctx).current_tick
+}
+
+shard_maintenance_monotonic_time_ns :: #force_inline proc(
+	ctx: Shard_Maintenance_Context,
+) -> Monotonic_Time_NS {
+	return shard_maintenance_invocation(ctx).monotonic_time_ns
+}
+
+shard_maintenance_timer_resolution_ns :: #force_inline proc(
+	ctx: Shard_Maintenance_Context,
+) -> u64 {
+	return shard_maintenance_invocation(ctx).timer_resolution_ns
+}
+
+shard_maintenance_current_tick :: #force_inline proc(ctx: Shard_Maintenance_Context) -> u64 {
+	return shard_maintenance_invocation(ctx).current_tick
+}
+
+shard_maintenance_shard_id :: #force_inline proc(ctx: Shard_Maintenance_Context) -> Shard_Id {
+	return shard_maintenance_invocation(ctx).shard_id
 }
 
 // Helper to safely cast an incoming message payload byte slice into a typed pointer.
