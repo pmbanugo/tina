@@ -27,8 +27,8 @@ on:
       - "examples/**"
 
 jobs:
-  check:
-    name: Type-check (${{ matrix.target }})
+  check-platform:
+    name: Type-check platform backend (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -45,8 +45,20 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: dev-2026-05
-      - name: odin check (${{ matrix.target }})
-        run: odin check src/ -strict-style -no-entry-point -define:TINA_SIM=true -define:TINA_ASSERTS=true -target:${{ matrix.target }}
+      - name: odin check platform backend (${{ matrix.target }})
+        run: odin check src/ -strict-style -no-entry-point -define:TINA_SIM=false -define:TINA_ASSERTS=true -target:${{ matrix.target }}
+
+  check-simulation:
+    name: Type-check simulation backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-05
+      - name: odin check simulation backend
+        run: odin check src/ -strict-style -no-entry-point -define:TINA_SIM=true -define:TINA_ASSERTS=true
 
   test-platform:
     name: Platform tests (${{ matrix.os }})
