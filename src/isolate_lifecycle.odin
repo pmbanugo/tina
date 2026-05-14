@@ -100,7 +100,6 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		type_id             = type_id,
 		slot_index          = slot,
 		shard_id            = shard.id,
-		monotonic_time_ns   = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
 		timer_resolution_ns = shard.timer_resolution_ns,
 		current_tick        = shard.current_tick,
 	}

@@ -157,7 +157,7 @@ Application_Pending_Message :: struct {
 HTTP_Shard_Runtime :: struct {
 	server:               Server_Runtime,
 	router:               Compiled_Router,
-	connection_type_id:    u8,
+	connection_type_id:    tina.Type_Id,
 	date_cache:           Date_Cache,
 	draining:             bool,
 	next_request_token:   Request_Token, // monotonic across the shard
@@ -294,8 +294,8 @@ HTTP_Listener_Init_Args :: struct {
 	server:                  ^Server_Runtime,
 	router:                  ^Compiled_Router,
 	connection_slot_count:    u16,
-	connection_type_id:       u8,
-	dispatcher_type_id:       u8,
+	connection_type_id:       tina.Type_Id,
+	dispatcher_type_id:       tina.Type_Id,
 	dispatcher_shard_count:   u8,
 }
 
@@ -304,7 +304,7 @@ HTTP_Dispatcher_Init_Args :: struct {
 	server:                ^Server_Runtime,
 	router:                ^Compiled_Router,
 	connection_slot_count: u16,
-	connection_type_id:    u8,
+	connection_type_id:    tina.Type_Id,
 }
 
 @(private = "package")
@@ -496,11 +496,11 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 		len(spec.types) + http_type_count <= tina.MAX_TYPE_DESCRIPTOR_ID + 1,
 		"install_into_system_spec: appending HTTP types would exceed MAX_TYPE_DESCRIPTOR_ID; reduce pre-existing types or split installs",
 	)
-	base_type_id := u8(len(spec.types))
+	base_type_index := len(spec.types)
 
-	listener_type_id := base_type_id + HTTP_TYPE_OFFSET_LISTENER
-	connection_type_id := base_type_id + HTTP_TYPE_OFFSET_CONNECTION
-	dispatcher_type_id := base_type_id + HTTP_TYPE_OFFSET_DISPATCHER
+	listener_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_LISTENER)
+	connection_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_CONNECTION)
+	dispatcher_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_DISPATCHER)
 
 	listener_init_args := HTTP_Listener_Init_Args {
 		server                = server_runtime,
@@ -844,12 +844,12 @@ _deadline_spoke_count_for_connection_count :: proc "contextless" (connection_slo
 
 @(private = "package")
 _make_shard_runtime :: proc(
-	allocator: mem.Allocator,
-	server: ^Server_Runtime,
-	router: ^Compiled_Router,
-	connection_slot_count: u16,
-	connection_type_id: u8,
-) -> ^HTTP_Shard_Runtime {
+		allocator: mem.Allocator,
+		server: ^Server_Runtime,
+		router: ^Compiled_Router,
+		connection_slot_count: u16,
+		connection_type_id: tina.Type_Id,
+	) -> ^HTTP_Shard_Runtime {
 	runtime_storage := make([]HTTP_Shard_Runtime, 1, allocator)
 	active_slot_indices := make([]u16, int(connection_slot_count), allocator)
 	active_connections := make([]^HTTP_Connection, int(connection_slot_count), allocator)
@@ -963,8 +963,8 @@ _next_power_of_two_u64 :: proc "contextless" (n: u64) -> u64 {
 @(private = "file")
 _attach_http_children :: proc(
 	shard_spec: ^tina.ShardSpec,
-	listener_type_id: u8,
-	dispatcher_type_id: u8,
+	listener_type_id: tina.Type_Id,
+	dispatcher_type_id: tina.Type_Id,
 	include_listener: bool,
 	include_dispatcher: bool,
 	connection_slot_count: u16,
@@ -999,8 +999,8 @@ _attach_http_children :: proc(
 @(private = "file")
 _append_static_children :: proc(
 	existing: []tina.Child_Spec,
-	listener_type_id: u8,
-	dispatcher_type_id: u8,
+	listener_type_id: tina.Type_Id,
+	dispatcher_type_id: tina.Type_Id,
 	include_listener: bool,
 	include_dispatcher: bool,
 	listener_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
@@ -1246,9 +1246,9 @@ test_install_make_system_spec_multi_shard_defaults_to_coordinator :: proc(t: ^te
 	// after install, HTTP types occupy the tail of `spec.types`. Reading the
 	// ids back out of the descriptor table is the same lookup the supervision
 	// tree did at install time.
-	base_type_id := u8(len(spec.types) - 3) // listener + connection + dispatcher
-	listener_type_id := base_type_id + HTTP_TYPE_OFFSET_LISTENER
-	dispatcher_type_id := base_type_id + HTTP_TYPE_OFFSET_DISPATCHER
+	base_type_index := len(spec.types) - 3 // listener + connection + dispatcher
+	listener_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_LISTENER)
+	dispatcher_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_DISPATCHER)
 
 	for shard_index in 0 ..< len(spec.shard_specs) {
 		root := spec.shard_specs[shard_index].root_group
@@ -1321,11 +1321,11 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 	install_into_system_spec(&spec, &server)
 
 	// HTTP types must be appended *after* the stub at the documented offsets.
-	expected_listener_id := u8(1) + HTTP_TYPE_OFFSET_LISTENER
-	expected_connection_id := u8(1) + HTTP_TYPE_OFFSET_CONNECTION
+	expected_listener_id := tina.Type_Id(1 + HTTP_TYPE_OFFSET_LISTENER)
+	expected_connection_id := tina.Type_Id(1 + HTTP_TYPE_OFFSET_CONNECTION)
 
 	testing.expect_value(t, len(spec.types), 3) // stub + listener + connection (single shard, no dispatcher)
-	testing.expect_value(t, spec.types[0].id, u8(0))
+	testing.expect_value(t, spec.types[0].id, tina.Type_Id(0))
 	testing.expect_value(t, spec.types[expected_listener_id].id, expected_listener_id)
 	testing.expect_value(t, spec.types[expected_connection_id].id, expected_connection_id)
 
@@ -1340,7 +1340,7 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 			found_listener_child = true
 		}
 		// No HTTP child should reference the stub type id.
-		testing.expect(t, static_child.type_id != 0, "HTTP wiring must not collide with pre-installed type")
+		testing.expect(t, static_child.type_id != tina.Type_Id(0), "HTTP wiring must not collide with pre-installed type")
 	}
 	testing.expect(t, found_listener_child, "listener child must use dynamic type id")
 

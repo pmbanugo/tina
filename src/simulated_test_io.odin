@@ -17,7 +17,7 @@ when TINA_SIMULATION_MODE {
 	//   4. The stale I/O completion arrives later -> io_sequence mismatch -> buffer freed
 	//   5. After quiescence, the reactor buffer pool is whole (no leaks)
 
-	IO_TIMEOUT_TYPE_ID: u8 : 6
+	IO_TIMEOUT_TYPE_ID: Type_Id : 6
 	APP_TAG_IO_TIMEOUT: Message_Tag : USER_MESSAGE_TAG_BASE + 3
 
 	IoTimeoutIsolate :: struct {
@@ -199,8 +199,8 @@ when TINA_SIMULATION_MODE {
 	// Teardown step 2b: write/send buffer reclamation via one_for_all
 	// ============================================================================
 
-	WRITE_CRASHER_TYPE_ID: u8 : 0 // Must be lower than Writer for dispatch ordering
-	WRITE_WRITER_TYPE_ID: u8 : 1
+	WRITE_CRASHER_TYPE_ID: Type_Id : 0 // Must be lower than Writer for dispatch ordering
+	WRITE_WRITER_TYPE_ID: Type_Id : 1
 
 	WriteCrasherIsolate :: struct {}
 	WriteWriterIsolate :: struct {
@@ -330,7 +330,7 @@ when TINA_SIMULATION_MODE {
 	// Shutdown dispatch priority: I/O completion > TAG_SHUTDOWN > inbox
 	// ============================================================================
 
-	PRIORITY_TYPE_ID: u8 : 0
+	PRIORITY_TYPE_ID: Type_Id : 0
 
 	PriorityTestIsolate :: struct {
 		received_tags:  [4]Message_Tag,

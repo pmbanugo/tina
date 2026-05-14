@@ -10,8 +10,8 @@ when TINA_SIMULATION_MODE {
 	// Intra-Type Starvation Prevention (Dispatch Cursor Verification)
 	// ============================================================================
 
-	STARVATION_COORD_ID: u8 : 0
-	STARVATION_WORKER_ID: u8 : 1
+	STARVATION_COORD_ID: Type_Id : 0
+	STARVATION_WORKER_ID: Type_Id : 1
 
 	StarvationWorker :: struct {
 		run_count: u32,

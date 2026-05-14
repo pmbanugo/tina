@@ -199,33 +199,35 @@ hydrate_shard :: proc(
 	for t, i in spec.types {
 		// Apply defaults at startup
 		desc := t
+		type_index := int(u16(desc.id))
+		assert(type_index == i, "TypeDescriptor ids must match dense descriptor index")
 		if desc.budget_weight == 0 do desc.budget_weight = 1
 		if desc.mailbox_capacity == 0 do desc.mailbox_capacity = 256
 
-		shard.type_descriptors[i] = desc
-		shard.isolate_free_heads[i] = POOL_NONE_INDEX // Initialize
+		shard.type_descriptors[type_index] = desc
+		shard.isolate_free_heads[type_index] = POOL_NONE_INDEX // Initialize
 
 		if desc.slot_count > 0 && desc.stride > 0 {
 			alloc_data.current_name = fmt.tprintf("Typed_Arena_%d", desc.id)
-			shard.isolate_memory[i] = make([]u8, desc.slot_count * desc.stride, alloc)
+			shard.isolate_memory[type_index] = make([]u8, desc.slot_count * desc.stride, alloc)
 		}
 
 		aligned_count := _aligned_capacity(desc.slot_count)
 		if aligned_count > 0 {
 			alloc_data.current_name = fmt.tprintf("SOA_Metadata_%d", desc.id)
-			shard.metadata[i] = make(#soa[]Isolate_Metadata, aligned_count, alloc)
+			shard.metadata[type_index] = make(#soa[]Isolate_Metadata, aligned_count, alloc)
 
 			// Build the intrusive free list for this Type Arena
 			// We iterate backwards so slot 0 is at the head of the free list
 			for slot := int(desc.slot_count) - 1; slot >= 0; slot -= 1 {
-				shard.metadata[i][slot].inbox_head = shard.isolate_free_heads[i]
-				shard.metadata[i][slot].state = .Unallocated
-				shard.metadata[i][slot].generation = 1 // Enforce ADR rule: generations start at 1
-				shard.isolate_free_heads[i] = u32(slot)
+				shard.metadata[type_index][slot].inbox_head = shard.isolate_free_heads[type_index]
+				shard.metadata[type_index][slot].state = .Unallocated
+				shard.metadata[type_index][slot].generation = 1 // Enforce ADR rule: generations start at 1
+				shard.isolate_free_heads[type_index] = u32(slot)
 			}
 		}
 		if desc.working_memory_size > 0 {
-			shard.working_memory[i] = grand_arena_alloc_slice(
+			shard.working_memory[type_index] = grand_arena_alloc_slice(
 				arena,
 				fmt.tprintf("Working_Memory_%d", desc.id),
 				desc.slot_count * desc.working_memory_size,
@@ -364,7 +366,7 @@ arena_print_layout :: proc(arena: ^Grand_Arena) {
 test_grand_arena :: proc(t: ^testing.T) {
 	types := [1]TypeDescriptor {
 		{
-			id = 1,
+			id = 0,
 			slot_count = 10,
 			stride = 64,
 			soa_metadata_size = size_of(Isolate_Metadata),

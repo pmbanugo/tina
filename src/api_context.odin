@@ -14,7 +14,6 @@ Isolate_Invocation :: struct {
 	flags:                  Context_Flags,
 	working_arena:          mem.Arena,
 	scratch_arena:          mem.Arena,
-	monotonic_time_ns:      Monotonic_Time_NS,
 	timer_resolution_ns:    u64,
 	current_tick:           u64,
 	type_id:                u16,
@@ -121,7 +120,7 @@ ctx_register_shard_maintenance_task :: proc(
 		task.budget_weight = Scheduler_Weight_Count(1)
 	}
 	if task.work_budget_count_max == 0 {
-		task.work_budget_count_max = Scheduler_Work_Count(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX)
+		task.work_budget_count_max = Scheduler_Work_Count(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT)
 	}
 	task_position := int(task_index)
 	shard.maintenance_tasks[task_position] = Shard_Maintenance_Task {

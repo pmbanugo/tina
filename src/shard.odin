@@ -112,7 +112,7 @@ Shard_Counters :: struct {
 
 Dynamic_Child_Spec :: struct {
 	args_payload: [MAX_INIT_ARGS_SIZE]u8,
-	type_id:      u8,
+	type_id:      Type_Id,
 	restart_type: Restart_Type,
 	args_size:    u8,
 	_padding:     [5]u8,
@@ -181,6 +181,7 @@ Shard :: struct {
 	handoff_retry_tail:     u32,
 	handoff_retry_count:    u32,
 	maintenance_task_count: u16,
+	maintenance_task_cursor: u16,
 	current_msg_slot:       u32,
 	current_slot_index:     u32,
 	dispatch_type_cursor:   u32,
@@ -301,7 +302,7 @@ _dispatch_type_batch :: proc(
 		return 0
 	}
 
-	type_id := type_descriptor.id
+		type_id := u16(type_descriptor.id)
 	slot_count := u32(type_descriptor.slot_count)
 
 	// Hoisted
@@ -313,7 +314,6 @@ _dispatch_type_batch :: proc(
 		current_message_source = HANDLE_NONE, // Assigned per invocation
 		current_correlation    = CORRELATION_ID_NONE, // Assigned per invocation
 		flags                  = {}, // Assigned per invocation
-		monotonic_time_ns      = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
 		timer_resolution_ns    = shard.timer_resolution_ns,
 		current_tick           = shard.current_tick,
 		type_id                = u16(type_id),
@@ -543,6 +543,22 @@ _scheduler_run_maintenance_tasks :: proc(shard: ^Shard) {
 		return
 	}
 
+	total_weight_count: u32 = 0
+	due_task_count: u16 = 0
+	for task_index in 0 ..< int(shard.maintenance_task_count) {
+		task := &shard.maintenance_tasks[task_index]
+		if task.handler == nil || shard.current_tick < task.next_tick {
+			continue
+		}
+		weight_count := u32(task.budget_weight)
+		if weight_count == 0 do weight_count = 1
+		total_weight_count += weight_count
+		due_task_count += 1
+	}
+	if due_task_count == 0 {
+		return
+	}
+
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
 		shard                  = shard,
@@ -551,7 +567,6 @@ _scheduler_run_maintenance_tasks :: proc(shard: ^Shard) {
 		current_message_source = HANDLE_NONE,
 		current_correlation    = CORRELATION_ID_NONE,
 		flags                  = {.Maintenance},
-		monotonic_time_ns      = Monotonic_Time_NS(shard.current_tick * shard.timer_resolution_ns),
 		timer_resolution_ns    = shard.timer_resolution_ns,
 		current_tick           = shard.current_tick,
 		type_id                = 0,
@@ -559,17 +574,47 @@ _scheduler_run_maintenance_tasks :: proc(shard: ^Shard) {
 		shard_id               = shard.id,
 	}
 
-	for task_index in 0 ..< int(shard.maintenance_task_count) {
+	turn_work_budget_count := u32(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT)
+	io_service_interval_count := u32(SCHEDULER_IO_SERVICE_INTERVAL_COUNT)
+	work_since_io_service_count: u32 = 0
+	scanned_task_count: u16 = 0
+
+	for turn_work_budget_count > 0 && scanned_task_count < shard.maintenance_task_count {
+		if work_since_io_service_count >= io_service_interval_count {
+			reactor_service_nonblocking(&shard.reactor, shard)
+			work_since_io_service_count = 0
+		}
+
+		task_index := int(shard.maintenance_task_cursor)
+		shard.maintenance_task_cursor += 1
+		if shard.maintenance_task_cursor >= shard.maintenance_task_count {
+			shard.maintenance_task_cursor = 0
+		}
+		scanned_task_count += 1
+
 		task := &shard.maintenance_tasks[task_index]
 		if task.handler == nil || shard.current_tick < task.next_tick {
 			continue
 		}
 
-		work_budget_count := u32(task.work_budget_count_max)
 		weight_count := u32(task.budget_weight)
 		if weight_count == 0 do weight_count = 1
-		if work_budget_count == 0 do work_budget_count = u32(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX)
-		work_budget_count *= weight_count
+
+		work_budget_count := u32(task.work_budget_count_max)
+		if work_budget_count == 0 do work_budget_count = u32(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT)
+
+		shared_budget_count :=
+			(u32(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT) * weight_count) /
+			total_weight_count
+		if shared_budget_count == 0 do shared_budget_count = 1
+
+		io_service_remaining_count := io_service_interval_count - work_since_io_service_count
+		work_budget_count = min(work_budget_count, shared_budget_count)
+		work_budget_count = min(work_budget_count, turn_work_budget_count)
+		work_budget_count = min(work_budget_count, io_service_remaining_count)
+		if work_budget_count == 0 {
+			continue
+		}
 
 		invocation.context_token = make_tina_context_token(shard)
 		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
@@ -589,8 +634,20 @@ _scheduler_run_maintenance_tasks :: proc(shard: ^Shard) {
 		context.temp_allocator = previous_temp_allocator
 		g_current_isolate_invocation = invocation.previous
 
+		work_count := u32(result.work_count)
+		when TINA_RUNTIME_ASSERTIONS {
+			assert(
+				work_count <= work_budget_count,
+				"maintenance task reported more work than its supplied work budget",
+			)
+		}
+		if work_count > work_budget_count do work_count = work_budget_count
+
+		turn_work_budget_count -= work_count
+		work_since_io_service_count += work_count
+
 		if result.wants_reschedule {
-			if result.work_count >= Scheduler_Work_Count(work_budget_count) {
+			if work_count >= work_budget_count {
 				task.next_tick = shard.current_tick
 			} else {
 				task.next_tick = shard.current_tick + u64(task.cadence_tick_count)
@@ -1533,7 +1590,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	}
 	fd_handoff_table_init(&shard.handoff_table, shard.handoff_table.entries)
 	for type_desc in shard.type_descriptors {
-		type_id := type_desc.id
+		type_id := u16(type_desc.id)
 		soa_meta := shard.metadata[type_id]
 
 		// Reset the free head for this type
@@ -1570,6 +1627,20 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		}
 	}
 
+	for type_index in 0 ..< len(shard.dispatch_credit_counts) {
+		shard.dispatch_credit_counts[type_index] = 0
+	}
+	shard.dispatch_type_cursor = 0
+	shard.current_type_id = 0
+	shard.current_slot_index = 0
+	shard.current_msg_slot = POOL_NONE_INDEX
+
+	for task_index in 0 ..< len(shard.maintenance_tasks) {
+		shard.maintenance_tasks[task_index] = {}
+	}
+	shard.maintenance_task_count = 0
+	shard.maintenance_task_cursor = 0
+
 	timer_wheel_reset(&shard.timer_wheel, shard.current_tick)
 
 	shard.next_correlation_id = 0
@@ -1588,7 +1659,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 @(private)
 shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
 	for type_desc in shard.type_descriptors {
-		states := shard.metadata[type_desc.id].state[:]
+		states := shard.metadata[u16(type_desc.id)].state[:]
 		for i in 0 ..< type_desc.slot_count {
 			if states[i] != .Unallocated {
 				return true
@@ -1677,6 +1748,78 @@ _alloc_handoff_test_entry :: proc(
 	return ref
 }
 
+@(private = "file")
+_make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
+	types := [1]TypeDescriptor {
+		{
+			id                      = 0,
+			slot_count              = 1,
+			stride                  = 8,
+			soa_metadata_size       = size_of(Isolate_Metadata),
+			working_memory_size     = 0,
+			scratch_requirement_max = 0,
+		},
+	}
+	root_children := [1]Child_Spec{Static_Child_Spec{type_id = 0, restart_type = .temporary}}
+	root_group := Group_Spec {
+		strategy              = .One_For_One,
+		restart_count_max     = 1,
+		window_duration_ticks = 1,
+		children              = root_children[:],
+	}
+	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+	spec := SystemSpec {
+		shard_count                = 1,
+		types                      = types[:],
+		shard_specs                = shard_specs[:],
+		pool_slot_count            = 16,
+		reactor_buffer_slot_count  = 4,
+		reactor_buffer_slot_size   = 1024,
+		transfer_slot_count        = 4,
+		transfer_slot_size         = 1024,
+		fd_table_slot_count        = 8,
+		fd_entry_size              = size_of(FD_Entry),
+		timer_spoke_count          = 16,
+		timer_entry_count          = 16,
+		log_ring_size              = 16,
+		supervision_groups_max     = 4,
+		maintenance_task_count_max = 2,
+		scratch_arena_size         = 16,
+		default_ring_size          = 16,
+	}
+
+	total_memory_size := compute_shard_memory_total(&spec)
+	arena := new(Grand_Arena)
+	err := grand_arena_init(arena, total_memory_size)
+	testing.expect_value(t, err, mem.Allocator_Error.None)
+
+	shard := new(Shard)
+	carve_err := hydrate_shard(arena, &spec, shard)
+	testing.expect_value(t, carve_err, mem.Allocator_Error.None)
+	return shard, arena
+}
+
+@(private = "file")
+Maintenance_Budget_Test_State :: struct {
+	call_count:    u32,
+	budget_total:  u32,
+}
+
+@(private = "file")
+_maintenance_budget_test_handler :: proc(
+	state: rawptr,
+	ctx: Shard_Maintenance_Context,
+	work_budget_count: Scheduler_Work_Count,
+) -> Shard_Maintenance_Result {
+	test_state := cast(^Maintenance_Budget_Test_State)state
+	test_state.call_count += 1
+	test_state.budget_total += u32(work_budget_count)
+	return Shard_Maintenance_Result {
+		work_count = work_budget_count,
+		wants_reschedule = true,
+	}
+}
+
 @(test)
 test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testing.T) {
 	shard := new(Shard)
@@ -1762,6 +1905,92 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 	testing.expect_value(t, shard.handoff_retry_head, u32(POOL_NONE_INDEX))
 	testing.expect_value(t, shard.handoff_retry_tail, u32(POOL_NONE_INDEX))
 	testing.expect_value(t, shard.counters.handoff_control_retry_drops, u64(0))
+}
+
+@(test)
+test_shard_mass_teardown_resets_scheduler_and_maintenance_state :: proc(t: ^testing.T) {
+	shard, arena := _make_teardown_test_shard(t)
+	defer {
+		os_release_arena_with_guard(arena.base)
+		free(arena)
+		free(shard)
+	}
+
+	shard.dispatch_credit_counts[0] = 7
+	shard.dispatch_type_cursor = 1
+	shard.current_type_id = 1
+	shard.current_slot_index = 1
+	shard.current_msg_slot = 3
+	shard.maintenance_task_count = 1
+	shard.maintenance_tasks[0] = Shard_Maintenance_Task {
+		next_tick             = 9,
+		cadence_tick_count    = 1,
+		budget_weight         = 1,
+		work_budget_count_max = 1,
+	}
+
+	shard_mass_teardown(shard)
+
+	testing.expect_value(t, shard.dispatch_credit_counts[0], Scheduler_Credit_Count(0))
+	testing.expect_value(t, shard.dispatch_type_cursor, u32(0))
+	testing.expect_value(t, shard.current_type_id, u16(0))
+	testing.expect_value(t, shard.current_slot_index, u32(0))
+	testing.expect_value(t, shard.current_msg_slot, POOL_NONE_INDEX)
+	testing.expect_value(t, shard.maintenance_task_count, u16(0))
+	testing.expect_value(t, shard.maintenance_tasks[0].next_tick, u64(0))
+	testing.expect_value(t, shard.maintenance_tasks[0].budget_weight, Scheduler_Weight_Count(0))
+}
+
+@(test)
+test_scheduler_run_maintenance_tasks_respects_turn_budget :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+
+	scratch_memory: [4096]u8
+	shard.scratch_memory = scratch_memory[:]
+	shard.timer_resolution_ns = 1
+	shard.current_tick = 1
+
+	backend_config := Backend_Config {
+		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
+		sim_config = Simulation_IO_Config{},
+	}
+	err := backend_init(&shard.reactor.backend, backend_config)
+	defer backend_deinit(&shard.reactor.backend)
+	testing.expect_value(t, err, Backend_Error.None)
+
+	state_a, state_b: Maintenance_Budget_Test_State
+	maintenance_tasks := [2]Shard_Maintenance_Task {
+		{
+			state                 = rawptr(&state_a),
+			handler               = _maintenance_budget_test_handler,
+			next_tick             = 0,
+			cadence_tick_count    = 1,
+			budget_weight         = 1,
+			work_budget_count_max = Scheduler_Work_Count(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT),
+		},
+		{
+			state                 = rawptr(&state_b),
+			handler               = _maintenance_budget_test_handler,
+			next_tick             = 0,
+			cadence_tick_count    = 1,
+			budget_weight         = 1,
+			work_budget_count_max = Scheduler_Work_Count(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT),
+		},
+	}
+	shard.maintenance_tasks = maintenance_tasks[:]
+	shard.maintenance_task_count = u16(len(maintenance_tasks))
+
+	_scheduler_run_maintenance_tasks(shard)
+
+	total_budget_count := state_a.budget_total + state_b.budget_total
+	testing.expect_value(
+		t,
+		total_budget_count,
+		u32(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT),
+	)
+	testing.expect_value(t, state_a.call_count, u32(1))
+	testing.expect_value(t, state_b.call_count, u32(1))
 }
 
 @(test)

@@ -12,7 +12,7 @@ when TINA_SIMULATION_MODE {
 	// Verifies every shard ticks exactly once per round by using a user checker
 	// that inspects shard.current_tick progression across rounds.
 
-	SCHED_NOOP_TYPE_ID: u8 : 0
+	SCHED_NOOP_TYPE_ID: Type_Id : 0
 
 	SchedNoopIsolate :: struct {}
 

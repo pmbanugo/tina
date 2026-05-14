@@ -4,9 +4,9 @@ import "core:mem"
 import "core:testing"
 
 when TINA_SIMULATION_MODE {
-	FD_HANDOFF_LISTENER_TYPE_ID: u8 : 0
-	FD_HANDOFF_DISPATCHER_TYPE_ID: u8 : 1
-	FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID: u8 : 1
+	FD_HANDOFF_LISTENER_TYPE_ID: Type_Id : 0
+	FD_HANDOFF_DISPATCHER_TYPE_ID: Type_Id : 1
+	FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID: Type_Id : 1
 
 	FDHandoffListener :: struct {
 		listen_fd:      FD_Handle,

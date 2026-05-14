@@ -9,7 +9,7 @@ when TINA_SIMULATION_MODE {
 	// Harness-level tests: termination reason, final checkers, user checkers
 	// ============================================================================
 
-	HARNESS_NOOP_TYPE_ID: u8 : 0
+	HARNESS_NOOP_TYPE_ID: Type_Id : 0
 
 	HarnessNoopIsolate :: struct {}
 

@@ -13,7 +13,7 @@ SUPERVISION_GROUP_ID_NONE :: Supervision_Group_Id(0xFFFF)
 SUPERVISION_GROUP_ID_ROOT :: Supervision_Group_Id(0)
 
 // Solves the 0xFFFF bitwise truncation hazard by explicitly using the 255th slot
-SUPERVISION_SUBGROUP_TYPE_ID: u8 : 255
+SUPERVISION_SUBGROUP_TYPE_ID: Type_Id : 255
 
 Crash_Reason :: enum u8 {
 	None                 = 0,
@@ -113,7 +113,7 @@ Transfer_Read_Result :: union {
 Spawn_Spec :: struct {
 	args_payload: [MAX_INIT_ARGS_SIZE]u8,
 	group_id:     Supervision_Group_Id,
-	type_id:      u8,
+	type_id:      Type_Id,
 	restart_type: Restart_Type,
 	args_size:    u8,
 	handoff_mode: Handoff_Mode,
@@ -150,7 +150,7 @@ bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 // This ensures all isolates process events using a consistent, uniform clock per tick.
 ctx_monotonic_time_ns :: #force_inline proc(ctx: TinaContext) -> Monotonic_Time_NS {
 	invocation := ctx_invocation(ctx)
-	return invocation.monotonic_time_ns
+	return Monotonic_Time_NS(invocation.current_tick * invocation.timer_resolution_ns)
 }
 
 ctx_timer_resolution_ns :: #force_inline proc(ctx: TinaContext) -> u64 {
@@ -164,7 +164,8 @@ ctx_current_tick :: #force_inline proc(ctx: TinaContext) -> u64 {
 shard_maintenance_monotonic_time_ns :: #force_inline proc(
 	ctx: Shard_Maintenance_Context,
 ) -> Monotonic_Time_NS {
-	return shard_maintenance_invocation(ctx).monotonic_time_ns
+	invocation := shard_maintenance_invocation(ctx)
+	return Monotonic_Time_NS(invocation.current_tick * invocation.timer_resolution_ns)
 }
 
 shard_maintenance_timer_resolution_ns :: #force_inline proc(

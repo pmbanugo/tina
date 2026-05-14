@@ -5,6 +5,7 @@ import "core:mem"
 import "core:testing"
 
 Shard_Id :: distinct u8
+Type_Id :: distinct u16
 MAX_SHARD_COUNT :: 255 // Max count fits in u8. Sacrifices the 256th slot to avoid u16 counts.
 REMOTE_SHARD_COUNT_MAX :: MAX_SHARD_COUNT - 1
 MIN_RING_SIZE :: 16
@@ -27,12 +28,14 @@ MAINTENANCE_TASK_INDEX_NONE :: Maintenance_Task_Index(0xFFFF)
 
 when TINA_ODIN_DEV {
 	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT :: 512
+	SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT_DEFAULT :: 64
 	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT :: 64
 	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT :: 64
 	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT :: 256
 	SCHEDULER_IO_SERVICE_INTERVAL_COUNT_DEFAULT :: 64
 } else {
 	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT :: 2048
+	SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT_DEFAULT :: 256
 	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT :: 256
 	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT :: 256
 	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT :: 1024
@@ -42,6 +45,10 @@ when TINA_ODIN_DEV {
 SCHEDULER_TURN_WORK_BUDGET_COUNT :: #config(
 	TINA_SCHEDULER_TURN_WORK_BUDGET_COUNT,
 	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT,
+)
+SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT :: #config(
+	TINA_SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT,
+	SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT_DEFAULT,
 )
 SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX :: #config(
 	TINA_SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX,
@@ -65,6 +72,7 @@ REACTOR_COMPLETION_BATCH_COUNT :: #config(TINA_REACTOR_COMPLETION_BATCH_COUNT, 2
 REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT :: #config(TINA_REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT, 192)
 
 #assert(size_of(Shard_Id) == 1)
+#assert(size_of(Type_Id) == 2)
 #assert(MAX_SHARD_COUNT > 0)
 #assert(MAX_SHARD_COUNT == 255)
 #assert(REMOTE_SHARD_COUNT_MAX == MAX_SHARD_COUNT - 1)
@@ -72,11 +80,13 @@ REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT :: #config(TINA_REACTOR_SUBMISSION_FLUS
 #assert(MIN_RING_SIZE > 0)
 #assert((MIN_RING_SIZE & (MIN_RING_SIZE - 1)) == 0)
 #assert(SCHEDULER_TURN_WORK_BUDGET_COUNT > 0)
+#assert(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT > 0)
 #assert(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX > 0)
 #assert(SCHEDULER_CREDIT_PER_WEIGHT_COUNT > 0)
 #assert(SCHEDULER_CREDIT_COUNT_MAX > 0)
 #assert(SCHEDULER_IO_SERVICE_INTERVAL_COUNT > 0)
 #assert(SCHEDULER_TURN_WORK_BUDGET_COUNT <= int(max(u32)))
+#assert(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT <= int(max(u32)))
 #assert(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX <= int(max(u32)))
 #assert(SCHEDULER_CREDIT_PER_WEIGHT_COUNT <= int(max(u32)))
 #assert(SCHEDULER_CREDIT_COUNT_MAX <= int(max(u32)))
@@ -123,7 +133,7 @@ Shard_Maintenance_Task :: struct {
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 TypeDescriptor :: struct {
-	id:                      u8,
+	id:                      Type_Id,
 	slot_count:              int,
 	stride:                  int,
 	soa_metadata_size:       int,
@@ -232,7 +242,7 @@ Supervision_Strategy :: enum u8 {
 }
 
 Static_Child_Spec :: struct {
-	type_id:      u8,
+	type_id:      Type_Id,
 	restart_type: Restart_Type,
 	args_size:    u8,
 	args_payload: [MAX_INIT_ARGS_SIZE]u8,
@@ -310,16 +320,27 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 	isolate_types_seen: [256]bool
 	scratch_max := 0
 
-	for t in spec.types {
-		if t.id > MAX_TYPE_DESCRIPTOR_ID {
+	for t, type_index in spec.types {
+		if u16(t.id) > MAX_TYPE_DESCRIPTOR_ID {
 			fmt.eprintfln("[FATAL] Type ID %v exceeds max (%v)", t.id, MAX_TYPE_DESCRIPTOR_ID)
 			return .InvalidTypeId
 		}
-		if isolate_types_seen[t.id] {
+
+		expected_type_id := Type_Id(type_index)
+		if t.id != expected_type_id {
+			fmt.eprintfln(
+				"[FATAL] Type ID %v must equal dense descriptor index %v",
+				t.id,
+				expected_type_id,
+			)
+			return .InvalidTypeId
+		}
+
+		if isolate_types_seen[u16(t.id)] {
 			fmt.eprintfln("[FATAL] Duplicate type_id: %v", t.id)
 			return .DuplicateTypeId
 		}
-		isolate_types_seen[t.id] = true
+		isolate_types_seen[u16(t.id)] = true
 
 		if t.slot_count > MAX_ISOLATES_PER_TYPE {
 			fmt.eprintfln(
@@ -781,11 +802,11 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 @(test)
 test_system_spec_validation :: proc(t: ^testing.T) {
 	types := [2]TypeDescriptor {
-		{id = 1, scratch_requirement_max = 1024},
-		{id = 2, scratch_requirement_max = 4096},
+		{id = 0, scratch_requirement_max = 1024},
+		{id = 1, scratch_requirement_max = 4096},
 	}
 
-	children := [1]Child_Spec{Static_Child_Spec{type_id = 1, restart_type = .permanent}}
+	children := [1]Child_Spec{Static_Child_Spec{type_id = 0, restart_type = .permanent}}
 	root_group := Group_Spec {
 		strategy              = .One_For_One,
 		restart_count_max     = 3,
@@ -845,6 +866,38 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 			testing.expect_value(t, err, SystemSpecError.UnsupportedPlatform)
 		}
 	}
+}
+
+@(test)
+test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
+	types := [2]TypeDescriptor {
+		{id = 0},
+		{id = 2},
+	}
+
+	children := [1]Child_Spec{Static_Child_Spec{type_id = 0, restart_type = .permanent}}
+	root_group := Group_Spec {
+		strategy              = .One_For_One,
+		restart_count_max     = 1,
+		window_duration_ticks = 1,
+		children              = children[:],
+	}
+	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+	spec := SystemSpec {
+		shard_count         = 1,
+		types               = types[:],
+		shard_specs         = shard_specs[:],
+		scratch_arena_size  = 1,
+		pool_slot_count     = 16,
+		log_ring_size       = 16,
+		timer_spoke_count   = 16,
+		timer_entry_count   = 16,
+		default_ring_size   = 16,
+	}
+
+	err := validate_system_spec(&spec)
+	testing.expect_value(t, err, SystemSpecError.InvalidTypeId)
 }
 
 when TINA_SIMULATION_MODE {
