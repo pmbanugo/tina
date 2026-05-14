@@ -421,6 +421,7 @@ when TINA_SIMULATION_MODE {
 		soa[0].io_result = 128
 		soa[0].state = .Runnable
 		soa[0].flags += {.Shutdown_Pending}
+		_dispatchable_refresh_slot(shard, u16(PRIORITY_TYPE_ID), 0)
 
 		simulator_run(&sim)
 

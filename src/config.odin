@@ -70,6 +70,16 @@ SCHEDULER_IO_SERVICE_INTERVAL_COUNT :: #config(
 REACTOR_SUBMISSION_BATCH_COUNT :: #config(TINA_REACTOR_SUBMISSION_BATCH_COUNT, 256)
 REACTOR_COMPLETION_BATCH_COUNT :: #config(TINA_REACTOR_COMPLETION_BATCH_COUNT, 256)
 REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT :: #config(TINA_REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT, 192)
+REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT_DEFAULT :: REACTOR_SUBMISSION_BATCH_COUNT
+REACTOR_LINUX_SENDFILE_ENTRY_COUNT_DEFAULT :: (REACTOR_SUBMISSION_BATCH_COUNT + 7) / 8
+REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT :: #config(
+	TINA_REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT,
+	REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT_DEFAULT,
+)
+REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
+	TINA_REACTOR_LINUX_SENDFILE_ENTRY_COUNT,
+	REACTOR_LINUX_SENDFILE_ENTRY_COUNT_DEFAULT,
+)
 
 #assert(size_of(Shard_Id) == 1)
 #assert(size_of(Type_Id) == 2)
@@ -97,6 +107,10 @@ REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT :: #config(TINA_REACTOR_SUBMISSION_FLUS
 #assert(REACTOR_COMPLETION_BATCH_COUNT <= int(max(u16)))
 #assert(REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT > 0)
 #assert(REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT <= REACTOR_SUBMISSION_BATCH_COUNT)
+#assert(REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT > 0)
+#assert(REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT <= int(max(u16)))
+#assert(REACTOR_LINUX_SENDFILE_ENTRY_COUNT > 0)
+#assert(REACTOR_LINUX_SENDFILE_ENTRY_COUNT <= int(max(u16)))
 
 Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect
@@ -761,6 +775,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 		aligned_count := _aligned_capacity(t.slot_count)
 		total += aligned_count * t.soa_metadata_size
 		total += t.slot_count * t.working_memory_size
+		total += _dispatch_word_count(t.slot_count) * size_of(u64)
 	}
 
 	total += spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE
@@ -785,6 +800,9 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	// Account for scheduler/type arrays: isolate_free_heads, dispatch_cursors, and dispatch_credit_counts.
 	total += types_count * size_of(u32) * 2
 	total += types_count * size_of(Scheduler_Credit_Count)
+	total += types_count * size_of([]u64)
+	total += types_count * size_of(u32)
+	total += _dispatch_word_count(types_count) * size_of(u64)
 
 	// Find the largest supervision tree across all shards and budget for its arrays
 	tree_memory_max := 0

@@ -433,12 +433,21 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		if soa_meta[slot_index].state == .Waiting_For_Io {
 			soa_meta[slot_index].state = .Runnable
 		}
+		_dispatchable_refresh_slot(shard, u16(type_index), slot_index)
 	}
 }
 
 reactor_service_nonblocking :: proc(reactor: ^Reactor, shard: ^Shard) {
 	reactor_collect_completions(reactor, shard, 0)
 	reactor_flush_submissions_if_needed(reactor, shard)
+}
+
+@(private = "file")
+_backend_error_to_io_error :: #force_inline proc "contextless" (err: Backend_Error) -> IO_Error {
+	if err == .Resource_Exhausted {
+		return IO_ERR_RESOURCE_EXHAUSTED
+	}
+	return IO_ERR_SUBMISSION_FULL
 }
 
 reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_Error {
@@ -454,6 +463,7 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 
 	// Error Path: Backend Queue Full
 	shard.counters.io_submission_exhaustions += u64(reactor.pending_count)
+	io_error := _backend_error_to_io_error(err)
 
 	for i in 0 ..< reactor.pending_count {
 		sub := &reactor.pending_submissions[i]
@@ -471,12 +481,13 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 			soa_meta[slot_index].io_completion_tag = Message_Tag(
 				submission_token_operation_tag(sub.token),
 			)
-			soa_meta[slot_index].io_result = i32(IO_ERR_SUBMISSION_FULL)
+			soa_meta[slot_index].io_result = i32(io_error)
 			soa_meta[slot_index].io_buffer_index = BUFFER_INDEX_NONE
 
 			if soa_meta[slot_index].state == .Waiting_For_Io {
 				soa_meta[slot_index].state = .Runnable
 			}
+			_dispatchable_refresh_slot(shard, u16(type_index), slot_index)
 		}
 	}
 
@@ -505,7 +516,7 @@ reactor_submit_io :: proc(
 	if reactor.pending_count >= MAX_REACTOR_SUBMISSION_BATCH {
 		flush_err := reactor_flush_submissions(reactor, shard)
 		if flush_err != .None {
-			return IO_ERR_SUBMISSION_FULL
+			return _backend_error_to_io_error(flush_err)
 		}
 		reactor_service_nonblocking(reactor, shard)
 		if reactor.pending_count >= MAX_REACTOR_SUBMISSION_BATCH {
@@ -949,6 +960,20 @@ test_reactor_control_socket_and_shutdown :: proc(t: ^testing.T) {
 @(test)
 test_fixed_file_sentinel_consistency :: proc(t: ^testing.T) {
 	testing.expect_value(t, FIXED_FILE_INDEX_NONE, u16(FD_TABLE_NONE_INDEX))
+}
+
+@(test)
+test_backend_error_to_io_error_maps_resource_exhausted :: proc(t: ^testing.T) {
+	testing.expect_value(
+		t,
+		_backend_error_to_io_error(Backend_Error.Resource_Exhausted),
+		IO_Error(IO_ERR_RESOURCE_EXHAUSTED),
+	)
+	testing.expect_value(
+		t,
+		_backend_error_to_io_error(Backend_Error.Queue_Full),
+		IO_Error(IO_ERR_SUBMISSION_FULL),
+	)
 }
 
 @(test)

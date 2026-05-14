@@ -20,6 +20,7 @@ package tina
 Backend_Error :: enum u8 {
 	None,
 	Queue_Full,
+	Resource_Exhausted,
 	System_Error,
 	Not_Found,
 	Too_Late,

@@ -24,8 +24,8 @@ import "core:testing"
 when !TINA_SIMULATION_MODE {
 
 	MAX_LINUX_UNQUEUED :: 256
-	MAX_LINUX_PENDING_ADDRS :: 64
-	MAX_LINUX_SENDFILE_ENTRIES :: 16
+	MAX_LINUX_PENDING_ADDRS :: REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT
+	MAX_LINUX_SENDFILE_ENTRIES :: REACTOR_LINUX_SENDFILE_ENTRY_COUNT
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_LINUX_UNQUEUED)
 
 	// Persistent storage for io_uring operations that need stable pointers
@@ -200,6 +200,43 @@ when !TINA_SIMULATION_MODE {
 		backend.unqueued_count = 0
 	}
 
+	@(private = "file")
+	_linux_submission_needs_addr_entry :: #force_inline proc "contextless" (submission: ^Submission) -> bool {
+		if _, ok := submission.operation.(Submission_Op_Accept); ok do return true
+		if _, ok := submission.operation.(Submission_Op_Connect); ok do return true
+		if _, ok := submission.operation.(Submission_Op_Sendto); ok do return true
+		if _, ok := submission.operation.(Submission_Op_Recvfrom); ok do return true
+		return false
+	}
+
+	@(private = "file")
+	_linux_submission_needs_sendfile_entry :: #force_inline proc "contextless" (submission: ^Submission) -> bool {
+		_, is_sendfile := submission.operation.(Submission_Op_Sendfile)
+		return is_sendfile
+	}
+
+	@(private = "file")
+	_linux_active_addr_entry_count :: proc "contextless" (backend: ^Platform_Backend) -> int {
+		active_count := 0
+		for i in 0 ..< MAX_LINUX_PENDING_ADDRS {
+			if backend.addr_entries[i].active {
+				active_count += 1
+			}
+		}
+		return active_count
+	}
+
+	@(private = "file")
+	_linux_active_sendfile_entry_count :: proc "contextless" (backend: ^Platform_Backend) -> int {
+		active_count := 0
+		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
+			if backend.sendfile_entries[i].active {
+				active_count += 1
+			}
+		}
+		return active_count
+	}
+
 	@(private = "package")
 	_backend_submit :: proc(
 		backend: ^Platform_Backend,
@@ -209,6 +246,23 @@ when !TINA_SIMULATION_MODE {
 		// In the worst case, every submission overflows to unqueued.
 		if int(backend.unqueued_count) + len(submissions) > MAX_LINUX_UNQUEUED {
 			return .Queue_Full
+		}
+
+		required_addr_entry_count := 0
+		required_sendfile_entry_count := 0
+		for &submission in submissions {
+			if _linux_submission_needs_addr_entry(&submission) {
+				required_addr_entry_count += 1
+			}
+			if _linux_submission_needs_sendfile_entry(&submission) {
+				required_sendfile_entry_count += 1
+			}
+		}
+		if _linux_active_addr_entry_count(backend) + required_addr_entry_count > MAX_LINUX_PENDING_ADDRS {
+			return .Resource_Exhausted
+		}
+		if _linux_active_sendfile_entry_count(backend) + required_sendfile_entry_count > MAX_LINUX_SENDFILE_ENTRIES {
+			return .Resource_Exhausted
 		}
 
 		for &submission in submissions {
@@ -743,33 +797,24 @@ when !TINA_SIMULATION_MODE {
 
 		case Submission_Op_Accept:
 			entry := _linux_alloc_addr_entry(backend, submission.token)
-			if entry != nil {
-				entry.sockaddr_len = size_of(entry.sockaddr)
-				sqe, ok := uring.accept(
-					&backend.ring,
-					ud,
-					linux.Fd(op.listen_fd),
-					&entry.sockaddr,
-					&entry.sockaddr_len,
-					linux.Socket_FD_Flags{},
-				)
-				if !ok {
-					entry.active = false
-				}
-				if ok && use_fixed {
-					_linux_apply_fixed_file(sqe, ffi)
-				}
-				return ok
+			when TINA_RUNTIME_ASSERTIONS {
+				assert(entry != nil, "linux accept requires a pending addr entry")
 			}
-			// No addr slot available, accept without sockaddr
+			if entry == nil {
+				return false
+			}
+			entry.sockaddr_len = size_of(entry.sockaddr)
 			sqe, ok := uring.accept(
 				&backend.ring,
 				ud,
 				linux.Fd(op.listen_fd),
-				(^linux.Sock_Addr_Any)(nil),
-				nil,
+				&entry.sockaddr,
+				&entry.sockaddr_len,
 				linux.Socket_FD_Flags{},
 			)
+			if !ok {
+				entry.active = false
+			}
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
 			}

@@ -184,6 +184,9 @@ hydrate_shard :: proc(
 	shard.working_memory = make([][]u8, types_count, alloc)
 	shard.metadata = make([]#soa[]Isolate_Metadata, types_count, alloc)
 	shard.isolate_free_heads = make([]u32, types_count, alloc)
+	shard.dispatchable_slot_words = make([][]u64, types_count, alloc)
+	shard.dispatchable_slot_counts = make([]u32, types_count, alloc)
+	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
 	if spec.maintenance_task_count_max > 0 {
 		alloc_data.current_name = "Maintenance_Tasks"
 		shard.maintenance_tasks = make([]Shard_Maintenance_Task, spec.maintenance_task_count_max, alloc)
@@ -210,6 +213,14 @@ hydrate_shard :: proc(
 		if desc.slot_count > 0 && desc.stride > 0 {
 			alloc_data.current_name = fmt.tprintf("Typed_Arena_%d", desc.id)
 			shard.isolate_memory[type_index] = make([]u8, desc.slot_count * desc.stride, alloc)
+		}
+		if desc.slot_count > 0 {
+			alloc_data.current_name = fmt.tprintf("Dispatchable_Slots_%d", desc.id)
+			shard.dispatchable_slot_words[type_index] = make(
+				[]u64,
+				_dispatch_word_count(desc.slot_count),
+				alloc,
+			)
 		}
 
 		aligned_count := _aligned_capacity(desc.slot_count)

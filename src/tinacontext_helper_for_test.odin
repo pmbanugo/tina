@@ -125,22 +125,35 @@ test_with_local_context :: proc(
 	defer delete(shard.type_descriptors)
 	shard.metadata = make([]#soa[]Isolate_Metadata, type_count)
 	defer delete(shard.metadata)
+	shard.dispatchable_slot_words = make([][]u64, type_count)
+	defer delete(shard.dispatchable_slot_words)
+	shard.dispatchable_slot_counts = make([]u32, type_count)
+	defer delete(shard.dispatchable_slot_counts)
+	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(type_count))
+	defer delete(shard.dispatchable_type_words)
 
 	target_type_id := extract_type_id(config.target_handle)
 	target_slot_index := extract_slot(config.target_handle)
 	target_slot_count := int(target_slot_index) + 1
 	shard.metadata[target_type_id] = make(#soa[]Isolate_Metadata, target_slot_count)
 	defer delete(shard.metadata[target_type_id])
+	shard.dispatchable_slot_words[target_type_id] = make(
+		[]u64,
+		_dispatch_word_count(target_slot_count),
+	)
+	defer delete(shard.dispatchable_slot_words[target_type_id])
 
 	mailbox_capacity := config.target_mailbox_capacity
 	if mailbox_capacity == 0 {
 		mailbox_capacity = 8
 	}
 	shard.type_descriptors[target_type_id].mailbox_capacity = u16(mailbox_capacity)
+	shard.type_descriptors[target_type_id].id = Type_Id(target_type_id)
 	shard.metadata[target_type_id][target_slot_index].generation = extract_generation(
 		config.target_handle,
 	)
 	shard.metadata[target_type_id][target_slot_index].state = config.target_state
+	_dispatchable_refresh_slot(shard, target_type_id, target_slot_index)
 
 	scratch_bytes := make([]u8, 4096)
 	defer delete(scratch_bytes)

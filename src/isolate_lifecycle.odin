@@ -125,6 +125,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 			soa_meta[slot].state = .Unallocated
 			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
 			shard.isolate_free_heads[type_id] = slot
+			_dispatchable_refresh_slot(shard, type_id, slot)
 			return Spawn_Error.init_failed
 		}
 	}
@@ -171,6 +172,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	}
 
 	_interpret_effect(shard, type_id, slot, effect, &child_invocation)
+	_dispatchable_refresh_slot(shard, type_id, slot)
 	return child_handle
 }
 
@@ -258,6 +260,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	soa_meta[slot_index].state = .Unallocated
 	soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
 	shard.isolate_free_heads[type_id] = slot_index
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
 
 	// Step 5: Invoke supervision subsystem (can now safely execute inline restarts)
 	if group_id != SUPERVISION_GROUP_ID_NONE {
