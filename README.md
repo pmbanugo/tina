@@ -3,7 +3,7 @@
 **A strictly bounded, thread-per-core concurrency framework.** It is designed For massive concurrency, safety, and  fault-tolerance.
 > Write simple, synchronous-looking state machines. Get massive multi-core throughput, automatic fault isolation, and 100% deterministic simulation testing.
 
-[![Odin Version](https://img.shields.io/badge/Odin-dev-2026-05-blue)](#)
+[![Odin Version](https://img.shields.io/badge/Odin-dev--2026--05-blue)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](./LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-0-orange)](#)
 [![Follow @p_mbanugo](https://img.shields.io/twitter/follow/p_mbanugo?style=social)](https://twitter.com/p_mbanugo)
