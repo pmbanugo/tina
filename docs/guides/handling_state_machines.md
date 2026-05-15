@@ -258,20 +258,20 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tin
     self.dispatcher = init_args.dispatcher
 
     // THE CHECK-IN PATTERN:
-    // After a restart, ctx.self_handle is a brand-new Handle.
+    // After a restart, tina.ctx_self_handle(ctx) is a brand-new Handle.
     // The old one is dead — sends to it return .stale_handle.
     // We must tell the Dispatcher our new identity.
     ready_msg := WorkerReadyMsg{
         id     = self.id,            // same role as before
-        handle = ctx.self_handle,    // new Handle (different after restart!)
+        handle = tina.ctx_self_handle(ctx),    // new Handle (different after restart!)
     }
     _ = tina.ctx_send(ctx, self.dispatcher, TAG_WORKER_READY, &ready_msg)
 
     str := fmt.bprintf(
-        ctx.scratch_arena.data,
+        tina.ctx_scratch_arena_bytes(ctx),
         "[RECOVER] Worker %d checked in with handle %X",
         self.id,
-        u64(ctx.self_handle),
+        u64(tina.ctx_self_handle(ctx)),
     )
     tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
@@ -327,7 +327,7 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) ->
 
         init_args := WorkerInitArgs{
             id         = u32(i),
-            dispatcher = ctx.self_handle,   // tell the Worker who we are
+            dispatcher = tina.ctx_self_handle(ctx),   // tell the Worker who we are
         }
         payload, size := tina.init_args_of(&init_args)
 

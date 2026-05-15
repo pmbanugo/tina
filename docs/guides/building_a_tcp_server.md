@@ -58,7 +58,7 @@ listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> t
     tina.ctx_listen(ctx, self.listen_fd, 128)
 
     // 5. Log that we're ready.
-    str := fmt.bprintf(ctx.scratch_arena.data, "TCP Server listening on 127.0.0.1:9090")
+    str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "TCP Server listening on 127.0.0.1:9090")
     tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
     // 6. Park waiting for the first connection.
