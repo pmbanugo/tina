@@ -9,7 +9,7 @@ import "core:mem"
 //
 // Wires the parser/router/response data structures from Phases 1–5 into
 // Tina's memory model: TypeDescriptors, supervision tree, working-memory
-// derivation, and the install() public entry points.
+// derivation, and the explicit install entry points.
 //
 // References:
 //   - HTTP_LIBRARY_SYSTEM_INTEGRATION.md  (Isolate types, install API, sharding)
@@ -325,7 +325,7 @@ HTTP_Connection_Init_Args :: struct {
 // at install time, then assigns each HTTP TypeDescriptor as
 // `base_type_id + HTTP_TYPE_OFFSET_<role>`. This keeps the install contract
 // position-independent: callers may register their own TypeDescriptors before
-// (or after) `install()` and the HTTP wiring still resolves correctly.
+// (or after) HTTP install and the wiring still resolves correctly.
 //
 // The runtime never reads these constants directly. Every place that needs
 // the actual type id reads it from a runtime field that was populated from
@@ -354,8 +354,8 @@ HTTP_INTERNAL_SCRATCH_NEED :: 4096
 
 // ─── Default sizing constants ───────────────────────────────────────────────
 //
-// Library-chosen ceilings for the convenience installers. Production callers
-// should pass their own values via `install_make_system_spec`.
+// Library-chosen ceilings for the development installer. Production and
+// mutating installers require explicit capacity from the caller.
 
 @(private = "package")
 HTTP_DEV_CONNECTION_SLOT_COUNT_DEFAULT :: 128
@@ -385,35 +385,40 @@ HTTP_PROD_DEFAULT_RING_SIZE :: 1024
 HTTP_DEFAULT_BACKLOG :: 1024
 
 
-// ─── install Procedure Group — Public API ───────────────────────────────────
+// ─── Install API — Public API ───────────────────────────────────────────────
 //
-// Tier 1 (`install_into_system_spec`) is the primitive: mutate an existing
-// SystemSpec by appending HTTP TypeDescriptors and wiring children into each
-// shard's supervision tree. Tier 2 (`install_make_system_spec`) builds a
-// production SystemSpec from scratch, then delegates to Tier 1.
-// `install_development_defaults` is a separate name because "dev mode" is a
-// semantic preset (single-shard, .Development memory, .Abort quarantine), not
-// a signature variant — see HTTP_LIBRARY_SYSTEM_INTEGRATION.md §3.1.
-
-install :: proc {
-	install_into_system_spec,
-	install_make_system_spec,
-}
-
-install_development_defaults :: proc {
-	install_development_defaults_default,
-	install_development_defaults_with_connection_slot_count,
-}
+// Explicit API surface:
+//   - `install_into_system_spec` mutates an existing SystemSpec using an
+//     explicit per-shard connection capacity.
+//   - `install` builds a production SystemSpec, then delegates to the mutating
+//     primitive with the same explicit capacity.
+//   - `install_development` builds a single-shard development SystemSpec with
+//     explicit connection capacity.
+//   - `install_development_defaults` is the only entry point that invents a
+//     connection capacity on behalf of the caller.
 
 
 // ─── Tier 1: mutate an existing SystemSpec ──────────────────────────────────
 
-install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
+install_into_system_spec :: proc(
+	spec: ^tina.SystemSpec,
+	server: ^Server,
+	connection_slot_count: u32,
+) {
 	assert(spec != nil, "install_into_system_spec: spec is nil")
 	assert(server != nil, "install_into_system_spec: server is nil")
 	assert(server.app != nil, "install_into_system_spec: server.app is nil — nothing to install")
+	assert(
+		connection_slot_count >= 1,
+		"install_into_system_spec: connection_slot_count must be >= 1",
+	)
+	assert(
+		connection_slot_count <= 65_535,
+		"install_into_system_spec: connection_slot_count exceeds u16 idle-tracker width",
+	)
 
 	_normalize_server_defaults(server)
+	connection_slot_count_per_shard := u16(connection_slot_count)
 
 	when ODIN_OS == .Windows {
 		assert(
@@ -433,11 +438,6 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 		"limits: pipeline_size_max exceeds u16 width",
 	)
 
-	connection_slot_count := _route_connection_slot_count(spec)
-	assert(
-		connection_slot_count <= 65_535,
-		"connection_slot_count exceeds u16 idle-tracker width",
-	)
 	assert(
 		len(server.app.routes) <= 254,
 		"too many routes (Route_Index reserves 0xFF as ROUTE_INDEX_NONE; 254 is the conservative cap)",
@@ -505,7 +505,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	listener_init_args := HTTP_Listener_Init_Args {
 		server                = server_runtime,
 		router                = router,
-		connection_slot_count = u16(connection_slot_count),
+		connection_slot_count = connection_slot_count_per_shard,
 		connection_type_id    = connection_type_id,
 		dispatcher_type_id    = dispatcher_type_id,
 		dispatcher_shard_count = spec.shard_count,
@@ -515,7 +515,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 	dispatcher_init_args := HTTP_Dispatcher_Init_Args {
 		server                = server_runtime,
 		router                = router,
-		connection_slot_count = u16(connection_slot_count),
+		connection_slot_count = connection_slot_count_per_shard,
 		connection_type_id    = connection_type_id,
 	}
 	dispatcher_args_payload, dispatcher_args_size := tina.init_args_of(&dispatcher_init_args)
@@ -532,7 +532,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 		slot_count              = 1,
 		stride                  = size_of(HTTP_Listener),
 		soa_metadata_size       = size_of(tina.Isolate_Metadata),
-		working_memory_size     = _listener_working_memory_size(int(connection_slot_count)),
+		working_memory_size     = _listener_working_memory_size(int(connection_slot_count_per_shard)),
 		scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
 		mailbox_capacity        = 16,
 		// The listener bootstraps the shard-local runtime and drives accept.
@@ -544,7 +544,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 
 	new_types[connection_type_id] = tina.TypeDescriptor {
 		id                      = connection_type_id,
-		slot_count              = int(connection_slot_count),
+		slot_count              = int(connection_slot_count_per_shard),
 		stride                  = size_of(HTTP_Connection),
 		soa_metadata_size       = size_of(tina.Isolate_Metadata),
 		working_memory_size     = working_memory_size,
@@ -560,7 +560,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 			slot_count              = 1,
 			stride                  = size_of(HTTP_Dispatcher),
 			soa_metadata_size       = size_of(tina.Isolate_Metadata),
-			working_memory_size     = _listener_working_memory_size(int(connection_slot_count)),
+			working_memory_size     = _listener_working_memory_size(int(connection_slot_count_per_shard)),
 			scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
 			mailbox_capacity        = 16,
 			init_handler            = _http_dispatcher_init,
@@ -580,7 +580,7 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 			dispatcher_type_id,
 			include_listener,
 			include_dispatcher,
-			u16(connection_slot_count),
+			connection_slot_count_per_shard,
 			listener_args_payload,
 			listener_args_size,
 			dispatcher_args_payload,
@@ -590,19 +590,19 @@ install_into_system_spec :: proc(spec: ^tina.SystemSpec, server: ^Server) {
 }
 
 
-// ─── Tier 2: build a production SystemSpec, then delegate ───────────────────
+// ─── Production convenience installer ───────────────────────────────────────
 
-install_make_system_spec :: proc(
+install :: proc(
 	server: ^Server,
 	shard_count: u8,
 	connection_slot_count: u32,
 ) -> tina.SystemSpec {
-	assert(server != nil, "install_make_system_spec: server is nil")
-	assert(server.app != nil, "install_make_system_spec: server.app is nil")
-	assert(shard_count >= 1, "install_make_system_spec: shard_count must be >= 1")
+	assert(server != nil, "install: server is nil")
+	assert(server.app != nil, "install: server.app is nil")
+	assert(shard_count >= 1, "install: shard_count must be >= 1")
 	assert(
 		connection_slot_count >= 1,
-		"install_make_system_spec: connection_slot_count must be >= 1",
+		"install: connection_slot_count must be >= 1",
 	)
 
 	spec := _make_base_system_spec(
@@ -613,26 +613,23 @@ install_make_system_spec :: proc(
 		HTTP_PROD_SHUTDOWN_TIMEOUT_MS,
 		HTTP_PROD_DEFAULT_RING_SIZE,
 	)
-	install_into_system_spec(&spec, server)
+	install_into_system_spec(&spec, server, connection_slot_count)
 	return spec
 }
 
 
-// ─── Development presets ────────────────────────────────────────────────────
+// ─── Development installers ─────────────────────────────────────────────────
 
-install_development_defaults_default :: proc(server: ^Server) -> tina.SystemSpec {
-	return install_development_defaults_with_connection_slot_count(
-		server,
-		HTTP_DEV_CONNECTION_SLOT_COUNT_DEFAULT,
-	)
+install_development_defaults :: proc(server: ^Server) -> tina.SystemSpec {
+	return install_development(server, HTTP_DEV_CONNECTION_SLOT_COUNT_DEFAULT)
 }
 
-install_development_defaults_with_connection_slot_count :: proc(
+install_development :: proc(
 	server: ^Server,
 	connection_slot_count: u32,
 ) -> tina.SystemSpec {
-	assert(server != nil, "install_development_defaults: server is nil")
-	assert(server.app != nil, "install_development_defaults: server.app is nil")
+	assert(server != nil, "install_development: server is nil")
+	assert(server.app != nil, "install_development: server.app is nil")
 	assert(connection_slot_count >= 1, "connection_slot_count must be >= 1")
 
 	// Force single-shard regardless of caller's distribution preference.
@@ -647,7 +644,7 @@ install_development_defaults_with_connection_slot_count :: proc(
 		HTTP_DEV_DEFAULT_RING_SIZE,
 	)
 	spec.quarantine_policy = .Abort
-	install_into_system_spec(&spec, server)
+	install_into_system_spec(&spec, server, connection_slot_count)
 	return spec
 }
 
@@ -894,20 +891,6 @@ _make_shard_runtime :: proc(
 		accept_backoff_ns     = 50_000_000,
 	}
 	return runtime
-}
-
-// Resolves the connection capacity used to size HTTP TypeDescriptor fields
-// when the user mutates an existing spec. We trust the connection
-// TypeDescriptor that was set up alongside install (Tier 2 / dev), and fall
-// back to the dev default for hand-rolled specs.
-@(private = "file")
-_route_connection_slot_count :: proc(spec: ^tina.SystemSpec) -> u32 {
-	for desc in spec.types {
-		if desc.stride == size_of(HTTP_Connection) && desc.slot_count > 0 {
-			return u32(desc.slot_count)
-		}
-	}
-	return HTTP_DEV_CONNECTION_SLOT_COUNT_DEFAULT
 }
 
 @(private = "file")
@@ -1179,7 +1162,33 @@ test_install_development_defaults_produces_valid_spec :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_install_make_system_spec_multi_shard_includes_dispatcher :: proc(t: ^testing.T) {
+test_install_development_respects_explicit_connection_capacity :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+
+	app := App{}
+	server := Server {
+		address = tina.ipv4(127, 0, 0, 1, 8080),
+		app     = &app,
+	}
+
+	spec := install_development(&server, 257)
+
+	root := spec.shard_specs[0].root_group
+	testing.expect_value(t, root.child_count_dynamic_max, u16(257))
+
+	found_connection := false
+	for desc in spec.types {
+		if desc.stride == size_of(HTTP_Connection) {
+			testing.expect_value(t, desc.slot_count, 257)
+			found_connection = true
+		}
+	}
+	testing.expect(t, found_connection, "HTTP_Connection TypeDescriptor must be installed")
+}
+
+@(test)
+test_install_multi_shard_includes_dispatcher :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	context.allocator = context.temp_allocator
 
@@ -1196,7 +1205,7 @@ test_install_make_system_spec_multi_shard_includes_dispatcher :: proc(t: ^testin
 		distribution = .Coordinator,
 	}
 
-	spec := install_make_system_spec(&server, 2, 64)
+	spec := install(&server, 2, 64)
 
 	testing.expect_value(t, spec.shard_count, u8(2))
 	testing.expect_value(t, spec.memory_init_mode, tina.Memory_Init_Mode.Production)
@@ -1226,7 +1235,7 @@ test_install_make_system_spec_multi_shard_includes_dispatcher :: proc(t: ^testin
 }
 
 @(test)
-test_install_make_system_spec_multi_shard_defaults_to_coordinator :: proc(t: ^testing.T) {
+test_install_multi_shard_defaults_to_coordinator :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	context.allocator = context.temp_allocator
 
@@ -1240,7 +1249,7 @@ test_install_make_system_spec_multi_shard_defaults_to_coordinator :: proc(t: ^te
 		app     = &app,
 	}
 
-	spec := install_make_system_spec(&server, 2, 64)
+	spec := install(&server, 2, 64)
 
 	// Derive expected type ids from the spec rather than from constants:
 	// after install, HTTP types occupy the tail of `spec.types`. Reading the
@@ -1274,7 +1283,9 @@ test_install_make_system_spec_multi_shard_defaults_to_coordinator :: proc(t: ^te
 // IDs. We seed the spec with a stub TypeDescriptor first so the HTTP types
 // are forced off the [0..2] offsets and any accidental hardcoding of those
 // values would surface as a mismatch between the supervision wiring (which
-// reads the dynamic id) and the installed descriptor table.
+// reads the dynamic id) and the installed descriptor table. This also verifies
+// that Tier 1 uses the caller's explicit connection capacity instead of any
+// pre-existing descriptor inference or hidden default.
 @(test)
 test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
@@ -1318,7 +1329,7 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 	)
 	spec.types = external_types
 
-	install_into_system_spec(&spec, &server)
+	install_into_system_spec(&spec, &server, 257)
 
 	// HTTP types must be appended *after* the stub at the documented offsets.
 	expected_listener_id := tina.Type_Id(1 + HTTP_TYPE_OFFSET_LISTENER)
@@ -1348,4 +1359,6 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 	// `runtime.connection_type_id` (set from install args) and the descriptor
 	// table agree at boot.
 	testing.expect_value(t, spec.types[expected_connection_id].stride, size_of(HTTP_Connection))
+	testing.expect_value(t, spec.types[expected_connection_id].slot_count, 257)
+	testing.expect_value(t, root.child_count_dynamic_max, u16(257))
 }

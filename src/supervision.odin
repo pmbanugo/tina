@@ -2,6 +2,7 @@ package tina
 
 import "core:fmt"
 import "core:mem"
+import "core:testing"
 
 Build_Result :: enum u8 {
 	Ok,
@@ -265,12 +266,16 @@ _on_child_exit :: proc(
 ) {
 	group := &shard.supervision_groups[u16(group_id)]
 
-	if exit_kind == .Shutdown {
-		return
-	}
-
 	child_index, found := _find_child_index(group, child_handle)
 	if !found do return
+
+	process_phase := load_process_phase()
+	if exit_kind == .Shutdown ||
+	   process_phase == .Shutting_Down ||
+	   process_phase == .Terminated {
+		_remove_child_at(group, child_index)
+		return
+	}
 
 	restart_type := _get_child_restart_type(group, child_index)
 
@@ -407,4 +412,44 @@ _rebuild_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) -> Build_Res
 	group.restart_count = 0
 	group.window_start_tick = shard.current_tick
 	return .Ok
+}
+
+@(test)
+test_on_child_exit_does_not_restart_during_process_shutdown :: proc(t: ^testing.T) {
+	phase_previous := load_process_phase()
+	defer store_process_phase(phase_previous)
+	store_process_phase(.Shutting_Down)
+
+	child_handle := make_handle(0, 1, 0, 1)
+	children := []Child_Spec {
+		Static_Child_Spec {
+			type_id      = 1,
+			restart_type = .permanent,
+		},
+	}
+	group_spec := Group_Spec {
+		strategy              = .One_For_One,
+		restart_count_max     = 3,
+		window_duration_ticks = 10,
+		children              = children,
+	}
+
+	shard := new(Shard)
+	defer free(shard)
+	shard.supervision_groups = make([]Supervision_Group, 1)
+	defer delete(shard.supervision_groups)
+
+	group := &shard.supervision_groups[0]
+	group.group_id = 0
+	group.boot_spec = &group_spec
+	group.strategy = .One_For_One
+	group.child_count_static = 1
+	group.children_handles = make([]Handle, 1)
+	defer delete(group.children_handles)
+	group.children_handles[0] = child_handle
+
+	_on_child_exit(shard, 0, child_handle, .Normal)
+
+	testing.expect_value(t, group.children_handles[0], HANDLE_NONE)
+	testing.expect_value(t, group.child_count_dynamic, u16(0))
 }

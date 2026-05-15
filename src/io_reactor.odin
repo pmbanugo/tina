@@ -530,21 +530,31 @@ reactor_submit_io :: proc(
 	type_index := extract_type_id(owner)
 	slot_index := extract_slot(owner)
 	soa_meta := shard.metadata[type_index]
+	meta := &soa_meta[slot_index]
 
 	// One-in-flight I/O invariant: an Isolate must not submit new I/O while
 	// already in WAITING_FOR_IO. The io_sequence mechanism assumes at most one
 	// in-flight operation per Isolate — if two were in flight, bumping the
 	// sequence would only invalidate one, leaving the other to corrupt state.
-	when TINA_RUNTIME_ASSERTIONS {
-		assert(
-			soa_meta[slot_index].state != .Waiting_For_Io,
-			"One-in-flight I/O invariant violated: Isolate submitted while WAITING_FOR_IO",
-		)
+	if meta.state == .Waiting_For_Io {
+		if _, is_close := io_op.(IoOp_Close); is_close {
+			// A close supersedes the abandoned in-flight operation. Bump once to
+			// stale the older completion, then again below for the new close
+			// submission so the stale path and valid path stay disjoint.
+			meta.io_sequence += 1
+		} else {
+			when TINA_RUNTIME_ASSERTIONS {
+				assert(
+					false,
+					"One-in-flight I/O invariant violated: Isolate submitted while WAITING_FOR_IO",
+				)
+			}
+		}
 	}
 
-	soa_meta[slot_index].io_sequence += 1
-	seq := soa_meta[slot_index].io_sequence
-	gen := u8(soa_meta[slot_index].generation)
+	meta.io_sequence += 1
+	seq := meta.io_sequence
+	gen := u8(meta.generation)
 
 	submission: Submission
 	submission.fixed_file_index = FIXED_FILE_INDEX_NONE
@@ -982,6 +992,46 @@ test_backend_error_to_io_error_maps_resource_exhausted :: proc(t: ^testing.T) {
 		_backend_error_to_io_error(Backend_Error.System_Error),
 		IO_Error(IO_ERR_BACKEND_FAILURE),
 	)
+}
+
+@(test)
+test_close_submission_supersedes_waiting_io_sequence :: proc(t: ^testing.T) {
+	config := Backend_Config {
+		sim_config = Simulation_IO_Config{},
+	}
+	fd_backing: [4]FD_Entry
+	buffer_backing: [1024]u8
+
+	reactor := new(Reactor)
+	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 1)
+	defer {reactor_deinit(reactor); free(reactor)}
+
+	shard := new(Shard)
+	defer free(shard)
+	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
+	defer delete(shard.metadata)
+	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata[1])
+
+	owner := make_handle(0, 1, 0, 1)
+	meta := &shard.metadata[1][0]
+	meta.generation = 1
+	meta.state = .Waiting_For_Io
+	meta.io_sequence = 7
+
+	fd_handle, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
+	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
+
+	io_err := reactor_submit_io(reactor, shard, owner, IoOp_Close {fd = fd_handle})
+	testing.expect_value(t, io_err, IO_ERR_NONE)
+	testing.expect_value(t, meta.io_sequence, u8(9))
+	testing.expect_value(t, reactor.pending_count, u16(1))
+	#partial switch close_op in reactor.pending_submissions[0].operation {
+	case Submission_Op_Close:
+		testing.expect_value(t, reactor.pending_submissions[0].fixed_file_index, FIXED_FILE_INDEX_NONE)
+	case:
+		testing.expect(t, false, "expected close submission")
+	}
 }
 
 @(test)

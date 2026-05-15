@@ -647,6 +647,43 @@ shard_maintenance_send_local :: #force_inline proc(
 	)
 }
 
+// Wakes a same-shard target if it is currently blocked on I/O. This mirrors
+// the timer wheel's stale-completion protocol: bump io_sequence so the
+// abandoned completion is discarded later, then make the slot runnable so a
+// queued timeout/control message can be dispatched.
+@(require_results)
+shard_maintenance_wake_if_waiting_for_io :: #force_inline proc(
+	ctx: Shard_Maintenance_Context,
+	target: Handle,
+) -> bool {
+	invocation := shard_maintenance_invocation(ctx)
+	if extract_shard_id(target) != invocation.shard_id {
+		return false
+	}
+
+	shard := invocation.shard
+	type_id := extract_type_id(target)
+	if int(type_id) >= len(shard.metadata) {
+		return false
+	}
+
+	slot_index := extract_slot(target)
+	soa_meta := shard.metadata[type_id]
+	if int(slot_index) >= len(soa_meta) {
+		return false
+	}
+	if soa_meta[slot_index].generation != extract_generation(target) {
+		return false
+	}
+	if soa_meta[slot_index].state != .Waiting_For_Io {
+		return false
+	}
+
+	soa_meta[slot_index].io_sequence += 1
+	_slot_set_state(shard, type_id, slot_index, .Runnable)
+	return true
+}
+
 @(private = "package")
 _transfer_pool_free :: #force_inline proc(shard: ^Shard, index: u16) {
 	reactor_buffer_pool_free(&shard.transfer_pool, index)

@@ -52,3 +52,49 @@ test_shard_maintenance_context_exposes_time_and_local_enqueue :: proc(t: ^testin
 	testing.expect_value(t, message.correlation, Correlation_Id(77))
 	testing.expect_value(t, message.user.source, HANDLE_NONE)
 }
+
+@(test)
+test_shard_maintenance_wake_if_waiting_for_io_wakes_target :: proc(t: ^testing.T) {
+	Wake_Test_State :: struct {
+		t:                  ^testing.T,
+		target_handle:      Handle,
+		wake_result:        bool,
+		target_state:       Isolate_State,
+		target_io_sequence: u8,
+	}
+	target_handle := make_handle(0, 2, 0, 1)
+	test_state := Wake_Test_State {
+		t             = t,
+		target_handle = target_handle,
+	}
+
+	message_count, _ := test_with_local_context(
+		Test_Local_Context_Config {
+			self_handle         = make_handle(0, 1, 0, 1),
+			target_handle       = target_handle,
+			current_tick        = 7,
+			flags               = {.Maintenance},
+			timer_resolution_ns = 1,
+			target_state        = .Waiting_For_Io,
+		},
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: TinaContext) {
+			state := cast(^Wake_Test_State)user_data
+			maintenance_ctx := Shard_Maintenance_Context(ctx)
+			state.wake_result = shard_maintenance_wake_if_waiting_for_io(
+				maintenance_ctx,
+				state.target_handle,
+			)
+
+			invocation := ctx_invocation(ctx)
+			soa_meta := invocation.shard.metadata[extract_type_id(state.target_handle)]
+			state.target_state = soa_meta[extract_slot(state.target_handle)].state
+			state.target_io_sequence = soa_meta[extract_slot(state.target_handle)].io_sequence
+		},
+	)
+
+	testing.expect_value(t, test_state.wake_result, true)
+	testing.expect_value(t, test_state.target_state, Isolate_State.Runnable)
+	testing.expect_value(t, test_state.target_io_sequence, u8(1))
+	testing.expect_value(t, message_count, u16(0))
+}

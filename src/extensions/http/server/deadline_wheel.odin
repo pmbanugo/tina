@@ -13,6 +13,11 @@ _runtime_active_slot_add :: proc(connection: ^HTTP_Connection, ctx: tina.TinaCon
 
 	self_handle := tina.ctx_self_handle(ctx)
 	slot_index := u16(tina.extract_slot(self_handle))
+	if int(slot_index) >= len(runtime.active_slot_positions) ||
+	   int(runtime.active_count) >= len(runtime.active_slot_indices) ||
+	   int(runtime.active_count) >= len(runtime.active_connections) {
+		return
+	}
 	if runtime.active_slot_positions[slot_index] != u16(IDLE_ARRAY_INDEX_NONE) {
 		return
 	}
@@ -25,23 +30,31 @@ _runtime_active_slot_add :: proc(connection: ^HTTP_Connection, ctx: tina.TinaCon
 }
 
 @(private = "package")
-_runtime_active_slot_remove :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext) {
+_runtime_active_slot_remove :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext) -> bool {
 	state := &connection.connection_state
 	if state.shard_runtime == nil {
-		return
+		return false
 	}
-	_runtime_active_slot_remove_by_slot(state.shard_runtime, u16(tina.extract_slot(tina.ctx_self_handle(ctx))))
+	return _runtime_active_slot_remove_by_slot(
+		state.shard_runtime,
+		u16(tina.extract_slot(tina.ctx_self_handle(ctx))),
+	)
 }
 
 @(private = "file")
-_runtime_active_slot_remove_by_slot :: proc(runtime: ^HTTP_Shard_Runtime, slot_index: u16) {
+_runtime_active_slot_remove_by_slot :: proc(runtime: ^HTTP_Shard_Runtime, slot_index: u16) -> bool {
 	if runtime == nil {
-		return
+		return false
+	}
+	if int(slot_index) >= len(runtime.active_slot_positions) || u16(runtime.active_count) == 0 {
+		return false
 	}
 
 	active_index := runtime.active_slot_positions[slot_index]
-	if active_index == u16(IDLE_ARRAY_INDEX_NONE) {
-		return
+	if active_index == u16(IDLE_ARRAY_INDEX_NONE) ||
+	   active_index >= u16(runtime.active_count) ||
+	   int(active_index) >= len(runtime.active_connections) {
+		return false
 	}
 
 	connection := runtime.active_connections[active_index]
@@ -60,6 +73,7 @@ _runtime_active_slot_remove_by_slot :: proc(runtime: ^HTTP_Shard_Runtime, slot_i
 	runtime.active_connections[last_index] = nil
 	runtime.active_slot_positions[slot_index] = u16(IDLE_ARRAY_INDEX_NONE)
 	runtime.active_count = Active_Array_Count(last_index)
+	return true
 }
 
 @(private = "file")
@@ -286,6 +300,7 @@ _http_deadline_maintenance_task :: proc(
 				send_result := _deadline_enqueue_timeout(ctx, connection)
 				switch send_result {
 				case .ok:
+					_ = tina.shard_maintenance_wake_if_waiting_for_io(ctx, state.self_handle)
 					state.deadline_flags += {.Timeout_Queued}
 				case .mailbox_full, .pool_exhausted:
 					_deadline_link(runtime, connection, current_tick + 1)
