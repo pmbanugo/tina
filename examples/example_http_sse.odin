@@ -55,7 +55,7 @@ publisher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> t
 	self.subscriber_count = 0
 	self.counter = 0
 
-	publisher_handle = ctx.self_handle
+	publisher_handle = tina.ctx_self_handle(ctx)
 	tina.ctx_register_timer(ctx, SSE_TICK_INTERVAL_NS, TAG_PUBLISHER_TICK)
 	return tina.Effect_Receive{}
 }

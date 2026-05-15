@@ -70,18 +70,18 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina
 	// If you know Rust, the old handle is a revoked capability, not a dangling pointer.
 
 	// 2. The Check-in Pattern: Tell the boss we are alive and hand over our ephemeral Handle.
-	// If we just crashed and restarted, ctx.self_handle is now a brand new Handle!
+	// If we just crashed and restarted, tina.ctx_self_handle(ctx) is now a brand new Handle!
 	ready_msg := WorkerReadyMsg {
 		id     = self.id,
-		handle = ctx.self_handle,
+		handle = tina.ctx_self_handle(ctx),
 	}
 	_ = tina.ctx_send(ctx, self.dispatcher, TAG_WORKER_READY, &ready_msg)
 
 	str := fmt.bprintf(
-		ctx.scratch_arena.data,
+		tina.ctx_scratch_arena_bytes(ctx),
 		"[RECOVER] Worker %d checked in with handle %X",
 		self.id,
-		u64(ctx.self_handle),
+		u64(tina.ctx_self_handle(ctx)),
 	)
 	tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
@@ -102,7 +102,7 @@ worker_handler :: proc(
 
 		if DEMO_CRASH_EVERY > 0 && msg.job_id % u32(DEMO_CRASH_EVERY) == 0 {
 			str := fmt.bprintf(
-				ctx.scratch_arena.data, // log_buf[:],
+				tina.ctx_scratch_arena_bytes(ctx), // log_buf[:],
 				"[FAIL] Worker %d crashed on Job %d. Watch: it will come back with a NEW handle.",
 				id,
 				msg.job_id,
@@ -116,7 +116,7 @@ worker_handler :: proc(
 
 		// Happy Path: Do the job and report success.
 		// str := fmt.bprintf(log_buf[:], "Worker %d: Completed Job %d.", id, msg.job_id)
-		str := fmt.bprintf(ctx.scratch_arena.data, "Worker %d: Completed Job %d.", id, msg.job_id)
+		str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "Worker %d: Completed Job %d.", id, msg.job_id)
 		tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 		done_msg := JobDoneMsg {
@@ -158,7 +158,7 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 
 		init_args := WorkerInitArgs {
 			id         = u32(i),
-			dispatcher = ctx.self_handle,
+			dispatcher = tina.ctx_self_handle(ctx),
 		}
 		payload, size := tina.init_args_of(&init_args)
 
@@ -205,7 +205,7 @@ dispatcher_handler :: proc(
 			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 			str2 := fmt.bprintf(
-				ctx.scratch_arena.data,
+				tina.ctx_scratch_arena_bytes(ctx),
 				"[INSIGHT] Same role. New identity. Stale sends fail safely.",
 			)
 			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str2)

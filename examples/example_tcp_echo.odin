@@ -58,7 +58,7 @@ server_listener_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext
 	tina.ctx_bind(ctx, self.listen_file_descriptor, tina.ipv4(127, 0, 0, 1, 9090))
 	tina.ctx_listen(ctx, self.listen_file_descriptor, 128)
 
-	str := fmt.bprintf(ctx.scratch_arena.data, "TCP Server listening on 127.0.0.1:9090")
+	str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "TCP Server listening on 127.0.0.1:9090")
 	tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 	return tina.Effect_Io{operation = tina.IoOp_Accept{listen_fd = self.listen_file_descriptor}}
@@ -241,7 +241,7 @@ client_handler :: proc(
 			packet := tina.payload_as(Packet, data)
 
 			str := fmt.bprintf(
-				ctx.scratch_arena.data,
+				tina.ctx_scratch_arena_bytes(ctx),
 				"Client on Shard %d: PONG #%d received ✓",
 				tina.ctx_shard_id(ctx),
 				packet.sequence_number,
@@ -348,7 +348,7 @@ chaos_handler :: proc(
 			packet := tina.payload_as(Packet, data)
 
 			str := fmt.bprintf(
-				ctx.scratch_arena.data,
+				tina.ctx_scratch_arena_bytes(ctx),
 				"Chaos client on Shard %d: PONG #%d received ✓",
 				tina.ctx_shard_id(ctx),
 				packet.sequence_number,
@@ -358,7 +358,7 @@ chaos_handler :: proc(
 
 		if self.sequence_number >= DEMO_ECHO_CHAOS_CRASH_AFTER {
 			str := fmt.bprintf(
-				ctx.scratch_arena.data,
+				tina.ctx_scratch_arena_bytes(ctx),
 				"[FAIL] Chaos client on Shard %d crashing (after %d pings)",
 				tina.ctx_shard_id(ctx),
 				self.sequence_number,
