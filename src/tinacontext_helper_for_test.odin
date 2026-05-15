@@ -129,8 +129,12 @@ test_with_local_context :: proc(
 	defer delete(shard.dispatchable_slot_words)
 	shard.dispatchable_slot_counts = make([]u32, type_count)
 	defer delete(shard.dispatchable_slot_counts)
+	shard.dispatch_credit_counts = make([]Scheduler_Credit_Count, type_count)
+	defer delete(shard.dispatch_credit_counts)
 	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(type_count))
 	defer delete(shard.dispatchable_type_words)
+	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(type_count))
+	defer delete(shard.dispatch_ready_type_words)
 
 	target_type_id := extract_type_id(config.target_handle)
 	target_slot_index := extract_slot(config.target_handle)

@@ -160,6 +160,7 @@ Shard :: struct {
 	dispatchable_slot_words: [][]u64,
 	dispatchable_slot_counts: []u32,
 	dispatchable_type_words: []u64,
+	dispatch_ready_type_words: []u64,
 	isolate_memory:         [][]u8,
 	working_memory:         [][]u8, // Base slices for working memory
 	scratch_memory:         []u8, // Base slice for scratch arena
@@ -225,15 +226,13 @@ _wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot
 
 	for slot_index in 0 ..< slot_count {
 		if states[slot_index] == .Unallocated do continue
-		flags[slot_index] += {.Shutdown_Pending}
-		_dispatchable_refresh_slot(shard, type_id, slot_index)
+		_slot_add_shutdown_pending(shard, type_id, slot_index)
 	}
 
 	for slot_index in 0 ..< slot_count {
 		state := states[slot_index]
 		if state == .Waiting {
-			states[slot_index] = .Runnable
-			_dispatchable_refresh_slot(shard, type_id, slot_index)
+			_slot_set_state(shard, type_id, slot_index, .Runnable)
 			continue
 		}
 		if state == .Waiting_For_Io {
@@ -243,15 +242,13 @@ _wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot
 			// reactor_collect_completions, and have its buffer freed
 			// by the stale-path reclamation. See §6.6.3 §12 design note.
 			io_sequences[slot_index] += 1
-			states[slot_index] = .Runnable
-			_dispatchable_refresh_slot(shard, type_id, slot_index)
+			_slot_set_state(shard, type_id, slot_index, .Runnable)
 			continue
 		}
 		if state == .Waiting_For_Reply {
 			// Discard stale replies.
 			pending_correlations[slot_index] = 0
-			states[slot_index] = .Runnable
-			_dispatchable_refresh_slot(shard, type_id, slot_index)
+			_slot_set_state(shard, type_id, slot_index, .Runnable)
 		}
 	}
 }
@@ -309,27 +306,48 @@ _dispatch_word_count :: #force_inline proc "contextless" (bit_count: int) -> int
 }
 
 @(private = "file")
-_dispatchable_type_set :: #force_inline proc "contextless" (shard: ^Shard, type_id: u16) {
-	if len(shard.dispatchable_type_words) == 0 {
+_bitset_set :: #force_inline proc "contextless" (words: []u64, bit_index: u32) {
+	if len(words) == 0 {
 		return
 	}
-	word_index := int(type_id >> 6)
-	bit_index := type_id & 63
-	shard.dispatchable_type_words[word_index] |= u64(1) << bit_index
+	word_index := int(bit_index >> 6)
+	bit_offset := bit_index & 63
+	words[word_index] |= u64(1) << bit_offset
 }
 
 @(private = "file")
-_dispatchable_type_clear :: #force_inline proc "contextless" (shard: ^Shard, type_id: u16) {
-	if len(shard.dispatchable_type_words) == 0 {
+_bitset_clear :: #force_inline proc "contextless" (words: []u64, bit_index: u32) {
+	if len(words) == 0 {
 		return
 	}
-	word_index := int(type_id >> 6)
-	bit_index := type_id & 63
-	shard.dispatchable_type_words[word_index] &= ~(u64(1) << bit_index)
+	word_index := int(bit_index >> 6)
+	bit_offset := bit_index & 63
+	words[word_index] &= ~(u64(1) << bit_offset)
 }
 
 @(private = "file")
-_dispatchable_slot_set :: #force_inline proc "contextless" (
+_dispatchable_type_refresh :: #force_inline proc "contextless" (shard: ^Shard, type_id: u16) {
+	if int(type_id) >= len(shard.dispatchable_slot_counts) {
+		return
+	}
+	bit_index := u32(type_id)
+	if shard.dispatchable_slot_counts[type_id] > 0 {
+		_bitset_set(shard.dispatchable_type_words, bit_index)
+	} else {
+		_bitset_clear(shard.dispatchable_type_words, bit_index)
+	}
+
+	if int(type_id) < len(shard.dispatch_credit_counts) &&
+	   shard.dispatchable_slot_counts[type_id] > 0 &&
+	   shard.dispatch_credit_counts[type_id] > 0 {
+		_bitset_set(shard.dispatch_ready_type_words, bit_index)
+	} else {
+		_bitset_clear(shard.dispatch_ready_type_words, bit_index)
+	}
+}
+
+@(private = "file")
+_dispatchable_slot_set_present :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_id: u16,
 	slot_index: u32,
@@ -342,18 +360,18 @@ _dispatchable_slot_set :: #force_inline proc "contextless" (
 		return
 	}
 	word_index := int(slot_index >> 6)
-	bit_index := slot_index & 63
-	bit_mask := u64(1) << bit_index
+	bit_offset := slot_index & 63
+	bit_mask := u64(1) << bit_offset
 	if words[word_index] & bit_mask != 0 {
 		return
 	}
 	words[word_index] |= bit_mask
 	shard.dispatchable_slot_counts[type_id] += 1
-	_dispatchable_type_set(shard, type_id)
+	_dispatchable_type_refresh(shard, type_id)
 }
 
 @(private = "file")
-_dispatchable_slot_clear :: #force_inline proc "contextless" (
+_dispatchable_slot_set_absent :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_id: u16,
 	slot_index: u32,
@@ -366,16 +384,14 @@ _dispatchable_slot_clear :: #force_inline proc "contextless" (
 		return
 	}
 	word_index := int(slot_index >> 6)
-	bit_index := slot_index & 63
-	bit_mask := u64(1) << bit_index
+	bit_offset := slot_index & 63
+	bit_mask := u64(1) << bit_offset
 	if words[word_index] & bit_mask == 0 {
 		return
 	}
 	words[word_index] &= ~bit_mask
 	shard.dispatchable_slot_counts[type_id] -= 1
-	if shard.dispatchable_slot_counts[type_id] == 0 {
-		_dispatchable_type_clear(shard, type_id)
-	}
+	_dispatchable_type_refresh(shard, type_id)
 }
 
 @(private = "package")
@@ -398,10 +414,78 @@ _dispatchable_refresh_slot :: #force_inline proc "contextless" (
 		soa_meta[slot_index].io_completion_tag,
 	)
 	if dispatch_kind == .None {
-		_dispatchable_slot_clear(shard, type_id, slot_index)
+		_dispatchable_slot_set_absent(shard, type_id, slot_index)
 	} else {
-		_dispatchable_slot_set(shard, type_id, slot_index)
+		_dispatchable_slot_set_present(shard, type_id, slot_index)
 	}
+}
+
+@(private = "file")
+_bitset_find_next_set_bit :: proc "contextless" (
+	words: []u64,
+	start_bit_index: u32,
+	bit_count: u32,
+) -> (
+	u32,
+	bool,
+) {
+	if len(words) == 0 || bit_count == 0 {
+		return 0, false
+	}
+
+	start_word_index := int(start_bit_index >> 6)
+	start_bit_offset := start_bit_index & 63
+	last_word_index := len(words) - 1
+	last_word_bit_count := bit_count & 63
+	last_word_mask := ~u64(0)
+	if last_word_bit_count != 0 {
+		last_word_mask = (u64(1) << last_word_bit_count) - 1
+	}
+
+	for word_index in start_word_index ..< len(words) {
+		word := words[word_index]
+		if word_index == last_word_index {
+			word &= last_word_mask
+		}
+		if word_index == start_word_index && start_bit_offset > 0 {
+			word &= ~((u64(1) << start_bit_offset) - 1)
+		}
+		if word == 0 {
+			continue
+		}
+
+		bit_offset := bits.trailing_zeros(word)
+		bit_index := u32(word_index * 64) + u32(bit_offset)
+		if bit_index < bit_count {
+			return bit_index, true
+		}
+	}
+
+	if start_word_index > 0 || start_bit_offset > 0 {
+		for word_index in 0 ..< min(start_word_index + 1, len(words)) {
+			word := words[word_index]
+			if word_index == last_word_index {
+				word &= last_word_mask
+			}
+			if word_index == start_word_index {
+				if start_bit_offset == 0 {
+					break
+				}
+				word &= (u64(1) << start_bit_offset) - 1
+			}
+			if word == 0 {
+				continue
+			}
+
+			bit_offset := bits.trailing_zeros(word)
+			bit_index := u32(word_index * 64) + u32(bit_offset)
+			if bit_index < bit_count {
+				return bit_index, true
+			}
+		}
+	}
+
+	return 0, false
 }
 
 @(private = "file")
@@ -414,68 +498,120 @@ _dispatchable_find_next_slot :: proc "contextless" (
 	u32,
 	bool,
 ) {
-	words := shard.dispatchable_slot_words[type_id]
-	if len(words) == 0 || slot_count == 0 {
-		return 0, false
+	return _bitset_find_next_set_bit(shard.dispatchable_slot_words[type_id], start_slot_index, slot_count)
+}
+
+@(private = "package")
+_slot_set_state :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+	state: Isolate_State,
+) {
+	shard.metadata[type_id][slot_index].state = state
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+@(private = "package")
+_slot_set_waiting_for_reply :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+	correlation_id: Correlation_Id,
+) {
+	shard.metadata[type_id][slot_index].pending_correlation = correlation_id
+	shard.metadata[type_id][slot_index].state = .Waiting_For_Reply
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+@(private = "package")
+_slot_set_io_completion_tag :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+	completion_tag: IO_Completion_Tag,
+) {
+	shard.metadata[type_id][slot_index].io_completion_tag = completion_tag
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+@(private = "package")
+_slot_add_shutdown_pending :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+) {
+	shard.metadata[type_id][slot_index].flags += {.Shutdown_Pending}
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+@(private = "package")
+_slot_clear_shutdown_pending :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+) {
+	shard.metadata[type_id][slot_index].flags -= {.Shutdown_Pending}
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+@(private = "package")
+_slot_increment_inbox_count :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+) {
+	shard.metadata[type_id][slot_index].inbox_count += 1
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+@(private = "package")
+_slot_decrement_inbox_count :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+) {
+	shard.metadata[type_id][slot_index].inbox_count -= 1
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+@(private = "package")
+_slot_set_io_completion_ready :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+	completion_tag: IO_Completion_Tag,
+	completion_result: i32,
+	buffer_index: u16,
+) {
+	meta := &shard.metadata[type_id][slot_index]
+	meta.io_completion_tag = completion_tag
+	meta.io_result = completion_result
+	meta.io_buffer_index = buffer_index
+	if meta.state == .Waiting_For_Io {
+		meta.state = .Runnable
 	}
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
 
-	start_word_index := int(start_slot_index >> 6)
-	start_bit_index := start_slot_index & 63
-	last_word_index := len(words) - 1
-	last_word_bit_count := slot_count & 63
-	last_word_mask := ~u64(0)
-	if last_word_bit_count != 0 {
-		last_word_mask = (u64(1) << last_word_bit_count) - 1
-	}
-
-	for word_index in start_word_index ..< len(words) {
-		word := words[word_index]
-		if word_index == last_word_index {
-			word &= last_word_mask
-		}
-		if word_index == start_word_index && start_bit_index > 0 {
-			word &= ~((u64(1) << start_bit_index) - 1)
-		}
-		if word == 0 {
-			continue
-		}
-
-		bit_index := bits.trailing_zeros(word)
-		slot_index := u32(word_index * 64) + u32(bit_index)
-		if slot_index < slot_count {
-			return slot_index, true
-		}
-	}
-
-	if start_word_index > 0 || start_bit_index > 0 {
-		for word_index in 0 ..< min(start_word_index + 1, len(words)) {
-			word := words[word_index]
-			if word_index == last_word_index {
-				word &= last_word_mask
-			}
-			if word_index == start_word_index {
-				if start_bit_index == 0 {
-					break
-				}
-				word &= (u64(1) << start_bit_index) - 1
-			}
-			if word == 0 {
-				continue
-			}
-
-			bit_index := bits.trailing_zeros(word)
-			slot_index := u32(word_index * 64) + u32(bit_index)
-			if slot_index < slot_count {
-				return slot_index, true
-			}
-		}
-	}
-
-	return 0, false
+@(private = "package")
+_slot_set_io_submit_failure :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: u16,
+	slot_index: u32,
+	completion_tag: IO_Completion_Tag,
+	completion_result: i32,
+) {
+	meta := &shard.metadata[type_id][slot_index]
+	meta.io_completion_tag = completion_tag
+	meta.io_result = completion_result
+	meta.io_buffer_index = BUFFER_INDEX_NONE
+	meta.state = .Runnable
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
 
 @(private = "file")
-_dispatchable_find_next_type :: proc "contextless" (
+_dispatch_ready_find_next_type :: proc "contextless" (
 	shard: ^Shard,
 	start_type_index: u32,
 	type_count: u32,
@@ -483,63 +619,7 @@ _dispatchable_find_next_type :: proc "contextless" (
 	u32,
 	bool,
 ) {
-	if len(shard.dispatchable_type_words) == 0 || type_count == 0 {
-		return 0, false
-	}
-
-	start_word_index := int(start_type_index >> 6)
-	start_bit_index := start_type_index & 63
-	last_word_index := len(shard.dispatchable_type_words) - 1
-	last_word_bit_count := type_count & 63
-	last_word_mask := ~u64(0)
-	if last_word_bit_count != 0 {
-		last_word_mask = (u64(1) << last_word_bit_count) - 1
-	}
-
-	for word_index in start_word_index ..< len(shard.dispatchable_type_words) {
-		word := shard.dispatchable_type_words[word_index]
-		if word_index == last_word_index {
-			word &= last_word_mask
-		}
-		if word_index == start_word_index && start_bit_index > 0 {
-			word &= ~((u64(1) << start_bit_index) - 1)
-		}
-		if word == 0 {
-			continue
-		}
-
-		bit_index := bits.trailing_zeros(word)
-		type_index := u32(word_index * 64) + u32(bit_index)
-		if type_index < type_count {
-			return type_index, true
-		}
-	}
-
-	if start_word_index > 0 || start_bit_index > 0 {
-		for word_index in 0 ..< min(start_word_index + 1, len(shard.dispatchable_type_words)) {
-			word := shard.dispatchable_type_words[word_index]
-			if word_index == last_word_index {
-				word &= last_word_mask
-			}
-			if word_index == start_word_index {
-				if start_bit_index == 0 {
-					break
-				}
-				word &= (u64(1) << start_bit_index) - 1
-			}
-			if word == 0 {
-				continue
-			}
-
-			bit_index := bits.trailing_zeros(word)
-			type_index := u32(word_index * 64) + u32(bit_index)
-			if type_index < type_count {
-				return type_index, true
-			}
-		}
-	}
-
-	return 0, false
+	return _bitset_find_next_set_bit(shard.dispatch_ready_type_words, start_type_index, type_count)
 }
 
 @(private = "file")
@@ -633,7 +713,7 @@ _dispatch_type_batch :: proc(
 			io_completions[slot_index],
 		)
 		if dispatch_kind == .None {
-			_dispatchable_slot_clear(shard, type_id, slot_index)
+			_dispatchable_slot_set_absent(shard, type_id, slot_index)
 			cursor = shard.dispatch_cursors[type_id]
 			continue
 		}
@@ -670,7 +750,7 @@ _dispatch_type_batch :: proc(
 			message.user.payload_size = 0
 
 			message_pointer = &message
-			flags[slot_index] -= {.Shutdown_Pending}
+			_slot_clear_shutdown_pending(shard, type_id, slot_index)
 		case .Inbox:
 			dequeue_result := _dequeue(shard, u16(type_id), slot_index)
 			shard.current_msg_slot = dequeue_result.pool_index
@@ -925,6 +1005,7 @@ _scheduler_replenish_dispatch_credits :: proc(shard: ^Shard) {
 		credit_count += weight_count * credit_per_weight_count
 		if credit_count > credit_count_max do credit_count = credit_count_max
 		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(credit_count)
+		_dispatchable_type_refresh(shard, u16(type_index))
 	}
 }
 
@@ -946,7 +1027,7 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 			dispatch_since_io_service_count = 0
 		}
 
-		type_index, found := _dispatchable_find_next_type(shard, shard.dispatch_type_cursor, type_count)
+		type_index, found := _dispatch_ready_find_next_type(shard, shard.dispatch_type_cursor, type_count)
 		if !found {
 			break
 		}
@@ -956,6 +1037,7 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 
 		credit_count := u32(shard.dispatch_credit_counts[type_index])
 		if credit_count == 0 {
+			_dispatchable_type_refresh(shard, u16(type_index))
 			continue
 		}
 
@@ -972,14 +1054,13 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 		))
 
 		if dispatched_count == 0 {
-			if shard.dispatchable_slot_counts[type_index] == 0 {
-				_dispatchable_type_clear(shard, u16(type_index))
-			}
+			_dispatchable_type_refresh(shard, u16(type_index))
 			continue
 		}
 
 		scanned_type_count = 0
 		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(credit_count - dispatched_count)
+		_dispatchable_type_refresh(shard, u16(type_index))
 		turn_work_budget_count -= dispatched_count
 		dispatch_since_io_service_count += dispatched_count
 
@@ -1064,9 +1145,9 @@ _interpret_effect :: proc(
 	case Effect_Done:
 		_teardown_isolate(shard, type_id, slot, .Normal)
 	case Effect_Yield:
-		soa_meta[slot].state = .Runnable
+		_slot_set_state(shard, type_id, slot, .Runnable)
 	case Effect_Receive:
-		soa_meta[slot].state = .Waiting
+		_slot_set_state(shard, type_id, slot, .Waiting)
 	case Effect_Crash:
 		reason_str := CRASH_REASONS_INTERPRETED[e.reason]
 		_shard_log(
@@ -1083,8 +1164,7 @@ _interpret_effect :: proc(
 		correlation_id := shard.next_correlation_id
 
 		// Set state before fast-fail enqueue so the timeout message is accepted
-		soa_meta[slot].pending_correlation = correlation_id
-		soa_meta[slot].state = .Waiting_For_Reply
+		_slot_set_waiting_for_reply(shard, type_id, slot, correlation_id)
 
 		// Quarantine Fast-Fail Check (§6.4.5.4 Step 4b)
 		destination_shard := extract_shard_id(e.to)
@@ -1099,7 +1179,6 @@ _interpret_effect :: proc(
 
 			_enqueue_system_msg(shard, invocation.self_handle, &timeout_env)
 			shard.counters.quarantine_drops += 1
-			_dispatchable_refresh_slot(shard, type_id, slot)
 			return
 		}
 
@@ -1137,7 +1216,7 @@ _interpret_effect :: proc(
 			_teardown_isolate(shard, type_id, slot, .Crashed)
 			return
 		}
-		soa_meta[slot].state = .Waiting
+		_slot_set_state(shard, type_id, slot, .Waiting)
 
 		local_msg := e.message // Make "e.message" it addressable
 		envelope: Message_Envelope
@@ -1155,15 +1234,17 @@ _interpret_effect :: proc(
 		err := reactor_submit_io(&shard.reactor, shard, invocation.self_handle, e.operation)
 		if err != IO_ERR_NONE {
 			if err == IO_ERR_RESOURCE_EXHAUSTED do shard.counters.io_buffer_exhaustions += 1
-			soa_meta[slot].io_completion_tag = _io_op_to_completion_tag(e.operation)
-			soa_meta[slot].io_result = i32(err)
-			soa_meta[slot].io_buffer_index = BUFFER_INDEX_NONE
-			soa_meta[slot].state = .Runnable
+			_slot_set_io_submit_failure(
+				shard,
+				type_id,
+				slot,
+				_io_op_to_completion_tag(e.operation),
+				i32(err),
+			)
 		} else {
-			soa_meta[slot].state = .Waiting_For_Io
+			_slot_set_state(shard, type_id, slot, .Waiting_For_Io)
 		}
 	}
-	_dispatchable_refresh_slot(shard, type_id, slot)
 }
 
 // --- Message Routing ---
@@ -1276,7 +1357,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	// Safe State Mutation (We are guaranteed to enqueue now)
 	if is_reply || is_timeout {
 		soa_meta[slot].pending_correlation = 0
-		soa_meta[slot].state = .Runnable
+		_slot_set_state(shard, type_id, slot, .Runnable)
 	}
 
 	// Link into Mailbox
@@ -1298,10 +1379,11 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	}
 
 	soa_meta[slot].inbox_tail = pool_index
-	soa_meta[slot].inbox_count += 1
+	_slot_increment_inbox_count(shard, type_id, slot)
 
-	if soa_meta[slot].state == .Waiting {soa_meta[slot].state = .Runnable}
-	_dispatchable_refresh_slot(shard, type_id, slot)
+	if soa_meta[slot].state == .Waiting {
+		_slot_set_state(shard, type_id, slot, .Runnable)
+	}
 	return .ok
 }
 
@@ -1341,7 +1423,7 @@ _dequeue :: proc "contextless" (
 	next_index := envelope.next_in_mailbox
 	soa_meta[slot].inbox_head = next_index
 	if next_index == POOL_NONE_INDEX {soa_meta[slot].inbox_tail = POOL_NONE_INDEX}
-	soa_meta[slot].inbox_count -= 1
+	_slot_decrement_inbox_count(shard, type_id, slot)
 
 	return result
 }
@@ -1635,12 +1717,11 @@ _inject_fd_handoff_accept :: proc "contextless" (
 		return .Target_Busy
 	}
 
-	soa_meta[target_slot.slot_index].io_completion_tag = IO_TAG_ACCEPT_COMPLETE
+	_slot_set_io_completion_tag(shard, target_slot.type_id, target_slot.slot_index, IO_TAG_ACCEPT_COMPLETE)
 	soa_meta[target_slot.slot_index].io_result = 0
 	soa_meta[target_slot.slot_index].io_fd = fd
 	soa_meta[target_slot.slot_index].io_buffer_index = BUFFER_INDEX_NONE
 	soa_meta[target_slot.slot_index].io_peer_address = peer_address
-	_dispatchable_refresh_slot(shard, target_slot.type_id, target_slot.slot_index)
 	return .None
 }
 
@@ -1663,12 +1744,11 @@ _clear_fd_handoff_accept :: proc "contextless" (
 		return
 	}
 
-	soa_meta[target_slot.slot_index].io_completion_tag = IO_TAG_NONE
+	_slot_set_io_completion_tag(shard, target_slot.type_id, target_slot.slot_index, IO_TAG_NONE)
 	soa_meta[target_slot.slot_index].io_result = 0
 	soa_meta[target_slot.slot_index].io_fd = FD_HANDLE_NONE
 	soa_meta[target_slot.slot_index].io_buffer_index = BUFFER_INDEX_NONE
 	soa_meta[target_slot.slot_index].io_peer_address = Peer_Address{}
-	_dispatchable_refresh_slot(shard, target_slot.type_id, target_slot.slot_index)
 }
 
 @(private = "file")
@@ -1885,6 +1965,9 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	for word_index in 0 ..< len(shard.dispatchable_type_words) {
 		shard.dispatchable_type_words[word_index] = 0
 	}
+	for word_index in 0 ..< len(shard.dispatch_ready_type_words) {
+		shard.dispatch_ready_type_words[word_index] = 0
+	}
 	shard.dispatch_type_cursor = 0
 	shard.current_type_id = 0
 	shard.current_slot_index = 0
@@ -2069,15 +2152,29 @@ test_dispatchable_refresh_slot_updates_type_summary :: proc(t: ^testing.T) {
 	defer delete(shard.dispatchable_slot_words[0])
 	shard.dispatchable_slot_counts = make([]u32, 1)
 	defer delete(shard.dispatchable_slot_counts)
+	shard.dispatch_credit_counts = make([]Scheduler_Credit_Count, 1)
+	defer delete(shard.dispatch_credit_counts)
 	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(1))
 	defer delete(shard.dispatchable_type_words)
+	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(1))
+	defer delete(shard.dispatch_ready_type_words)
 
+	shard.dispatch_credit_counts[0] = 1
 	shard.metadata[0][1].state = .Runnable
 	_dispatchable_refresh_slot(shard, 0, 1)
 
 	testing.expect_value(t, shard.dispatchable_slot_counts[0], u32(1))
 	testing.expect_value(t, shard.dispatchable_slot_words[0][0], u64(1 << 1))
 	testing.expect_value(t, shard.dispatchable_type_words[0], u64(1))
+	testing.expect_value(t, shard.dispatch_ready_type_words[0], u64(1))
+
+	shard.dispatch_credit_counts[0] = 0
+	_dispatchable_type_refresh(shard, 0)
+	testing.expect_value(t, shard.dispatchable_type_words[0], u64(1))
+	testing.expect_value(t, shard.dispatch_ready_type_words[0], u64(0))
+
+	shard.dispatch_credit_counts[0] = 1
+	_dispatchable_type_refresh(shard, 0)
 
 	shard.metadata[0][1].state = .Waiting_For_Io
 	_dispatchable_refresh_slot(shard, 0, 1)
@@ -2085,6 +2182,7 @@ test_dispatchable_refresh_slot_updates_type_summary :: proc(t: ^testing.T) {
 	testing.expect_value(t, shard.dispatchable_slot_counts[0], u32(0))
 	testing.expect_value(t, shard.dispatchable_slot_words[0][0], u64(0))
 	testing.expect_value(t, shard.dispatchable_type_words[0], u64(0))
+	testing.expect_value(t, shard.dispatch_ready_type_words[0], u64(0))
 }
 
 @(test)

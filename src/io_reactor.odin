@@ -420,20 +420,20 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		}
 
 		// Valid completion delivery.
-		soa_meta[slot_index].io_completion_tag = Message_Tag(op_tag)
-		soa_meta[slot_index].io_result = completion.result
-		soa_meta[slot_index].io_buffer_index = buffer_index
+		_slot_set_io_completion_ready(
+			shard,
+			u16(type_index),
+			slot_index,
+			Message_Tag(op_tag),
+			completion.result,
+			buffer_index,
+		)
 
 		if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) {
 			_reactor_completion_apply_accept(reactor, shard, soa_meta, type_index, slot_index, completion)
 		} else if op_tag == u8(IO_TAG_RECVFROM_COMPLETE) {
 			_reactor_completion_apply_recvfrom(soa_meta, slot_index, completion)
 		}
-
-		if soa_meta[slot_index].state == .Waiting_For_Io {
-			soa_meta[slot_index].state = .Runnable
-		}
-		_dispatchable_refresh_slot(shard, u16(type_index), slot_index)
 	}
 }
 
@@ -444,10 +444,16 @@ reactor_service_nonblocking :: proc(reactor: ^Reactor, shard: ^Shard) {
 
 @(private = "file")
 _backend_error_to_io_error :: #force_inline proc "contextless" (err: Backend_Error) -> IO_Error {
-	if err == .Resource_Exhausted {
+	#partial switch err {
+	case .Resource_Exhausted:
 		return IO_ERR_RESOURCE_EXHAUSTED
+	case .System_Error:
+		return IO_ERR_BACKEND_FAILURE
+	case .Queue_Full:
+		return IO_ERR_SUBMISSION_FULL
+	case:
+		return IO_ERR_BACKEND_FAILURE
 	}
-	return IO_ERR_SUBMISSION_FULL
 }
 
 reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_Error {
@@ -478,16 +484,13 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 		soa_meta := shard.metadata[type_index]
 
 		if u8(soa_meta[slot_index].generation) == submission_token_generation(sub.token) {
-			soa_meta[slot_index].io_completion_tag = Message_Tag(
-				submission_token_operation_tag(sub.token),
+			_slot_set_io_submit_failure(
+				shard,
+				u16(type_index),
+				slot_index,
+				Message_Tag(submission_token_operation_tag(sub.token)),
+				i32(io_error),
 			)
-			soa_meta[slot_index].io_result = i32(io_error)
-			soa_meta[slot_index].io_buffer_index = BUFFER_INDEX_NONE
-
-			if soa_meta[slot_index].state == .Waiting_For_Io {
-				soa_meta[slot_index].state = .Runnable
-			}
-			_dispatchable_refresh_slot(shard, u16(type_index), slot_index)
 		}
 	}
 
@@ -973,6 +976,11 @@ test_backend_error_to_io_error_maps_resource_exhausted :: proc(t: ^testing.T) {
 		t,
 		_backend_error_to_io_error(Backend_Error.Queue_Full),
 		IO_Error(IO_ERR_SUBMISSION_FULL),
+	)
+	testing.expect_value(
+		t,
+		_backend_error_to_io_error(Backend_Error.System_Error),
+		IO_Error(IO_ERR_BACKEND_FAILURE),
 	)
 }
 

@@ -227,8 +227,7 @@ _advance_timers :: proc(
 					soa_meta := shard.metadata[target_type]
 					if soa_meta[target_slot].state == .Waiting_For_Io {
 						soa_meta[target_slot].io_sequence += 1
-						soa_meta[target_slot].state = .Runnable
-						_dispatchable_refresh_slot(shard, target_type, target_slot)
+						_slot_set_state(shard, target_type, target_slot, .Runnable)
 					}
 				}
 			}

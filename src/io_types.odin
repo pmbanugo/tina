@@ -528,6 +528,7 @@ IO_ERR_STALE_FD: IO_Error : -2
 IO_ERR_AFFINITY_VIOLATION: IO_Error : -3
 IO_ERR_BOUNDS_VIOLATION: IO_Error : -4
 IO_ERR_SUBMISSION_FULL: IO_Error : -5
+IO_ERR_BACKEND_FAILURE: IO_Error : -6
 
 // --- Transfer Buffer Handle (§6.9 §8.2) ---
 // Layout: lower 16 bits = pool index, upper 16 bits = generation

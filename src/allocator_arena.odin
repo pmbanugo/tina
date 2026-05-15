@@ -187,6 +187,7 @@ hydrate_shard :: proc(
 	shard.dispatchable_slot_words = make([][]u64, types_count, alloc)
 	shard.dispatchable_slot_counts = make([]u32, types_count, alloc)
 	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
+	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
 	if spec.maintenance_task_count_max > 0 {
 		alloc_data.current_name = "Maintenance_Tasks"
 		shard.maintenance_tasks = make([]Shard_Maintenance_Task, spec.maintenance_task_count_max, alloc)

@@ -78,6 +78,8 @@ when !TINA_SIMULATION_MODE {
 		wake_buffer:        u64,
 		unqueued:           [MAX_LINUX_UNQUEUED]Submission,
 		unqueued_count:     u16,
+		addr_entry_count_active: u16,
+		sendfile_entry_count_active: u16,
 		buffers_registered: bool,
 		files_registered:   bool,
 		fixed_fd_count:     u16,
@@ -117,6 +119,8 @@ when !TINA_SIMULATION_MODE {
 		backend.buffer_slot_size = config.buffer_slot_size
 		backend.buffer_slot_count = config.buffer_slot_count
 		backend.unqueued_count = 0
+		backend.addr_entry_count_active = 0
+		backend.sendfile_entry_count_active = 0
 		backend.buffers_registered = false
 
 		for i in 0 ..< MAX_LINUX_PENDING_ADDRS {
@@ -198,6 +202,8 @@ when !TINA_SIMULATION_MODE {
 		linux.close(linux.Fd(backend.wake_fd))
 		uring.destroy(&backend.ring)
 		backend.unqueued_count = 0
+		backend.addr_entry_count_active = 0
+		backend.sendfile_entry_count_active = 0
 	}
 
 	@(private = "file")
@@ -216,25 +222,27 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_linux_active_addr_entry_count :: proc "contextless" (backend: ^Platform_Backend) -> int {
-		active_count := 0
-		for i in 0 ..< MAX_LINUX_PENDING_ADDRS {
-			if backend.addr_entries[i].active {
-				active_count += 1
-			}
+	_linux_release_addr_entry :: #force_inline proc "contextless" (
+		backend: ^Platform_Backend,
+		entry: ^Pending_Addr_Entry,
+	) {
+		if !entry.active {
+			return
 		}
-		return active_count
+		entry.active = false
+		backend.addr_entry_count_active -= 1
 	}
 
 	@(private = "file")
-	_linux_active_sendfile_entry_count :: proc "contextless" (backend: ^Platform_Backend) -> int {
-		active_count := 0
-		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
-			if backend.sendfile_entries[i].active {
-				active_count += 1
-			}
+	_linux_release_sendfile_entry :: #force_inline proc "contextless" (
+		backend: ^Platform_Backend,
+		entry: ^Sendfile_Entry,
+	) {
+		if !entry.active {
+			return
 		}
-		return active_count
+		entry.active = false
+		backend.sendfile_entry_count_active -= 1
 	}
 
 	@(private = "package")
@@ -258,10 +266,10 @@ when !TINA_SIMULATION_MODE {
 				required_sendfile_entry_count += 1
 			}
 		}
-		if _linux_active_addr_entry_count(backend) + required_addr_entry_count > MAX_LINUX_PENDING_ADDRS {
+		if int(backend.addr_entry_count_active) + required_addr_entry_count > MAX_LINUX_PENDING_ADDRS {
 			return .Resource_Exhausted
 		}
-		if _linux_active_sendfile_entry_count(backend) + required_sendfile_entry_count > MAX_LINUX_SENDFILE_ENTRIES {
+		if int(backend.sendfile_entry_count_active) + required_sendfile_entry_count > MAX_LINUX_SENDFILE_ENTRIES {
 			return .Resource_Exhausted
 		}
 
@@ -356,7 +364,7 @@ when !TINA_SIMULATION_MODE {
 						client_fd      = OS_FD(cqe.res),
 						client_address = _linux_sockaddr_to_socket_address(&entry.sockaddr),
 					}
-					entry.active = false
+					_linux_release_addr_entry(backend, entry)
 				} else {
 					completion.extra = Completion_Extra_Accept {
 						client_fd = OS_FD(cqe.res),
@@ -368,13 +376,13 @@ when !TINA_SIMULATION_MODE {
 					completion.extra = Completion_Extra_Recvfrom {
 						peer_address = _linux_sockaddr_to_socket_address(&entry.sockaddr),
 					}
-					entry.active = false
+					_linux_release_addr_entry(backend, entry)
 				}
 			} else {
 				// Free addr entry for connect/sendto completions
 				entry := _linux_find_addr_entry(backend, token)
 				if entry != nil {
-					entry.active = false
+					_linux_release_addr_entry(backend, entry)
 				}
 			}
 
@@ -813,7 +821,7 @@ when !TINA_SIMULATION_MODE {
 				linux.Socket_FD_Flags{},
 			)
 			if !ok {
-				entry.active = false
+				_linux_release_addr_entry(backend, entry)
 			}
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
@@ -831,7 +839,7 @@ when !TINA_SIMULATION_MODE {
 					&entry.sockaddr,
 				)
 				if !ok {
-					entry.active = false
+					_linux_release_addr_entry(backend, entry)
 				}
 				if ok && use_fixed {
 					_linux_apply_fixed_file(sqe, ffi)
@@ -911,7 +919,7 @@ when !TINA_SIMULATION_MODE {
 				{.NOSIGNAL},
 			)
 			if !ok {
-				entry.active = false
+				_linux_release_addr_entry(backend, entry)
 			}
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
@@ -947,7 +955,7 @@ when !TINA_SIMULATION_MODE {
 				{.NOSIGNAL},
 			)
 			if !ok {
-				entry.active = false
+				_linux_release_addr_entry(backend, entry)
 			}
 			if ok && use_fixed {
 				_linux_apply_fixed_file(sqe, ffi)
@@ -968,9 +976,12 @@ when !TINA_SIMULATION_MODE {
 			entry.bytes_in_pipe = 0
 			entry.bytes_sent_total = 0
 			entry.phase = .File_To_Pipe
-			entry.active = true
 
-			return _linux_submit_splice_file_to_pipe(backend, entry)
+			if !_linux_submit_splice_file_to_pipe(backend, entry) {
+				_linux_release_sendfile_entry(backend, entry)
+				return false
+			}
+			return true
 		}
 
 		return false
@@ -984,6 +995,8 @@ when !TINA_SIMULATION_MODE {
 	_linux_alloc_sendfile_entry :: proc(backend: ^Platform_Backend) -> ^Sendfile_Entry {
 		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
 			if !backend.sendfile_entries[i].active {
+				backend.sendfile_entries[i].active = true
+				backend.sendfile_entry_count_active += 1
 				return &backend.sendfile_entries[i]
 			}
 		}
@@ -1102,7 +1115,7 @@ when !TINA_SIMULATION_MODE {
 				entry.bytes_in_pipe = 0
 			}
 
-			return _linux_complete_sendfile(entry, completions, count, output_max, result)
+			return _linux_complete_sendfile(backend, entry, completions, count, output_max, result)
 		}
 
 		bytes := u32(cqe.res)
@@ -1116,6 +1129,7 @@ when !TINA_SIMULATION_MODE {
 					entry.phase = .Pipe_To_Socket
 					if !_linux_submit_splice_pipe_to_socket(backend, entry) {
 						return _linux_complete_sendfile(
+							backend,
 							entry,
 							completions,
 							count,
@@ -1125,6 +1139,7 @@ when !TINA_SIMULATION_MODE {
 					}
 				} else {
 					return _linux_complete_sendfile(
+						backend,
 						entry,
 						completions,
 						count,
@@ -1143,6 +1158,7 @@ when !TINA_SIMULATION_MODE {
 			entry.phase = .Pipe_To_Socket
 			if !_linux_submit_splice_pipe_to_socket(backend, entry) {
 				return _linux_complete_sendfile(
+					backend,
 					entry,
 					completions,
 					count,
@@ -1159,6 +1175,7 @@ when !TINA_SIMULATION_MODE {
 				// Pipe not fully drained — keep draining before advancing
 				if !_linux_submit_splice_pipe_to_socket(backend, entry) {
 					return _linux_complete_sendfile(
+						backend,
 						entry,
 						completions,
 						count,
@@ -1174,6 +1191,7 @@ when !TINA_SIMULATION_MODE {
 				entry.phase = .File_To_Pipe
 				if !_linux_submit_splice_file_to_pipe(backend, entry) {
 					return _linux_complete_sendfile(
+						backend,
 						entry,
 						completions,
 						count,
@@ -1184,6 +1202,7 @@ when !TINA_SIMULATION_MODE {
 			} else {
 				// All done — emit user completion
 				return _linux_complete_sendfile(
+					backend,
 					entry,
 					completions,
 					count,
@@ -1198,6 +1217,7 @@ when !TINA_SIMULATION_MODE {
 	// Emit the final user-visible completion for a sendfile operation and release the entry.
 	@(private = "file")
 	_linux_complete_sendfile :: proc(
+		backend: ^Platform_Backend,
 		entry: ^Sendfile_Entry,
 		completions: []Raw_Completion,
 		count: u32,
@@ -1213,7 +1233,7 @@ when !TINA_SIMULATION_MODE {
 			}
 			count_next += 1
 		}
-		entry.active = false
+		_linux_release_sendfile_entry(backend, entry)
 		return count_next
 	}
 
@@ -1420,6 +1440,7 @@ when !TINA_SIMULATION_MODE {
 			if !backend.addr_entries[i].active {
 				entry := &backend.addr_entries[i]
 				entry.active = true
+				backend.addr_entry_count_active += 1
 				entry.token = token
 				entry.sockaddr = {}
 				entry.sockaddr_len = 0

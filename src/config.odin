@@ -803,6 +803,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += types_count * size_of([]u64)
 	total += types_count * size_of(u32)
 	total += _dispatch_word_count(types_count) * size_of(u64)
+	total += _dispatch_word_count(types_count) * size_of(u64)
 
 	// Find the largest supervision tree across all shards and budget for its arrays
 	tree_memory_max := 0

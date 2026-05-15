@@ -168,7 +168,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 
 	// §11: Spawns during shutdown
 	if child_shutdown_pending {
-		soa_meta[slot].flags += {.Shutdown_Pending}
+		_slot_add_shutdown_pending(shard, type_id, slot)
 	}
 
 	_interpret_effect(shard, type_id, slot, effect, &child_invocation)
