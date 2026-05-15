@@ -1,6 +1,7 @@
 package http_server
 
 import tina "../../.."
+import "core:testing"
 
 @(private = "package")
 HTTP_TCP_NOTSENT_LOWAT_BYTES :: #config(HTTP_TCP_NOTSENT_LOWAT_BYTES, 16 * 1024)
@@ -278,4 +279,57 @@ _listener_accept_fd_exhausted :: #force_inline proc "contextless" (error_code: i
 		return false
 	}
 	return error_code == -23 || error_code == -24
+}
+
+@(test)
+test_listener_shutdown_close_completion_terminates_listener :: proc(t: ^testing.T) {
+	runtime := HTTP_Shard_Runtime{}
+	listener := HTTP_Listener {
+		listen_fd     = tina.FD_Handle(41),
+		shard_runtime = &runtime,
+	}
+
+	Listener_Shutdown_Test_State :: struct {
+		listener: ^HTTP_Listener,
+		t:        ^testing.T,
+	}
+	test_state := Listener_Shutdown_Test_State {
+		listener = &listener,
+		t        = t,
+	}
+
+	tina.test_with_context(
+		tina.Test_Context_Config {
+			self_handle         = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_LISTENER), 0, 1),
+			timer_resolution_ns = 1,
+		},
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			state := cast(^Listener_Shutdown_Test_State)user_data
+			shutdown_message: tina.Message
+			shutdown_message.tag = tina.TAG_SHUTDOWN
+			effect := _http_listener_handler(rawptr(state.listener), &shutdown_message, ctx)
+			#partial switch io_effect in effect {
+			case tina.Effect_Io:
+				#partial switch close_op in io_effect.operation {
+				case tina.IoOp_Close:
+					testing.expect_value(state.t, close_op.fd, state.listener.listen_fd)
+				case:
+					testing.expect(state.t, false, "listener shutdown must close the listen socket")
+				}
+			case:
+				testing.expect(state.t, false, "listener shutdown must return close I/O")
+			}
+
+			close_complete: tina.Message
+			close_complete.tag = tina.IO_TAG_CLOSE_COMPLETE
+			close_complete.io.fd = state.listener.listen_fd
+			effect = _http_listener_handler(rawptr(state.listener), &close_complete, ctx)
+			if _, ok := effect.(tina.Effect_Done); !ok {
+				testing.expect(state.t, false, "listener must terminate when its listen socket close completes")
+			}
+		},
+	)
+
+	testing.expect(t, runtime.draining, "listener shutdown must mark the shard runtime draining")
 }

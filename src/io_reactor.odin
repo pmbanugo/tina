@@ -697,7 +697,9 @@ reactor_submit_io :: proc(
 		}
 
 	case IoOp_Close:
-		target_fd = FD_HANDLE_NONE
+		// Keep the logical handle in metadata so the eventual close completion can
+		// identify which FD finished closing after the FD table entry is freed.
+		target_fd = op.fd
 		submission_op_tag = u8(IO_TAG_CLOSE_COMPLETE)
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Any)
 		if err != IO_ERR_NONE do return err
@@ -795,7 +797,8 @@ _reactor_submission_finalize :: #force_inline proc (
 ) {
 	submission_value := submission
 
-	if target_fd != FD_HANDLE_NONE {
+	if target_fd != FD_HANDLE_NONE &&
+	   submission_op_tag != u8(IO_TAG_CLOSE_COMPLETE) {
 		submission_value.fixed_file_index = fd_handle_index(target_fd)
 	}
 
@@ -1109,6 +1112,42 @@ test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
 	io_err := reactor_submit_io(reactor, shard, owner, IoOp_Close{fd = fd_handle})
 	testing.expect_value(t, io_err, IO_ERR_NONE)
 	testing.expect_value(t, reactor.pending_count, 1)
+	testing.expect_value(t, reactor.pending_submissions[0].fixed_file_index, FIXED_FILE_INDEX_NONE)
+}
+
+@(test)
+test_close_submission_preserves_fd_handle_for_completion_identity :: proc(t: ^testing.T) {
+	config := Backend_Config {
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+	}
+	fd_backing: [8]FD_Entry
+	buffer_backing: [4096]u8
+
+	reactor := new(Reactor)
+	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	defer {reactor_deinit(reactor); free(reactor)}
+
+	owner := make_handle(0, 1, 0, 1)
+	fd_handle, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
+	testing.expect_value(t, sock_err, Reactor_Socket_Error.None)
+
+	shard := new(Shard)
+	defer free(shard)
+	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
+	defer delete(shard.metadata)
+	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata[1])
+	shard.metadata[1][0].generation = 1
+	shard.metadata[1][0].state = .Runnable
+
+	io_err := reactor_submit_io(reactor, shard, owner, IoOp_Close{fd = fd_handle})
+	testing.expect_value(t, io_err, IO_ERR_NONE)
+	testing.expect_value(t, shard.metadata[1][0].io_fd, fd_handle)
+
+	_, resolve_err := fd_table_resolve(&reactor.fd_table, fd_handle)
+	testing.expect_value(t, resolve_err, FD_Table_Error.Stale_Generation)
+	// The fd table entry is already gone, so completion identity must come from
+	// isolate metadata rather than a later table lookup.
 	testing.expect_value(t, reactor.pending_submissions[0].fixed_file_index, FIXED_FILE_INDEX_NONE)
 }
 
