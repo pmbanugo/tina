@@ -23,7 +23,7 @@ The scratch arena is for data that does not outlive the current handler call. Th
 
 ### String formatting for logging
 
-The most common pattern. Use `ctx.scratch_arena.data` as the destination buffer for `fmt.bprintf`:
+The most common pattern. Use `tina.ctx_scratch_arena_bytes(ctx)` as the destination buffer for `fmt.bprintf`:
 
 ```odin
 handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
@@ -31,7 +31,7 @@ handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext
 
     // Format a log string into the scratch arena's backing buffer.
     // This buffer is valid until this handler returns.
-    str := fmt.bprintf(ctx.scratch_arena.data, "Processed request %d on Shard %d",
+    str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "Processed request %d on Shard %d",
         self.request_count, tina.ctx_shard_id(ctx))
     tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 

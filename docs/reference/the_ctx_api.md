@@ -88,7 +88,7 @@ MY_METRIC_TAG: tina.Log_Tag : tina.USER_LOG_TAG_BASE + 1  // 0x41
 
 ```odin
 // Format into the scratch arena, then log.
-str := fmt.bprintf(ctx.scratch_arena.data, "Connection %d closed after %d bytes",
+str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "Connection %d closed after %d bytes",
     self.conn_id, self.bytes_sent)
 tina.ctx_log(ctx, .INFO, MY_APP_TAG, transmute([]u8)str)
 ```
