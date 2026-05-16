@@ -2,6 +2,7 @@ package http_server
 
 import tina "../../.."
 import "core:testing"
+import "core:fmt"
 
 @(private = "package")
 HTTP_TCP_NOTSENT_LOWAT_BYTES :: #config(HTTP_TCP_NOTSENT_LOWAT_BYTES, 16 * 1024)
@@ -47,8 +48,20 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 		listener.dispatcher_handles = dispatcher_handles
 	}
 
-	listener.listen_fd = _listener_open_listen_socket(ctx, listener.shard_runtime)
+	listen_fd, socket_err := _listener_open_listen_socket(ctx, listener.shard_runtime)
+	listener.listen_fd = listen_fd
 	if listener.listen_fd == tina.FD_HANDLE_NONE {
+		step_labels := [4]string {
+			"socket()",
+			"setsockopt()",
+			"bind()",
+			"listen()",
+		}
+		msg := fmt.tprintf(
+			"HTTP listener: %s failed. Is the address already in use?",
+			step_labels[int(socket_err.step)],
+		)
+		tina.ctx_log(ctx, tina.Log_Level.ERROR, tina.USER_LOG_TAG_BASE, transmute([]u8)msg)
 		return tina.Effect_Crash{reason = .Init_Failed}
 	}
 
@@ -217,7 +230,20 @@ _listener_dispatch_connection :: proc(
 }
 
 @(private = "file")
-_listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard_Runtime) -> tina.FD_Handle {
+Listener_Socket_Step :: enum u8 {
+	Socket_Create,
+	Set_Sockopt,
+	Bind,
+	Listen,
+}
+
+@(private = "file")
+Listener_Socket_Error :: struct {
+	step: Listener_Socket_Step,
+}
+
+@(private = "file")
+_listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard_Runtime) -> (tina.FD_Handle, Listener_Socket_Error) {
 	server := &runtime.server
 	domain := tina.Socket_Domain.AF_INET
 	#partial switch address in server.address {
@@ -231,7 +257,7 @@ _listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard
 
 	listen_fd, socket_error := tina.ctx_socket(ctx, domain, .STREAM, .TCP)
 	if socket_error != .None {
-		return tina.FD_HANDLE_NONE
+		return tina.FD_HANDLE_NONE, {step = .Socket_Create}
 	}
 
 	_ = tina.ctx_setsockopt_bool(ctx, listen_fd, .SOL_SOCKET, .SO_REUSEADDR, true)
@@ -243,12 +269,12 @@ _listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard
 
 	bind_error := tina.ctx_bind(ctx, listen_fd, server.address)
 	if bind_error != .None {
-		return tina.FD_HANDLE_NONE
+		return tina.FD_HANDLE_NONE, {step = .Bind}
 	}
 
 	listen_error := tina.ctx_listen(ctx, listen_fd, server.backlog)
 	if listen_error != .None {
-		return tina.FD_HANDLE_NONE
+		return tina.FD_HANDLE_NONE, {step = .Listen}
 	}
 
 	// Inherited by accepted connections to ensure zero setsockopt syscalls on each connections.
@@ -265,7 +291,7 @@ _listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard
 	// - SO_RCVBUF / SO_SNDBUF (untouched, leave to kernel auto-tuning)
 	// - TCP_FASTOPEN (deferred)
 
-	return listen_fd
+	return listen_fd, {}
 }
 
 @(private = "file")
