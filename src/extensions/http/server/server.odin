@@ -385,6 +385,36 @@ HTTP_PROD_DEFAULT_RING_SIZE :: 1024
 HTTP_DEFAULT_BACKLOG :: 1024
 
 
+// ─── Mailbox & Pool Capacity Constants ──────────────────────────────────────
+//
+// Derived from the HTTP connection state machine's message flow.
+//
+// The connection is a sequential reactive handler. The dispatch priority is:
+//   IO_Completion > Shutdown > Inbox (pool-backed)
+//
+// Pool-backed system messages that bypass mailbox_capacity:
+//   - 1 deadline timeout  (HTTP deadline wheel → _enqueue_system_msg)
+//   - 1 application timer (core timer wheel → _enqueue_system_msg)
+//
+// Pool-backed user messages subject to mailbox_capacity:
+//   - 1 application reply/notification (from expect_reply/expect_notification)
+//   - 1 TAG_EVICT (from listener idle-slot eviction)
+//   - 2 headroom for unsolicited application-layer messages
+
+// User-message mailbox depth per isolate type.
+@(private = "package")
+HTTP_CONNECTION_MAILBOX_CAPACITY :: 4
+@(private = "package")
+HTTP_LISTENER_MAILBOX_CAPACITY :: 4
+@(private = "package")
+HTTP_DISPATCHER_MAILBOX_CAPACITY :: 4
+
+// System messages per connection that bypass mailbox_capacity but consume pool
+// envelopes: 1 deadline timeout + 1 application timer.
+@(private = "package")
+HTTP_SYSTEM_MESSAGES_PER_CONNECTION :: 2
+
+
 // ─── Install API — Public API ───────────────────────────────────────────────
 //
 // Explicit API surface:
@@ -534,7 +564,7 @@ install_into_system_spec :: proc(
 		soa_metadata_size       = size_of(tina.Isolate_Metadata),
 		working_memory_size     = _listener_working_memory_size(int(connection_slot_count_per_shard)),
 		scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
-		mailbox_capacity        = 16,
+		mailbox_capacity        = HTTP_LISTENER_MAILBOX_CAPACITY,
 		// The listener bootstraps the shard-local runtime and drives accept.
 		// Its init args carry the immutable boot-time config.
 		// The runtime lives in the listener's working arena.
@@ -549,7 +579,7 @@ install_into_system_spec :: proc(
 		soa_metadata_size       = size_of(tina.Isolate_Metadata),
 		working_memory_size     = working_memory_size,
 		scratch_requirement_max = scratch_requirement,
-		mailbox_capacity        = 32,
+		mailbox_capacity        = HTTP_CONNECTION_MAILBOX_CAPACITY,
 		init_handler            = _http_connection_init,
 		handler_fn              = _http_connection_handler,
 	}
@@ -562,13 +592,29 @@ install_into_system_spec :: proc(
 			soa_metadata_size       = size_of(tina.Isolate_Metadata),
 			working_memory_size     = _listener_working_memory_size(int(connection_slot_count_per_shard)),
 			scratch_requirement_max = HTTP_INTERNAL_SCRATCH_NEED,
-			mailbox_capacity        = 16,
+			mailbox_capacity        = HTTP_DISPATCHER_MAILBOX_CAPACITY,
 			init_handler            = _http_dispatcher_init,
 			handler_fn              = _http_dispatcher_handler,
 		}
 	}
 
 	spec.types = new_types
+
+	// --- Raise pool_slot_count if total mailbox demand exceeds current budget ---
+	theoretical_mailbox_demand: int = 0
+	for t in spec.types {
+		theoretical_mailbox_demand += t.slot_count * int(t.mailbox_capacity)
+	}
+	// The pool must also absorb system messages (deadline timeouts, timer events)
+	// that bypass mailbox_capacity but still allocate from the pool. Budget for
+	// those on top of the user-message demand.
+	system_message_demand := int(connection_slot_count_per_shard) * HTTP_SYSTEM_MESSAGES_PER_CONNECTION
+	required_pool_slot_count := int(
+		_next_power_of_two_u64(u64(theoretical_mailbox_demand + system_message_demand) * 2),
+	)
+	if spec.pool_slot_count < required_pool_slot_count {
+		spec.pool_slot_count = required_pool_slot_count
+	}
 
 	// --- Wire the supervision tree on each shard ---
 	for shard_index in 0 ..< len(spec.shard_specs) {
@@ -712,7 +758,16 @@ _make_base_system_spec :: proc(
 		}
 	}
 
-	pool_slot_count := int(_next_power_of_two_u64(max(u64(1024), u64(connection_slot_count) * 8)))
+	// Pool must cover user messages (bounded by mailbox_capacity per slot) plus
+	// system messages that bypass capacity but still consume pool envelopes.
+	// the 2× factor ensures the user-message ceiling
+	// stays below that threshold with headroom for system messages.
+	pool_user_demand :=
+		int(connection_slot_count) * int(HTTP_CONNECTION_MAILBOX_CAPACITY) +
+		int(HTTP_LISTENER_MAILBOX_CAPACITY) +
+		(shard_count > 1 ? int(HTTP_DISPATCHER_MAILBOX_CAPACITY) : 0)
+	pool_system_demand := int(connection_slot_count) * HTTP_SYSTEM_MESSAGES_PER_CONNECTION
+	pool_slot_count := int(_next_power_of_two_u64(max(u64(1024), u64(pool_user_demand + pool_system_demand) * 2)))
 	timer_entry_count := _derive_timer_entry_count(connection_slot_count, shard_count)
 	reactor_buffer_slot_count := int(min(u64(4094), max(u64(64), u64(connection_slot_count))))
 
