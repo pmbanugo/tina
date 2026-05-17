@@ -1,7 +1,7 @@
 package tina
 
-TIMER_DEFAULT_SPOKE_COUNT :: 4096
-TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256
+TIMER_DEFAULT_SPOKE_COUNT :: 4096 // TODO: make this configuration via compile/build flag
+TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256 // TODO: make this configuration via compile/build flag
 
 Timer_Entry :: struct {
 	deliver_at:  u64,
@@ -147,7 +147,7 @@ _timer_wheel_insert :: #force_inline proc "contextless" (
 	wheel.resident_count += 1
 }
 
-// FUTURE OPT: The envelope construction (128 bytes on stack) + _enqueue copy could be
+// POSSIBLE OPTIMISATION: The envelope construction (128 bytes on stack) + _enqueue copy could be
 // eliminated by allocating the pool slot first and writing directly into it. This avoids
 // a 128-byte stack write + 128-byte memcpy per expiration. Requires changing _enqueue's
 // interface to return a writable slot pointer, which has wider implications across the
