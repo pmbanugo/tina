@@ -95,6 +95,7 @@ Socket_Option :: enum u16 {
 	SO_SNDBUF         = 0x0005,
 	SO_LINGER         = 0x0006,
 	SO_BINDTODEVICE   = 0x0007,
+	SO_EXCLUSIVEADDRUSE = 0x0008,
 	// IPPROTO_TCP
 	TCP_NODELAY       = 0x0101,
 	TCP_CORK          = 0x0102,

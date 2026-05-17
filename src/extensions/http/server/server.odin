@@ -26,13 +26,32 @@ App :: struct {
 	routes: []Route,
 }
 
-// Multi-shard distribution strategy. `Coordinator` is the primary path; an
-// L4-only ingress listener fans out via cross-shard FD handoff.
-// `Reuse_Port` is a platform-specific fallback for environments where
-// SO_REUSEPORT semantics are acceptable.
-Distribution_Mode :: enum u8 {
+// Multi-shard ingress strategy. `Coordinator` is the primary path; one
+// exclusive ingress listener accepts locally and fans out via cross-shard FD
+// handoff. `Reuse_Port` is an explicit multi-shard fallback that delegates
+// accept distribution to the kernel.
+Ingress_Mode :: enum u8 {
 	Coordinator,
 	Reuse_Port,
+}
+
+@(private = "package")
+Listener_Bind_Mode :: enum u8 {
+	Exclusive,
+	Reuse_Port,
+}
+
+@(private = "package")
+Ingress_Topology_Error :: enum u8 {
+	None,
+	Reuse_Port_Requires_Multi_Shard,
+}
+
+@(private = "package")
+HTTP_Ingress_Topology :: struct {
+	ingress_mode:             Ingress_Mode,
+	bind_mode:                Listener_Bind_Mode,
+	coordinator_mode_enabled: bool,
 }
 
 // Keep-alive shedding policy.
@@ -48,7 +67,7 @@ Keepalive_Config :: struct {
 Server :: struct {
 	address:           tina.Socket_Address,
 	backlog:           u32,
-	distribution:      Distribution_Mode,
+	ingress_mode:      Ingress_Mode,
 	app:               ^App,
 	limits:            Limits,
 	timeouts:          Timeouts,
@@ -62,7 +81,7 @@ Server :: struct {
 Server_Runtime :: struct {
 	address:                tina.Socket_Address,
 	backlog:                u32,
-	distribution:           Distribution_Mode,
+	ingress_mode:           Ingress_Mode,
 	limits:                 Limits,
 	timeouts:               Timeouts,
 	keepalive_reserve_slots: u16,
@@ -477,6 +496,12 @@ install_into_system_spec :: proc(
 		"timer_resolution_ns must be <= 1 s (Date cache lower bound)",
 	)
 
+	topology, topology_error := _derive_http_ingress_topology(spec.shard_count, server.ingress_mode)
+	assert(
+		topology_error == .None,
+		"install_into_system_spec: `server.ingress_mode = .Reuse_Port` requires shard_count > 1; single-shard HTTP always binds exclusively",
+	)
+
 	// Compile the route table once at boot and keep it alive for the lifetime
 	// of the system spec.
 	router_value, router_error, router_error_index := compile_router(server.app.routes, context.allocator)
@@ -490,7 +515,7 @@ install_into_system_spec :: proc(
 	server_runtime_storage := make([]Server_Runtime, 1, context.allocator)
 	server_runtime_storage[0] = _bake_server_runtime(server)
 	server_runtime := &server_runtime_storage[0]
-	coordinator_mode_enabled := spec.shard_count > 1 && server.distribution == .Coordinator
+	coordinator_mode_enabled := topology.coordinator_mode_enabled
 
 	// --- Derive memory budgets ---
 	working_memory_size := _compute_working_memory_size(server)
@@ -678,9 +703,6 @@ install_development :: proc(
 	assert(server.app != nil, "install_development: server.app is nil")
 	assert(connection_slot_count >= 1, "connection_slot_count must be >= 1")
 
-	// Force single-shard regardless of caller's distribution preference.
-	server.distribution = .Reuse_Port
-
 	spec := _make_base_system_spec(
 		server,
 		1, // single shard
@@ -717,6 +739,40 @@ _normalize_server_defaults :: proc(server: ^Server) {
 	if server.graceful_drain_ms == 0 {
 		server.graceful_drain_ms = HTTP_DEV_SHUTDOWN_TIMEOUT_MS
 	}
+}
+
+// Derives the runtime ingress topology from the public configuration.
+// Single-shard HTTP always binds exclusively. `Reuse_Port` is valid only in
+// multi-shard mode, where it replaces coordinator routing with kernel-level
+// accept distribution.
+@(private = "package")
+_derive_http_ingress_topology :: proc(
+	shard_count: u8,
+	ingress_mode: Ingress_Mode,
+) -> (
+	HTTP_Ingress_Topology,
+	Ingress_Topology_Error,
+) {
+	topology := HTTP_Ingress_Topology {
+		ingress_mode             = ingress_mode,
+		bind_mode                = .Exclusive,
+		coordinator_mode_enabled = false,
+	}
+
+	if shard_count <= 1 {
+		if ingress_mode == .Reuse_Port {
+			return topology, .Reuse_Port_Requires_Multi_Shard
+		}
+		return topology, .None
+	}
+
+	if ingress_mode == .Reuse_Port {
+		topology.bind_mode = .Reuse_Port
+		return topology, .None
+	}
+
+	topology.coordinator_mode_enabled = true
+	return topology, .None
 }
 
 @(private = "file")
@@ -858,7 +914,7 @@ _bake_server_runtime :: proc(server: ^Server) -> Server_Runtime {
 	return Server_Runtime {
 		address                = server.address,
 		backlog                = server.backlog,
-		distribution           = server.distribution,
+		ingress_mode           = server.ingress_mode,
 		limits                 = server.limits,
 		timeouts               = server.timeouts,
 		keepalive_reserve_slots = server.keepalive.reserve_slots,
@@ -1257,7 +1313,7 @@ test_install_multi_shard_includes_dispatcher :: proc(t: ^testing.T) {
 	server := Server {
 		address      = tina.ipv4(127, 0, 0, 1, 8080),
 		app          = &app,
-		distribution = .Coordinator,
+		ingress_mode = .Coordinator,
 	}
 
 	spec := install(&server, 2, 64)
@@ -1287,6 +1343,40 @@ test_install_multi_shard_includes_dispatcher :: proc(t: ^testing.T) {
 			fmt.tprintf("shard %d static children mismatch", shard_index),
 		)
 	}
+}
+
+@(test)
+test_derive_http_ingress_topology_single_shard_is_exclusive :: proc(t: ^testing.T) {
+	topology, topology_error := _derive_http_ingress_topology(1, .Coordinator)
+
+	testing.expect_value(t, topology_error, Ingress_Topology_Error.None)
+	testing.expect_value(t, topology.bind_mode, Listener_Bind_Mode.Exclusive)
+	testing.expect(t, !topology.coordinator_mode_enabled, "single-shard HTTP must not enable coordinator routing")
+}
+
+@(test)
+test_derive_http_ingress_topology_single_shard_rejects_reuse_port :: proc(t: ^testing.T) {
+	_, topology_error := _derive_http_ingress_topology(1, .Reuse_Port)
+
+	testing.expect_value(t, topology_error, Ingress_Topology_Error.Reuse_Port_Requires_Multi_Shard)
+}
+
+@(test)
+test_derive_http_ingress_topology_multi_shard_coordinator_is_exclusive :: proc(t: ^testing.T) {
+	topology, topology_error := _derive_http_ingress_topology(4, .Coordinator)
+
+	testing.expect_value(t, topology_error, Ingress_Topology_Error.None)
+	testing.expect_value(t, topology.bind_mode, Listener_Bind_Mode.Exclusive)
+	testing.expect(t, topology.coordinator_mode_enabled, "multi-shard coordinator mode must enable explicit dispatcher routing")
+}
+
+@(test)
+test_derive_http_ingress_topology_multi_shard_reuse_port_is_kernel_distributed :: proc(t: ^testing.T) {
+	topology, topology_error := _derive_http_ingress_topology(4, .Reuse_Port)
+
+	testing.expect_value(t, topology_error, Ingress_Topology_Error.None)
+	testing.expect_value(t, topology.bind_mode, Listener_Bind_Mode.Reuse_Port)
+	testing.expect(t, !topology.coordinator_mode_enabled, "reuse-port mode must not instantiate coordinator routing")
 }
 
 @(test)

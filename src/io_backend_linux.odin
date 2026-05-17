@@ -566,6 +566,8 @@ when !TINA_SIMULATION_MODE {
 			opt = 2
 		case .SO_REUSEPORT:
 			opt = 15
+		case .SO_EXCLUSIVEADDRUSE:
+			return .Unsupported
 		case .SO_KEEPALIVE:
 			opt = 9
 		case .SO_RCVBUF:
@@ -643,6 +645,8 @@ when !TINA_SIMULATION_MODE {
 			opt = 2
 		case .SO_REUSEPORT:
 			opt = 15
+		case .SO_EXCLUSIVEADDRUSE:
+			return nil, .Unsupported
 		case .SO_KEEPALIVE:
 			opt = 9
 		case .SO_RCVBUF:

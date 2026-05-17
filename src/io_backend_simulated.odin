@@ -24,11 +24,16 @@ when TINA_SIMULATION_MODE {
 	SIM_ERR_NFILE :: i32(-24)
 
 	Sim_FD_Object :: struct {
-		ref_count:       u16,
-		inflight_count:  u16,
-		next_free_index: u16,
-		alive:           bool,
-		_padding:        [3]u8,
+		ref_count:                    u16,
+		inflight_count:               u16,
+		next_free_index:              u16,
+		alive:                        bool,
+		bound:                        bool,
+		listening:                    bool,
+		reuse_port_enabled:           bool,
+		exclusive_address_use_enabled: bool,
+		_padding:                     [3]u8,
+		bind_address:                 Socket_Address,
 	}
 
 	Sim_FD_Descriptor :: struct {
@@ -329,7 +334,30 @@ when TINA_SIMULATION_MODE {
 		fd: OS_FD,
 		address: Socket_Address,
 	) -> Backend_Error {
-		if _, ok := _sim_lookup_descriptor(backend, fd); !ok do return .System_Error
+		desc, ok := _sim_lookup_descriptor(backend, fd)
+		if !ok do return .System_Error
+
+		object := &g_sim_fd_state.objects[desc.object_index]
+		if object.bound {
+			return .Invalid_Argument
+		}
+
+		for object_index in 0 ..< MAX_SIMULATED_OBJECTS {
+			other := &g_sim_fd_state.objects[object_index]
+			if !other.alive || !other.bound || u16(object_index) == desc.object_index {
+				continue
+			}
+			if !_sim_bind_addresses_overlap(address, other.bind_address) {
+				continue
+			}
+			if _sim_bind_allows_shared_port(object, other) {
+				continue
+			}
+			return .Address_In_Use
+		}
+
+		object.bound = true
+		object.bind_address = address
 		return .None
 	}
 
@@ -339,7 +367,13 @@ when TINA_SIMULATION_MODE {
 		fd: OS_FD,
 		backlog: u32,
 	) -> Backend_Error {
-		if _, ok := _sim_lookup_descriptor(backend, fd); !ok do return .System_Error
+		desc, ok := _sim_lookup_descriptor(backend, fd)
+		if !ok do return .System_Error
+		object := &g_sim_fd_state.objects[desc.object_index]
+		if !object.bound {
+			return .Invalid_Argument
+		}
+		object.listening = true
 		return .None
 	}
 
@@ -351,7 +385,24 @@ when TINA_SIMULATION_MODE {
 		option: Socket_Option,
 		value: Socket_Option_Value,
 	) -> Backend_Error {
-		if _, ok := _sim_lookup_descriptor(backend, fd); !ok do return .System_Error
+		desc, ok := _sim_lookup_descriptor(backend, fd)
+		if !ok do return .System_Error
+		object := &g_sim_fd_state.objects[desc.object_index]
+
+		if level == .SOL_SOCKET {
+			#partial switch option {
+			case .SO_REUSEPORT:
+				if enabled, enabled_ok := value.(bool); enabled_ok {
+					object.reuse_port_enabled = enabled
+				}
+			case .SO_EXCLUSIVEADDRUSE:
+				if enabled, enabled_ok := value.(bool); enabled_ok {
+					object.exclusive_address_use_enabled = enabled
+				}
+			case:
+			}
+		}
+
 		return .None
 	}
 
@@ -455,10 +506,14 @@ when TINA_SIMULATION_MODE {
 		g_sim_fd_state.object_free_head = object.next_free_index
 		g_sim_fd_state.object_free_count -= 1
 		object^ = Sim_FD_Object {
-			ref_count = 1,
-			inflight_count = 0,
-			next_free_index = SIM_OBJECT_NONE_INDEX,
-			alive = true,
+			ref_count                     = 1,
+			inflight_count                = 0,
+			next_free_index               = SIM_OBJECT_NONE_INDEX,
+			alive                         = true,
+			bound                         = false,
+			listening                     = false,
+			reuse_port_enabled            = false,
+			exclusive_address_use_enabled = false,
 		}
 		return index, true
 	}
@@ -609,6 +664,70 @@ when TINA_SIMULATION_MODE {
 		case Submission_Op_Sendfile: return o.fd_socket
 		}
 		return OS_FD_INVALID
+	}
+
+	@(private = "file")
+	_sim_bind_allows_shared_port :: #force_inline proc "contextless" (
+		candidate: ^Sim_FD_Object,
+		existing: ^Sim_FD_Object,
+	) -> bool {
+		if candidate == nil || existing == nil do return false
+		if candidate.exclusive_address_use_enabled || existing.exclusive_address_use_enabled {
+			return false
+		}
+		return candidate.reuse_port_enabled && existing.reuse_port_enabled
+	}
+
+	@(private = "file")
+	_sim_bind_addresses_overlap :: proc "contextless" (
+		left: Socket_Address,
+		right: Socket_Address,
+	) -> bool {
+		#partial switch left_address in left {
+		case Socket_Address_Inet4:
+			right_address, ok := right.(Socket_Address_Inet4)
+			if !ok {
+				return false
+			}
+			if left_address.port != right_address.port {
+				return false
+			}
+			left_is_wildcard := _sim_is_ipv4_wildcard(left_address.address)
+			right_is_wildcard := _sim_is_ipv4_wildcard(right_address.address)
+			return left_is_wildcard || right_is_wildcard || left_address.address == right_address.address
+		case Socket_Address_Inet6:
+			right_address, ok := right.(Socket_Address_Inet6)
+			if !ok {
+				return false
+			}
+			if left_address.port != right_address.port {
+				return false
+			}
+			left_is_unspecified := _sim_is_ipv6_unspecified(left_address.address)
+			right_is_unspecified := _sim_is_ipv6_unspecified(right_address.address)
+			return left_is_unspecified || right_is_unspecified || (
+				left_address.address == right_address.address &&
+				left_address.flow == right_address.flow &&
+				left_address.scope == right_address.scope
+			)
+		case Socket_Address_Unix:
+			right_address, ok := right.(Socket_Address_Unix)
+			if !ok {
+				return false
+			}
+			return left_address.path == right_address.path
+		}
+		return false
+	}
+
+	@(private = "file")
+	_sim_is_ipv4_wildcard :: #force_inline proc "contextless" (address: [4]u8) -> bool {
+		return address == [4]u8{}
+	}
+
+	@(private = "file")
+	_sim_is_ipv6_unspecified :: #force_inline proc "contextless" (address: [16]u8) -> bool {
+		return address == [16]u8{}
 	}
 
 	// Derive a deterministic per-operation value from (seed, tick, token).
@@ -1092,6 +1211,60 @@ when TINA_SIMULATION_MODE {
 		testing.expect(t, ok, "accept completion should carry accept extra")
 		_, descriptor_ok := _sim_lookup_descriptor(&backend, accept_extra.client_fd)
 		testing.expect(t, descriptor_ok, "accepted client fd should be tracked by simulated backend")
+	}
+
+	@(test)
+	test_simulated_backend_bind_rejects_duplicate_exclusive_address :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			sim_config = Simulation_IO_Config {seed = t.seed},
+		}
+		err := backend_init(&backend, config)
+		testing.expect_value(t, err, Backend_Error.None)
+		defer backend_deinit(&backend)
+
+		address := Socket_Address_Inet4 {address = {127, 0, 0, 1}, port = 8080}
+
+		first_fd, first_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, first_error, Backend_Error.None)
+		first_bind_error := backend_control_bind(&backend, first_fd, address)
+		testing.expect_value(t, first_bind_error, Backend_Error.None)
+
+		second_fd, second_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, second_error, Backend_Error.None)
+		second_bind_error := backend_control_bind(&backend, second_fd, address)
+		testing.expect_value(t, second_bind_error, Backend_Error.Address_In_Use)
+	}
+
+	@(test)
+	test_simulated_backend_bind_accepts_duplicate_reuse_port_address :: proc(t: ^testing.T) {
+		backend: Platform_Backend
+		config := Backend_Config {
+			sim_config = Simulation_IO_Config {seed = t.seed},
+		}
+		err := backend_init(&backend, config)
+		testing.expect_value(t, err, Backend_Error.None)
+		defer backend_deinit(&backend)
+
+		address := Socket_Address_Inet4 {address = {127, 0, 0, 1}, port = 8080}
+
+		first_fd, first_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, first_error, Backend_Error.None)
+		testing.expect_value(
+			t,
+			backend_control_setsockopt(&backend, first_fd, .SOL_SOCKET, .SO_REUSEPORT, bool(true)),
+			Backend_Error.None,
+		)
+		testing.expect_value(t, backend_control_bind(&backend, first_fd, address), Backend_Error.None)
+
+		second_fd, second_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, second_error, Backend_Error.None)
+		testing.expect_value(
+			t,
+			backend_control_setsockopt(&backend, second_fd, .SOL_SOCKET, .SO_REUSEPORT, bool(true)),
+			Backend_Error.None,
+		)
+		testing.expect_value(t, backend_control_bind(&backend, second_fd, address), Backend_Error.None)
 	}
 
 } // when TINA_SIM

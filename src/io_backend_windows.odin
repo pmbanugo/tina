@@ -910,7 +910,7 @@ when !TINA_SIMULATION_MODE {
 
 		// Boolean options return bool, others return i32
 		#partial switch option {
-		case .SO_REUSEADDR, .SO_REUSEPORT, .SO_KEEPALIVE, .TCP_NODELAY, .IPV6_V6ONLY:
+		case .SO_REUSEADDR, .SO_KEEPALIVE, .TCP_NODELAY, .IPV6_V6ONLY, .SO_EXCLUSIVEADDRUSE:
 			return bool(val != 0), .None
 		case:
 			return i32(val), .None
@@ -1202,7 +1202,7 @@ when !TINA_SIMULATION_MODE {
 		case .SO_REUSEADDR:
 			return win.SO_REUSEADDR
 		case .SO_REUSEPORT:
-			return win.SO_REUSEADDR // Windows uses REUSEADDR
+			return 0 // Windows has no SO_REUSEPORT equivalent
 		case .SO_KEEPALIVE:
 			return win.SO_KEEPALIVE
 		case .SO_RCVBUF:
@@ -1213,6 +1213,8 @@ when !TINA_SIMULATION_MODE {
 			return win.SO_LINGER
 		case .SO_BINDTODEVICE:
 			return 0 // Not supported on Windows
+		case .SO_EXCLUSIVEADDRUSE:
+			return win.SO_EXCLUSIVEADDRUSE
 		case .TCP_NODELAY:
 			return win.TCP_NODELAY
 		case .TCP_CORK:

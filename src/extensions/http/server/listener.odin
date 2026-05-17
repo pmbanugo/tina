@@ -58,7 +58,15 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 		return tina.Effect_Crash{reason = .Init_Failed}
 	}
 
-	if init_args.server.distribution == .Coordinator && init_args.dispatcher_shard_count > 1 {
+	topology, topology_error := _derive_http_ingress_topology(
+		init_args.dispatcher_shard_count,
+		init_args.server.ingress_mode,
+	)
+	if topology_error != .None {
+		return tina.Effect_Crash{reason = .Init_Failed}
+	}
+
+	if topology.coordinator_mode_enabled {
 		dispatcher_handles := make([]tina.Handle, int(init_args.dispatcher_shard_count), runtime_allocator)
 		for shard_index in 0 ..< len(dispatcher_handles) {
 			dispatcher_handles[shard_index] = tina.make_handle(
@@ -71,7 +79,7 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 		listener.dispatcher_handles = dispatcher_handles
 	}
 
-	listener.listen_fd = _listener_open_listen_socket(ctx, listener.shard_runtime)
+	listener.listen_fd = _listener_open_listen_socket(ctx, listener.shard_runtime, topology.bind_mode)
 	if listener.listen_fd == tina.FD_HANDLE_NONE {
 		return tina.Effect_Crash{reason = .Init_Failed}
 	}
@@ -241,7 +249,11 @@ _listener_dispatch_connection :: proc(
 }
 
 @(private = "file")
-_listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard_Runtime) -> tina.FD_Handle {
+_listener_open_listen_socket :: proc(
+	ctx: tina.TinaContext,
+	runtime: ^HTTP_Shard_Runtime,
+	bind_mode: Listener_Bind_Mode,
+) -> tina.FD_Handle {
 	server := &runtime.server
 	domain := tina.Socket_Domain.AF_INET
 	#partial switch address in server.address {
@@ -284,9 +296,13 @@ _listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard
 		return tina.FD_HANDLE_NONE
 	}
 
-	_ = tina.ctx_setsockopt_bool(ctx, listen_fd, .SOL_SOCKET, .SO_REUSEADDR, true)
-	when ODIN_OS != .Windows {
-		if server.distribution == .Reuse_Port {
+	when ODIN_OS == .Windows {
+		if bind_mode == .Exclusive {
+			_ = tina.ctx_setsockopt_bool(ctx, listen_fd, .SOL_SOCKET, .SO_EXCLUSIVEADDRUSE, true)
+		}
+	} else {
+		_ = tina.ctx_setsockopt_bool(ctx, listen_fd, .SOL_SOCKET, .SO_REUSEADDR, true)
+		if bind_mode == .Reuse_Port {
 			_ = tina.ctx_setsockopt_bool(ctx, listen_fd, .SOL_SOCKET, .SO_REUSEPORT, true)
 		}
 	}
