@@ -33,6 +33,26 @@ when !TINA_SIMULATION_MODE {
 	MAX_WIN_COMPLETED :: REACTOR_SUBMISSION_BATCH_COUNT + REACTOR_COMPLETION_BATCH_COUNT
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_WIN_OVERLAPPED)
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_WIN_COMPLETED)
+
+	@(private = "file")
+	_win_map_socket_startup_error :: #force_inline proc "contextless" (err: i32) -> Backend_Error {
+		switch err {
+		case win.WSAEACCES:
+			return .Permission_Denied
+		case win.WSAEINVAL:
+			return .Invalid_Argument
+		case win.WSAEADDRINUSE:
+			return .Address_In_Use
+		case win.WSAEADDRNOTAVAIL:
+			return .Address_Not_Available
+		case win.WSAEAFNOSUPPORT, win.WSAEPROTONOSUPPORT, win.WSAESOCKTNOSUPPORT, win.WSAEOPNOTSUPP:
+			return .Unsupported
+		case win.WSAEMFILE, win.WSAENOBUFS:
+			return .Resource_Exhausted
+		case:
+			return .System_Error
+		}
+	}
 	#assert(REACTOR_COMPLETION_BATCH_COUNT <= MAX_WIN_COMPLETED)
 
 	// TransmitFile (sendfile) — not in core:sys/windows, define locally.
@@ -754,7 +774,7 @@ when !TINA_SIMULATION_MODE {
 
 		sock := win.WSASocketW(af, st, proto, nil, 0, win.WSA_FLAG_OVERLAPPED)
 		if sock == win.INVALID_SOCKET {
-			return OS_FD_INVALID, .System_Error
+			return OS_FD_INVALID, _win_map_socket_startup_error(win.WSAGetLastError())
 		}
 
 		// Associate with IOCP at creation time — before any I/O submission
@@ -772,7 +792,7 @@ when !TINA_SIMULATION_MODE {
 		sockaddr, socklen := _win_socket_address_to_sockaddr(address)
 		if win.bind(win.SOCKET(uintptr(fd)), &sockaddr, socklen) ==
 		   win.SOCKET_ERROR {
-			return .System_Error
+			return _win_map_socket_startup_error(win.WSAGetLastError())
 		}
 		return .None
 	}
@@ -784,7 +804,7 @@ when !TINA_SIMULATION_MODE {
 		backlog: u32,
 	) -> Backend_Error {
 		if win.listen(win.SOCKET(uintptr(fd)), i32(backlog)) == win.SOCKET_ERROR {
-			return .System_Error
+			return _win_map_socket_startup_error(win.WSAGetLastError())
 		}
 		return .None
 	}

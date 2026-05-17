@@ -21,6 +21,10 @@ Backend_Error :: enum u8 {
 	None,
 	Queue_Full,
 	Resource_Exhausted,
+	Address_In_Use,
+	Address_Not_Available,
+	Permission_Denied,
+	Invalid_Argument,
 	System_Error,
 	Not_Found,
 	Too_Late,
@@ -91,6 +95,24 @@ backend_init :: proc(backend: ^Platform_Backend, config: Backend_Config) -> Back
 
 backend_deinit :: proc(backend: ^Platform_Backend) {
 	_backend_deinit(backend)
+}
+
+backend_error_label :: #force_inline proc "contextless" (err: Backend_Error) -> string {
+	@(static, rodata)
+	labels := [Backend_Error]string {
+		.None                 = "none",
+		.Queue_Full           = "queue full",
+		.Resource_Exhausted   = "resource exhausted",
+		.Address_In_Use       = "address already in use",
+		.Address_Not_Available = "address not available",
+		.Permission_Denied    = "permission denied",
+		.Invalid_Argument     = "invalid argument",
+		.System_Error         = "system error",
+		.Not_Found            = "not found",
+		.Too_Late             = "too late",
+		.Unsupported          = "unsupported",
+	}
+	return labels[err]
 }
 
 // Submit a batch of I/O operations. All-or-error semantics.

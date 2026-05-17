@@ -216,29 +216,52 @@ tina_start :: proc(spec: ^SystemSpec) {
 	time.stopwatch_start(&stopwatch)
 
 	init_loop: for {
+		when !TINA_SIMULATION_MODE {
+			event := os_poll_watchdog_events(0)
+			if event == .Shutdown {
+				fmt.eprintfln("[FATAL] Shutdown requested during shard initialization. Force exiting bootstrap.")
+				os_force_exit(130)
+			}
+		}
+
 		all_running := true
+		failed_shard_index := -1
+		failed_state := Shard_State.Init
 		for index in 0 ..< spec.shard_count {
 			state := load_watchdog_state_acquire(&shard_runtime_states[index])
-			if state != .Running {
-				all_running = false
+			if state == .Running {
+				continue
+			}
+
+			all_running = false
+			if state != .Init {
+				failed_shard_index = int(index)
+				failed_state = state
 				break
 			}
 		}
 
 		if all_running do break init_loop
+		if failed_shard_index >= 0 {
+			fmt.eprintfln(
+				"[FATAL] Shard %d entered %s during initialization before watchdog startup. Inspect prior logs for the root cause.",
+				failed_shard_index,
+				shard_state_label(failed_state),
+			)
+			os_force_exit(1)
+		}
 
 		if time.stopwatch_duration(stopwatch) > timeout_duration {
 			for index in 0 ..< spec.shard_count {
 				state := load_watchdog_state(&shard_runtime_states[index])
-				if state == .Init {
-					fmt.eprintfln(
-						"[FATAL] Shard %d failed to initialize within %v",
-						index,
-						timeout_duration,
-					)
-				}
+				fmt.eprintfln(
+					"[FATAL] Shard %d failed to initialize within %v (state: %s)",
+					index,
+					timeout_duration,
+					shard_state_label(state),
+				)
 			}
-			os.exit(1)
+			os_force_exit(1)
 		}
 		time.sleep(10 * time.Millisecond) // Coarse polling
 	}

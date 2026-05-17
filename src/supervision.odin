@@ -365,15 +365,11 @@ _build_group :: proc(
 
 		#partial switch &s in child_spec_pointer {
 		case Static_Child_Spec:
-			spawn_loop: for {
-				if _spawn_static_child_at(shard, group, u16(i)) {
-					break spawn_loop
-				}
-
-				if _check_and_record_restart(shard, group) {
-					_escalate(shard, group)
-					return .Escalated
-				}
+			// Initial tree construction is a control-plane build step. Retrying the same
+			// static child spawn in a tight loop without any state change is pure churn.
+			if !_spawn_static_child_at(shard, group, u16(i)) {
+				_escalate(shard, group)
+				return .Escalated
 			}
 
 		case Group_Spec:

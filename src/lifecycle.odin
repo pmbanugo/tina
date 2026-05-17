@@ -24,6 +24,18 @@ load_watchdog_state_acquire :: #force_inline proc "contextless" (runtime_state: 
 	return cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Acquire)
 }
 
+shard_state_label :: #force_inline proc "contextless" (state: Shard_State) -> string {
+	@(static, rodata)
+	labels := [Shard_State]string {
+		.Init          = "Init",
+		.Running       = "Running",
+		.Quarantined   = "Quarantined",
+		.Shutting_Down = "Shutting_Down",
+		.Terminated    = "Terminated",
+	}
+	return labels[state]
+}
+
 @(private = "package")
 store_watchdog_state :: proc {
 	_store_watchdog_state_runtime,

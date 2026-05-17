@@ -1,6 +1,7 @@
 package http_server
 
 import tina "../../.."
+import "core:fmt"
 import "core:testing"
 
 @(private = "package")
@@ -11,6 +12,29 @@ Listener_Dispatch_Result :: enum u8 {
 	Local_Spawned,
 	Handoff_Offered,
 	Local_Capacity_Full,
+}
+
+@(private = "file")
+_listener_log_startup_failure :: proc(
+	ctx: tina.TinaContext,
+	stage: string,
+	address: tina.Socket_Address,
+	error_label: string,
+	advice: string,
+) {
+	message := fmt.tprintf(
+		"HTTP listener startup failed during %s for %v (%s). %s",
+		stage,
+		address,
+		error_label,
+		advice,
+	)
+	tina.ctx_log(
+		ctx,
+		tina.Log_Level.ERROR,
+		tina.USER_LOG_TAG_BASE,
+		transmute([]u8)message,
+	)
 }
 
 @(private = "package")
@@ -231,6 +255,32 @@ _listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard
 
 	listen_fd, socket_error := tina.ctx_socket(ctx, domain, .STREAM, .TCP)
 	if socket_error != .None {
+		error_label := "backend error"
+		advice := "Inspect the platform socket configuration and prior system logs."
+		#partial switch socket_error {
+		case .FD_Table_Full:
+			error_label = "fd table full"
+			advice = "Increase Tina's fd table capacity for this shard."
+		case .Resource_Exhausted:
+			error_label = "resource exhausted"
+			advice = "Check process file-descriptor limits and kernel socket resources."
+		case .Permission_Denied:
+			error_label = "permission denied"
+			advice = "Check the process privileges and security policy for socket creation."
+		case .Invalid_Argument:
+			error_label = "invalid argument"
+			advice = "Check the configured address family, socket type, and protocol."
+		case .Unsupported:
+			error_label = "unsupported"
+			advice = "Check whether this socket family/protocol is supported on the current platform."
+		}
+		_listener_log_startup_failure(
+			ctx,
+			"socket",
+			server.address,
+			error_label,
+			advice,
+		)
 		return tina.FD_HANDLE_NONE
 	}
 
@@ -243,11 +293,69 @@ _listener_open_listen_socket :: proc(ctx: tina.TinaContext, runtime: ^HTTP_Shard
 
 	bind_error := tina.ctx_bind(ctx, listen_fd, server.address)
 	if bind_error != .None {
+		error_label := "system error"
+		advice := "Inspect the platform socket configuration and prior system logs."
+		#partial switch bind_error {
+		case .Address_In_Use:
+			error_label = "address already in use"
+			advice = "Stop the process already using this address or choose a different host/port."
+		case .Address_Not_Available:
+			error_label = "address not available"
+			advice = "Bind only to an address configured on this host."
+		case .Permission_Denied:
+			error_label = "permission denied"
+			advice = "Check the process privileges and whether this port/address requires elevated access."
+		case .Invalid_Argument:
+			error_label = "invalid argument"
+			advice = "Check the listener address configuration."
+		case .Resource_Exhausted:
+			error_label = "resource exhausted"
+			advice = "Check process file-descriptor limits and kernel socket resources."
+		case .Unsupported:
+			error_label = "unsupported"
+		}
+		_ = tina.ctx_close_fd(ctx, listen_fd)
+		_listener_log_startup_failure(
+			ctx,
+			"bind",
+			server.address,
+			error_label,
+			advice,
+		)
 		return tina.FD_HANDLE_NONE
 	}
 
 	listen_error := tina.ctx_listen(ctx, listen_fd, server.backlog)
 	if listen_error != .None {
+		error_label := "system error"
+		advice := "Inspect the platform socket configuration and prior system logs."
+		#partial switch listen_error {
+		case .Invalid_Argument:
+			error_label = "invalid argument"
+			advice = "Check the configured listen backlog and socket state."
+		case .Permission_Denied:
+			error_label = "permission denied"
+			advice = "Check the process privileges and network policy for listen()."
+		case .Resource_Exhausted:
+			error_label = "resource exhausted"
+			advice = "Check process file-descriptor limits and kernel socket resources."
+		case .Address_In_Use:
+			error_label = "address already in use"
+			advice = "Stop the process already using this address or choose a different host/port."
+		case .Address_Not_Available:
+			error_label = "address not available"
+			advice = "Bind only to an address configured on this host."
+		case .Unsupported:
+			error_label = "unsupported"
+		}
+		_ = tina.ctx_close_fd(ctx, listen_fd)
+		_listener_log_startup_failure(
+			ctx,
+			"listen",
+			server.address,
+			error_label,
+			advice,
+		)
 		return tina.FD_HANDLE_NONE
 	}
 

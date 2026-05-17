@@ -548,6 +548,11 @@ ctx_shutdown :: #force_inline proc(
 	return reactor_control_shutdown(&invocation.shard.reactor, fd, invocation.self_handle, how)
 }
 
+ctx_close_fd :: #force_inline proc(ctx: TinaContext, fd: FD_Handle) -> Backend_Error {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	return reactor_control_close(&invocation.shard.reactor, fd, invocation.self_handle)
+}
+
 ctx_read_buffer :: #force_inline proc(ctx: TinaContext, buffer_index: u16, size: u32) -> []u8 {
 	shard := ctx_invocation(ctx).shard
 	if size <= 0 do return nil

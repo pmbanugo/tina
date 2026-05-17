@@ -28,6 +28,26 @@ when !TINA_SIMULATION_MODE {
 	MAX_LINUX_SENDFILE_ENTRIES :: REACTOR_LINUX_SENDFILE_ENTRY_COUNT
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_LINUX_UNQUEUED)
 
+	@(private = "file")
+	_linux_map_socket_startup_error :: #force_inline proc "contextless" (err: linux.Errno) -> Backend_Error {
+		#partial switch err {
+		case .EACCES, .EPERM:
+			return .Permission_Denied
+		case .EINVAL:
+			return .Invalid_Argument
+		case .EADDRINUSE:
+			return .Address_In_Use
+		case .EADDRNOTAVAIL:
+			return .Address_Not_Available
+		case .EAFNOSUPPORT, .EPROTONOSUPPORT, .ESOCKTNOSUPPORT, .EOPNOTSUPP:
+			return .Unsupported
+		case .EMFILE, .ENFILE, .ENOBUFS, .ENOMEM:
+			return .Resource_Exhausted
+		case:
+			return .System_Error
+		}
+	}
+
 	// Persistent storage for io_uring operations that need stable pointers
 	// (accept, connect, sendto, recvfrom). Allocated on submit, freed on CQE.
 	Pending_Addr_Entry :: struct {
@@ -486,7 +506,7 @@ when !TINA_SIMULATION_MODE {
 
 		fd, err := linux.socket(af, st, sf, proto)
 		if err != nil {
-			return OS_FD_INVALID, .System_Error
+			return OS_FD_INVALID, _linux_map_socket_startup_error(err)
 		}
 		return OS_FD(fd), .None
 	}
@@ -502,7 +522,7 @@ when !TINA_SIMULATION_MODE {
 
 		err := linux.bind(linux.Fd(fd), &sockaddr)
 		if err != nil {
-			return .System_Error
+			return _linux_map_socket_startup_error(err)
 		}
 		return .None
 	}
@@ -515,7 +535,7 @@ when !TINA_SIMULATION_MODE {
 	) -> Backend_Error {
 		err := linux.listen(linux.Fd(fd), i32(backlog))
 		if err != nil {
-			return .System_Error
+			return _linux_map_socket_startup_error(err)
 		}
 		return .None
 	}

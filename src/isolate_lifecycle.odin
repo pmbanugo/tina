@@ -151,8 +151,26 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		soa_meta[slot].working_arena_offset = u32(child_invocation.working_arena.offset)
 	}
 
-	_, is_crash := effect.(Effect_Crash)
+	crash_effect, is_crash := effect.(Effect_Crash)
 	_, is_done := effect.(Effect_Done)
+	if is_crash {
+		reason_str := CRASH_REASONS_INTERPRETED[crash_effect.reason]
+		_shard_log(
+			shard,
+			child_handle,
+			.ERROR,
+			LOG_TAG_ISOLATE_CRASHED,
+			transmute([]u8)reason_str,
+		)
+	} else if is_done {
+		_shard_log(
+			shard,
+			child_handle,
+			.ERROR,
+			LOG_TAG_ISOLATE_CRASHED,
+			transmute([]u8)string("Init handler returned Effect_Done"),
+		)
+	}
 	if is_crash || is_done {
 		if spec.handoff_fd != FD_HANDLE_NONE {
 			fd_table_handoff(

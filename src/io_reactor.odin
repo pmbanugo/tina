@@ -13,6 +13,10 @@ Reactor_Socket_Error :: enum u8 {
 	None,
 	Backend_Error,
 	FD_Table_Full,
+	Resource_Exhausted,
+	Permission_Denied,
+	Invalid_Argument,
+	Unsupported,
 }
 
 Direction_Affinity :: enum u8 {
@@ -83,6 +87,38 @@ reactor_deinit :: proc(reactor: ^Reactor) {
 	reactor.pending_count = 0
 }
 
+reactor_socket_error_label :: #force_inline proc "contextless" (err: Reactor_Socket_Error) -> string {
+	@(static, rodata)
+	labels := [Reactor_Socket_Error]string {
+		.None               = "none",
+		.Backend_Error      = "backend error",
+		.FD_Table_Full      = "fd table full",
+		.Resource_Exhausted = "resource exhausted",
+		.Permission_Denied  = "permission denied",
+		.Invalid_Argument   = "invalid argument",
+		.Unsupported        = "unsupported",
+	}
+	return labels[err]
+}
+
+@(private = "file")
+_reactor_socket_error_from_backend_error :: #force_inline proc "contextless" (
+	err: Backend_Error,
+) -> Reactor_Socket_Error {
+	#partial switch err {
+	case .Resource_Exhausted:
+		return .Resource_Exhausted
+	case .Permission_Denied:
+		return .Permission_Denied
+	case .Invalid_Argument:
+		return .Invalid_Argument
+	case .Unsupported:
+		return .Unsupported
+	case:
+		return .Backend_Error
+	}
+}
+
 // ======================================
 // Synchronous Control Wrappers (§6.6.3)
 // ======================================
@@ -100,7 +136,7 @@ reactor_control_socket :: proc(
 ) {
 
 	os_fd, backend_error := backend_control_socket(&reactor.backend, domain, socket_type, protocol)
-	if backend_error != .None do return FD_HANDLE_NONE, .Backend_Error
+	if backend_error != .None do return FD_HANDLE_NONE, _reactor_socket_error_from_backend_error(backend_error)
 
 	fd_handle, t_err := fd_table_alloc(&reactor.fd_table, os_fd, owner)
 	if t_err != .None {
@@ -182,6 +218,20 @@ reactor_control_shutdown :: proc(
 	if err != IO_ERR_NONE do return .Not_Found
 
 	return backend_control_shutdown(&reactor.backend, os_fd, how)
+}
+
+reactor_control_close :: proc(
+	reactor: ^Reactor,
+	fd: FD_Handle,
+	owner: Handle,
+) -> Backend_Error {
+	os_fd, err := _resolve_os_fd(reactor, fd, owner, .Any)
+	if err != IO_ERR_NONE do return .Not_Found
+
+	backend_unregister_fixed_fd(&reactor.backend, fd_handle_index(fd))
+	close_error := backend_control_close(&reactor.backend, os_fd)
+	_ = fd_table_free(&reactor.fd_table, fd)
+	return close_error
 }
 
 reactor_internal_close_fd :: proc "contextless" (reactor: ^Reactor, fd: FD_Handle) {

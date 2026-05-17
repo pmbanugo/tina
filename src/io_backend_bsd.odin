@@ -43,6 +43,26 @@ when !TINA_SIMULATION_MODE {
 	#assert(REACTOR_COMPLETION_BATCH_COUNT <= MAX_POSIX_COMPLETED)
 	POSIX_WAKE_IDENT :: 69
 
+	@(private = "file")
+	_posix_map_socket_startup_error :: #force_inline proc "contextless" (err: posix.Errno) -> Backend_Error {
+		#partial switch err {
+		case .EACCES, .EPERM:
+			return .Permission_Denied
+		case .EINVAL:
+			return .Invalid_Argument
+		case .EADDRINUSE:
+			return .Address_In_Use
+		case .EADDRNOTAVAIL:
+			return .Address_Not_Available
+		case .EAFNOSUPPORT, .EPROTONOSUPPORT, .EOPNOTSUPP:
+			return .Unsupported
+		case .EMFILE, .ENFILE, .ENOBUFS, .ENOMEM:
+			return .Resource_Exhausted
+		case:
+			return .System_Error
+		}
+	}
+
 	// SO_NOSIGPIPE suppresses SIGPIPE on a per-socket basis.
 	// Available on Darwin (0x1022), FreeBSD (0x0800), and NetBSD (0x0800).
 	// OpenBSD does NOT have SO_NOSIGPIPE — it relies solely on MSG_NOSIGNAL per-send.
@@ -427,18 +447,18 @@ when !TINA_SIMULATION_MODE {
 
 		fd := posix.socket(af, st, proto)
 		if fd < 0 {
-			return OS_FD_INVALID, .System_Error
+			return OS_FD_INVALID, _posix_map_socket_startup_error(posix.errno())
 		}
 
 		// Set non-blocking.
 		flags := posix.fcntl(fd, .GETFL)
 		if flags < 0 {
 			posix.close(fd)
-			return OS_FD_INVALID, .System_Error
+			return OS_FD_INVALID, _posix_map_socket_startup_error(posix.errno())
 		}
 		if posix.fcntl(fd, .SETFL, transmute(posix.O_Flags)(flags) + {.NONBLOCK}) < 0 {
 			posix.close(fd)
-			return OS_FD_INVALID, .System_Error
+			return OS_FD_INVALID, _posix_map_socket_startup_error(posix.errno())
 		}
 
 		// Set close-on-exec.
@@ -471,7 +491,7 @@ when !TINA_SIMULATION_MODE {
 			return .Unsupported
 		}
 		if posix.bind(posix.FD(fd), (^posix.sockaddr)(&sa), sa_len) != .OK {
-			return .System_Error
+			return _posix_map_socket_startup_error(posix.errno())
 		}
 		return .None
 	}
@@ -483,7 +503,7 @@ when !TINA_SIMULATION_MODE {
 		backlog: u32,
 	) -> Backend_Error {
 		if posix.listen(posix.FD(fd), i32(backlog)) != .OK {
-			return .System_Error
+			return _posix_map_socket_startup_error(posix.errno())
 		}
 		return .None
 	}
