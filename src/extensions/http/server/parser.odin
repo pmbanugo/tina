@@ -2,6 +2,7 @@ package http_server
 
 import "core:bytes"
 import "core:testing"
+import tina "../../.."
 
 @(private = "package")
 Parse_Phase :: enum u8 {
@@ -39,8 +40,8 @@ Parser_Flags :: distinct bit_set[Parser_Flag;u8]
 //
 // Bit mapping:
 //   - bit index = ASCII value (0–255)
-//   - word index = c >> 6
-//   - bit index  = c & 63   (LSB = lower ASCII values)
+//   - word index = tina.bitmap_word_index_from_bit_index(c)
+//   - bit index  = tina.bitmap_word_bit_index_from_bit_index(c) (LSB = lower ASCII values)
 //
 // Example:
 //   'A' (65) → table[1] bit 1
@@ -105,27 +106,47 @@ CHARS_DIGIT_DECIMAL := Table_256 {
 
 @(private = "package")
 is_token_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	#no_bounds_check return (CHARS_HTTP_TOKEN[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	bit_index := u32(byte_value)
+	#no_bounds_check return (
+		CHARS_HTTP_TOKEN[tina.bitmap_word_index_from_bit_index(bit_index)] &
+		tina.bitmap_mask_from_bit_index(bit_index)
+	) != 0
 }
 
 @(private = "package")
 is_uri_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	#no_bounds_check return (CHARS_URI[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	bit_index := u32(byte_value)
+	#no_bounds_check return (
+		CHARS_URI[tina.bitmap_word_index_from_bit_index(bit_index)] &
+		tina.bitmap_mask_from_bit_index(bit_index)
+	) != 0
 }
 
 @(private = "package")
 is_header_value_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	#no_bounds_check return (CHARS_HEADER_VALUE[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	bit_index := u32(byte_value)
+	#no_bounds_check return (
+		CHARS_HEADER_VALUE[tina.bitmap_word_index_from_bit_index(bit_index)] &
+		tina.bitmap_mask_from_bit_index(bit_index)
+	) != 0
 }
 
 @(private = "package")
 is_hex_digit_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	#no_bounds_check return (CHARS_DIGIT_HEX[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	bit_index := u32(byte_value)
+	#no_bounds_check return (
+		CHARS_DIGIT_HEX[tina.bitmap_word_index_from_bit_index(bit_index)] &
+		tina.bitmap_mask_from_bit_index(bit_index)
+	) != 0
 }
 
 @(private = "package")
 is_decimal_digit_byte :: #force_inline proc "contextless" (byte_value: u8) -> bool {
-	#no_bounds_check return (CHARS_DIGIT_DECIMAL[byte_value >> 6] & (u64(1) << (byte_value & 63))) != 0
+	bit_index := u32(byte_value)
+	#no_bounds_check return (
+		CHARS_DIGIT_DECIMAL[tina.bitmap_word_index_from_bit_index(bit_index)] &
+		tina.bitmap_mask_from_bit_index(bit_index)
+	) != 0
 }
 
 // Validates that every byte in the slice is a valid HTTP token character.

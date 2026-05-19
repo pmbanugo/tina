@@ -228,9 +228,9 @@ timer_arm_renewable :: proc(
 	wheel.renewable_correlation[index] = correlation
 
 	// Set bit in armed bitmap
-	word_index := index / 64
-	bit_index := index % 64
-	wheel.renewable_armed_words[word_index] |= u64(1) << bit_index
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	wheel.renewable_armed_words[word_index] |= bit_mask
 	wheel.renewable_armed_count += 1
 
 	return Timer_Handle(index)
@@ -260,9 +260,9 @@ timer_cancel_renewable :: proc(
 	index := u32(handle)
 
 	// Clear bit in armed bitmap
-	word_index := index / 64
-	bit_index := index % 64
-	wheel.renewable_armed_words[word_index] &= ~(u64(1) << bit_index)
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	wheel.renewable_armed_words[word_index] &= ~bit_mask
 	wheel.renewable_armed_count -= 1
 
 	// Push index onto free list
@@ -399,7 +399,7 @@ _advance_timers :: proc(
 			if expirations >= expirations_max do return
 
 			bit_index := u32(intrinsics.count_trailing_zeros(word))
-			slot_index := u32(word_index) * 64 + bit_index
+			slot_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, bit_index)
 
 			if wheel.renewable_deliver_at[slot_index] <= now {
 				// Clear bit in word and in the backing array
@@ -476,7 +476,7 @@ when TINA_SIMULATION_MODE {
 			word := wheel.renewable_armed_words[word_index]
 			for word != 0 {
 				bit_index := u32(intrinsics.count_trailing_zeros(word))
-				slot_index := u32(word_index) * 64 + bit_index
+				slot_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, bit_index)
 				if wheel.renewable_deliver_at[slot_index] < earliest {
 					earliest = wheel.renewable_deliver_at[slot_index]
 				}

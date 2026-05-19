@@ -1,6 +1,7 @@
 package http_server
 
 import "core:testing"
+import tina "../../.."
 
 // Headers with semantic meaning to the parser — tracked during parse
 @(private = "package")
@@ -88,17 +89,17 @@ validate_and_hash_header_name :: proc "contextless" (
 // Sets 2 bits in a 64-bit bloom filter derived from the hash.
 @(private = "package")
 bloom_set :: #force_inline proc "contextless" (bloom: u64, hash: FNV_Hash_1a) -> u64 {
-	bit_a := hash & 0x3F // low 6 bits  -> bit position 0..63
-	bit_b := (hash >> 6) & 0x3F // next 6 bits -> bit position 0..63
-	return bloom | (1 << bit_a) | (1 << bit_b)
+	bit_a := tina.bitmap_word_bit_index_from_bit_index(u32(hash))
+	bit_b := tina.bitmap_word_bit_index_from_bit_index(u32(hash) >> tina.BITMAP_WORD_SHIFT_COUNT)
+	return bloom | tina.bitmap_mask_from_word_bit_index(bit_a) | tina.bitmap_mask_from_word_bit_index(bit_b)
 }
 
 // Check if  the bloom filter may contain a header with the given hash.
 @(private = "package")
 bloom_may_contain :: #force_inline proc "contextless" (bloom: u64, hash: FNV_Hash_1a) -> bool {
-	bit_a := hash & 0x3F
-	bit_b := (hash >> 6) & 0x3F
-	mask := u64(1 << bit_a) | u64(1 << bit_b)
+	bit_a := tina.bitmap_word_bit_index_from_bit_index(u32(hash))
+	bit_b := tina.bitmap_word_bit_index_from_bit_index(u32(hash) >> tina.BITMAP_WORD_SHIFT_COUNT)
+	mask := tina.bitmap_mask_from_word_bit_index(bit_a) | tina.bitmap_mask_from_word_bit_index(bit_b)
 	return (bloom & mask) == mask
 }
 

@@ -742,7 +742,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.timer_renewable_entry_count * size_of(Handle)           // renewable_target
 	total += spec.timer_renewable_entry_count * size_of(Message_Tag)      // renewable_tag
 	total += spec.timer_renewable_entry_count * size_of(Correlation_Id)   // renewable_correlation
-	total += ((spec.timer_renewable_entry_count + 63) / 64) * size_of(u64) // renewable_armed_words
+	total += bitmap_word_count_from_bit_count(spec.timer_renewable_entry_count) * size_of(u64) // renewable_armed_words
 	total += spec.fd_table_slot_count * spec.fd_entry_size
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)

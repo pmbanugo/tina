@@ -6,15 +6,18 @@ import "core:testing"
 Shard_Mask :: distinct [4]u64
 
 shard_mask_contains :: #force_inline proc "contextless" (m: ^Shard_Mask, id: Shard_Id) -> bool {
-	return (m[id >> 6] & (u64(1) << (id & 63))) != 0
+	bit_index := u32(id)
+	return (m[bitmap_word_index_from_bit_index(bit_index)] & bitmap_mask_from_bit_index(bit_index)) != 0
 }
 
 shard_mask_include :: #force_inline proc "contextless" (m: ^Shard_Mask, id: Shard_Id) {
-	m[id >> 6] |= (u64(1) << (id & 63))
+	bit_index := u32(id)
+	m[bitmap_word_index_from_bit_index(bit_index)] |= bitmap_mask_from_bit_index(bit_index)
 }
 
 shard_mask_exclude :: #force_inline proc "contextless" (m: ^Shard_Mask, id: Shard_Id) {
-	m[id >> 6] &= ~(u64(1) << (id & 63))
+	bit_index := u32(id)
+	m[bitmap_word_index_from_bit_index(bit_index)] &= ~bitmap_mask_from_bit_index(bit_index)
 }
 
 @(test)

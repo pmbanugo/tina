@@ -22,9 +22,9 @@ os_pin_thread_to_core :: proc(core_id: i32) -> bool {
 	if core_id < 0 do return true // No affinity requested
 
 	mask: cpu_set_t
-	index := core_id / 64
-	bit := u64(1) << u64(core_id % 64)
-	mask.bits[index] |= bit
+	bit_index := u32(core_id)
+	word_index := bitmap_word_index_from_bit_index(bit_index)
+	mask.bits[word_index] |= bitmap_mask_from_bit_index(bit_index)
 
 	return sched_setaffinity(0, size_of(cpu_set_t), &mask) == 0
 }

@@ -295,7 +295,7 @@ hydrate_shard :: proc(
 		alloc_data.current_name = "Timer_Renewable_Correlation"
 		renewable_correlation := make([]Correlation_Id, spec.timer_renewable_entry_count, alloc)
 		alloc_data.current_name = "Timer_Renewable_Armed_Words"
-		armed_word_count := (spec.timer_renewable_entry_count + 63) / 64
+		armed_word_count := bitmap_word_count_from_bit_count(spec.timer_renewable_entry_count)
 		renewable_armed_words := make([]u64, armed_word_count, alloc)
 
 		timer_wheel_init_renewable(

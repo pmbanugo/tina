@@ -296,10 +296,7 @@ _dispatch_kind_for_slot :: #force_inline proc "contextless" (
 
 @(private = "package")
 _dispatch_word_count :: #force_inline proc "contextless" (bit_count: int) -> int {
-	if bit_count <= 0 {
-		return 0
-	}
-	return (bit_count + 63) / 64
+	return bitmap_word_count_from_bit_count(bit_count)
 }
 
 @(private = "file")
@@ -307,9 +304,8 @@ _bitset_set :: #force_inline proc "contextless" (words: []u64, bit_index: u32) {
 	if len(words) == 0 {
 		return
 	}
-	word_index := int(bit_index >> 6)
-	bit_offset := bit_index & 63
-	words[word_index] |= u64(1) << bit_offset
+	word_index := bitmap_word_index_from_bit_index(bit_index)
+	words[word_index] |= bitmap_mask_from_bit_index(bit_index)
 }
 
 @(private = "file")
@@ -317,9 +313,8 @@ _bitset_clear :: #force_inline proc "contextless" (words: []u64, bit_index: u32)
 	if len(words) == 0 {
 		return
 	}
-	word_index := int(bit_index >> 6)
-	bit_offset := bit_index & 63
-	words[word_index] &= ~(u64(1) << bit_offset)
+	word_index := bitmap_word_index_from_bit_index(bit_index)
+	words[word_index] &= ~bitmap_mask_from_bit_index(bit_index)
 }
 
 @(private = "file")
@@ -356,9 +351,8 @@ _dispatchable_slot_set_present :: #force_inline proc "contextless" (
 	if len(words) == 0 {
 		return
 	}
-	word_index := int(slot_index >> 6)
-	bit_offset := slot_index & 63
-	bit_mask := u64(1) << bit_offset
+	word_index := bitmap_word_index_from_bit_index(slot_index)
+	bit_mask := bitmap_mask_from_bit_index(slot_index)
 	if words[word_index] & bit_mask != 0 {
 		return
 	}
@@ -380,9 +374,8 @@ _dispatchable_slot_set_absent :: #force_inline proc "contextless" (
 	if len(words) == 0 {
 		return
 	}
-	word_index := int(slot_index >> 6)
-	bit_offset := slot_index & 63
-	bit_mask := u64(1) << bit_offset
+	word_index := bitmap_word_index_from_bit_index(slot_index)
+	bit_mask := bitmap_mask_from_bit_index(slot_index)
 	if words[word_index] & bit_mask == 0 {
 		return
 	}
@@ -430,10 +423,10 @@ _bitset_find_next_set_bit :: proc "contextless" (
 		return 0, false
 	}
 
-	start_word_index := int(start_bit_index >> 6)
-	start_bit_offset := start_bit_index & 63
+	start_word_index := bitmap_word_index_from_bit_index(start_bit_index)
+	start_word_bit_index := bitmap_word_bit_index_from_bit_index(start_bit_index)
 	last_word_index := len(words) - 1
-	last_word_bit_count := bit_count & 63
+	last_word_bit_count := bitmap_word_bit_index_from_bit_index(bit_count)
 	last_word_mask := ~u64(0)
 	if last_word_bit_count != 0 {
 		last_word_mask = (u64(1) << last_word_bit_count) - 1
@@ -444,38 +437,38 @@ _bitset_find_next_set_bit :: proc "contextless" (
 		if word_index == last_word_index {
 			word &= last_word_mask
 		}
-		if word_index == start_word_index && start_bit_offset > 0 {
-			word &= ~((u64(1) << start_bit_offset) - 1)
+		if word_index == start_word_index && start_word_bit_index > 0 {
+			word &= ~((u64(1) << start_word_bit_index) - 1)
 		}
 		if word == 0 {
 			continue
 		}
 
-		bit_offset := bits.trailing_zeros(word)
-		bit_index := u32(word_index * 64) + u32(bit_offset)
+		word_bit_index := u32(bits.trailing_zeros(word))
+		bit_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, word_bit_index)
 		if bit_index < bit_count {
 			return bit_index, true
 		}
 	}
 
-	if start_word_index > 0 || start_bit_offset > 0 {
+	if start_word_index > 0 || start_word_bit_index > 0 {
 		for word_index in 0 ..< min(start_word_index + 1, len(words)) {
 			word := words[word_index]
 			if word_index == last_word_index {
 				word &= last_word_mask
 			}
 			if word_index == start_word_index {
-				if start_bit_offset == 0 {
+				if start_word_bit_index == 0 {
 					break
 				}
-				word &= (u64(1) << start_bit_offset) - 1
+				word &= (u64(1) << start_word_bit_index) - 1
 			}
 			if word == 0 {
 				continue
 			}
 
-			bit_offset := bits.trailing_zeros(word)
-			bit_index := u32(word_index * 64) + u32(bit_offset)
+			word_bit_index := u32(bits.trailing_zeros(word))
+			bit_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, word_bit_index)
 			if bit_index < bit_count {
 				return bit_index, true
 			}
