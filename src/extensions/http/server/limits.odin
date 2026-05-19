@@ -24,9 +24,9 @@ Limits :: struct {
 
 // ─── Timeouts ───────────────────────────────────────────────────────────────
 //
-// Per-connection timeout configuration. Each timeout arms a timer wheel entry
-// that fires a lazy-cancellation message. Stale timeouts are filtered by
-// deadline + sequence checks (HTTP_LIBRARY_RUNTIME_POLICIES.md §1).
+// Per-connection timeout configuration. Each timeout arms a renewable deadline
+// in Tina's core timer subsystem. Stale timeouts are filtered by deadline +
+// sequence checks (HTTP_LIBRARY_RUNTIME_POLICIES.md §1).
 
 Timeouts :: struct {
 	timeout_ms_idle:   u32, // Keep-alive idle timeout.

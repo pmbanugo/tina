@@ -54,10 +54,6 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 		init_args.connection_slot_count,
 		init_args.connection_type_id,
 	)
-	if !_http_register_deadline_maintenance_task(listener.shard_runtime, ctx) {
-		return tina.Effect_Crash{reason = .Init_Failed}
-	}
-
 	topology, topology_error := _derive_http_ingress_topology(
 		init_args.dispatcher_shard_count,
 		init_args.server.ingress_mode,

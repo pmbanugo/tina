@@ -9,6 +9,34 @@ _timeout_duration_ns :: #force_inline proc "contextless" (timeout_ms: u32) -> u6
 	return u64(timeout_ms) * 1_000_000
 }
 
+@(private = "file")
+_connection_arm_or_rearm_deadline :: proc(
+	connection: ^HTTP_Connection,
+	ctx: tina.TinaContext,
+	duration_ns: u64,
+	tag: Message_Tag,
+) {
+	state := &connection.connection_state
+	correlation := tina.Correlation_Id(state.request_token)
+	handle := state.deadline_timer_handle
+	deadline_armed := handle != tina.TIMER_HANDLE_NONE && state.deadline_ns != 0
+
+	state.deadline_ns = tina.Monotonic_Time_NS(u64(tina.ctx_monotonic_time_ns(ctx)) + duration_ns)
+	if deadline_armed {
+		tina.ctx_rearm_renewable_deadline(ctx, handle, duration_ns, tag, correlation)
+		return
+	}
+
+	handle = tina.ctx_arm_renewable_deadline(ctx, duration_ns, tag, correlation)
+	when tina.TINA_RUNTIME_ASSERTIONS {
+		assert(
+			handle != tina.TIMER_HANDLE_NONE,
+			"_connection_arm_or_rearm_deadline: renewable deadline pool exhausted",
+		)
+	}
+	state.deadline_timer_handle = handle
+}
+
 @(private = "package")
 _connection_should_drain :: #force_inline proc(
 	runtime: ^HTTP_Shard_Runtime,
@@ -96,14 +124,8 @@ _connection_begin_keep_alive_wait :: proc(connection: ^HTTP_Connection, ctx: tin
 	state.request_token += 1
 	if state.request_token == 0 do state.request_token = 1
 
-	_deadline_arm(
-		runtime,
-		ctx,
-		connection,
-		_timeout_duration_ns(runtime.server.timeouts.timeout_ms_idle),
-		TAG_IDLE_TIMEOUT,
-		tina.Correlation_Id(state.request_token),
-	)
+	duration_ns := _timeout_duration_ns(runtime.server.timeouts.timeout_ms_idle)
+	_connection_arm_or_rearm_deadline(connection, ctx, duration_ns, TAG_IDLE_TIMEOUT)
 
 	_idle_slot_push(connection, ctx)
 }
@@ -117,14 +139,8 @@ _connection_prepare_incoming_request :: proc(connection: ^HTTP_Connection, ctx: 
 
 	_idle_slot_remove(connection, ctx)
 	state.state = .Recv_Headers
-	_deadline_arm(
-		state.shard_runtime,
-		ctx,
-		connection,
-		_timeout_duration_ns(state.shard_runtime.server.timeouts.timeout_ms_header),
-		TAG_HEADER_TIMEOUT,
-		tina.Correlation_Id(state.request_token),
-	)
+	duration_ns := _timeout_duration_ns(state.shard_runtime.server.timeouts.timeout_ms_header)
+	_connection_arm_or_rearm_deadline(connection, ctx, duration_ns, TAG_HEADER_TIMEOUT)
 }
 
 @(private = "package")
@@ -132,14 +148,8 @@ _connection_arm_send_timeout :: proc(connection: ^HTTP_Connection, ctx: tina.Tin
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil do return
-	_deadline_arm(
-		runtime,
-		ctx,
-		connection,
-		_timeout_duration_ns(runtime.server.timeouts.timeout_ms_send),
-		TAG_SEND_TIMEOUT,
-		tina.Correlation_Id(state.request_token),
-	)
+	duration_ns := _timeout_duration_ns(runtime.server.timeouts.timeout_ms_send)
+	_connection_arm_or_rearm_deadline(connection, ctx, duration_ns, TAG_SEND_TIMEOUT)
 }
 
 @(private = "package")
@@ -147,14 +157,8 @@ _connection_arm_body_timeout :: proc(connection: ^HTTP_Connection, ctx: tina.Tin
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil do return
-	_deadline_arm(
-		runtime,
-		ctx,
-		connection,
-		_timeout_duration_ns(runtime.server.timeouts.timeout_ms_body),
-		TAG_BODY_TIMEOUT,
-		tina.Correlation_Id(state.request_token),
-	)
+	duration_ns := _timeout_duration_ns(runtime.server.timeouts.timeout_ms_body)
+	_connection_arm_or_rearm_deadline(connection, ctx, duration_ns, TAG_BODY_TIMEOUT)
 }
 
 @(private = "package")
@@ -162,14 +166,8 @@ _connection_arm_drain_timeout :: proc(connection: ^HTTP_Connection, ctx: tina.Ti
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil do return
-	_deadline_arm(
-		runtime,
-		ctx,
-		connection,
-		_timeout_duration_ns(runtime.server.graceful_drain_ms),
-		TAG_DRAIN_TIMEOUT,
-		tina.Correlation_Id(state.request_token),
-	)
+	duration_ns := _timeout_duration_ns(runtime.server.graceful_drain_ms)
+	_connection_arm_or_rearm_deadline(connection, ctx, duration_ns, TAG_DRAIN_TIMEOUT)
 }
 
 @(private = "package")
@@ -192,10 +190,11 @@ _connection_mark_draining :: proc(connection: ^HTTP_Connection, ctx: tina.TinaCo
 }
 
 @(private = "package")
-_connection_timeout_is_current :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext, deadline_ns: tina.Monotonic_Time_NS, correlation: tina.Correlation_Id) -> bool {
-	if deadline_ns == 0 do return false
-	if correlation != tina.Correlation_Id(connection.connection_state.request_token) do return false
-	return tina.ctx_monotonic_time_ns(ctx) >= deadline_ns
+_connection_timeout_is_current :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext, correlation: tina.Correlation_Id) -> bool {
+	state := &connection.connection_state
+	if state.deadline_ns == 0 do return false
+	if correlation != tina.Correlation_Id(state.request_token) do return false
+	return tina.ctx_monotonic_time_ns(ctx) >= state.deadline_ns
 }
 
 @(private = "package")
@@ -212,6 +211,74 @@ _runtime_evict_idle_connection :: proc(runtime: ^HTTP_Shard_Runtime, ctx: tina.T
 @(private = "package")
 _listener_evict_idle_connection :: proc(listener: ^HTTP_Listener, ctx: tina.TinaContext) -> bool {
 	return _runtime_evict_idle_connection(listener.shard_runtime, ctx)
+}
+
+@(private = "package")
+_runtime_active_slot_add :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext) {
+	state := &connection.connection_state
+	runtime := state.shard_runtime
+	if runtime == nil {
+		return
+	}
+
+	self_handle := tina.ctx_self_handle(ctx)
+	slot_index := u16(tina.extract_slot(self_handle))
+	if int(slot_index) >= len(runtime.active_slot_positions) ||
+	   int(runtime.active_count) >= len(runtime.active_slot_indices) ||
+	   int(runtime.active_count) >= len(runtime.active_connections) {
+		return
+	}
+	if runtime.active_slot_positions[slot_index] != u16(IDLE_ARRAY_INDEX_NONE) {
+		return
+	}
+
+	active_index := u16(runtime.active_count)
+	runtime.active_slot_indices[active_index] = slot_index
+	runtime.active_connections[active_index] = connection
+	runtime.active_slot_positions[slot_index] = active_index
+	runtime.active_count = Active_Array_Count(active_index + 1)
+}
+
+@(private = "package")
+_runtime_active_slot_remove :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext) -> bool {
+	state := &connection.connection_state
+	if state.shard_runtime == nil {
+		return false
+	}
+	return _runtime_active_slot_remove_by_slot(
+		state.shard_runtime,
+		u16(tina.extract_slot(tina.ctx_self_handle(ctx))),
+	)
+}
+
+@(private = "file")
+_runtime_active_slot_remove_by_slot :: proc(runtime: ^HTTP_Shard_Runtime, slot_index: u16) -> bool {
+	if runtime == nil {
+		return false
+	}
+	if int(slot_index) >= len(runtime.active_slot_positions) || u16(runtime.active_count) == 0 {
+		return false
+	}
+
+	active_index := runtime.active_slot_positions[slot_index]
+	if active_index == u16(IDLE_ARRAY_INDEX_NONE) ||
+	   active_index >= u16(runtime.active_count) ||
+	   int(active_index) >= len(runtime.active_connections) {
+		return false
+	}
+
+	last_index := u16(runtime.active_count) - 1
+	last_slot := runtime.active_slot_indices[last_index]
+	if active_index != last_index {
+		runtime.active_slot_indices[active_index] = last_slot
+		runtime.active_connections[active_index] = runtime.active_connections[last_index]
+		runtime.active_slot_positions[last_slot] = active_index
+	}
+
+	runtime.active_connections[last_index] = nil
+	runtime.active_slot_positions[slot_index] = u16(IDLE_ARRAY_INDEX_NONE)
+	runtime.active_count = Active_Array_Count(last_index)
+	return true
 }
 
 

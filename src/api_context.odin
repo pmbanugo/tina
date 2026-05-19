@@ -43,20 +43,6 @@ ctx_invocation :: #force_inline proc(ctx: TinaContext) -> ^Isolate_Invocation {
 }
 
 @(private = "package")
-shard_maintenance_invocation :: #force_inline proc(
-	ctx: Shard_Maintenance_Context,
-) -> ^Isolate_Invocation {
-	invocation := ctx_invocation(TinaContext(ctx))
-	when TINA_RUNTIME_ASSERTIONS {
-		assert(
-			.Maintenance in invocation.flags,
-			"Shard_Maintenance_Context used outside active maintenance callback",
-		)
-	}
-	return invocation
-}
-
-@(private = "package")
 ctx_invocation_require_self_handle :: #force_inline proc(ctx: TinaContext) -> ^Isolate_Invocation {
 	invocation := ctx_invocation(ctx)
 	when TINA_RUNTIME_ASSERTIONS {
@@ -100,59 +86,6 @@ ctx_reserve_correlation_id :: #force_inline proc(ctx: TinaContext) -> Correlatio
 	shard.next_correlation_id += 1
 	if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
 	return Correlation_Id(shard.next_correlation_id)
-}
-
-ctx_register_shard_maintenance_task :: proc(
-	ctx: TinaContext,
-	descriptor: Shard_Maintenance_Descriptor,
-) -> Maintenance_Task_Index {
-	shard := ctx_invocation(ctx).shard
-	if int(shard.maintenance_task_count) >= len(shard.maintenance_tasks) {
-		return MAINTENANCE_TASK_INDEX_NONE
-	}
-
-	task_index := Maintenance_Task_Index(shard.maintenance_task_count)
-	task := descriptor
-	if task.cadence_tick_count == 0 {
-		task.cadence_tick_count = 1
-	}
-	if task.budget_weight == 0 {
-		task.budget_weight = Scheduler_Weight_Count(1)
-	}
-	if task.work_budget_count_max == 0 {
-		task.work_budget_count_max = Scheduler_Work_Count(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT)
-	}
-	task_position := int(task_index)
-	shard.maintenance_tasks[task_position] = Shard_Maintenance_Task {
-		state                 = task.state,
-		handler               = task.handler,
-		next_tick             = shard.current_tick,
-		cadence_tick_count    = task.cadence_tick_count,
-		budget_weight         = task.budget_weight,
-		work_budget_count_max = task.work_budget_count_max,
-	}
-	shard.maintenance_task_count += 1
-	return task_index
-}
-
-ctx_reschedule_shard_maintenance_task :: proc(
-	ctx: TinaContext,
-	task_index: Maintenance_Task_Index,
-	next_tick: u64,
-) -> bool {
-	if task_index == MAINTENANCE_TASK_INDEX_NONE {
-		return false
-	}
-	shard := ctx_invocation(ctx).shard
-	if int(task_index) >= int(shard.maintenance_task_count) {
-		return false
-	}
-	task := &shard.maintenance_tasks[int(task_index)]
-	if task.handler == nil {
-		return false
-	}
-	task.next_tick = next_tick
-	return true
 }
 
 // Sends an inline message with an explicit correlation id.
@@ -343,6 +276,56 @@ ctx_fd_handoff :: #force_inline proc(
 
 ctx_self_handle :: #force_inline proc(ctx: TinaContext) -> Handle {
 	return ctx_invocation(ctx).self_handle
+}
+
+// Arm a renewable deadline. Returns a handle stored in the caller's state.
+// Duration is in nanoseconds, converted to ticks internally.
+@(require_results)
+ctx_arm_renewable_deadline :: #force_inline proc(
+	ctx: TinaContext,
+	duration_ns: u64,
+	tag: Message_Tag,
+	correlation: Correlation_Id,
+) -> Timer_Handle {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	shard := invocation.shard
+	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
+	return timer_arm_renewable(
+		&shard.timer_wheel,
+		invocation.self_handle,
+		shard.current_tick + delay_ticks,
+		tag,
+		correlation,
+	)
+}
+
+// Re-arm an existing renewable deadline with a new duration. O(1) field update.
+ctx_rearm_renewable_deadline :: #force_inline proc(
+	ctx: TinaContext,
+	handle: Timer_Handle,
+	duration_ns: u64,
+	tag: Message_Tag,
+	correlation: Correlation_Id,
+) {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	shard := invocation.shard
+	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
+	timer_rearm_renewable(
+		&shard.timer_wheel,
+		handle,
+		shard.current_tick + delay_ticks,
+		tag,
+		correlation,
+	)
+}
+
+// Cancel a renewable deadline and free the slot. O(1) bit clear + free list push.
+ctx_cancel_renewable_deadline :: #force_inline proc(
+	ctx: TinaContext,
+	handle: Timer_Handle,
+) {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	timer_cancel_renewable(&invocation.shard.timer_wheel, handle)
 }
 
 // =================================
@@ -600,93 +583,6 @@ ctx_getsockopt :: #force_inline proc(
 ) {
 	shard := ctx_invocation(ctx).shard
 	return reactor_control_getsockopt(&shard.reactor, fd, level, option)
-}
-@(require_results)
-shard_maintenance_send_local_with_correlation :: #force_inline proc(
-	ctx: Shard_Maintenance_Context,
-	to: Handle,
-	tag: Message_Tag,
-	payload: []u8,
-	correlation: Correlation_Id,
-) -> Send_Result {
-	when TINA_RUNTIME_ASSERTIONS {
-		assert(
-			tag >= USER_MESSAGE_TAG_BASE,
-			"shard_maintenance_send_local_with_correlation: Tag must be >= 0x0040.",
-		)
-		assert(
-			len(payload) <= MAX_PAYLOAD_SIZE,
-			"shard_maintenance_send_local_with_correlation payload exceeds MAX_PAYLOAD_SIZE",
-		)
-	}
-	invocation := shard_maintenance_invocation(ctx)
-	shard := invocation.shard
-	if extract_shard_id(to) != invocation.shard_id {
-		return .stale_handle
-	}
-
-	envelope: Message_Envelope
-	envelope.source = HANDLE_NONE
-	envelope.destination = to
-	envelope.tag = tag
-	envelope.correlation = correlation
-	envelope.payload_size = u16(len(payload))
-	copy(envelope.payload[:], payload)
-
-	return _enqueue_system_msg(shard, to, &envelope)
-}
-
-@(require_results)
-shard_maintenance_send_local :: #force_inline proc(
-	ctx: Shard_Maintenance_Context,
-	to: Handle,
-	tag: Message_Tag,
-	payload: []u8,
-) -> Send_Result {
-	return shard_maintenance_send_local_with_correlation(
-		ctx,
-		to,
-		tag,
-		payload,
-		CORRELATION_ID_NONE,
-	)
-}
-
-// Wakes a same-shard target if it is currently blocked on I/O. This mirrors
-// the timer wheel's stale-completion protocol: bump io_sequence so the
-// abandoned completion is discarded later, then make the slot runnable so a
-// queued timeout/control message can be dispatched.
-@(require_results)
-shard_maintenance_wake_if_waiting_for_io :: #force_inline proc(
-	ctx: Shard_Maintenance_Context,
-	target: Handle,
-) -> bool {
-	invocation := shard_maintenance_invocation(ctx)
-	if extract_shard_id(target) != invocation.shard_id {
-		return false
-	}
-
-	shard := invocation.shard
-	type_id := extract_type_id(target)
-	if int(type_id) >= len(shard.metadata) {
-		return false
-	}
-
-	slot_index := extract_slot(target)
-	soa_meta := shard.metadata[type_id]
-	if int(slot_index) >= len(soa_meta) {
-		return false
-	}
-	if soa_meta[slot_index].generation != extract_generation(target) {
-		return false
-	}
-	if soa_meta[slot_index].state != .Waiting_For_Io {
-		return false
-	}
-
-	soa_meta[slot_index].io_sequence += 1
-	_slot_set_state(shard, type_id, slot_index, .Runnable)
-	return true
 }
 
 @(private = "package")

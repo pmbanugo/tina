@@ -188,10 +188,6 @@ hydrate_shard :: proc(
 	shard.dispatchable_slot_counts = make([]u32, types_count, alloc)
 	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
 	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
-	if spec.maintenance_task_count_max > 0 {
-		alloc_data.current_name = "Maintenance_Tasks"
-		shard.maintenance_tasks = make([]Shard_Maintenance_Task, spec.maintenance_task_count_max, alloc)
-	}
 
 	alloc_data.current_name = "Dispatch_Cursors"
 	shard.dispatch_cursors = make([]u32, types_count, alloc)
@@ -287,6 +283,30 @@ hydrate_shard :: proc(
 	entry_buf := make([]Timer_Entry, spec.timer_entry_count, alloc)
 
 	timer_wheel_init(&shard.timer_wheel, spoke_buf, entry_buf)
+
+	// Renewable deadlines
+	if spec.timer_renewable_entry_count > 0 {
+		alloc_data.current_name = "Timer_Renewable_Deliver_At"
+		renewable_deliver_at := make([]u64, spec.timer_renewable_entry_count, alloc)
+		alloc_data.current_name = "Timer_Renewable_Target"
+		renewable_target := make([]Handle, spec.timer_renewable_entry_count, alloc)
+		alloc_data.current_name = "Timer_Renewable_Tag"
+		renewable_tag := make([]Message_Tag, spec.timer_renewable_entry_count, alloc)
+		alloc_data.current_name = "Timer_Renewable_Correlation"
+		renewable_correlation := make([]Correlation_Id, spec.timer_renewable_entry_count, alloc)
+		alloc_data.current_name = "Timer_Renewable_Armed_Words"
+		armed_word_count := (spec.timer_renewable_entry_count + 63) / 64
+		renewable_armed_words := make([]u64, armed_word_count, alloc)
+
+		timer_wheel_init_renewable(
+			&shard.timer_wheel,
+			renewable_deliver_at,
+			renewable_target,
+			renewable_tag,
+			renewable_correlation,
+			renewable_armed_words,
+		)
+	}
 
 	alloc_data.current_name = "Log_Ring_Buffer"
 	log_buf := make([]u8, spec.log_ring_size, alloc)

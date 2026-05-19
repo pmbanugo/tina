@@ -43,17 +43,37 @@ test_with_context :: proc(
 	shard^ = Shard {
 		id                     = extract_shard_id(config.self_handle),
 		timer_resolution_ns    = config.timer_resolution_ns,
+		current_tick           = u64(config.monotonic_time_ns) / max(u64(config.timer_resolution_ns), u64(1)),
 		watchdog_state_pointer = &watchdog_state,
 	}
 	if shard.timer_resolution_ns == 0 {
 		shard.timer_resolution_ns = 1
+		shard.current_tick = u64(config.monotonic_time_ns)
 	}
 
 	spokes := make([]u32, 8)
 	defer delete(spokes)
 	entries := make([]Timer_Entry, 16)
 	defer delete(entries)
-	timer_wheel_init(&shard.timer_wheel, spokes, entries, 0)
+	timer_wheel_init(&shard.timer_wheel, spokes, entries, shard.current_tick)
+	renewable_deliver_at := make([]u64, 16)
+	defer delete(renewable_deliver_at)
+	renewable_target := make([]Handle, 16)
+	defer delete(renewable_target)
+	renewable_tag := make([]Message_Tag, 16)
+	defer delete(renewable_tag)
+	renewable_correlation := make([]Correlation_Id, 16)
+	defer delete(renewable_correlation)
+	renewable_armed_words := make([]u64, 1)
+	defer delete(renewable_armed_words)
+	timer_wheel_init_renewable(
+		&shard.timer_wheel,
+		renewable_deliver_at,
+		renewable_target,
+		renewable_tag,
+		renewable_correlation,
+		renewable_armed_words,
+	)
 
 	scratch_bytes := make([]u8, 4096)
 	defer delete(scratch_bytes)
@@ -117,6 +137,30 @@ test_with_local_context :: proc(
 	pool_backing := make([]u8, MESSAGE_ENVELOPE_SIZE * 8)
 	defer delete(pool_backing)
 	pool_init(&shard.message_pool, pool_backing, MESSAGE_ENVELOPE_SIZE)
+
+	spokes := make([]u32, 8)
+	defer delete(spokes)
+	entries := make([]Timer_Entry, 16)
+	defer delete(entries)
+	timer_wheel_init(&shard.timer_wheel, spokes, entries, config.current_tick)
+	renewable_deliver_at := make([]u64, 16)
+	defer delete(renewable_deliver_at)
+	renewable_target := make([]Handle, 16)
+	defer delete(renewable_target)
+	renewable_tag := make([]Message_Tag, 16)
+	defer delete(renewable_tag)
+	renewable_correlation := make([]Correlation_Id, 16)
+	defer delete(renewable_correlation)
+	renewable_armed_words := make([]u64, 1)
+	defer delete(renewable_armed_words)
+	timer_wheel_init_renewable(
+		&shard.timer_wheel,
+		renewable_deliver_at,
+		renewable_target,
+		renewable_tag,
+		renewable_correlation,
+		renewable_armed_words,
+	)
 
 	type_count :=
 		max(int(extract_type_id(config.self_handle)), int(extract_type_id(config.target_handle))) +

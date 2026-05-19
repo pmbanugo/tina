@@ -19,9 +19,6 @@ _http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -
 		init_args.connection_slot_count,
 		init_args.connection_type_id,
 	)
-	if !_http_register_deadline_maintenance_task(dispatcher.shard_runtime, ctx) {
-		return tina.Effect_Crash{reason = .Init_Failed}
-	}
 
 	return tina.Effect_Receive{}
 }

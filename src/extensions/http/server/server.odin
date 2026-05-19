@@ -124,18 +124,6 @@ Active_Array_Count :: distinct u16
 IDLE_ARRAY_INDEX_NONE :: Idle_Array_Index(0xFFFF)
 
 @(private = "package")
-DEADLINE_SLOT_INDEX_NONE :: u16(0xFFFF)
-
-@(private = "package")
-Deadline_Flag :: enum u8 {
-	Armed,
-	Timeout_Queued,
-}
-
-@(private = "package")
-Deadline_Flags :: distinct bit_set[Deadline_Flag; u8]
-
-@(private = "package")
 Connection_Phase :: enum u8 {
 	// Recv path
 	Recv_Headers, // accumulating request line + headers
@@ -181,16 +169,10 @@ HTTP_Shard_Runtime :: struct {
 	draining:             bool,
 	next_request_token:   Request_Token, // monotonic across the shard
 	keepalive_reserve:    u16, // mirrors Keepalive_Config.reserve_slots
-	deadline_task_index:   tina.Maintenance_Task_Index,
 	active_slot_indices:   []u16, // dense swap-and-pop tracker for allocated connections
 	active_connections:    []^HTTP_Connection,
 	active_slot_positions: []u16,
 	active_count:          Active_Array_Count,
-	deadline_spoke_heads:  []u16,
-	deadline_spoke_mask:   u64,
-	deadline_current_tick: u64,
-	deadline_armed_count:  u16,
-	deadline_due_count_max: u16,
 	idle_slot_indices:    []u16, // dense swap-and-pop tracker
 	idle_slot_handles:    []tina.Handle,
 	idle_slot_positions:  []u16,
@@ -232,18 +214,8 @@ HTTP_Dispatcher :: struct {
 HTTP_Connection_State :: struct {
 	// --- scheduler hot path ---
 	shard_runtime:              ^HTTP_Shard_Runtime,
-	deadline_ns_idle:           tina.Monotonic_Time_NS,
-	deadline_ns_header:         tina.Monotonic_Time_NS,
-	deadline_ns_body:           tina.Monotonic_Time_NS,
-	deadline_ns_send:           tina.Monotonic_Time_NS,
-	deadline_ns_drain:          tina.Monotonic_Time_NS,
-	deadline_tick:              u64,
-	deadline_next_index:        u16,
-	deadline_previous_index:    u16,
-	deadline_spoke_index:       u16,
-	deadline_tag:               tina.Message_Tag,
-	deadline_correlation:       tina.Correlation_Id,
-	deadline_flags:             Deadline_Flags,
+	deadline_timer_handle:      tina.Timer_Handle,
+	deadline_ns:                tina.Monotonic_Time_NS,
 	fd:                         tina.FD_Handle,
 	request_token:              Request_Token,
 	application_expectation_kind: Application_Expectation_Kind,
@@ -412,7 +384,7 @@ HTTP_DEFAULT_BACKLOG :: 1024
 //   IO_Completion > Shutdown > Inbox (pool-backed)
 //
 // Pool-backed system messages that bypass mailbox_capacity:
-//   - 1 deadline timeout  (HTTP deadline wheel → _enqueue_system_msg)
+//   - 1 deadline timeout  (core timer wheel → _enqueue_system_msg)
 //   - 1 application timer (core timer wheel → _enqueue_system_msg)
 //
 // Pool-backed user messages subject to mailbox_capacity:
@@ -527,10 +499,10 @@ install_into_system_spec :: proc(
 		spec.scratch_arena_size = scratch_requirement
 	}
 
-	maintenance_task_count_max := coordinator_mode_enabled ? 2 : 1
-	if spec.maintenance_task_count_max < maintenance_task_count_max {
-		spec.maintenance_task_count_max = maintenance_task_count_max
-	}
+	spec.timer_renewable_entry_count = max(
+		spec.timer_renewable_entry_count,
+		int(connection_slot_count_per_shard),
+	)
 
 	// --- Append HTTP TypeDescriptors ---
 	include_dispatcher := coordinator_mode_enabled
@@ -859,7 +831,6 @@ _make_base_system_spec :: proc(
 		fd_entry_size             = size_of(tina.FD_Entry),
 		log_ring_size             = HTTP_DEV_LOG_RING_SIZE,
 		supervision_groups_max    = HTTP_DEV_SUPERVISION_GROUPS_MAX,
-		maintenance_task_count_max = 1,
 		default_ring_size         = default_ring_size,
 		// types and scratch_arena_size are filled in by install_into_system_spec.
 	}
@@ -871,11 +842,10 @@ _derive_timer_entry_count :: proc "contextless" (
 	connection_slot_count: u32,
 	shard_count: u8,
 ) -> int {
-	// Renewable transport deadlines (idle/header/body/send/drain) are enforced by
-	// the shard-local HTTP deadline wheel (ADR/http_deadline_revision.md), not by
-	// one core timer-wheel entry per re-arm.
-	// Keep a modest reserve here for sparse waits such as application parking,
-	// listener accept backoff, and route-owned timers.
+	// Renewable transport deadlines live in the core timer wheel's dedicated
+	// renewable pool, so the one-shot entry pool only needs headroom for sparse
+	// waits such as application parking, listener accept backoff, and route-owned
+	// timers.
 	entry_count := u64(connection_slot_count) * 4
 	entry_count += u64(shard_count) * 64
 	if entry_count < 2048 {
@@ -939,15 +909,9 @@ _listener_working_memory_size :: #force_inline proc "contextless" (
 		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(^HTTP_Connection)) +
 		_align_up(connection_slot_count * size_of(u16)) +
-		_align_up(_deadline_spoke_count_for_connection_count(connection_slot_count) * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(tina.Handle)) +
 		_align_up(connection_slot_count * size_of(u16))
-}
-
-@(private = "package")
-_deadline_spoke_count_for_connection_count :: proc "contextless" (connection_slot_count: int) -> int {
-	return int(_next_power_of_two_u64(max(u64(1), u64(connection_slot_count) * 2)))
 }
 
 @(private = "package")
@@ -962,16 +926,11 @@ _make_shard_runtime :: proc(
 	active_slot_indices := make([]u16, int(connection_slot_count), allocator)
 	active_connections := make([]^HTTP_Connection, int(connection_slot_count), allocator)
 	active_slot_positions := make([]u16, int(connection_slot_count), allocator)
-	deadline_spoke_count := _deadline_spoke_count_for_connection_count(int(connection_slot_count))
-	deadline_spoke_heads := make([]u16, deadline_spoke_count, allocator)
 	idle_slot_indices := make([]u16, int(connection_slot_count), allocator)
 	idle_slot_handles := make([]tina.Handle, int(connection_slot_count), allocator)
 	idle_slot_positions := make([]u16, int(connection_slot_count), allocator)
 	for index in 0 ..< len(active_slot_positions) {
 		active_slot_positions[index] = u16(IDLE_ARRAY_INDEX_NONE)
-	}
-	for index in 0 ..< len(deadline_spoke_heads) {
-		deadline_spoke_heads[index] = DEADLINE_SLOT_INDEX_NONE
 	}
 	for index in 0 ..< len(idle_slot_positions) {
 		idle_slot_positions[index] = u16(IDLE_ARRAY_INDEX_NONE)
@@ -987,12 +946,6 @@ _make_shard_runtime :: proc(
 		active_connections    = active_connections,
 		active_slot_positions = active_slot_positions,
 		active_count          = 0,
-		deadline_task_index   = tina.MAINTENANCE_TASK_INDEX_NONE,
-		deadline_spoke_heads  = deadline_spoke_heads,
-		deadline_spoke_mask   = u64(deadline_spoke_count - 1),
-		deadline_current_tick = 0,
-		deadline_armed_count  = 0,
-		deadline_due_count_max = u16(min(deadline_spoke_count, int(max(u16)))),
 		idle_slot_indices     = idle_slot_indices,
 		idle_slot_handles     = idle_slot_handles,
 		idle_slot_positions   = idle_slot_positions,

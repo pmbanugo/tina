@@ -28,13 +28,7 @@ when TINA_SIMULATION_MODE {
 
 			// Check if any timers are registered
 			if shard.timer_wheel.resident_count > 0 do return false
-
-			// Active maintenance tasks are scheduler-visible work even when no Isolate
-			// mailbox traffic is pending. HTTP deadlines depend on this path.
-			for task_index in 0 ..< int(shard.maintenance_task_count) {
-				task := shard.maintenance_tasks[task_index]
-				if task.handler != nil && task.next_tick != max(u64) do return false
-			}
+			if shard.timer_wheel.renewable_armed_count > 0 do return false
 		}
 
 		// Check if any SimulatedNetwork channel has delayed messages in flight
@@ -50,17 +44,8 @@ when TINA_SIMULATION_MODE {
 		return true
 	}
 
-	@(private = "file")
-	_simulator_idle_test_maintenance_handler :: proc(
-		state: rawptr,
-		ctx: Shard_Maintenance_Context,
-		work_budget_count: Scheduler_Work_Count,
-	) -> Shard_Maintenance_Result {
-		return Shard_Maintenance_Result{}
-	}
-
 	@(test)
-	test_simulator_is_globally_idle_counts_active_maintenance_tasks :: proc(t: ^testing.T) {
+	test_simulator_is_globally_idle_counts_active_renewable_deadlines :: proc(t: ^testing.T) {
 		spec := SystemSpec {shard_count = 1}
 		shards := make([]Shard, 1)
 		defer delete(shards)
@@ -70,29 +55,50 @@ when TINA_SIMULATION_MODE {
 			shards = shards,
 		}
 		shard := &sim.shards[0]
+		deadline_handle := TIMER_HANDLE_NONE
 
-		shard.maintenance_tasks = make([]Shard_Maintenance_Task, 1)
-		defer delete(shard.maintenance_tasks)
-		shard.maintenance_task_count = 1
-		shard.maintenance_tasks[0] = Shard_Maintenance_Task {
-			handler               = _simulator_idle_test_maintenance_handler,
-			next_tick             = 5,
-			cadence_tick_count    = 1,
-			budget_weight         = Scheduler_Weight_Count(1),
-			work_budget_count_max = Scheduler_Work_Count(1),
-		}
+		spokes := make([]u32, 8)
+		defer delete(spokes)
+		entries := make([]Timer_Entry, 8)
+		defer delete(entries)
+		timer_wheel_init(&shard.timer_wheel, spokes, entries, 0)
+		renewable_deliver_at := make([]u64, 8)
+		defer delete(renewable_deliver_at)
+		renewable_target := make([]Handle, 8)
+		defer delete(renewable_target)
+		renewable_tag := make([]Message_Tag, 8)
+		defer delete(renewable_tag)
+		renewable_correlation := make([]Correlation_Id, 8)
+		defer delete(renewable_correlation)
+		renewable_armed_words := make([]u64, 1)
+		defer delete(renewable_armed_words)
+		timer_wheel_init_renewable(
+			&shard.timer_wheel,
+			renewable_deliver_at,
+			renewable_target,
+			renewable_tag,
+			renewable_correlation,
+			renewable_armed_words,
+		)
+		deadline_handle = timer_arm_renewable(
+			&shard.timer_wheel,
+			make_handle(0, 1, 0, 1),
+			5,
+			Message_Tag(USER_MESSAGE_TAG_BASE),
+			CORRELATION_ID_NONE,
+		)
 
 		testing.expect(
 			t,
 			!simulator_is_globally_idle(&sim),
-			"active maintenance task should keep simulator non-idle",
+			"active renewable deadline should keep simulator non-idle",
 		)
 
-		shard.maintenance_tasks[0].next_tick = max(u64)
+		timer_cancel_renewable(&shard.timer_wheel, deadline_handle)
 		testing.expect(
 			t,
 			simulator_is_globally_idle(&sim),
-			"disabled maintenance task should not block quiescence",
+			"cancelled renewable deadline should not block quiescence",
 		)
 	}
 }

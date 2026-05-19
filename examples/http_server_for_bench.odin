@@ -52,7 +52,7 @@ main :: proc() {
 	server := http.Server {
 		address      = tina.ipv4(0, 0, 0, 0, 8080),
 		backlog      = 4096,
-		distribution = .Coordinator,
+		ingress_mode = .Coordinator,
 		app          = &app,
 	}
 

@@ -24,6 +24,8 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -
 		int(runtime.server.limits.request_line_size_max) +
 		int(runtime.server.limits.header_size_max)
 	connection.connection_state.shard_runtime = runtime
+	connection.connection_state.deadline_timer_handle = tina.TIMER_HANDLE_NONE
+	connection.connection_state.deadline_ns = 0
 	connection.connection_state.self_handle = tina.ctx_self_handle(ctx)
 	connection.connection_state.fd = init_args.client_fd
 	_connection_init_working_memory_regions(connection, ctx, frame_size)
@@ -153,12 +155,7 @@ _http_connection_handler :: proc(
 		if state.request.route_index != ROUTE_INDEX_NONE {
 			return tina.Effect_Receive{}
 		}
-		if !_connection_timeout_is_current(
-			connection,
-			ctx,
-			state.deadline_ns_header,
-			message.correlation,
-		) {
+		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
 			return tina.Effect_Receive{}
 		}
 		state.response.flags += {.Close_After_Send, .Aborted}
@@ -172,12 +169,7 @@ _http_connection_handler :: proc(
 		if state.state != .Recv_Body_Streamed && state.state != .Recv_Body_Buffered {
 			return tina.Effect_Receive{}
 		}
-		if !_connection_timeout_is_current(
-			connection,
-			ctx,
-			state.deadline_ns_body,
-			message.correlation,
-		) {
+		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
 			return tina.Effect_Receive{}
 		}
 		state.response.flags += {.Close_After_Send, .Aborted}
@@ -191,12 +183,7 @@ _http_connection_handler :: proc(
 		if state.state != .Sending {
 			return tina.Effect_Receive{}
 		}
-		if !_connection_timeout_is_current(
-			connection,
-			ctx,
-			state.deadline_ns_send,
-			message.correlation,
-		) {
+		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
 			return tina.Effect_Receive{}
 		}
 		return _connection_begin_close(connection, ctx)
@@ -205,12 +192,7 @@ _http_connection_handler :: proc(
 		if state.state != .Keep_Alive_Idle {
 			return tina.Effect_Receive{}
 		}
-		if !_connection_timeout_is_current(
-			connection,
-			ctx,
-			state.deadline_ns_idle,
-			message.correlation,
-		) {
+		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
 			return tina.Effect_Receive{}
 		}
 		return _connection_begin_close(connection, ctx)
@@ -225,12 +207,7 @@ _http_connection_handler :: proc(
 		if !state.shard_runtime.draining {
 			return tina.Effect_Receive{}
 		}
-		if !_connection_timeout_is_current(
-			connection,
-			ctx,
-			state.deadline_ns_drain,
-			message.correlation,
-		) {
+		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
 			return tina.Effect_Receive{}
 		}
 		return _connection_begin_close(connection, ctx)
@@ -1412,7 +1389,11 @@ _connection_begin_close :: proc(connection: ^HTTP_Connection, ctx: tina.TinaCont
 	runtime := state.shard_runtime
 	if runtime != nil {
 		_idle_slot_remove(connection, ctx)
-		_deadline_disarm(runtime, connection)
+		if state.deadline_timer_handle != tina.TIMER_HANDLE_NONE {
+			tina.ctx_cancel_renewable_deadline(ctx, state.deadline_timer_handle)
+			state.deadline_timer_handle = tina.TIMER_HANDLE_NONE
+			state.deadline_ns = 0
+		}
 	}
 	state.state = .Closing
 	return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
@@ -2262,17 +2243,27 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 	connection.connection_state.response.flags += {.Headers_Committed, .Close_After_Send}
 	connection.connection_state.response.egress_size = 0
 	connection.connection_state.response.egress_size_sent = 0
+	connection.connection_state.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
 
-	effect := _dispatch_step(&connection, .Flush_Final, 0)
-	#partial switch _ in effect {
-	case tina.Effect_Io:
-		operation := effect.(tina.Effect_Io).operation
-		if _, ok := operation.(tina.IoOp_Close); !ok {
-			testing.expect(t, false, "final flush with close-after-send should close")
-		}
-	case:
-		testing.expect(t, false, "expected close effect")
-	}
+	Dispatch_Flush_Final_Test_State :: struct {connection: ^HTTP_Connection, t: ^testing.T}
+	dispatch_flush_final_test_state := Dispatch_Flush_Final_Test_State {connection = &connection, t = t}
+	tina.test_with_context(
+		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&dispatch_flush_final_test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			test_state := cast(^Dispatch_Flush_Final_Test_State)user_data
+			effect := _dispatch_step(test_state.connection, .Flush_Final, ctx)
+			#partial switch _ in effect {
+			case tina.Effect_Io:
+				operation := effect.(tina.Effect_Io).operation
+				if _, ok := operation.(tina.IoOp_Close); !ok {
+					testing.expect(test_state.t, false, "final flush with close-after-send should close")
+				}
+			case:
+				testing.expect(test_state.t, false, "expected close effect")
+			}
+		},
+	)
 	testing.expect_value(t, route_state_storage[0].send_ready_count, u32(0))
 }
 
@@ -2344,6 +2335,7 @@ test_stage_canned_response_arms_send_timeout :: proc(t: ^testing.T) {
 
 	connection := HTTP_Connection{}
 	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.deadline_timer_handle = tina.TIMER_HANDLE_NONE
 	connection.connection_state.fd = tina.FD_Handle(31)
 	connection.connection_state.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
 
@@ -2380,9 +2372,10 @@ test_stage_canned_response_arms_send_timeout :: proc(t: ^testing.T) {
 
 	testing.expect(
 		t,
-		connection.connection_state.deadline_ns_send != 0,
+		connection.connection_state.deadline_timer_handle != tina.TIMER_HANDLE_NONE,
 		"canned response should arm send timeout",
 	)
+	testing.expect(t, connection.connection_state.deadline_ns != 0, "canned response should store deadline")
 }
 
 @(test)
@@ -2409,6 +2402,7 @@ test_drive_body_read_restarts_send_from_unsent_offset :: proc(t: ^testing.T) {
 
 	connection := HTTP_Connection{}
 	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.deadline_timer_handle = tina.TIMER_HANDLE_NONE
 	connection.connection_state.fd = tina.FD_Handle(41)
 	connection.connection_state.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
 	connection.connection_state.request.route_index = Route_Index(0)
@@ -2456,9 +2450,10 @@ test_drive_body_read_restarts_send_from_unsent_offset :: proc(t: ^testing.T) {
 
 	testing.expect(
 		t,
-		connection.connection_state.deadline_ns_send != 0,
+		connection.connection_state.deadline_timer_handle != tina.TIMER_HANDLE_NONE,
 		"resumed body send should arm send timeout",
 	)
+	testing.expect(t, connection.connection_state.deadline_ns != 0, "resumed body send should store deadline")
 }
 
 @(test)
@@ -2496,20 +2491,34 @@ test_send_complete_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.
 	connection.connection_state.request.route_index = Route_Index(0)
 	connection.connection_state.response_header_bytes = response_header_storage[:]
 	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
+	connection.connection_state.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
 
 	message: tina.Message
 	message.tag = tina.IO_TAG_SEND_COMPLETE
 	message.io.result = -1
 
-	effect := _http_connection_handler(rawptr(&connection), &message, 0)
-	#partial switch io_effect in effect {
-	case tina.Effect_Io:
-		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-			testing.expect(t, false, "send failure should close after Peer_Closed dispatch")
-		}
-	case:
-		testing.expect(t, false, "expected close effect")
+	Peer_Closed_Error_Test_State :: struct {
+		connection: ^HTTP_Connection,
+		message:    ^tina.Message,
+		t:          ^testing.T,
 	}
+	test_state := Peer_Closed_Error_Test_State {connection = &connection, message = &message, t = t}
+	tina.test_with_context(
+		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			state := cast(^Peer_Closed_Error_Test_State)user_data
+			effect := _http_connection_handler(rawptr(state.connection), state.message, ctx)
+			#partial switch io_effect in effect {
+			case tina.Effect_Io:
+				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
+					testing.expect(state.t, false, "send failure should close after Peer_Closed dispatch")
+				}
+			case:
+				testing.expect(state.t, false, "expected close effect")
+			}
+		},
+	)
 	testing.expect_value(t, route_state_storage[0].peer_closed_count, u32(1))
 	testing.expect_value(t, connection.connection_state.state, Connection_Phase.Closing)
 	testing.expect_value(t, connection.connection_state.response.egress_size, Egress_Size(0))
@@ -2552,20 +2561,34 @@ test_sendfile_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
 	connection.connection_state.route_state_bytes = tina.bytes_of(&route_state_storage[0])
 	connection.connection_state.sendfile_active = true
 	connection.connection_state.sendfile_size_remaining = 4096
+	connection.connection_state.self_handle = tina.make_handle(0, u16(HTTP_TYPE_OFFSET_CONNECTION), 0, 1)
 
 	message: tina.Message
 	message.tag = tina.IO_TAG_SENDFILE_COMPLETE
 	message.io.result = -1
 
-	effect := _http_connection_handler(rawptr(&connection), &message, 0)
-	#partial switch io_effect in effect {
-	case tina.Effect_Io:
-		if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-			testing.expect(t, false, "sendfile failure should close after Peer_Closed dispatch")
-		}
-	case:
-		testing.expect(t, false, "expected close effect")
+	Sendfile_Error_Test_State :: struct {
+		connection: ^HTTP_Connection,
+		message:    ^tina.Message,
+		t:          ^testing.T,
 	}
+	test_state := Sendfile_Error_Test_State {connection = &connection, message = &message, t = t}
+	tina.test_with_context(
+		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: tina.TinaContext) {
+			state := cast(^Sendfile_Error_Test_State)user_data
+			effect := _http_connection_handler(rawptr(state.connection), state.message, ctx)
+			#partial switch io_effect in effect {
+			case tina.Effect_Io:
+				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
+					testing.expect(state.t, false, "sendfile failure should close after Peer_Closed dispatch")
+				}
+			case:
+				testing.expect(state.t, false, "expected close effect")
+			}
+		},
+	)
 	testing.expect_value(t, route_state_storage[0].peer_closed_count, u32(1))
 	testing.expect_value(t, connection.connection_state.state, Connection_Phase.Closing)
 	testing.expect_value(t, connection.connection_state.response.egress_size, Egress_Size(0))

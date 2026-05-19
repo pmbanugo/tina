@@ -21,21 +21,16 @@ Scheduler_Work_Count :: distinct u32
 Scheduler_Credit_Count :: distinct u32
 Scheduler_Weight_Count :: distinct u16
 Scheduler_Type_Index :: distinct u16
-Maintenance_Task_Index :: distinct u16
 Reactor_Batch_Count :: distinct u16
-
-MAINTENANCE_TASK_INDEX_NONE :: Maintenance_Task_Index(0xFFFF)
 
 when TINA_ODIN_DEV {
 	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT :: 512
-	SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT_DEFAULT :: 64
 	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT :: 64
 	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT :: 64
 	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT :: 256
 	SCHEDULER_IO_SERVICE_INTERVAL_COUNT_DEFAULT :: 64
 } else {
 	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT :: 2048
-	SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT_DEFAULT :: 256
 	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT :: 256
 	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT :: 256
 	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT :: 1024
@@ -45,10 +40,6 @@ when TINA_ODIN_DEV {
 SCHEDULER_TURN_WORK_BUDGET_COUNT :: #config(
 	TINA_SCHEDULER_TURN_WORK_BUDGET_COUNT,
 	SCHEDULER_TURN_WORK_BUDGET_COUNT_DEFAULT,
-)
-SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT :: #config(
-	TINA_SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT,
-	SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT_DEFAULT,
 )
 SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX :: #config(
 	TINA_SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX,
@@ -90,13 +81,11 @@ REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
 #assert(MIN_RING_SIZE > 0)
 #assert((MIN_RING_SIZE & (MIN_RING_SIZE - 1)) == 0)
 #assert(SCHEDULER_TURN_WORK_BUDGET_COUNT > 0)
-#assert(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT > 0)
 #assert(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX > 0)
 #assert(SCHEDULER_CREDIT_PER_WEIGHT_COUNT > 0)
 #assert(SCHEDULER_CREDIT_COUNT_MAX > 0)
 #assert(SCHEDULER_IO_SERVICE_INTERVAL_COUNT > 0)
 #assert(SCHEDULER_TURN_WORK_BUDGET_COUNT <= int(max(u32)))
-#assert(SCHEDULER_MAINTENANCE_TURN_WORK_BUDGET_COUNT <= int(max(u32)))
 #assert(SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX <= int(max(u32)))
 #assert(SCHEDULER_CREDIT_PER_WEIGHT_COUNT <= int(max(u32)))
 #assert(SCHEDULER_CREDIT_COUNT_MAX <= int(max(u32)))
@@ -114,36 +103,6 @@ REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
 
 Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect
-
-Shard_Maintenance_Result :: struct {
-	work_count:         Scheduler_Work_Count,
-	wants_reschedule:   bool,
-	_padding:           [3]u8,
-}
-
-Shard_Maintenance_Handler :: #type proc(
-	state: rawptr,
-	ctx: Shard_Maintenance_Context,
-	work_budget_count: Scheduler_Work_Count,
-) -> Shard_Maintenance_Result
-
-Shard_Maintenance_Descriptor :: struct {
-	state:                 rawptr,
-	handler:               Shard_Maintenance_Handler,
-	cadence_tick_count:    u32,
-	budget_weight:         Scheduler_Weight_Count,
-	work_budget_count_max: Scheduler_Work_Count,
-}
-
-@(private = "package")
-Shard_Maintenance_Task :: struct {
-	state:                 rawptr,
-	handler:               Shard_Maintenance_Handler,
-	next_tick:             u64,
-	cadence_tick_count:    u32,
-	budget_weight:         Scheduler_Weight_Count,
-	work_budget_count_max: Scheduler_Work_Count,
-}
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 TypeDescriptor :: struct {
@@ -224,11 +183,11 @@ SystemSpec :: struct {
 	fd_handoff_entry_count:    int,
 	timer_spoke_count:         int,
 	timer_entry_count:         int,
+	timer_renewable_entry_count: int,
 	fd_table_slot_count:       int,
 	fd_entry_size:             int,
 	log_ring_size:             int,
 	supervision_groups_max:    int,
-	maintenance_task_count_max: int,
 	scratch_arena_size:        int,
 	shard_count:               u8,
 	default_ring_size:         u32,
@@ -413,16 +372,6 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 			"[FATAL] fd_handoff_entry_count (%v) must be 0-%v",
 			spec.fd_handoff_entry_count,
 			int(FD_HANDOFF_NONE_INDEX) - 1,
-		)
-		return .ValueOutOfBounds
-	}
-
-	if spec.maintenance_task_count_max < 0 ||
-	   spec.maintenance_task_count_max > int(max(u16)) {
-		fmt.eprintfln(
-			"[FATAL] maintenance_task_count_max (%v) must be 0-%v",
-			spec.maintenance_task_count_max,
-			int(max(u16)),
 		)
 		return .ValueOutOfBounds
 	}
@@ -710,26 +659,30 @@ _validate_dio_config :: proc(spec: ^SystemSpec) -> SystemSpecError {
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
 	// 3 per type (Typed Arena, Isolate Metadata, Working Memory)
-	// + 21 static framework regions, including the SubRegion tracker array.
-	return (types_count * 3) + 21
+	// + 25 static framework regions, including the SubRegion tracker array.
+	return (types_count * 3) + 25
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
 	// 2-6. Slice headers for TypeDescriptor/isolate/working/metadata/free-head arrays
-	// 7. Maintenance Tasks
-	// 8. Dispatch Cursors
-	// 9. Dispatch Credit Counts
-	// 10. Message Pool
-	// 11. Transfer Buffer Pool
-	// 12. Transfer Generations
-	// 13. FD Handoff Table
-	// 14. Timer Wheel Spokes
-	// 15. Timer Wheel Entries
-	// 16. Log Ring Buffer
-	// 17. Supervision Group Table
-	// 18. Scratch Arena
-	// 19. FD Table
-	// 20. Reactor Buffer Pool
-	// 21. Spare fixed region for optional platform/runtime allocation
+	// 7. Dispatch Cursors
+	// 8. Dispatch Credit Counts
+	// 9. Message Pool
+	// 10. Transfer Buffer Pool
+	// 11. Transfer Generations
+	// 12. FD Handoff Table
+	// 13. Timer Wheel Spokes
+	// 14. Timer Wheel Entries
+	// 15. Log Ring Buffer
+	// 16. Supervision Group Table
+	// 17. Scratch Arena
+	// 18. FD Table
+	// 19. Reactor Buffer Pool
+	// 20. Spare fixed region for optional platform/runtime allocation
+	// 21. Timer Renewable Deliver At
+	// 22. Timer Renewable Target
+	// 23. Timer Renewable Tag
+	// 24. Timer Renewable Correlation
+	// 25. Timer Renewable Armed Words
 }
 
 // Computes an upper-bound capacity aligned to a multiple of 8.
@@ -785,10 +738,14 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.fd_handoff_entry_count * size_of(FD_Handoff_Entry)
 	total += spec.timer_spoke_count * size_of(u32) // Spoke head array
 	total += spec.timer_entry_count * size_of(Timer_Entry) // Timer entry pool
+	total += spec.timer_renewable_entry_count * size_of(u64)              // renewable_deliver_at
+	total += spec.timer_renewable_entry_count * size_of(Handle)           // renewable_target
+	total += spec.timer_renewable_entry_count * size_of(Message_Tag)      // renewable_tag
+	total += spec.timer_renewable_entry_count * size_of(Correlation_Id)   // renewable_correlation
+	total += ((spec.timer_renewable_entry_count + 63) / 64) * size_of(u64) // renewable_armed_words
 	total += spec.fd_table_slot_count * spec.fd_entry_size
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)
-	total += spec.maintenance_task_count_max * size_of(Shard_Maintenance_Task)
 	total += spec.scratch_arena_size
 	total += regions_max * size_of(SubRegion)
 
