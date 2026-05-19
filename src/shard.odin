@@ -177,6 +177,7 @@ Shard :: struct {
 
 	// --- Hot Scalars (Ordered largest to smallest) ---
 	current_tick:           u64, // The current time quantized to the resolution
+	current_time_ns:        u64,
 	timer_resolution_ns:    u64, // E.g., 1_000_000 for 1ms ticks
 	heartbeat_tick:         u64,
 	next_context_token:     u64,
@@ -636,6 +637,7 @@ _dispatch_type_batch :: proc(
 		flags                  = {}, // Assigned per invocation
 		timer_resolution_ns    = shard.timer_resolution_ns,
 		current_tick           = shard.current_tick,
+		current_time_ns        = shard.current_time_ns,
 		type_id                = u16(type_id),
 		slot_index             = 0, // Assigned per invocation
 		shard_id               = shard.id,
@@ -943,6 +945,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 
 	when !TINA_SIMULATION_MODE {
 		now_ns := os_monotonic_time_ns()
+		shard.current_time_ns = now_ns
 		// Quantize to timer wheel ticks.
 		// If timer_resolution_ns is a power of 2, the compiler should be able to
 		// turn this into a bit-shift.

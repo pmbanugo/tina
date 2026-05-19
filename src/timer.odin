@@ -393,6 +393,8 @@ _advance_timers :: proc(
 		return
 	}
 
+	now_ns := shard.current_time_ns
+
 	for word_index in 0 ..< len(wheel.renewable_armed_words) {
 		word := wheel.renewable_armed_words[word_index]
 		for word != 0 {
@@ -401,7 +403,7 @@ _advance_timers :: proc(
 			bit_index := u32(intrinsics.count_trailing_zeros(word))
 			slot_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, bit_index)
 
-			if wheel.renewable_deliver_at[slot_index] <= now {
+			if wheel.renewable_deliver_at[slot_index] <= now_ns {
 				// Clear bit in word and in the backing array
 				word &= word - 1
 				wheel.renewable_armed_words[word_index] = word
@@ -523,6 +525,7 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			)
 
 			invocation.shard.current_tick = 9
+			invocation.shard.current_time_ns = 9
 			_advance_timers(invocation.shard)
 			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
 			testing.expect_value(
@@ -532,6 +535,7 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			)
 
 			invocation.shard.current_tick = 10
+			invocation.shard.current_time_ns = 10
 			_advance_timers(invocation.shard)
 		},
 	)
@@ -580,6 +584,7 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 			)
 
 			invocation.shard.current_tick = 25
+			invocation.shard.current_time_ns = 25
 			_advance_timers(invocation.shard)
 			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
 			testing.expect_value(
@@ -589,6 +594,7 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 			)
 
 			invocation.shard.current_tick = 30
+			invocation.shard.current_time_ns = 30
 			_advance_timers(invocation.shard)
 		},
 	)
@@ -640,6 +646,7 @@ test_renewable_deadline_cancel_frees_slot_and_prevents_expiration :: proc(t: ^te
 			)
 
 			invocation.shard.current_tick = 106
+			invocation.shard.current_time_ns = 106
 			_advance_timers(invocation.shard)
 			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
 			testing.expect_value(
@@ -649,6 +656,7 @@ test_renewable_deadline_cancel_frees_slot_and_prevents_expiration :: proc(t: ^te
 			)
 
 			invocation.shard.current_tick = 107
+			invocation.shard.current_time_ns = 107
 			_advance_timers(invocation.shard)
 		},
 	)
@@ -688,6 +696,7 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 			)
 
 			invocation.shard.current_tick = 55
+			invocation.shard.current_time_ns = 55
 			_advance_timers(invocation.shard)
 
 			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]

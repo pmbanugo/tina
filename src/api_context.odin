@@ -16,6 +16,7 @@ Isolate_Invocation :: struct {
 	scratch_arena:          mem.Arena,
 	timer_resolution_ns:    u64,
 	current_tick:           u64,
+	current_time_ns:        u64,
 	type_id:                u16,
 	slot_index:             u32,
 	shard_id:               Shard_Id,
@@ -279,7 +280,7 @@ ctx_self_handle :: #force_inline proc(ctx: TinaContext) -> Handle {
 }
 
 // Arm a renewable deadline. Returns a handle stored in the caller's state.
-// Duration is in nanoseconds, converted to ticks internally.
+// Duration is in nanoseconds.
 @(require_results)
 ctx_arm_renewable_deadline :: #force_inline proc(
 	ctx: TinaContext,
@@ -288,12 +289,10 @@ ctx_arm_renewable_deadline :: #force_inline proc(
 	correlation: Correlation_Id,
 ) -> Timer_Handle {
 	invocation := ctx_invocation_require_self_handle(ctx)
-	shard := invocation.shard
-	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
 	return timer_arm_renewable(
-		&shard.timer_wheel,
+		&invocation.shard.timer_wheel,
 		invocation.self_handle,
-		shard.current_tick + delay_ticks,
+		invocation.current_time_ns + duration_ns,
 		tag,
 		correlation,
 	)
@@ -308,12 +307,10 @@ ctx_rearm_renewable_deadline :: #force_inline proc(
 	correlation: Correlation_Id,
 ) {
 	invocation := ctx_invocation_require_self_handle(ctx)
-	shard := invocation.shard
-	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
 	timer_rearm_renewable(
-		&shard.timer_wheel,
+		&invocation.shard.timer_wheel,
 		handle,
-		shard.current_tick + delay_ticks,
+		invocation.current_time_ns + duration_ns,
 		tag,
 		correlation,
 	)

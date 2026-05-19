@@ -159,8 +159,11 @@ when TINA_SIMULATION_MODE {
 					one_shot_deadline := timer_wheel_earliest_deadline(&sim.shards[i].timer_wheel)
 					if one_shot_deadline < earliest_deadline do earliest_deadline = one_shot_deadline
 
-					renewable_deadline := timer_renewable_earliest_deadline(&sim.shards[i].timer_wheel)
-					if renewable_deadline < earliest_deadline do earliest_deadline = renewable_deadline
+					renewable_deadline_ns := timer_renewable_earliest_deadline(&sim.shards[i].timer_wheel)
+					if renewable_deadline_ns != max(u64) {
+						renewable_deadline := (renewable_deadline_ns + sim.tick_resolution_ns - 1) / sim.tick_resolution_ns
+						if renewable_deadline < earliest_deadline do earliest_deadline = renewable_deadline
+					}
 				}
 
 				if earliest_deadline == max(u64) {
@@ -188,6 +191,7 @@ when TINA_SIMULATION_MODE {
 				shard := &sim.shards[shard_id]
 				// The clock advances synchronously for all shards in the sim
 				shard.current_tick = round
+				shard.current_time_ns = round * sim.tick_resolution_ns
 				scheduler_tick(shard)
 			}
 
