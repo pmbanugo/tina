@@ -31,9 +31,10 @@ Timer_Wheel :: struct {
 	renewable_tag:         []Message_Tag,
 	renewable_correlation: []Correlation_Id,
 	renewable_armed_words: []u64,          // bit N = slot N is armed
-	renewable_free_head:   u32,
-	renewable_capacity:    u32,
-	renewable_armed_count: u32,
+	renewable_free_head:          u32,
+	renewable_capacity:           u32,
+	renewable_armed_count:        u32,
+	renewable_earliest_deadline_ns: u64,
 }
 
 timer_wheel_init :: proc(
@@ -51,6 +52,7 @@ timer_wheel_init :: proc(
 	wheel.renewable_free_head = POOL_NONE_INDEX
 	wheel.renewable_capacity = 0
 	wheel.renewable_armed_count = 0
+	wheel.renewable_earliest_deadline_ns = max(u64)
 
 	for i in 0 ..< len(spoke_backing) {
 		wheel.spokes[i] = POOL_NONE_INDEX
@@ -80,6 +82,7 @@ timer_wheel_init_renewable :: proc(
 	wheel.renewable_capacity = capacity
 	wheel.renewable_armed_count = 0
 	wheel.renewable_free_head = POOL_NONE_INDEX
+	wheel.renewable_earliest_deadline_ns = max(u64)
 
 	// Zero the armed bitmap
 	for i in 0 ..< len(armed_words_backing) {
@@ -113,6 +116,7 @@ timer_wheel_reset :: proc(wheel: ^Timer_Wheel, current_tick: u64) {
 	}
 	wheel.renewable_armed_count = 0
 	wheel.renewable_free_head = POOL_NONE_INDEX
+	wheel.renewable_earliest_deadline_ns = max(u64)
 	for i := int(wheel.renewable_capacity) - 1; i >= 0; i -= 1 {
 		wheel.renewable_deliver_at[i] = u64(wheel.renewable_free_head)
 		wheel.renewable_free_head = u32(i)
@@ -233,6 +237,10 @@ timer_arm_renewable :: proc(
 	wheel.renewable_armed_words[word_index] |= bit_mask
 	wheel.renewable_armed_count += 1
 
+	if deliver_at < wheel.renewable_earliest_deadline_ns {
+		wheel.renewable_earliest_deadline_ns = deliver_at
+	}
+
 	return Timer_Handle(index)
 }
 
@@ -250,6 +258,10 @@ timer_rearm_renewable :: proc(
 	wheel.renewable_correlation[index] = correlation
 	// Target does not change — same connection.
 	// Bit is already set in renewable_armed_words — no bitmap manipulation.
+
+	if deliver_at < wheel.renewable_earliest_deadline_ns {
+		wheel.renewable_earliest_deadline_ns = deliver_at
+	}
 }
 
 @(private = "package")
@@ -395,10 +407,20 @@ _advance_timers :: proc(
 
 	now_ns := shard.current_time_ns
 
+	if now_ns < wheel.renewable_earliest_deadline_ns {
+		return
+	}
+
+	next_earliest_deadline: u64 = max(u64)
+	finished := true
+
 	for word_index in 0 ..< len(wheel.renewable_armed_words) {
 		word := wheel.renewable_armed_words[word_index]
 		for word != 0 {
-			if expirations >= expirations_max do return
+			if expirations >= expirations_max {
+				finished = false
+				break
+			}
 
 			bit_index := u32(intrinsics.count_trailing_zeros(word))
 			slot_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, bit_index)
@@ -441,10 +463,23 @@ _advance_timers :: proc(
 				wheel.renewable_deliver_at[slot_index] = u64(wheel.renewable_free_head)
 				wheel.renewable_free_head = slot_index
 			} else {
+				if wheel.renewable_deliver_at[slot_index] < next_earliest_deadline {
+					next_earliest_deadline = wheel.renewable_deliver_at[slot_index]
+				}
 				// Not expired — clear this bit from the local word to continue scanning
 				word &= word - 1
 			}
 		}
+		if !finished {
+			break
+		}
+	}
+
+	if finished {
+		wheel.renewable_earliest_deadline_ns = next_earliest_deadline
+	} else {
+		// Budget exhausted. Force a scan on the next tick by using now_ns
+		wheel.renewable_earliest_deadline_ns = now_ns
 	}
 }
 
