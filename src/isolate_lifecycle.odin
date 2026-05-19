@@ -102,6 +102,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		shard_id            = shard.id,
 		timer_resolution_ns = shard.timer_resolution_ns,
 		current_tick        = shard.current_tick,
+		current_time_ns     = shard.current_time_ns,
 	}
 	child_ctx := child_invocation.context_token
 

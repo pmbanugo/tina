@@ -151,6 +151,11 @@ ctx_monotonic_time_ns :: #force_inline proc(ctx: TinaContext) -> Monotonic_Time_
 	return Monotonic_Time_NS(invocation.current_tick * invocation.timer_resolution_ns)
 }
 
+// Retrieves the raw current time (in nanoseconds) from the scheduler.
+ctx_current_time_ns :: #force_inline proc(ctx: TinaContext) -> u64 {
+	return ctx_invocation(ctx).current_time_ns
+}
+
 ctx_timer_resolution_ns :: #force_inline proc(ctx: TinaContext) -> u64 {
 	return ctx_invocation(ctx).timer_resolution_ns
 }

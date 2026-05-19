@@ -468,7 +468,8 @@ _advance_timers :: proc(
 			if wheel.renewable_deliver_at[slot_index] <= now_ns {
 				// Clear bit in word and in the backing array
 				word &= word - 1
-				wheel.renewable_armed_words[word_index] = word
+				bit_mask := bitmap_mask_from_word_bit_index(bit_index)
+				wheel.renewable_armed_words[word_index] &= ~bit_mask
 				wheel.renewable_armed_count -= 1
 
 				target := wheel.renewable_target[slot_index]
@@ -516,6 +517,17 @@ _advance_timers :: proc(
 	} else {
 		// Budget exhausted. Force a scan on the next tick by using now_ns
 		wheel.renewable_earliest_deadline_ns = now_ns
+	}
+
+	when TINA_RUNTIME_ASSERTIONS {
+		expected_armed_count: u32 = 0
+		for word in wheel.renewable_armed_words {
+			expected_armed_count += u32(intrinsics.count_ones(word))
+		}
+		assert(
+			wheel.renewable_armed_count == expected_armed_count,
+			"renewable_armed_count drift detected: armed_count does not match bitmap popcount",
+		)
 	}
 }
 
@@ -798,3 +810,97 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 	testing.expect_value(t, test_state.target_io_sequence, u8(1))
 	testing.expect_value(t, message_count, u16(1))
 }
+
+@(test)
+test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
+	Mixed_Expiry_Test_State :: struct {
+		t:                   ^testing.T,
+		handle:              Handle,
+		timer_handle_first:  Timer_Handle,
+		timer_handle_second: Timer_Handle,
+	}
+	test_state := Mixed_Expiry_Test_State {
+		t                   = t,
+		handle              = make_handle(0, 1, 0, 1),
+		timer_handle_first  = TIMER_HANDLE_NONE,
+		timer_handle_second = TIMER_HANDLE_NONE,
+	}
+
+	message_count, message := test_with_local_context(
+		Test_Local_Context_Config {
+			self_handle         = test_state.handle,
+			target_handle       = test_state.handle,
+			current_tick        = 100,
+			timer_resolution_ns = 1,
+			target_state        = .Waiting,
+		},
+		rawptr(&test_state),
+		proc(user_data: rawptr, ctx: TinaContext) {
+			state := cast(^Mixed_Expiry_Test_State)user_data
+			invocation := ctx_invocation(ctx)
+
+			// Both handles will map to the same 64-bit word of renewable_armed_words bitmap
+			state.timer_handle_first = ctx_acquire_renewable_deadline(ctx)
+			state.timer_handle_second = ctx_acquire_renewable_deadline(ctx)
+
+			ctx_rearm_renewable_deadline(
+				ctx,
+				state.timer_handle_first,
+				5,
+				Message_Tag(USER_MESSAGE_TAG_BASE),
+				Correlation_Id(3),
+			)
+			ctx_rearm_renewable_deadline(
+				ctx,
+				state.timer_handle_second,
+				10,
+				Message_Tag(USER_MESSAGE_TAG_BASE + 1),
+				Correlation_Id(4),
+			)
+
+			// Advance past the first deadline but before the second
+			invocation.shard.current_tick = 106
+			invocation.shard.current_time_ns = 106
+			_advance_timers(invocation.shard)
+
+			// The first deadline should have fired, but the second must still be armed.
+			// Let's verify that the bitmap still has the second bit set, meaning it wasn't disarmed.
+			word := invocation.shard.timer_wheel.renewable_armed_words[0]
+			testing.expect(
+				state.t,
+				word != 0,
+				"Second timer bit in renewable_armed_words was incorrectly cleared",
+			)
+			testing.expect_value(
+				state.t,
+				invocation.shard.timer_wheel.renewable_armed_count,
+				u32(1),
+			)
+
+			// Now advance past the second deadline
+			invocation.shard.current_tick = 111
+			invocation.shard.current_time_ns = 111
+			_advance_timers(invocation.shard)
+
+			// Verify that the second timer has now also fired and count is zero
+			testing.expect_value(
+				state.t,
+				invocation.shard.timer_wheel.renewable_armed_words[0],
+				u64(0),
+			)
+			testing.expect_value(
+				state.t,
+				invocation.shard.timer_wheel.renewable_armed_count,
+				u32(0),
+			)
+
+			ctx_release_renewable_deadline(ctx, state.timer_handle_first)
+			ctx_release_renewable_deadline(ctx, state.timer_handle_second)
+		},
+	)
+
+	// Since the callback ran two sweeps, first message is for timer_handle_first
+	testing.expect_value(t, message.tag, Message_Tag(USER_MESSAGE_TAG_BASE))
+	testing.expect_value(t, message.correlation, Correlation_Id(3))
+}
+
