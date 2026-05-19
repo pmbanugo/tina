@@ -279,23 +279,23 @@ ctx_self_handle :: #force_inline proc(ctx: TinaContext) -> Handle {
 	return ctx_invocation(ctx).self_handle
 }
 
-// Arm a renewable deadline. Returns a handle stored in the caller's state.
-// Duration is in nanoseconds.
+// Acquire a pre-allocated renewable deadline slot. Returns a handle.
+// Strictly zero-dynamic allocation.
 @(require_results)
-ctx_arm_renewable_deadline :: #force_inline proc(
+ctx_acquire_renewable_deadline :: #force_inline proc(
 	ctx: TinaContext,
-	duration_ns: u64,
-	tag: Message_Tag,
-	correlation: Correlation_Id,
 ) -> Timer_Handle {
 	invocation := ctx_invocation_require_self_handle(ctx)
-	return timer_arm_renewable(
-		&invocation.shard.timer_wheel,
-		invocation.self_handle,
-		invocation.current_time_ns + duration_ns,
-		tag,
-		correlation,
-	)
+	return timer_acquire_renewable(&invocation.shard.timer_wheel, invocation.self_handle)
+}
+
+// Release an acquired renewable deadline slot back to the pool.
+ctx_release_renewable_deadline :: #force_inline proc(
+	ctx: TinaContext,
+	handle: Timer_Handle,
+) {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	timer_release_renewable(&invocation.shard.timer_wheel, handle)
 }
 
 // Re-arm an existing renewable deadline with a new duration. O(1) field update.
@@ -316,7 +316,7 @@ ctx_rearm_renewable_deadline :: #force_inline proc(
 	)
 }
 
-// Cancel a renewable deadline and free the slot. O(1) bit clear + free list push.
+// Cancel (disarm) a renewable deadline. O(1) bit clear.
 ctx_cancel_renewable_deadline :: #force_inline proc(
 	ctx: TinaContext,
 	handle: Timer_Handle,

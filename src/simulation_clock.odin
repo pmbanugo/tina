@@ -80,9 +80,10 @@ when TINA_SIMULATION_MODE {
 			renewable_correlation,
 			renewable_armed_words,
 		)
-		deadline_handle = timer_arm_renewable(
+		deadline_handle = timer_acquire_renewable(&shard.timer_wheel, make_handle(0, 1, 0, 1))
+		timer_rearm_renewable(
 			&shard.timer_wheel,
-			make_handle(0, 1, 0, 1),
+			deadline_handle,
 			5,
 			Message_Tag(USER_MESSAGE_TAG_BASE),
 			CORRELATION_ID_NONE,
@@ -94,7 +95,7 @@ when TINA_SIMULATION_MODE {
 			"active renewable deadline should keep simulator non-idle",
 		)
 
-		timer_cancel_renewable(&shard.timer_wheel, deadline_handle)
+		timer_release_renewable(&shard.timer_wheel, deadline_handle)
 		testing.expect(
 			t,
 			simulator_is_globally_idle(&sim),

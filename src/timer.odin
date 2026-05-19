@@ -212,12 +212,9 @@ _timer_wheel_insert :: #force_inline proc "contextless" (
 }
 
 @(private = "package")
-timer_arm_renewable :: proc(
+timer_acquire_renewable :: proc(
 	wheel: ^Timer_Wheel,
 	target: Handle,
-	deliver_at: u64,
-	tag: Message_Tag,
-	correlation: Correlation_Id,
 ) -> Timer_Handle {
 	if wheel.renewable_free_head == POOL_NONE_INDEX {
 		return TIMER_HANDLE_NONE
@@ -226,22 +223,48 @@ timer_arm_renewable :: proc(
 	index := wheel.renewable_free_head
 	wheel.renewable_free_head = u32(wheel.renewable_deliver_at[index])
 
-	wheel.renewable_deliver_at[index] = deliver_at
+	wheel.renewable_deliver_at[index] = 0
 	wheel.renewable_target[index] = target
-	wheel.renewable_tag[index] = tag
-	wheel.renewable_correlation[index] = correlation
+	wheel.renewable_tag[index] = Message_Tag(0)
+	wheel.renewable_correlation[index] = Correlation_Id(0)
 
-	// Set bit in armed bitmap
+	// Ensure armed bit is cleared
 	word_index := bitmap_word_index_from_bit_index(index)
 	bit_mask := bitmap_mask_from_bit_index(index)
-	wheel.renewable_armed_words[word_index] |= bit_mask
-	wheel.renewable_armed_count += 1
-
-	if deliver_at < wheel.renewable_earliest_deadline_ns {
-		wheel.renewable_earliest_deadline_ns = deliver_at
-	}
+	wheel.renewable_armed_words[word_index] &= ~bit_mask
 
 	return Timer_Handle(index)
+}
+
+@(private = "package")
+timer_release_renewable :: proc(
+	wheel: ^Timer_Wheel,
+	handle: Timer_Handle,
+) {
+	if handle == TIMER_HANDLE_NONE {
+		return
+	}
+	index := u32(handle)
+	if index >= wheel.renewable_capacity {
+		return
+	}
+
+	// Disarm if it was armed
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	if (wheel.renewable_armed_words[word_index] & bit_mask) != 0 {
+		wheel.renewable_armed_words[word_index] &= ~bit_mask
+		wheel.renewable_armed_count -= 1
+	}
+
+	// Clear fields
+	wheel.renewable_target[index] = HANDLE_NONE
+	wheel.renewable_tag[index] = Message_Tag(0)
+	wheel.renewable_correlation[index] = Correlation_Id(0)
+
+	// Push index onto free list
+	wheel.renewable_deliver_at[index] = u64(wheel.renewable_free_head)
+	wheel.renewable_free_head = index
 }
 
 @(private = "package")
@@ -252,12 +275,25 @@ timer_rearm_renewable :: proc(
 	tag: Message_Tag,
 	correlation: Correlation_Id,
 ) {
+	if handle == TIMER_HANDLE_NONE {
+		return
+	}
 	index := u32(handle)
+	if index >= wheel.renewable_capacity {
+		return
+	}
+
 	wheel.renewable_deliver_at[index] = deliver_at
 	wheel.renewable_tag[index] = tag
 	wheel.renewable_correlation[index] = correlation
-	// Target does not change — same connection.
-	// Bit is already set in renewable_armed_words — no bitmap manipulation.
+
+	// Set bit in armed bitmap if not already armed
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	if (wheel.renewable_armed_words[word_index] & bit_mask) == 0 {
+		wheel.renewable_armed_words[word_index] |= bit_mask
+		wheel.renewable_armed_count += 1
+	}
 
 	if deliver_at < wheel.renewable_earliest_deadline_ns {
 		wheel.renewable_earliest_deadline_ns = deliver_at
@@ -269,17 +305,21 @@ timer_cancel_renewable :: proc(
 	wheel: ^Timer_Wheel,
 	handle: Timer_Handle,
 ) {
+	if handle == TIMER_HANDLE_NONE {
+		return
+	}
 	index := u32(handle)
+	if index >= wheel.renewable_capacity {
+		return
+	}
 
 	// Clear bit in armed bitmap
 	word_index := bitmap_word_index_from_bit_index(index)
 	bit_mask := bitmap_mask_from_bit_index(index)
-	wheel.renewable_armed_words[word_index] &= ~bit_mask
-	wheel.renewable_armed_count -= 1
-
-	// Push index onto free list
-	wheel.renewable_deliver_at[index] = u64(wheel.renewable_free_head)
-	wheel.renewable_free_head = index
+	if (wheel.renewable_armed_words[word_index] & bit_mask) != 0 {
+		wheel.renewable_armed_words[word_index] &= ~bit_mask
+		wheel.renewable_armed_count -= 1
+	}
 }
 
 // POSSIBLE OPTIMISATION: The envelope construction (128 bytes on stack) + _enqueue copy could be
@@ -458,10 +498,6 @@ _advance_timers :: proc(
 
 				_enqueue_system_msg(shard, target, &envelope)
 				expirations += 1
-
-				// Push slot onto free list
-				wheel.renewable_deliver_at[slot_index] = u64(wheel.renewable_free_head)
-				wheel.renewable_free_head = slot_index
 			} else {
 				if wheel.renewable_deliver_at[slot_index] < next_earliest_deadline {
 					next_earliest_deadline = wheel.renewable_deliver_at[slot_index]
@@ -547,16 +583,18 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Arm_And_Expire_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			timer_handle := ctx_arm_renewable_deadline(
-				ctx,
-				5,
-				Message_Tag(USER_MESSAGE_TAG_BASE),
-				Correlation_Id(7),
-			)
+			timer_handle := ctx_acquire_renewable_deadline(ctx)
 			testing.expect(
 				state.t,
 				timer_handle != TIMER_HANDLE_NONE,
-				"renewable deadline should arm",
+				"renewable deadline should acquire",
+			)
+			ctx_rearm_renewable_deadline(
+				ctx,
+				timer_handle,
+				5,
+				Message_Tag(USER_MESSAGE_TAG_BASE),
+				Correlation_Id(7),
 			)
 
 			invocation.shard.current_tick = 9
@@ -572,6 +610,8 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			invocation.shard.current_tick = 10
 			invocation.shard.current_time_ns = 10
 			_advance_timers(invocation.shard)
+
+			ctx_release_renewable_deadline(ctx, timer_handle)
 		},
 	)
 
@@ -604,8 +644,10 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Rearm_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			timer_handle := ctx_arm_renewable_deadline(
+			timer_handle := ctx_acquire_renewable_deadline(ctx)
+			ctx_rearm_renewable_deadline(
 				ctx,
+				timer_handle,
 				5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(1),
@@ -631,6 +673,8 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 			invocation.shard.current_tick = 30
 			invocation.shard.current_time_ns = 30
 			_advance_timers(invocation.shard)
+
+			ctx_release_renewable_deadline(ctx, timer_handle)
 		},
 	)
 
@@ -640,17 +684,17 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 }
 
 @(test)
-test_renewable_deadline_cancel_frees_slot_and_prevents_expiration :: proc(t: ^testing.T) {
-	Cancel_Test_State :: struct {
+test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^testing.T) {
+	Release_Test_State :: struct {
 		t:                   ^testing.T,
 		handle:              Handle,
 		timer_handle_first:  Timer_Handle,
 		timer_handle_second: Timer_Handle,
 	}
-	test_state := Cancel_Test_State {
-		t                  = t,
-		handle             = make_handle(0, 1, 0, 1),
-		timer_handle_first = TIMER_HANDLE_NONE,
+	test_state := Release_Test_State {
+		t                   = t,
+		handle              = make_handle(0, 1, 0, 1),
+		timer_handle_first  = TIMER_HANDLE_NONE,
 		timer_handle_second = TIMER_HANDLE_NONE,
 	}
 
@@ -664,17 +708,21 @@ test_renewable_deadline_cancel_frees_slot_and_prevents_expiration :: proc(t: ^te
 		},
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: TinaContext) {
-			state := cast(^Cancel_Test_State)user_data
+			state := cast(^Release_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			state.timer_handle_first = ctx_arm_renewable_deadline(
+			state.timer_handle_first = ctx_acquire_renewable_deadline(ctx)
+			ctx_rearm_renewable_deadline(
 				ctx,
+				state.timer_handle_first,
 				5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(3),
 			)
-			ctx_cancel_renewable_deadline(ctx, state.timer_handle_first)
-			state.timer_handle_second = ctx_arm_renewable_deadline(
+			ctx_release_renewable_deadline(ctx, state.timer_handle_first)
+			state.timer_handle_second = ctx_acquire_renewable_deadline(ctx)
+			ctx_rearm_renewable_deadline(
 				ctx,
+				state.timer_handle_second,
 				7,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 2),
 				Correlation_Id(4),
@@ -693,6 +741,8 @@ test_renewable_deadline_cancel_frees_slot_and_prevents_expiration :: proc(t: ^te
 			invocation.shard.current_tick = 107
 			invocation.shard.current_time_ns = 107
 			_advance_timers(invocation.shard)
+
+			ctx_release_renewable_deadline(ctx, state.timer_handle_second)
 		},
 	)
 
@@ -723,8 +773,10 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Wake_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			_ = ctx_arm_renewable_deadline(
+			timer_handle := ctx_acquire_renewable_deadline(ctx)
+			ctx_rearm_renewable_deadline(
 				ctx,
+				timer_handle,
 				5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(11),
@@ -737,6 +789,8 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
 			state.target_state = soa_meta[extract_slot(state.handle)].state
 			state.target_io_sequence = soa_meta[extract_slot(state.handle)].io_sequence
+
+			ctx_release_renewable_deadline(ctx, timer_handle)
 		},
 	)
 

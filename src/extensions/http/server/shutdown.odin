@@ -18,23 +18,9 @@ _connection_arm_or_rearm_deadline :: proc(
 ) {
 	state := &connection.connection_state
 	correlation := tina.Correlation_Id(state.request_token)
-	handle := state.deadline_timer_handle
-	deadline_armed := handle != tina.TIMER_HANDLE_NONE && state.deadline_ns != 0
 
 	state.deadline_ns = tina.Monotonic_Time_NS(u64(tina.ctx_monotonic_time_ns(ctx)) + duration_ns)
-	if deadline_armed {
-		tina.ctx_rearm_renewable_deadline(ctx, handle, duration_ns, tag, correlation)
-		return
-	}
-
-	handle = tina.ctx_arm_renewable_deadline(ctx, duration_ns, tag, correlation)
-	when tina.TINA_RUNTIME_ASSERTIONS {
-		assert(
-			handle != tina.TIMER_HANDLE_NONE,
-			"_connection_arm_or_rearm_deadline: renewable deadline pool exhausted",
-		)
-	}
-	state.deadline_timer_handle = handle
+	tina.ctx_rearm_renewable_deadline(ctx, state.deadline_timer_handle, duration_ns, tag, correlation)
 }
 
 @(private = "package")
