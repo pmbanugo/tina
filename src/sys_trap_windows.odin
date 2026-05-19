@@ -5,7 +5,7 @@ import "core:c"
 
 OS_Trap_Environment :: distinct [64]c.long
 
-foreign import libc "system:c"
+foreign import libc "system:vcruntime.lib"
 @(default_calling_convention = "c")
 foreign libc {
 	@(link_name = "_setjmp")
