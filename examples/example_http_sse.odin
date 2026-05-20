@@ -279,7 +279,7 @@ main :: proc() {
 
 	spec := http.install_development_defaults(&server)
 
-	publisher_type_id := u8(len(spec.types))
+	publisher_type_id := tina.Type_Id(len(spec.types))
 	new_types := make([]tina.TypeDescriptor, len(spec.types) + 1)
 	copy(new_types, spec.types)
 	new_types[publisher_type_id] = tina.TypeDescriptor {
