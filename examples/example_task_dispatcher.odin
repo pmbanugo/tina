@@ -291,7 +291,7 @@ main :: proc() {
 	quarantine_policy := tina.Quarantine_Policy.Quarantine
 	if DEMO_ABORT_ON_QUARANTINE do quarantine_policy = .Abort
 
-	types := [2]tina.TypeDescriptor {
+	types := [2]tina.IsolateTypeDescriptor {
 		{
 			id = DISPATCHER_ISOLATE_TYPE,
 			slot_count = 1,

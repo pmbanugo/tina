@@ -393,7 +393,7 @@ any :: proc {
 }
 
 // Compiled, immutable per-route record stored in `Compiled_Router.descriptors`
-// and indexed by `Route_Index`. Mirrors Tina core's `TypeDescriptor` pattern.
+// and indexed by `Route_Index`. Mirrors Tina core's `IsolateTypeDescriptor` pattern.
 
 @(private = "package")
 Route_Descriptor :: struct {

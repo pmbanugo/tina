@@ -164,7 +164,7 @@ Application_Pending_Message :: struct {
 HTTP_Shard_Runtime :: struct {
 	server:               Server_Runtime,
 	router:               Compiled_Router,
-	connection_type_id:    tina.Type_Id,
+	connection_type_id:    tina.Isolate_Type_Id,
 	date_cache:           Date_Cache,
 	draining:             bool,
 	next_request_token:   Request_Token, // monotonic across the shard
@@ -285,8 +285,8 @@ HTTP_Listener_Init_Args :: struct {
 	server:                  ^Server_Runtime,
 	router:                  ^Compiled_Router,
 	connection_slot_count:    u16,
-	connection_type_id:       tina.Type_Id,
-	dispatcher_type_id:       tina.Type_Id,
+	connection_type_id:       tina.Isolate_Type_Id,
+	dispatcher_type_id:       tina.Isolate_Type_Id,
 	dispatcher_shard_count:   u8,
 }
 
@@ -295,7 +295,7 @@ HTTP_Dispatcher_Init_Args :: struct {
 	server:                ^Server_Runtime,
 	router:                ^Compiled_Router,
 	connection_slot_count: u16,
-	connection_type_id:    tina.Type_Id,
+	connection_type_id:    tina.Isolate_Type_Id,
 }
 
 @(private = "package")
@@ -313,7 +313,7 @@ HTTP_Connection_Init_Args :: struct {
 //
 // These are *positional offsets* relative to `base_type_id`, not absolute
 // type IDs. `install_into_system_spec` derives `base_type_id := len(spec.types)`
-// at install time, then assigns each HTTP TypeDescriptor as
+// at install time, then assigns each HTTP IsolateTypeDescriptor as
 // `base_type_id + HTTP_TYPE_OFFSET_<role>`. This keeps the install contract
 // position-independent: callers may register their own TypeDescriptors before
 // (or after) HTTP install and the wiring still resolves correctly.
@@ -525,9 +525,9 @@ install_into_system_spec :: proc(
 	)
 	base_type_index := len(spec.types)
 
-	listener_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_LISTENER)
-	connection_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_CONNECTION)
-	dispatcher_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_DISPATCHER)
+	listener_type_id := tina.Isolate_Type_Id(base_type_index + HTTP_TYPE_OFFSET_LISTENER)
+	connection_type_id := tina.Isolate_Type_Id(base_type_index + HTTP_TYPE_OFFSET_CONNECTION)
+	dispatcher_type_id := tina.Isolate_Type_Id(base_type_index + HTTP_TYPE_OFFSET_DISPATCHER)
 
 	listener_init_args := HTTP_Listener_Init_Args {
 		server                = server_runtime,
@@ -548,13 +548,13 @@ install_into_system_spec :: proc(
 	dispatcher_args_payload, dispatcher_args_size := tina.init_args_of(&dispatcher_init_args)
 
 	new_types := make(
-		[]tina.TypeDescriptor,
+		[]tina.IsolateTypeDescriptor,
 		len(spec.types) + http_type_count,
 		context.allocator,
 	)
 	copy(new_types, spec.types)
 
-	new_types[listener_type_id] = tina.TypeDescriptor {
+	new_types[listener_type_id] = tina.IsolateTypeDescriptor {
 		id                      = listener_type_id,
 		slot_count              = 1,
 		stride                  = size_of(HTTP_Listener),
@@ -569,7 +569,7 @@ install_into_system_spec :: proc(
 		handler_fn              = _http_listener_handler,
 	}
 
-	new_types[connection_type_id] = tina.TypeDescriptor {
+	new_types[connection_type_id] = tina.IsolateTypeDescriptor {
 		id                      = connection_type_id,
 		slot_count              = int(connection_slot_count_per_shard),
 		stride                  = size_of(HTTP_Connection),
@@ -582,7 +582,7 @@ install_into_system_spec :: proc(
 	}
 
 	if include_dispatcher {
-		new_types[dispatcher_type_id] = tina.TypeDescriptor {
+		new_types[dispatcher_type_id] = tina.IsolateTypeDescriptor {
 			id                      = dispatcher_type_id,
 			slot_count              = 1,
 			stride                  = size_of(HTTP_Dispatcher),
@@ -920,7 +920,7 @@ _make_shard_runtime :: proc(
 		server: ^Server_Runtime,
 		router: ^Compiled_Router,
 		connection_slot_count: u16,
-		connection_type_id: tina.Type_Id,
+		connection_type_id: tina.Isolate_Type_Id,
 	) -> ^HTTP_Shard_Runtime {
 	runtime_storage := make([]HTTP_Shard_Runtime, 1, allocator)
 	active_slot_indices := make([]u16, int(connection_slot_count), allocator)
@@ -1010,8 +1010,8 @@ _next_power_of_two_u64 :: proc "contextless" (n: u64) -> u64 {
 @(private = "file")
 _attach_http_children :: proc(
 	shard_spec: ^tina.ShardSpec,
-	listener_type_id: tina.Type_Id,
-	dispatcher_type_id: tina.Type_Id,
+	listener_type_id: tina.Isolate_Type_Id,
+	dispatcher_type_id: tina.Isolate_Type_Id,
 	include_listener: bool,
 	include_dispatcher: bool,
 	connection_slot_count: u16,
@@ -1046,8 +1046,8 @@ _attach_http_children :: proc(
 @(private = "file")
 _append_static_children :: proc(
 	existing: []tina.Child_Spec,
-	listener_type_id: tina.Type_Id,
-	dispatcher_type_id: tina.Type_Id,
+	listener_type_id: tina.Isolate_Type_Id,
+	dispatcher_type_id: tina.Isolate_Type_Id,
 	include_listener: bool,
 	include_dispatcher: bool,
 	listener_args_payload: [tina.MAX_INIT_ARGS_SIZE]u8,
@@ -1207,7 +1207,7 @@ test_install_development_defaults_produces_valid_spec :: proc(t: ^testing.T) {
 		u16(HTTP_DEV_CONNECTION_SLOT_COUNT_DEFAULT),
 	)
 
-	// Locate the connection TypeDescriptor and verify it carries the
+	// Locate the connection IsolateTypeDescriptor and verify it carries the
 	// derived working_memory_size and matching slot_count.
 	found_connection := false
 	for desc in spec.types {
@@ -1222,7 +1222,7 @@ test_install_development_defaults_produces_valid_spec :: proc(t: ^testing.T) {
 			found_connection = true
 		}
 	}
-	testing.expect(t, found_connection, "HTTP_Connection TypeDescriptor must be installed")
+	testing.expect(t, found_connection, "HTTP_Connection IsolateTypeDescriptor must be installed")
 }
 
 @(test)
@@ -1248,7 +1248,7 @@ test_install_development_respects_explicit_connection_capacity :: proc(t: ^testi
 			found_connection = true
 		}
 	}
-	testing.expect(t, found_connection, "HTTP_Connection TypeDescriptor must be installed")
+	testing.expect(t, found_connection, "HTTP_Connection IsolateTypeDescriptor must be installed")
 }
 
 @(test)
@@ -1354,8 +1354,8 @@ test_install_multi_shard_defaults_to_coordinator :: proc(t: ^testing.T) {
 	// ids back out of the descriptor table is the same lookup the supervision
 	// tree did at install time.
 	base_type_index := len(spec.types) - 3 // listener + connection + dispatcher
-	listener_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_LISTENER)
-	dispatcher_type_id := tina.Type_Id(base_type_index + HTTP_TYPE_OFFSET_DISPATCHER)
+	listener_type_id := tina.Isolate_Type_Id(base_type_index + HTTP_TYPE_OFFSET_LISTENER)
+	dispatcher_type_id := tina.Isolate_Type_Id(base_type_index + HTTP_TYPE_OFFSET_DISPATCHER)
 
 	for shard_index in 0 ..< len(spec.shard_specs) {
 		root := spec.shard_specs[shard_index].root_group
@@ -1378,7 +1378,7 @@ test_install_multi_shard_defaults_to_coordinator :: proc(t: ^testing.T) {
 
 // Verifies that `install_into_system_spec` appends HTTP TypeDescriptors at
 // `len(spec.types) + HTTP_TYPE_OFFSET_<role>` rather than at fixed absolute
-// IDs. We seed the spec with a stub TypeDescriptor first so the HTTP types
+// IDs. We seed the spec with a stub IsolateTypeDescriptor first so the HTTP types
 // are forced off the [0..2] offsets and any accidental hardcoding of those
 // values would surface as a mismatch between the supervision wiring (which
 // reads the dynamic id) and the installed descriptor table. This also verifies
@@ -1403,7 +1403,7 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 	stub_handler :: proc(self: rawptr, message: ^tina.Message, ctx: tina.TinaContext) -> tina.Effect {
 		return tina.Effect_Receive{}
 	}
-	external_types := []tina.TypeDescriptor {
+	external_types := []tina.IsolateTypeDescriptor {
 		{
 			id                      = 0,
 			slot_count              = 1,
@@ -1430,11 +1430,11 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 	install_into_system_spec(&spec, &server, 257)
 
 	// HTTP types must be appended *after* the stub at the documented offsets.
-	expected_listener_id := tina.Type_Id(1 + HTTP_TYPE_OFFSET_LISTENER)
-	expected_connection_id := tina.Type_Id(1 + HTTP_TYPE_OFFSET_CONNECTION)
+	expected_listener_id := tina.Isolate_Type_Id(1 + HTTP_TYPE_OFFSET_LISTENER)
+	expected_connection_id := tina.Isolate_Type_Id(1 + HTTP_TYPE_OFFSET_CONNECTION)
 
 	testing.expect_value(t, len(spec.types), 3) // stub + listener + connection (single shard, no dispatcher)
-	testing.expect_value(t, spec.types[0].id, tina.Type_Id(0))
+	testing.expect_value(t, spec.types[0].id, tina.Isolate_Type_Id(0))
 	testing.expect_value(t, spec.types[expected_listener_id].id, expected_listener_id)
 	testing.expect_value(t, spec.types[expected_connection_id].id, expected_connection_id)
 
@@ -1449,11 +1449,11 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 			found_listener_child = true
 		}
 		// No HTTP child should reference the stub type id.
-		testing.expect(t, static_child.type_id != tina.Type_Id(0), "HTTP wiring must not collide with pre-installed type")
+		testing.expect(t, static_child.type_id != tina.Isolate_Type_Id(0), "HTTP wiring must not collide with pre-installed type")
 	}
 	testing.expect(t, found_listener_child, "listener child must use dynamic type id")
 
-	// Connection TypeDescriptor's stored id must equal the dynamic id, so
+	// Connection IsolateTypeDescriptor's stored id must equal the dynamic id, so
 	// `runtime.connection_type_id` (set from install args) and the descriptor
 	// table agree at boot.
 	testing.expect_value(t, spec.types[expected_connection_id].stride, size_of(HTTP_Connection))

@@ -107,7 +107,7 @@ router_handler :: proc(
 
 ### Sizing
 
-Set the working arena size per Isolate type via `working_memory_size` on the `TypeDescriptor`. If the arena fills up, allocations fail (return `nil`). This is a deployment sizing issue — increase `working_memory_size` and rebuild.
+Set the working arena size per Isolate type via `working_memory_size` on the `IsolateTypeDescriptor`. If the arena fills up, allocations fail (return `nil`). This is a deployment sizing issue — increase `working_memory_size` and rebuild.
 
 If `working_memory_size = 0` (the default), `ctx_working_arena()` returns a zero-size allocator — any allocation attempt fails immediately. This is correct for simple reactive Isolates that only hold struct fields.
 

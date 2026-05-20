@@ -60,7 +60,7 @@ when TINA_SIMULATION_MODE {
 	@(private = "package")
 	sim_test_make_spec :: #force_inline proc "contextless" (
 		sim_config: ^SimulationConfig,
-		types: []TypeDescriptor,
+		types: []IsolateTypeDescriptor,
 		shard_specs: []ShardSpec,
 		options: Sim_Test_Spec_Options = {},
 	) -> SystemSpec {

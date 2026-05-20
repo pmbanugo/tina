@@ -10,7 +10,7 @@ when TINA_SIMULATION_MODE {
 		checker_flags: Checker_Flags,
 		fd_handoff_entry_count: int = 0,
 	) -> Simulator {
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = HARNESS_NOOP_TYPE_ID,
 				slot_count = 1,

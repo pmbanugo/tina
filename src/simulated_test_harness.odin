@@ -9,7 +9,7 @@ when TINA_SIMULATION_MODE {
 	// Harness-level tests: termination reason, final checkers, user checkers
 	// ============================================================================
 
-	HARNESS_NOOP_TYPE_ID: Type_Id : 0
+	HARNESS_NOOP_TYPE_ID: Isolate_Type_Id : 0
 
 	HarnessNoopIsolate :: struct {}
 
@@ -25,7 +25,7 @@ when TINA_SIMULATION_MODE {
 	test_termination_reason_quiescent :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = HARNESS_NOOP_TYPE_ID,
 				slot_count = 1,
@@ -66,7 +66,7 @@ when TINA_SIMULATION_MODE {
 	test_termination_reason_ticks_max :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = HARNESS_NOOP_TYPE_ID,
 				slot_count = 1,
@@ -105,7 +105,7 @@ when TINA_SIMULATION_MODE {
 	test_user_checker_violation_stops_simulation :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = HARNESS_NOOP_TYPE_ID,
 				slot_count = 1,
@@ -161,7 +161,7 @@ when TINA_SIMULATION_MODE {
 	test_final_checkers_run_on_quiescent_termination :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = HARNESS_NOOP_TYPE_ID,
 				slot_count = 1,
@@ -210,7 +210,7 @@ when TINA_SIMULATION_MODE {
 	test_disabled_builtin_checkers_do_not_fire :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = HARNESS_NOOP_TYPE_ID,
 				slot_count = 1,

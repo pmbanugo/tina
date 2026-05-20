@@ -15,7 +15,7 @@ Backpressure in Tina emerges from three bounded resources, each with a hard capa
 
 ### 1. Per-Isolate Mailbox
 
-Every Isolate has a mailbox — a FIFO queue of pending messages. The mailbox capacity is set per Isolate type via `mailbox_capacity` in the `TypeDescriptor` (default: 256 messages).
+Every Isolate has a mailbox — a FIFO queue of pending messages. The mailbox capacity is set per Isolate type via `mailbox_capacity` in the `IsolateTypeDescriptor` (default: 256 messages).
 
 When a sender targets a full mailbox, the scheduler rejects the delivery and drops the message. The message pool slot is not allocated. The sender receives `.mailbox_full` as the return value.
 

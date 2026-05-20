@@ -12,7 +12,7 @@ when TINA_SIMULATION_MODE {
 	// Verifies every shard ticks exactly once per round by using a user checker
 	// that inspects shard.current_tick progression across rounds.
 
-	SCHED_NOOP_TYPE_ID: Type_Id : 0
+	SCHED_NOOP_TYPE_ID: Isolate_Type_Id : 0
 
 	SchedNoopIsolate :: struct {}
 
@@ -31,7 +31,7 @@ when TINA_SIMULATION_MODE {
 		SHARD_COUNT :: 3
 		TICKS :: 10
 
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = SCHED_NOOP_TYPE_ID,
 				slot_count = 1,

@@ -416,7 +416,7 @@ Tick 6:  Dispatcher sends Job #9 to Worker #0 (Handle = 0xBB) → .ok ✓
 
 ```odin
 main :: proc() {
-    types := [2]tina.TypeDescriptor{
+    types := [2]tina.IsolateTypeDescriptor{
         {
             id               = DISPATCHER_TYPE,
             slot_count       = 1,                          // one dispatcher

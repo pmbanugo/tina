@@ -20,7 +20,7 @@ This guide walks through every tuning knob, organized by subsystem.
 
 ---
 
-## Mailbox Capacity (`mailbox_capacity` on TypeDescriptor)
+## Mailbox Capacity (`mailbox_capacity` on IsolateTypeDescriptor)
 
 **What it controls:** The maximum number of messages that can be queued for any single Isolate of this type. When an Isolate's mailbox is full, further sends to it return `Send_Result.mailbox_full`.
 
@@ -87,7 +87,7 @@ ring_overrides := [1]tina.Ring_Override{
 
 ---
 
-## Working Memory (`working_memory_size` on TypeDescriptor)
+## Working Memory (`working_memory_size` on IsolateTypeDescriptor)
 
 **What it controls:** Per-Isolate private arena for data that persists across handler invocations but dies with the Isolate. Accessed via `ctx_working_arena()`. Set per Isolate type.
 
@@ -105,7 +105,7 @@ ring_overrides := [1]tina.Ring_Override{
 
 **What it controls:** Shard-wide temporary memory, reset before every handler invocation. Accessed via `ctx_scratch_arena()`. Used for string formatting, parsing, intermediate computations — anything that doesn't need to survive past the current handler call.
 
-**How to size it:** Find the single most memory-hungry handler across all Isolate types on the Shard. The scratch arena must be at least that large. Each type can declare `scratch_requirement_max` on its `TypeDescriptor` — startup validation ensures the scratch arena is large enough.
+**How to size it:** Find the single most memory-hungry handler across all Isolate types on the Shard. The scratch arena must be at least that large. Each type can declare `scratch_requirement_max` on its `IsolateTypeDescriptor` — startup validation ensures the scratch arena is large enough.
 
 **What happens when it's too small:** Scratch allocations fail (return nil). Startup validation catches this if `scratch_requirement_max` is set correctly.
 
@@ -115,7 +115,7 @@ ring_overrides := [1]tina.Ring_Override{
 
 ---
 
-## Isolate Slots (`slot_count` on TypeDescriptor)
+## Isolate Slots (`slot_count` on IsolateTypeDescriptor)
 
 **What it controls:** The maximum number of Isolates of this type that can exist simultaneously on one Shard. Each slot is pre-allocated in the typed arena: `slot_count × stride` bytes.
 

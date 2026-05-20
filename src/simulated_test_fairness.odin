@@ -10,8 +10,8 @@ when TINA_SIMULATION_MODE {
 	// Intra-Type Starvation Prevention (Dispatch Cursor Verification)
 	// ============================================================================
 
-	STARVATION_COORD_ID: Type_Id : 0
-	STARVATION_WORKER_ID: Type_Id : 1
+	STARVATION_COORD_ID: Isolate_Type_Id : 0
+	STARVATION_WORKER_ID: Isolate_Type_Id : 1
 
 	StarvationWorker :: struct {
 		run_count: u32,
@@ -57,7 +57,7 @@ when TINA_SIMULATION_MODE {
 	test_intra_type_starvation_prevention :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [2]TypeDescriptor {
+		types := [2]IsolateTypeDescriptor {
 			{
 				id                = STARVATION_COORD_ID,
 				slot_count        = 1,

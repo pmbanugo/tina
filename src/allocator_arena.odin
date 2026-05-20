@@ -179,7 +179,7 @@ hydrate_shard :: proc(
 
 	// 2. Allocate the Slice Headers
 	alloc_data.current_name = "Slice_Headers"
-	shard.type_descriptors = make([]TypeDescriptor, types_count, alloc)
+	shard.type_descriptors = make([]IsolateTypeDescriptor, types_count, alloc)
 	shard.isolate_memory = make([][]u8, types_count, alloc)
 	shard.working_memory = make([][]u8, types_count, alloc)
 	shard.metadata = make([]#soa[]Isolate_Metadata, types_count, alloc)
@@ -200,7 +200,7 @@ hydrate_shard :: proc(
 		// Apply defaults at startup
 		desc := t
 		type_index := int(u16(desc.id))
-		assert(type_index == i, "TypeDescriptor ids must match dense descriptor index")
+		assert(type_index == i, "IsolateTypeDescriptor ids must match dense descriptor index")
 		if desc.budget_weight == 0 do desc.budget_weight = 1
 		if desc.mailbox_capacity == 0 do desc.mailbox_capacity = 256
 
@@ -396,7 +396,7 @@ arena_print_layout :: proc(arena: ^Grand_Arena) {
 // === TESTS ===
 @(test)
 test_grand_arena :: proc(t: ^testing.T) {
-	types := [1]TypeDescriptor {
+	types := [1]IsolateTypeDescriptor {
 		{
 			id = 0,
 			slot_count = 10,

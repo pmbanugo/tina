@@ -24,12 +24,12 @@ when TINA_SIMULATION_MODE {
 		unreachable()
 	}
 
-	COORDINATOR_TYPE_ID: Type_Id : 0
-	PING_TYPE_ID: Type_Id : 1
-	PONG_TYPE_ID: Type_Id : 2
-	SUPERVISOR_TYPE_ID: Type_Id : 3
-	EXITER_TYPE_ID: Type_Id : 4
-	BYSTANDER_TYPE_ID: Type_Id : 5
+	COORDINATOR_TYPE_ID: Isolate_Type_Id : 0
+	PING_TYPE_ID: Isolate_Type_Id : 1
+	PONG_TYPE_ID: Isolate_Type_Id : 2
+	SUPERVISOR_TYPE_ID: Isolate_Type_Id : 3
+	EXITER_TYPE_ID: Isolate_Type_Id : 4
+	BYSTANDER_TYPE_ID: Isolate_Type_Id : 5
 
 	APP_TAG_PING: Message_Tag : USER_MESSAGE_TAG_BASE + 1
 	APP_TAG_PONG: Message_Tag : USER_MESSAGE_TAG_BASE + 2
@@ -147,7 +147,7 @@ when TINA_SIMULATION_MODE {
 	test_ping_pong_simulation :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [3]TypeDescriptor {
+		types := [3]IsolateTypeDescriptor {
 			{
 				id = COORDINATOR_TYPE_ID,
 				slot_count = 1,

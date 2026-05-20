@@ -32,7 +32,7 @@ test_my_scenario :: proc(t: ^testing.T) {
     defer free_all(context.temp_allocator)
 
     // 1. Define isolate types with init/handler functions
-    types := [1]TypeDescriptor{
+    types := [1]IsolateTypeDescriptor{
         {
             id = 0, slot_count = 10,
             stride = size_of(MyIsolate),

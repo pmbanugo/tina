@@ -17,7 +17,7 @@ when TINA_SIMULATION_MODE {
 	//   4. The stale I/O completion arrives later -> io_sequence mismatch -> buffer freed
 	//   5. After quiescence, the reactor buffer pool is whole (no leaks)
 
-	IO_TIMEOUT_TYPE_ID: Type_Id : 6
+	IO_TIMEOUT_TYPE_ID: Isolate_Type_Id : 6
 	APP_TAG_IO_TIMEOUT: Message_Tag : USER_MESSAGE_TAG_BASE + 3
 
 	IoTimeoutIsolate :: struct {
@@ -63,7 +63,7 @@ when TINA_SIMULATION_MODE {
 	test_io_sequence_stale_completion_reclamation :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [7]TypeDescriptor {
+		types := [7]IsolateTypeDescriptor {
 			{
 				id = COORDINATOR_TYPE_ID,
 				slot_count = 1,
@@ -199,8 +199,8 @@ when TINA_SIMULATION_MODE {
 	// Teardown step 2b: write/send buffer reclamation via one_for_all
 	// ============================================================================
 
-	WRITE_CRASHER_TYPE_ID: Type_Id : 0 // Must be lower than Writer for dispatch ordering
-	WRITE_WRITER_TYPE_ID: Type_Id : 1
+	WRITE_CRASHER_TYPE_ID: Isolate_Type_Id : 0 // Must be lower than Writer for dispatch ordering
+	WRITE_WRITER_TYPE_ID: Isolate_Type_Id : 1
 
 	WriteCrasherIsolate :: struct {}
 	WriteWriterIsolate :: struct {
@@ -242,7 +242,7 @@ when TINA_SIMULATION_MODE {
 	test_write_buffer_reclamation_on_teardown :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [2]TypeDescriptor {
+		types := [2]IsolateTypeDescriptor {
 			{
 				id = WRITE_CRASHER_TYPE_ID,
 				slot_count = 1,
@@ -330,7 +330,7 @@ when TINA_SIMULATION_MODE {
 	// Shutdown dispatch priority: I/O completion > TAG_SHUTDOWN > inbox
 	// ============================================================================
 
-	PRIORITY_TYPE_ID: Type_Id : 0
+	PRIORITY_TYPE_ID: Isolate_Type_Id : 0
 
 	PriorityTestIsolate :: struct {
 		received_tags:  [4]Message_Tag,
@@ -354,7 +354,7 @@ when TINA_SIMULATION_MODE {
 	test_shutdown_dispatch_priority_io_before_shutdown :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [1]TypeDescriptor {
+		types := [1]IsolateTypeDescriptor {
 			{
 				id = PRIORITY_TYPE_ID,
 				slot_count = 1,

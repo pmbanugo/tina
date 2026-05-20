@@ -170,7 +170,7 @@ test_with_local_context :: proc(
 	type_count :=
 		max(int(extract_type_id(config.self_handle)), int(extract_type_id(config.target_handle))) +
 		1
-	shard.type_descriptors = make([]TypeDescriptor, type_count)
+	shard.type_descriptors = make([]IsolateTypeDescriptor, type_count)
 	defer delete(shard.type_descriptors)
 	shard.metadata = make([]#soa[]Isolate_Metadata, type_count)
 	defer delete(shard.metadata)
@@ -201,7 +201,7 @@ test_with_local_context :: proc(
 		mailbox_capacity = 8
 	}
 	shard.type_descriptors[target_type_id].mailbox_capacity = u16(mailbox_capacity)
-	shard.type_descriptors[target_type_id].id = Type_Id(target_type_id)
+	shard.type_descriptors[target_type_id].id = Isolate_Type_Id(target_type_id)
 	shard.metadata[target_type_id][target_slot_index].generation = extract_generation(
 		config.target_handle,
 	)

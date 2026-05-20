@@ -5,7 +5,7 @@ import "core:mem"
 import "core:testing"
 
 Shard_Id :: distinct u8
-Type_Id :: distinct u16
+Isolate_Type_Id :: distinct u16
 MAX_SHARD_COUNT :: 255 // Max count fits in u8. Sacrifices the 256th slot to avoid u16 counts.
 REMOTE_SHARD_COUNT_MAX :: MAX_SHARD_COUNT - 1
 MIN_RING_SIZE :: 16
@@ -73,7 +73,7 @@ REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
 )
 
 #assert(size_of(Shard_Id) == 1)
-#assert(size_of(Type_Id) == 2)
+#assert(size_of(Isolate_Type_Id) == 2)
 #assert(MAX_SHARD_COUNT > 0)
 #assert(MAX_SHARD_COUNT == 255)
 #assert(REMOTE_SHARD_COUNT_MAX == MAX_SHARD_COUNT - 1)
@@ -105,8 +105,8 @@ Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect
 Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
-TypeDescriptor :: struct {
-	id:                      Type_Id,
+IsolateTypeDescriptor :: struct {
+	id:                      Isolate_Type_Id,
 	slot_count:              int,
 	stride:                  int,
 	soa_metadata_size:       int,
@@ -172,7 +172,7 @@ SystemSpec :: struct {
 	dio:                       ^Dio_Config, // nil means DIO disabled
 
 	// Subsystem parameters
-	types:                     []TypeDescriptor,
+	types:                     []IsolateTypeDescriptor,
 	shard_specs:               []ShardSpec,
 	timer_resolution_ns:       u64,
 	pool_slot_count:           int,
@@ -215,7 +215,7 @@ Supervision_Strategy :: enum u8 {
 }
 
 Static_Child_Spec :: struct {
-	type_id:      Type_Id,
+	type_id:      Isolate_Type_Id,
 	restart_type: Restart_Type,
 	args_size:    u8,
 	args_payload: [MAX_INIT_ARGS_SIZE]u8,
@@ -299,7 +299,7 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 			return .InvalidTypeId
 		}
 
-		expected_type_id := Type_Id(type_index)
+		expected_type_id := Isolate_Type_Id(type_index)
 		if t.id != expected_type_id {
 			fmt.eprintfln(
 				"[FATAL] Type ID %v must equal dense descriptor index %v",
@@ -663,7 +663,7 @@ compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	return (types_count * 3) + 25
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
-	// 2-6. Slice headers for TypeDescriptor/isolate/working/metadata/free-head arrays
+	// 2-6. Slice headers for IsolateTypeDescriptor/isolate/working/metadata/free-head arrays
 	// 7. Dispatch Cursors
 	// 8. Dispatch Credit Counts
 	// 9. Message Pool
@@ -752,7 +752,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
 	slice_headers_overhead :=
 		types_count *
-		(size_of(TypeDescriptor) + size_of([]u8) * 2 + size_of(#soa[]Isolate_Metadata))
+		(size_of(IsolateTypeDescriptor) + size_of([]u8) * 2 + size_of(#soa[]Isolate_Metadata))
 	total += slice_headers_overhead
 	// Account for scheduler/type arrays: isolate_free_heads, dispatch_cursors, and dispatch_credit_counts.
 	total += types_count * size_of(u32) * 2
@@ -777,7 +777,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 // === TESTS ===
 @(test)
 test_system_spec_validation :: proc(t: ^testing.T) {
-	types := [2]TypeDescriptor {
+	types := [2]IsolateTypeDescriptor {
 		{id = 0, scratch_requirement_max = 1024},
 		{id = 1, scratch_requirement_max = 4096},
 	}
@@ -846,7 +846,7 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 
 @(test)
 test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
-	types := [2]TypeDescriptor {
+	types := [2]IsolateTypeDescriptor {
 		{id = 0},
 		{id = 2},
 	}
@@ -879,7 +879,7 @@ test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
 when TINA_SIMULATION_MODE {
 	@(test)
 	test_simulation_config_validation :: proc(t: ^testing.T) {
-		types := [1]TypeDescriptor{{id = 0, scratch_requirement_max = 0}}
+		types := [1]IsolateTypeDescriptor{{id = 0, scratch_requirement_max = 0}}
 
 		children := [1]Child_Spec{Static_Child_Spec{type_id = 0, restart_type = .permanent}}
 		root_group := Group_Spec {

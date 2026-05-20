@@ -4,9 +4,9 @@ import "core:mem"
 import "core:testing"
 
 when TINA_SIMULATION_MODE {
-	FD_HANDOFF_LISTENER_TYPE_ID: Type_Id : 0
-	FD_HANDOFF_DISPATCHER_TYPE_ID: Type_Id : 1
-	FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID: Type_Id : 1
+	FD_HANDOFF_LISTENER_TYPE_ID: Isolate_Type_Id : 0
+	FD_HANDOFF_DISPATCHER_TYPE_ID: Isolate_Type_Id : 1
+	FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID: Isolate_Type_Id : 1
 
 	FDHandoffListener :: struct {
 		listen_fd:      FD_Handle,
@@ -109,7 +109,7 @@ when TINA_SIMULATION_MODE {
 			bytes_of(&target_handle),
 		)
 
-		types := [2]TypeDescriptor {
+		types := [2]IsolateTypeDescriptor {
 			{
 				id = FD_HANDOFF_LISTENER_TYPE_ID,
 				slot_count = 1,
@@ -219,7 +219,7 @@ when TINA_SIMULATION_MODE {
 			bytes_of(&target_handle),
 		)
 
-		types := [2]TypeDescriptor {
+		types := [2]IsolateTypeDescriptor {
 			{
 				id = FD_HANDOFF_LISTENER_TYPE_ID,
 				slot_count = 1,
@@ -321,7 +321,7 @@ when TINA_SIMULATION_MODE {
 			bytes_of(&target_handle),
 		)
 
-		types := [2]TypeDescriptor {
+		types := [2]IsolateTypeDescriptor {
 			{
 				id = FD_HANDOFF_LISTENER_TYPE_ID,
 				slot_count = 1,
@@ -447,7 +447,7 @@ when TINA_SIMULATION_MODE {
 			bytes_of(&target_handle),
 		)
 
-		types := [2]TypeDescriptor {
+		types := [2]IsolateTypeDescriptor {
 			{
 				id = FD_HANDOFF_LISTENER_TYPE_ID,
 				slot_count = 1,

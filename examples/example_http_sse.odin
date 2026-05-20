@@ -279,10 +279,10 @@ main :: proc() {
 
 	spec := http.install_development_defaults(&server)
 
-	publisher_type_id := tina.Type_Id(len(spec.types))
-	new_types := make([]tina.TypeDescriptor, len(spec.types) + 1)
+	publisher_type_id := tina.Isolate_Type_Id(len(spec.types))
+	new_types := make([]tina.IsolateTypeDescriptor, len(spec.types) + 1)
 	copy(new_types, spec.types)
-	new_types[publisher_type_id] = tina.TypeDescriptor {
+	new_types[publisher_type_id] = tina.IsolateTypeDescriptor {
 		id                = publisher_type_id,
 		slot_count        = 1,
 		stride            = size_of(PublisherIsolate),

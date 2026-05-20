@@ -93,7 +93,7 @@ listener_handler :: proc(
 
             // Spawn the Connection Isolate.
             spec := tina.Spawn_Spec{
-                type_id      = CONN_TYPE,                              // which TypeDescriptor to use
+                type_id      = CONN_TYPE,                              // which IsolateTypeDescriptor to use
                 group_id     = tina.ctx_supervision_group_id(ctx),     // same supervision group as us
                 restart_type = .temporary,                             // don't restart on clean exit
                 args_payload = payload,                                // serialized ConnectionArgs
@@ -129,7 +129,7 @@ package main
 import tina "../src"
 import "core:mem"
 
-// ---- Type IDs (unique per Isolate type, used in TypeDescriptor and Spawn_Spec) ----
+// ---- Type IDs (unique per Isolate type, used in IsolateTypeDescriptor and Spawn_Spec) ----
 LISTENER_TYPE: u8 : 0
 CONN_TYPE:     u8 : 1
 
@@ -254,9 +254,9 @@ import "core:fmt"
 
 main :: proc() {
     // ---- 1. Register Isolate types ----
-    // Each TypeDescriptor tells the framework how much memory to reserve,
+    // Each IsolateTypeDescriptor tells the framework how much memory to reserve,
     // which functions to call, and how many Isolates of this type can exist.
-    types := [2]tina.TypeDescriptor{
+    types := [2]tina.IsolateTypeDescriptor{
         {
             id               = LISTENER_TYPE,               // matches LISTENER_TYPE constant
             slot_count       = 1,                            // only one listener per shard

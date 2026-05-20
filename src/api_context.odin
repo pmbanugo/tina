@@ -556,7 +556,7 @@ ctx_root_supervision_group_id :: #force_inline proc() -> Supervision_Group_Id {
 	return SUPERVISION_GROUP_ID_ROOT
 }
 
-ctx_type_config :: #force_inline proc(ctx: TinaContext) -> ^TypeDescriptor {
+ctx_type_config :: #force_inline proc(ctx: TinaContext) -> ^IsolateTypeDescriptor {
 	invocation := ctx_invocation(ctx)
 	return &invocation.shard.type_descriptors[invocation.type_id]
 }

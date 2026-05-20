@@ -50,7 +50,7 @@ when TINA_SIMULATION_MODE {
 	test_temporary_child_exit_no_escalation :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [6]TypeDescriptor {
+		types := [6]IsolateTypeDescriptor {
 			{
 				id = COORDINATOR_TYPE_ID,
 				slot_count = 1,
@@ -177,7 +177,7 @@ when TINA_SIMULATION_MODE {
 	test_mixed_static_subgroup_and_dynamic_children :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		types := [6]TypeDescriptor {
+		types := [6]IsolateTypeDescriptor {
 			{
 				id = COORDINATOR_TYPE_ID,
 				slot_count = 1,

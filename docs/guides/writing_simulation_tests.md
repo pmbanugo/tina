@@ -89,7 +89,7 @@ Build a boot spec that includes both your real Isolate types AND the TestDriver.
 ```odin
 main :: proc() {
     // ---- Real types + TestDriver ----
-    types := [3]tina.TypeDescriptor{
+    types := [3]tina.IsolateTypeDescriptor{
         // Real application types (same as production)
         {
             id         = 0,

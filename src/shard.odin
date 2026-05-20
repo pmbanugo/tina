@@ -113,7 +113,7 @@ Shard_Counters :: struct {
 
 Dynamic_Child_Spec :: struct {
 	args_payload: [MAX_INIT_ARGS_SIZE]u8,
-	type_id:      Type_Id,
+	type_id:      Isolate_Type_Id,
 	restart_type: Restart_Type,
 	args_size:    u8,
 	_padding:     [5]u8,
@@ -153,7 +153,7 @@ Shard :: struct {
 	// --- Hot Pointers & Slices (8-byte aligned) ---
 	outbound_rings:         []^SPSC_Ring,
 	inbound_rings:          []^SPSC_Ring,
-	type_descriptors:       []TypeDescriptor,
+	type_descriptors:       []IsolateTypeDescriptor,
 	isolate_free_heads:     []u32, // free list heads per Isolate Type
 	dispatch_cursors:       []u32, // Resumption index for budgeted dispatch
 	dispatch_credit_counts: []Scheduler_Credit_Count,
@@ -616,7 +616,7 @@ _dispatch_ready_find_next_type :: proc "contextless" (
 @(private = "file")
 _dispatch_type_batch :: proc(
 	shard: ^Shard,
-	type_descriptor: TypeDescriptor,
+	type_descriptor: IsolateTypeDescriptor,
 	work_budget_count: Scheduler_Work_Count,
 ) -> Scheduler_Work_Count {
 	if work_budget_count == 0 {
@@ -1951,7 +1951,7 @@ _alloc_handoff_test_entry :: proc(
 
 @(private = "file")
 _make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
-	types := [1]TypeDescriptor {
+	types := [1]IsolateTypeDescriptor {
 		{
 			id                      = 0,
 			slot_count              = 1,

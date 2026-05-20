@@ -20,7 +20,7 @@ The root boot specification for the entire Tina process.
 | `safety_margin` | `f32` | `0.9` | Memory safety margin multiplier. If 0 or negative, the framework applies 0.9 (90% of system RAM). |
 | `watchdog` | `Watchdog_Config` | — | Watchdog thread configuration. |
 | `dio` | `^Dio_Config` | `nil` | Direct I/O configuration. `nil` means DIO disabled. Currently reserved. |
-| `types` | `[]TypeDescriptor` | — | **Required.** Registered Isolate types. 1–254 entries. |
+| `types` | `[]IsolateTypeDescriptor` | — | **Required.** Registered Isolate types. 1–254 entries. |
 | `shard_specs` | `[]ShardSpec` | — | **Required.** Per-Shard configurations. Length must equal `shard_count`. |
 | `shard_count` | `u8` | — | **Required.** Number of Shards (OS threads). 1–255. |
 | `timer_resolution_ns` | `u64` | — | **Required.** Timer wheel resolution in nanoseconds. Must be > 0. |
@@ -36,7 +36,7 @@ The root boot specification for the entire Tina process.
 | `fd_entry_size` | `int` | `0` | Size of each FD entry. Use `size_of(tina.FD_Entry)`. |
 | `log_ring_size` | `int` | — | **Required.** Logging Subsystem buffer capacity. Must be a power of 2. |
 | `supervision_groups_max` | `int` | `0` | Max supervision groups per Shard. |
-| `scratch_arena_size` | `int` | `0` | Scratch arena size in bytes. Must be >= the largest `TypeDescriptor.scratch_requirement_max`. |
+| `scratch_arena_size` | `int` | `0` | Scratch arena size in bytes. Must be >= the largest `IsolateTypeDescriptor.scratch_requirement_max`. |
 | `default_ring_size` | `u32` | — | **Required.** Default cross-shard messaging channel capacity. Must be a power of 2, >= 16. |
 | `ring_overrides` | `[]Ring_Override` | `nil` | Per-pair or per-shard ring size overrides. |
 | `simulation` | `^SimulationConfig` | `nil` | Simulation mode config. Only present when compiled with `TINA_SIM=true`. |
@@ -55,7 +55,7 @@ Per-Shard (OS thread) configuration.
 
 ---
 
-## `TypeDescriptor`
+## `IsolateTypeDescriptor`
 
 Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 
@@ -102,7 +102,7 @@ A statically declared child in the supervision tree. Spawned at boot and on rest
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type_id` | `u8` | — | Registered `TypeDescriptor.id`. Must reference a valid type. |
+| `type_id` | `u8` | — | Registered `IsolateTypeDescriptor.id`. Must reference a valid type. |
 | `restart_type` | `Restart_Type` | — | `.permanent`, `.transient`, or `.temporary`. |
 | `args_size` | `u8` | `0` | Byte count of serialized args within `args_payload`. |
 | `args_payload` | `[MAX_INIT_ARGS_SIZE]u8` | `{}` | Serialized init args (max 64 bytes). Use `init_args_of` to populate. |
@@ -117,7 +117,7 @@ Runtime spawn configuration passed to `ctx_spawn`.
 |-------|------|---------|-------------|
 | `args_payload` | `[MAX_INIT_ARGS_SIZE]u8` | `{}` | Serialized init args. |
 | `group_id` | `Supervision_Group_Id` | — | Target supervision group. Use `ctx_supervision_group_id(ctx)` or `SUPERVISION_GROUP_ID_NONE`. |
-| `type_id` | `u8` | — | Registered `TypeDescriptor.id`. |
+| `type_id` | `u8` | — | Registered `IsolateTypeDescriptor.id`. |
 | `restart_type` | `Restart_Type` | — | `.permanent`, `.transient`, or `.temporary`. |
 | `args_size` | `u8` | `0` | Byte count within `args_payload`. |
 | `handoff_mode` | `Handoff_Mode` | `.Full` | FD ownership transfer mode (`.Full`, `.Read_Only`, `.Write_Only`). |
@@ -334,7 +334,7 @@ These fields must be powers of 2 (1, 2, 4, 8, 16, 32, ...):
 |-------|-----|-----|-------|
 | `shard_count` | 1 | 255 | `len(shard_specs)` must equal `shard_count`. |
 | `types` (length) | 1 | 254 | Type IDs must be unique and <= 254. ID 255 is reserved. |
-| `TypeDescriptor.slot_count` | — | 1,048,575 | 20-bit slot index. |
+| `IsolateTypeDescriptor.slot_count` | — | 1,048,575 | 20-bit slot index. |
 | `reactor_buffer_slot_count` | — | 4,094 | 12-bit token field. |
 | `timer_resolution_ns` | 1 | — | Must be > 0. |
 
@@ -346,7 +346,7 @@ These fields must be powers of 2 (1, 2, 4, 8, 16, 32, ...):
 
 ### Arena Constraints
 
-- `scratch_arena_size` >= the largest `TypeDescriptor.scratch_requirement_max` across all types.
+- `scratch_arena_size` >= the largest `IsolateTypeDescriptor.scratch_requirement_max` across all types.
 
 ### Simulation Constraints (when `TINA_SIM=true`)
 
@@ -391,7 +391,7 @@ my_handler :: proc(self: rawptr, msg: ^tina.Message, ctx: ^tina.TinaContext) -> 
 }
 
 main :: proc() {
-    types := [1]tina.TypeDescriptor{{
+    types := [1]tina.IsolateTypeDescriptor{{
         id             = 0,
         slot_count     = 1,
         stride         = size_of(MyIsolate),

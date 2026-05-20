@@ -156,7 +156,7 @@ These are non-batched, non-blocking control-plane operations executed during han
 | `ctx_shard_id` | `ctx_shard_id(ctx) -> u8` | `u8` | Current Shard's ID. |
 | `ctx_supervision_group_id` | `ctx_supervision_group_id(ctx) -> Supervision_Group_Id` | `Supervision_Group_Id` | Current Isolate's supervision group. |
 | `ctx_root_supervision_group_id` | `ctx_root_supervision_group_id() -> Supervision_Group_Id` | `Supervision_Group_Id` | Root supervision group ID (constant `0`). No `ctx` parameter. |
-| `ctx_type_config` | `ctx_type_config(ctx) -> ^TypeDescriptor` | `^TypeDescriptor` | Type descriptor for current Isolate's registered type. |
+| `ctx_type_config` | `ctx_type_config(ctx) -> ^IsolateTypeDescriptor` | `^IsolateTypeDescriptor` | Type descriptor for current Isolate's registered type. |
 
 ---
 
@@ -290,7 +290,7 @@ Configuration passed to `ctx_spawn`.
 Spawn_Spec :: struct {
     args_payload: [MAX_INIT_ARGS_SIZE]u8,  // Serialized init args (max 64 bytes).
     group_id:     Supervision_Group_Id,     // Target supervision group.
-    type_id:      u8,                       // Registered TypeDescriptor ID.
+    type_id:      u8,                       // Registered IsolateTypeDescriptor ID.
     restart_type: Restart_Type,             // permanent | transient | temporary.
     args_size:    u8,                       // Actual byte count within args_payload.
     handoff_mode: Handoff_Mode,             // FD ownership transfer mode.

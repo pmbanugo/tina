@@ -15,7 +15,7 @@ when TINA_SIMULATION_MODE {
 	}
 
 	run_ping_pong_simulation_once :: proc(seed: u64) -> Ping_Pong_Run_Result {
-		types := [3]TypeDescriptor {
+		types := [3]IsolateTypeDescriptor {
 			{
 				id = COORDINATOR_TYPE_ID,
 				slot_count = 1,
@@ -132,7 +132,7 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		run_with_faults :: proc(seed: u64) -> Ping_Pong_Run_Result {
-			types := [3]TypeDescriptor {
+			types := [3]IsolateTypeDescriptor {
 				{
 					id = COORDINATOR_TYPE_ID,
 					slot_count = 1,

@@ -123,10 +123,10 @@ There is no privileged injection API. No god-mode message insertion. No bypassin
 SystemSpec {
     types = [
         // Real application types
-        TypeDescriptor { id = 0, handler_fn = session_handler, ... },
-        TypeDescriptor { id = 1, handler_fn = router_handler, ...  },
+        IsolateTypeDescriptor { id = 0, handler_fn = session_handler, ... },
+        IsolateTypeDescriptor { id = 1, handler_fn = router_handler, ...  },
         // Test workload driver (simulation only)
-        TypeDescriptor { id = 100, handler_fn = driver_handler, ... },
+        IsolateTypeDescriptor { id = 100, handler_fn = driver_handler, ... },
     ],
     simulation = SimulationConfig {
         seed = 0xDEADBEEF,

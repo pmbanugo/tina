@@ -150,7 +150,7 @@ The echo example runs a two-shard TCP server. A chaos client crashes after a few
 | [`docs/guides/tuning_the_boot_spec.md`](./docs/guides/tuning_the_boot_spec.md) | Sizing every knob — pools, mailboxes, channels, buffers, timers, workload profiles |
 | **Reference** | |
 | [`docs/reference/the_ctx_api.md`](./docs/reference/the_ctx_api.md) | Complete `ctx` API — messaging, spawning, memory, I/O, timers, all types |
-| [`docs/reference/system_spec.md`](./docs/reference/system_spec.md) | SystemSpec, ShardSpec, TypeDescriptor, supervision, simulation config |
+| [`docs/reference/system_spec.md`](./docs/reference/system_spec.md) | SystemSpec, ShardSpec, IsolateTypeDescriptor, supervision, simulation config |
 | **Examples** | |
 | [`examples/`](./examples) | Runnable examples with detailed walkthroughs |
 | [`src/README_DST.md`](./src/README_DST.md) | Deterministic Simulation Testing — writing tests, fault injection, reproducing failures |

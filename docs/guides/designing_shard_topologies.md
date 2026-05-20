@@ -294,7 +294,7 @@ APP_TAG_SPAWN_RESPONSE: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 11
 
 // Sent from any Shard to the target Shard's Coordinator.
 SpawnRequest :: struct {
-    type_id:    u8,       // which TypeDescriptor to instantiate
+    type_id:    u8,       // which IsolateTypeDescriptor to instantiate
     client_id:  u64,      // key that determined this Shard (for logging/debug)
     client_fd:  tina.FD_Handle,  // FD to hand off to the new Isolate
 }
