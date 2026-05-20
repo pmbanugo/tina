@@ -53,6 +53,7 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		sim := _make_fd_invariant_simulator(t, {.FD_Table_Integrity})
+		defer simulator_deinit(&sim)
 		shard := &sim.shards[0]
 		owner := make_handle(0, u16(HARNESS_NOOP_TYPE_ID), 0, 1)
 
@@ -79,6 +80,7 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		sim := _make_fd_invariant_simulator(t, {.FD_Handoff_Integrity}, 2)
+		defer simulator_deinit(&sim)
 		shard := &sim.shards[0]
 		target_handle := make_handle(0, u16(HARNESS_NOOP_TYPE_ID), 0, 1)
 
@@ -117,6 +119,7 @@ when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
 
 		sim := _make_fd_invariant_simulator(t, {.Sim_FD_Integrity})
+		defer simulator_deinit(&sim)
 		backend := &sim.shards[0].reactor.backend
 
 		fd, sock_err := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)

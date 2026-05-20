@@ -2158,6 +2158,7 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 test_shard_mass_teardown_resets_scheduler_state :: proc(t: ^testing.T) {
 	shard, arena := _make_teardown_test_shard(t)
 	defer {
+		reactor_deinit(&shard.reactor)
 		os_release_arena_with_guard(arena.base)
 		free(arena)
 		free(shard)

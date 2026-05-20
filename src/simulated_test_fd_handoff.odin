@@ -174,6 +174,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {0, 0}
@@ -287,6 +288,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {64, 64}
@@ -386,6 +388,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {0, 0}
@@ -512,6 +515,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {0, 0}

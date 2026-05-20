@@ -88,6 +88,7 @@ when TINA_SIMULATION_MODE {
 		if err != .None {
 			panic("simulator_init failed in run_ping_pong_simulation_once")
 		}
+		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
 
@@ -208,6 +209,7 @@ when TINA_SIMULATION_MODE {
 			if err != .None {
 				panic("simulator_init failed in run_with_faults")
 			}
+			defer simulator_deinit(&sim)
 
 			simulator_run(&sim)
 

@@ -55,6 +55,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
 
@@ -94,6 +95,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
 
@@ -146,6 +148,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
 
@@ -199,6 +202,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
 
@@ -248,6 +252,7 @@ when TINA_SIMULATION_MODE {
 		sim: Simulator
 		err := simulator_init(&sim, &spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
 
 		// Corrupt message pool to trigger Pool_Integrity if it were enabled
 		sim.shards[0].message_pool.free_count = sim.shards[0].message_pool.slot_count + 1

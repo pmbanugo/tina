@@ -229,6 +229,20 @@ when TINA_SIMULATION_MODE {
 	}
 
 	// ============================================================================
+	// Simulation Teardown
+	// ============================================================================
+	// Symmetric counterpart to simulator_init. Walks every shard and calls
+	// reactor_deinit so that the thread-local g_sim_fd_state (active_backend_count,
+	// bound objects, descriptor table) is properly released. Without this,
+	// stale bound addresses and non-zero active_backend_count leak across tests
+	// running on the same OS thread, causing order-dependent failures.
+	simulator_deinit :: proc(sim: ^Simulator) {
+		for i in 0 ..< sim.spec.shard_count {
+			reactor_deinit(&sim.shards[i].reactor)
+		}
+	}
+
+	// ============================================================================
 	// End-of-Simulation Summary
 	// ============================================================================
 	@(private = "file")
