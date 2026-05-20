@@ -898,7 +898,7 @@ _connection_handle_application_mailbox_message :: proc(
 				Application_Reply {
 					source_handle = state.application_expected_source,
 					message_tag = state.application_expected_tag,
-					payload_bytes = nil,
+					payload_bytes = {},
 					reply_result = .Timeout,
 				},
 			)
@@ -979,7 +979,7 @@ _connection_handle_application_mailbox_message :: proc(
 			Application_Reply {
 				source_handle = state.application_expected_source,
 				message_tag = state.application_expected_tag,
-				payload_bytes = nil,
+				payload_bytes = {},
 				reply_result = .Timeout,
 			},
 		)
@@ -1197,7 +1197,7 @@ _connection_drive_body_read :: proc(
 		route_context := _make_route_context(state, ctx)
 		state.request_body_complete_notified = true
 		step := _dispatch_route_event(
-			Route_Event(Body_Chunk{data = nil, is_last = true}),
+			Route_Event(Body_Chunk{data = {}, is_last = true}),
 			&request,
 			&response,
 			route_context,
