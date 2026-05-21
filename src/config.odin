@@ -1023,6 +1023,7 @@ SimulationConfig :: struct {
 	builtin_checkers:       Checker_Flags,
 	user_checkers:          []Checker_Fn,
 	checker_interval_ticks: u32,
+	sim_io_world:           rawptr, // ^Sim_IO_World; set by simulator_init before hydration
 }
 
 // --- Topology / Painter's Algorithm ---

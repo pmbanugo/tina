@@ -957,9 +957,15 @@ _alloc_and_copy_in :: #force_inline proc(
 
 @(test)
 test_reactor_init_deinit :: proc(t: ^testing.T) {
+	_world_ptr: rawptr
+	when TINA_SIMULATION_MODE {
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
+		_world_ptr = cast(rawptr)_world
+	}
 	config := Backend_Config {
 		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
-		sim_config = Simulation_IO_Config{delay_range_ticks = {0, 0}},
+		sim_config = Simulation_IO_Config{delay_range_ticks = {0, 0}, world = _world_ptr},
 	}
 
 	fd_backing: [16]FD_Entry
@@ -978,8 +984,14 @@ test_reactor_init_deinit :: proc(t: ^testing.T) {
 
 @(test)
 test_reactor_control_socket_and_shutdown :: proc(t: ^testing.T) {
+	_world_ptr: rawptr
+	when TINA_SIMULATION_MODE {
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
+		_world_ptr = cast(rawptr)_world
+	}
 	config := Backend_Config {
-		sim_config = Simulation_IO_Config{},
+		sim_config = Simulation_IO_Config{world = _world_ptr},
 	}
 	fd_backing: [4]FD_Entry
 	buffer_backing: [1024]u8
@@ -1049,8 +1061,14 @@ test_backend_error_to_io_error_maps_resource_exhausted :: proc(t: ^testing.T) {
 
 @(test)
 test_close_submission_supersedes_waiting_io_sequence :: proc(t: ^testing.T) {
+	_world_ptr: rawptr
+	when TINA_SIMULATION_MODE {
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
+		_world_ptr = cast(rawptr)_world
+	}
 	config := Backend_Config {
-		sim_config = Simulation_IO_Config{},
+		sim_config = Simulation_IO_Config{world = _world_ptr},
 	}
 	fd_backing: [4]FD_Entry
 	buffer_backing: [1024]u8
@@ -1089,8 +1107,14 @@ test_close_submission_supersedes_waiting_io_sequence :: proc(t: ^testing.T) {
 
 @(test)
 test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
+	_world_ptr: rawptr
+	when TINA_SIMULATION_MODE {
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
+		_world_ptr = cast(rawptr)_world
+	}
 	config := Backend_Config {
-		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, world = _world_ptr},
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
@@ -1134,8 +1158,14 @@ test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
 
 @(test)
 test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
+	_world_ptr: rawptr
+	when TINA_SIMULATION_MODE {
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
+		_world_ptr = cast(rawptr)_world
+	}
 	config := Backend_Config {
-		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, world = _world_ptr},
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
@@ -1167,8 +1197,14 @@ test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
 
 @(test)
 test_close_submission_preserves_fd_handle_for_completion_identity :: proc(t: ^testing.T) {
+	_world_ptr: rawptr
+	when TINA_SIMULATION_MODE {
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
+		_world_ptr = cast(rawptr)_world
+	}
 	config := Backend_Config {
-		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, world = _world_ptr},
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
@@ -1203,8 +1239,14 @@ test_close_submission_preserves_fd_handle_for_completion_identity :: proc(t: ^te
 
 @(test)
 test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
+	_world_ptr: rawptr
+	when TINA_SIMULATION_MODE {
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
+		_world_ptr = cast(rawptr)_world
+	}
 	config := Backend_Config {
-		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}},
+		sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, world = _world_ptr},
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
@@ -1291,12 +1333,12 @@ when TINA_SIMULATION_MODE {
 	@(test)
 	test_reactor_real_os_stale_completion_reclamation :: proc(t: ^testing.T) {
 		// 1. Setup Backing Memory and Reactor
+		_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_world)
 		config := Backend_Config {
 			queue_size = 32,
+			sim_config = Simulation_IO_Config{world = _world},
 		}
-		//when TINA_SIMULATION_MODE {
-		//	config.sim_config = Simulation_IO_Config{delay_range_ticks = {100, 200}, seed = t.seed}
-		//}
 
 		fd_backing: [8]FD_Entry
 		buffer_backing: [4096]u8

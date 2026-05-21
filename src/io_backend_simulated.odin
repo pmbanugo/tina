@@ -57,21 +57,17 @@ when TINA_SIMULATION_MODE {
 		_padding:       [1]u8,
 	}
 
-	Sim_FD_State :: struct {
+	Sim_IO_World :: struct {
 		descriptors:          [MAX_SIMULATED_DESCRIPTORS]Sim_FD_Descriptor,
 		objects:              [MAX_SIMULATED_OBJECTS]Sim_FD_Object,
 		descriptor_free_head: u16,
 		descriptor_free_count: u16,
 		object_free_head:     u16,
 		object_free_count:    u16,
-		active_backend_count: u16,
+		active_backend_count: u16, // INVARIANT ONLY — not used for lifecycle decisions
 		_padding:             u16,
 		next_sim_fd:          i32,
 	}
-
-	@(private = "package")
-	@(thread_local)
-	g_sim_fd_state: Sim_FD_State
 
 	_Platform_State :: struct {
 		pending:       [MAX_SIMULATED_PENDING]Simulated_Operation,
@@ -82,6 +78,7 @@ when TINA_SIMULATION_MODE {
 		time_controlled: bool,
 		_padding:        [7]u8,
 		config:        Simulation_IO_Config,
+		sim_world:     ^Sim_IO_World, // shared context — set before backend_init
 	}
 
 	@(private = "package")
@@ -90,10 +87,11 @@ when TINA_SIMULATION_MODE {
 		backend.tick_count = 0
 		backend.time_controlled = false
 		backend.config = config.sim_config
-		if g_sim_fd_state.active_backend_count == 0 {
-			_sim_fd_state_reset()
+		world := cast(^Sim_IO_World)config.sim_config.world
+		backend.sim_world = world
+		if world != nil {
+			world.active_backend_count += 1
 		}
-		g_sim_fd_state.active_backend_count += 1
 
 		// Seed from config — populated from Prng_Tree at shard hydration,
 		// or from t.seed in tests.
@@ -105,12 +103,13 @@ when TINA_SIMULATION_MODE {
 	@(private = "package")
 	_backend_deinit :: proc(backend: ^Platform_Backend) {
 		backend.pending_count = 0
-		if g_sim_fd_state.active_backend_count > 0 {
-			g_sim_fd_state.active_backend_count -= 1
+		world := backend.sim_world
+		if world != nil {
+			if world.active_backend_count > 0 {
+				world.active_backend_count -= 1
+			}
 		}
-		if g_sim_fd_state.active_backend_count == 0 {
-			_sim_fd_state_reset()
-		}
+		backend.sim_world = nil
 	}
 
 	@(private = "package")
@@ -118,6 +117,7 @@ when TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		submissions: []Submission,
 	) -> Backend_Error {
+		world := backend.sim_world
 		for &sub in submissions {
 			if backend.pending_count >= MAX_SIMULATED_PENDING {
 				return .Queue_Full
@@ -137,7 +137,7 @@ when TINA_SIMULATION_MODE {
 					_sim_unpin_object(backend, object_index)
 					return .System_Error
 				}
-				file_object_index := g_sim_fd_state.descriptors[file_desc_index].object_index
+				file_object_index := world.descriptors[file_desc_index].object_index
 				if !_sim_pin_object(backend, file_object_index) {
 					_sim_unpin_object(backend, object_index)
 					return .System_Error
@@ -337,13 +337,14 @@ when TINA_SIMULATION_MODE {
 		desc, ok := _sim_lookup_descriptor(backend, fd)
 		if !ok do return .System_Error
 
-		object := &g_sim_fd_state.objects[desc.object_index]
+		world := backend.sim_world
+		object := &world.objects[desc.object_index]
 		if object.bound {
 			return .Invalid_Argument
 		}
 
 		for object_index in 0 ..< MAX_SIMULATED_OBJECTS {
-			other := &g_sim_fd_state.objects[object_index]
+			other := &world.objects[object_index]
 			if !other.alive || !other.bound || u16(object_index) == desc.object_index {
 				continue
 			}
@@ -369,7 +370,8 @@ when TINA_SIMULATION_MODE {
 	) -> Backend_Error {
 		desc, ok := _sim_lookup_descriptor(backend, fd)
 		if !ok do return .System_Error
-		object := &g_sim_fd_state.objects[desc.object_index]
+		world := backend.sim_world
+		object := &world.objects[desc.object_index]
 		if !object.bound {
 			return .Invalid_Argument
 		}
@@ -387,7 +389,8 @@ when TINA_SIMULATION_MODE {
 	) -> Backend_Error {
 		desc, ok := _sim_lookup_descriptor(backend, fd)
 		if !ok do return .System_Error
-		object := &g_sim_fd_state.objects[desc.object_index]
+		world := backend.sim_world
+		object := &world.objects[desc.object_index]
 
 		if level == .SOL_SOCKET {
 			#partial switch option {
@@ -450,7 +453,8 @@ when TINA_SIMULATION_MODE {
 		if !ok {
 			return OS_FD_INVALID, .System_Error
 		}
-		object := &g_sim_fd_state.objects[desc.object_index]
+		world := backend.sim_world
+		object := &world.objects[desc.object_index]
 		object.ref_count += 1
 		dup_fd, alloc_ok := _sim_alloc_descriptor(backend, desc.object_index, true)
 		if !alloc_ok {
@@ -473,38 +477,40 @@ when TINA_SIMULATION_MODE {
 	// --- Internal Helpers ---
 
 	@(private = "package")
-	_sim_fd_state_reset :: proc "contextless" () {
-		g_sim_fd_state.descriptor_free_head = SIM_DESCRIPTOR_NONE_INDEX
-		g_sim_fd_state.descriptor_free_count = MAX_SIMULATED_DESCRIPTORS
+	_sim_world_init :: proc "contextless" (world: ^Sim_IO_World) {
+		world.descriptor_free_head = SIM_DESCRIPTOR_NONE_INDEX
+		world.descriptor_free_count = MAX_SIMULATED_DESCRIPTORS
 		for i := MAX_SIMULATED_DESCRIPTORS - 1; i >= 0; i -= 1 {
-			g_sim_fd_state.descriptors[i] = Sim_FD_Descriptor {
+			world.descriptors[i] = Sim_FD_Descriptor {
 				fd_number = OS_FD_INVALID,
 				object_index = SIM_OBJECT_NONE_INDEX,
-				next_free_index = g_sim_fd_state.descriptor_free_head,
+				next_free_index = world.descriptor_free_head,
 			}
-			g_sim_fd_state.descriptor_free_head = u16(i)
+			world.descriptor_free_head = u16(i)
 		}
 
-		g_sim_fd_state.object_free_head = SIM_OBJECT_NONE_INDEX
-		g_sim_fd_state.object_free_count = MAX_SIMULATED_OBJECTS
+		world.object_free_head = SIM_OBJECT_NONE_INDEX
+		world.object_free_count = MAX_SIMULATED_OBJECTS
 		for i := MAX_SIMULATED_OBJECTS - 1; i >= 0; i -= 1 {
-			g_sim_fd_state.objects[i] = Sim_FD_Object {
-				next_free_index = g_sim_fd_state.object_free_head,
+			world.objects[i] = Sim_FD_Object {
+				next_free_index = world.object_free_head,
 			}
-			g_sim_fd_state.object_free_head = u16(i)
+			world.object_free_head = u16(i)
 		}
-		g_sim_fd_state.next_sim_fd = 100
+		world.next_sim_fd = 100
+		world.active_backend_count = 0
 	}
 
 	@(private = "file")
 	_sim_alloc_object :: proc "contextless" (backend: ^Platform_Backend) -> (u16, bool) {
-		if g_sim_fd_state.object_free_head == SIM_OBJECT_NONE_INDEX {
+		world := backend.sim_world
+		if world.object_free_head == SIM_OBJECT_NONE_INDEX {
 			return SIM_OBJECT_NONE_INDEX, false
 		}
-		index := g_sim_fd_state.object_free_head
-		object := &g_sim_fd_state.objects[index]
-		g_sim_fd_state.object_free_head = object.next_free_index
-		g_sim_fd_state.object_free_count -= 1
+		index := world.object_free_head
+		object := &world.objects[index]
+		world.object_free_head = object.next_free_index
+		world.object_free_count -= 1
 		object^ = Sim_FD_Object {
 			ref_count                     = 1,
 			inflight_count                = 0,
@@ -527,16 +533,17 @@ when TINA_SIMULATION_MODE {
 		OS_FD,
 		bool,
 	) {
-		if g_sim_fd_state.descriptor_free_head == SIM_DESCRIPTOR_NONE_INDEX {
+		world := backend.sim_world
+		if world.descriptor_free_head == SIM_DESCRIPTOR_NONE_INDEX {
 			return OS_FD_INVALID, false
 		}
-		index := g_sim_fd_state.descriptor_free_head
-		desc := &g_sim_fd_state.descriptors[index]
-		g_sim_fd_state.descriptor_free_head = desc.next_free_index
-		g_sim_fd_state.descriptor_free_count -= 1
+		index := world.descriptor_free_head
+		desc := &world.descriptors[index]
+		world.descriptor_free_head = desc.next_free_index
+		world.descriptor_free_count -= 1
 
-		fd_number := OS_FD(g_sim_fd_state.next_sim_fd)
-		g_sim_fd_state.next_sim_fd += 1
+		fd_number := OS_FD(world.next_sim_fd)
+		world.next_sim_fd += 1
 		desc^ = Sim_FD_Descriptor {
 			fd_number = fd_number,
 			object_index = object_index,
@@ -549,8 +556,9 @@ when TINA_SIMULATION_MODE {
 
 	@(private = "package")
 	_sim_lookup_descriptor_index :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> (u16, bool) {
+		world := backend.sim_world
 		for i in 0 ..< MAX_SIMULATED_DESCRIPTORS {
-			desc := &g_sim_fd_state.descriptors[i]
+			desc := &world.descriptors[i]
 			if desc.active && desc.fd_number == fd {
 				return u16(i), true
 			}
@@ -560,28 +568,31 @@ when TINA_SIMULATION_MODE {
 
 	@(private = "package")
 	_sim_lookup_descriptor :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> (^Sim_FD_Descriptor, bool) {
+		world := backend.sim_world
 		index, ok := _sim_lookup_descriptor_index(backend, fd)
 		if !ok {
 			return nil, false
 		}
-		return &g_sim_fd_state.descriptors[index], true
+		return &world.descriptors[index], true
 	}
 
 	@(private = "file")
 	_sim_maybe_free_object :: proc "contextless" (backend: ^Platform_Backend, object_index: u16) {
+		world := backend.sim_world
 		if object_index == SIM_OBJECT_NONE_INDEX do return
-		object := &g_sim_fd_state.objects[object_index]
+		object := &world.objects[object_index]
 		if !object.alive || object.ref_count != 0 || object.inflight_count != 0 do return
 		object.alive = false
-		object.next_free_index = g_sim_fd_state.object_free_head
-		g_sim_fd_state.object_free_head = object_index
-		g_sim_fd_state.object_free_count += 1
+		object.next_free_index = world.object_free_head
+		world.object_free_head = object_index
+		world.object_free_count += 1
 	}
 
 	@(private = "file")
 	_sim_object_release_ref :: proc "contextless" (backend: ^Platform_Backend, object_index: u16) {
+		world := backend.sim_world
 		if object_index == SIM_OBJECT_NONE_INDEX do return
-		object := &g_sim_fd_state.objects[object_index]
+		object := &world.objects[object_index]
 		if object.ref_count > 0 {
 			object.ref_count -= 1
 		}
@@ -590,8 +601,9 @@ when TINA_SIMULATION_MODE {
 
 	@(private = "file")
 	_sim_pin_object :: proc "contextless" (backend: ^Platform_Backend, object_index: u16) -> bool {
+		world := backend.sim_world
 		if object_index == SIM_OBJECT_NONE_INDEX do return false
-		object := &g_sim_fd_state.objects[object_index]
+		object := &world.objects[object_index]
 		if !object.alive do return false
 		object.inflight_count += 1
 		return true
@@ -599,8 +611,9 @@ when TINA_SIMULATION_MODE {
 
 	@(private = "file")
 	_sim_unpin_object :: proc "contextless" (backend: ^Platform_Backend, object_index: u16) {
+		world := backend.sim_world
 		if object_index == SIM_OBJECT_NONE_INDEX do return
-		object := &g_sim_fd_state.objects[object_index]
+		object := &world.objects[object_index]
 		if object.inflight_count > 0 {
 			object.inflight_count -= 1
 		}
@@ -609,21 +622,21 @@ when TINA_SIMULATION_MODE {
 
 	@(private = "file")
 	_sim_close_descriptor_index :: proc "contextless" (backend: ^Platform_Backend, descriptor_index: u16) -> bool {
+		world := backend.sim_world
 		if descriptor_index == SIM_DESCRIPTOR_NONE_INDEX || descriptor_index >= MAX_SIMULATED_DESCRIPTORS {
 			return false
 		}
-		desc := &g_sim_fd_state.descriptors[descriptor_index]
+	desc := &world.descriptors[descriptor_index]
 		if !desc.active {
 			return false
 		}
 		object_index := desc.object_index
+		desc.active = false
 		desc^ = Sim_FD_Descriptor {
-			fd_number = OS_FD_INVALID,
-			object_index = SIM_OBJECT_NONE_INDEX,
-			next_free_index = g_sim_fd_state.descriptor_free_head,
+			next_free_index = world.descriptor_free_head,
 		}
-		g_sim_fd_state.descriptor_free_head = descriptor_index
-		g_sim_fd_state.descriptor_free_count += 1
+		world.descriptor_free_head = descriptor_index
+		world.descriptor_free_count += 1
 		_sim_object_release_ref(backend, object_index)
 		return true
 	}
@@ -637,12 +650,13 @@ when TINA_SIMULATION_MODE {
 		u16,
 		bool,
 	) {
+		world := backend.sim_world
 		fd := _sim_submission_fd(op)
 		descriptor_index, ok := _sim_lookup_descriptor_index(backend, fd)
 		if !ok {
 			return SIM_DESCRIPTOR_NONE_INDEX, SIM_OBJECT_NONE_INDEX, false
 		}
-		object_index := g_sim_fd_state.descriptors[descriptor_index].object_index
+		object_index := world.descriptors[descriptor_index].object_index
 		if !_sim_pin_object(backend, object_index) {
 			return SIM_DESCRIPTOR_NONE_INDEX, SIM_OBJECT_NONE_INDEX, false
 		}
@@ -840,27 +854,32 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_init :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
 			queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
-			sim_config = Simulation_IO_Config{delay_range_ticks = {1, 3}, seed = t.seed},
+			sim_config = Simulation_IO_Config{delay_range_ticks = {1, 3}, seed = t.seed, world = cast(rawptr)world},
 		}
 
 		err := backend_init(&backend, config)
 		testing.expect_value(t, err, Backend_Error.None)
 		testing.expect_value(t, backend.pending_count, 0)
-		testing.expect(t, g_sim_fd_state.next_sim_fd >= 100, "sim FD should start at 100+")
+		testing.expect(t, world.next_sim_fd >= 100, "sim FD should start at 100+")
 
 		backend_deinit(&backend)
 	}
 
 	@(test)
 	test_simulated_backend_submit_collect :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
 				delay_range_ticks = {0, 1}, // complete within 1 tick
 				seed              = t.seed,
+				world             = world,
 			},
 		}
 		backend_init(&backend, config)
@@ -894,11 +913,14 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_cancel :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
 				delay_range_ticks = {100, 200}, // won't complete soon
 				seed              = t.seed,
+				world             = world,
 			},
 		}
 		backend_init(&backend, config)
@@ -926,9 +948,11 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_control_socket :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
-			sim_config = Simulation_IO_Config{seed = t.seed},
+			sim_config = Simulation_IO_Config{seed = t.seed, world = cast(rawptr)world},
 		}
 		backend_init(&backend, config)
 
@@ -949,9 +973,11 @@ when TINA_SIMULATION_MODE {
 		seed := t.seed
 
 		run_sim :: proc(seed: u64) -> [4]Raw_Completion {
+			world := new(Sim_IO_World, context.temp_allocator)
+			_sim_world_init(world)
 			backend: Platform_Backend
 			config := Backend_Config {
-				sim_config = Simulation_IO_Config{delay_range_ticks = {1, 5}, seed = seed},
+				sim_config = Simulation_IO_Config{delay_range_ticks = {1, 5}, seed = seed, world = cast(rawptr)world},
 			}
 			backend_init(&backend, config)
 			defer backend_deinit(&backend)
@@ -1002,11 +1028,14 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_collect_uses_shard_controlled_time :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
 				delay_range_ticks = {1, 1},
 				seed              = t.seed,
+				world             = world,
 			},
 		}
 		backend_init(&backend, config)
@@ -1055,6 +1084,8 @@ when TINA_SIMULATION_MODE {
 			{error_code = -32, weight = 1},
 		}
 
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
@@ -1062,6 +1093,7 @@ when TINA_SIMULATION_MODE {
 				fault_rate         = Ratio{numerator = 1, denominator = 1}, // 100% fault rate
 				seed               = t.seed,
 				error_distribution = dist[:],
+				world              = world,
 			},
 		}
 		backend_init(&backend, config)
@@ -1092,9 +1124,11 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_control_dup_returns_distinct_fd :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
-			sim_config = Simulation_IO_Config {seed = t.seed},
+			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
 		err := backend_init(&backend, config)
 		testing.expect_value(t, err, Backend_Error.None)
@@ -1114,9 +1148,11 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_close_invalidates_only_closed_descriptor :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
-			sim_config = Simulation_IO_Config {seed = t.seed},
+			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
 		err := backend_init(&backend, config)
 		testing.expect_value(t, err, Backend_Error.None)
@@ -1141,11 +1177,14 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_pending_op_survives_close_of_duplicate_descriptor :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
 				delay_range_ticks = {2, 2},
 				seed = t.seed,
+				world = cast(rawptr)world,
 			},
 		}
 		err := backend_init(&backend, config)
@@ -1181,11 +1220,14 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_accept_completion_returns_tracked_descriptor :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {
 				delay_range_ticks = {0, 0},
 				seed = t.seed,
+				world = cast(rawptr)world,
 			},
 		}
 		err := backend_init(&backend, config)
@@ -1215,9 +1257,11 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_bind_rejects_duplicate_exclusive_address :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
-			sim_config = Simulation_IO_Config {seed = t.seed},
+			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
 		err := backend_init(&backend, config)
 		testing.expect_value(t, err, Backend_Error.None)
@@ -1238,9 +1282,11 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_simulated_backend_bind_accepts_duplicate_reuse_port_address :: proc(t: ^testing.T) {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
 		backend: Platform_Backend
 		config := Backend_Config {
-			sim_config = Simulation_IO_Config {seed = t.seed},
+			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
 		err := backend_init(&backend, config)
 		testing.expect_value(t, err, Backend_Error.None)

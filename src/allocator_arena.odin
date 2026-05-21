@@ -345,6 +345,7 @@ hydrate_shard :: proc(
 				delay_range_ticks = spec.simulation.faults.io_delay_range_ticks,
 				reorder           = true,
 				seed              = io_seed,
+				world             = cast(rawptr)spec.simulation.sim_io_world,
 			}
 		}
 	}
@@ -441,6 +442,7 @@ test_grand_arena :: proc(t: ^testing.T) {
 	defer free(shard)
 
 	carve_err := hydrate_shard(&arena, &spec, shard)
+	defer reactor_deinit(&shard.reactor)
 	testing.expect_value(t, carve_err, mem.Allocator_Error.None)
 
 	testing.expect(t, arena.region_count > 1, "Arena should have carved regions")

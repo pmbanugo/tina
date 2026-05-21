@@ -35,7 +35,8 @@ when TINA_SIMULATION_MODE {
 			checker_interval_ticks = 1,
 		}
 
-		spec := sim_test_make_spec(
+		spec := new(SystemSpec, context.temp_allocator)
+		spec^ = sim_test_make_spec(
 			&sim_config,
 			types[:],
 			shard_specs[:],
@@ -43,7 +44,7 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
+		err := simulator_init(&sim, spec, context.temp_allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
 		return sim
 	}
@@ -127,7 +128,7 @@ when TINA_SIMULATION_MODE {
 
 		desc, ok := _sim_lookup_descriptor(backend, fd)
 		testing.expect(t, ok, "simulated descriptor should resolve")
-		g_sim_fd_state.objects[desc.object_index].ref_count += 1
+		backend.sim_world.objects[desc.object_index].ref_count += 1
 
 		testing.expect(
 			t,

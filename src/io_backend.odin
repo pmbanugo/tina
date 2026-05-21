@@ -59,6 +59,7 @@ Simulation_IO_Config :: struct {
 	reorder:            bool, // whether completions can be reordered
 	seed:               u64, // deterministic seed (from Prng_Tree.shard_io)
 	error_distribution: []Error_Weight, // varied error codes for fault injection
+	world:              rawptr, // ^Sim_IO_World in simulation mode; ignored in non-sim
 }
 
 // --- Platform Backend Struct ---

@@ -152,11 +152,11 @@ when TINA_SIMULATION_MODE {
 			}
 
 			if .Sim_FD_Integrity in flags && i == 0 {
-				descriptor_refs: [MAX_SIMULATED_OBJECTS]u16
-				pending_refs: [MAX_SIMULATED_OBJECTS]u16
+				descriptor_refs := make([]u16, MAX_SIMULATED_OBJECTS, context.temp_allocator)
+				pending_refs := make([]u16, MAX_SIMULATED_OBJECTS, context.temp_allocator)
 
 				for descriptor_index in 0 ..< MAX_SIMULATED_DESCRIPTORS {
-					desc := &g_sim_fd_state.descriptors[descriptor_index]
+					desc := &sim.sim_io_world.descriptors[descriptor_index]
 					if !desc.active {
 						continue
 					}
@@ -169,7 +169,7 @@ when TINA_SIMULATION_MODE {
 						)
 						return true
 					}
-					object := &g_sim_fd_state.objects[desc.object_index]
+					object := &sim.sim_io_world.objects[desc.object_index]
 					if !object.alive {
 						fmt.eprintfln(
 							"[CHECKER] simulated descriptor points to dead object at index %d",
@@ -192,7 +192,7 @@ when TINA_SIMULATION_MODE {
 							)
 							return true
 						}
-						object := &g_sim_fd_state.objects[op.object_index]
+						object := &sim.sim_io_world.objects[op.object_index]
 						if !object.alive {
 							fmt.eprintfln(
 								"[CHECKER] pending simulated op points to dead object at shard %d pending slot %d",
@@ -206,7 +206,7 @@ when TINA_SIMULATION_MODE {
 				}
 
 				for object_index in 0 ..< MAX_SIMULATED_OBJECTS {
-					object := &g_sim_fd_state.objects[object_index]
+					object := &sim.sim_io_world.objects[object_index]
 					if !object.alive {
 						continue
 					}

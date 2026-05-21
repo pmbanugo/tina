@@ -1913,15 +1913,22 @@ _init_handoff_test_shard :: proc(
 	t: ^testing.T,
 	shard: ^Shard,
 	handoff_backing: []FD_Handoff_Entry,
+	sim_world_raw: rawptr = nil,
 ) {
-	shard.id = 0
+	shard.peer_alive_mask = {~u64(0), ~u64(0), ~u64(0), ~u64(0)}
 	shard.handoff_retry_head = POOL_NONE_INDEX
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
 	fd_handoff_table_init(&shard.handoff_table, handoff_backing)
 	backend_config := Backend_Config {
 		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
-		sim_config = Simulation_IO_Config{},
+	}
+	when TINA_SIMULATION_MODE {
+		world := (cast(^Sim_IO_World)sim_world_raw)
+		_sim_world_init(world)
+		backend_config.sim_config = Simulation_IO_Config {
+			world = world,
+		}
 	}
 	err := backend_init(&shard.reactor.backend, backend_config)
 	testing.expect_value(t, err, Backend_Error.None)
@@ -1994,6 +2001,15 @@ _make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
 	testing.expect_value(t, err, mem.Allocator_Error.None)
 
 	shard := new(Shard)
+	when TINA_SIMULATION_MODE {
+		_mt_world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_mt_world)
+		_mt_sim_config := new(SimulationConfig, context.temp_allocator)
+		_mt_sim_config^ = SimulationConfig {
+			sim_io_world = cast(rawptr)_mt_world,
+		}
+		spec.simulation = _mt_sim_config
+	}
 	carve_err := hydrate_shard(arena, &spec, shard)
 	testing.expect_value(t, carve_err, mem.Allocator_Error.None)
 	return shard, arena
@@ -2218,7 +2234,13 @@ test_fd_handoff_peer_quarantine_closes_entries_targeting_that_shard :: proc(t: ^
 	shard := new(Shard)
 	defer free(shard)
 	handoff_backing: [4]FD_Handoff_Entry
-	_init_handoff_test_shard(t, shard, handoff_backing[:])
+	_world_raw: rawptr
+	when TINA_SIMULATION_MODE {
+		_w := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_w)
+		_world_raw = cast(rawptr)_w
+	}
+	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw)
 	defer backend_deinit(&shard.reactor.backend)
 
 	ref_target_1_a := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 0, 1), 100)
@@ -2246,7 +2268,12 @@ test_fd_handoff_close_all_entries_reclaims_all_in_flight_entries :: proc(t: ^tes
 	shard := new(Shard)
 	defer free(shard)
 	handoff_backing: [4]FD_Handoff_Entry
-	_init_handoff_test_shard(t, shard, handoff_backing[:])
+	_world_raw_b: rawptr
+	when TINA_SIMULATION_MODE {
+		_wb := new(Sim_IO_World, context.temp_allocator)
+		_world_raw_b = cast(rawptr)_wb
+	}
+	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw_b)
 	defer backend_deinit(&shard.reactor.backend)
 
 	ref_a := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 0, 1), 100)
@@ -2267,7 +2294,12 @@ test_fd_handoff_timeout_scan_counts_but_keeps_entry :: proc(t: ^testing.T) {
 	shard := new(Shard)
 	defer free(shard)
 	handoff_backing: [2]FD_Handoff_Entry
-	_init_handoff_test_shard(t, shard, handoff_backing[:])
+	_world_raw_c: rawptr
+	when TINA_SIMULATION_MODE {
+		_wc := new(Sim_IO_World, context.temp_allocator)
+		_world_raw_c = cast(rawptr)_wc
+	}
+	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw_c)
 	defer backend_deinit(&shard.reactor.backend)
 
 	target_handle := make_handle(1, 1, 0, 1)
@@ -2307,7 +2339,12 @@ test_shard_mass_teardown_reclaims_in_flight_handoff_entries :: proc(t: ^testing.
 	shard := new(Shard)
 	defer free(shard)
 	handoff_backing: [2]FD_Handoff_Entry
-	_init_handoff_test_shard(t, shard, handoff_backing[:])
+	_world_raw_d: rawptr
+	when TINA_SIMULATION_MODE {
+		_wd := new(Sim_IO_World, context.temp_allocator)
+		_world_raw_d = cast(rawptr)_wd
+	}
+	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw_d)
 	defer backend_deinit(&shard.reactor.backend)
 
 	target_handle := make_handle(1, 1, 0, 1)

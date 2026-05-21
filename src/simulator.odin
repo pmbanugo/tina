@@ -18,6 +18,7 @@ when TINA_SIMULATION_MODE {
 		network:            SimulatedNetwork,
 		prng_tree:          Prng_Tree,
 		fault_engine:       FaultEngine,
+		sim_io_world:       ^Sim_IO_World, // shared IO world — set before shard hydration
 
 		// For fast-forward and clock management
 		tick_resolution_ns: u64,
@@ -46,8 +47,12 @@ when TINA_SIMULATION_MODE {
 
 		// Use the validated timer resolution from the spec (uniform across all shards)
 		sim.tick_resolution_ns = spec.timer_resolution_ns
-		_sim_fd_state_reset()
-		g_sim_fd_state.active_backend_count = 0
+
+		// Create a shared IO world for all shard backends — owned by the simulator
+		io_world := new(Sim_IO_World) or_return
+		_sim_world_init(io_world)
+		sim.sim_io_world = io_world
+		spec.simulation.sim_io_world = cast(rawptr)io_world
 
 		// SI-1: Initialize PRNG Tree
 		seed := spec.simulation.seed
@@ -231,14 +236,14 @@ when TINA_SIMULATION_MODE {
 	// ============================================================================
 	// Simulation Teardown
 	// ============================================================================
-	// Symmetric counterpart to simulator_init. Walks every shard and calls
-	// reactor_deinit so that the thread-local g_sim_fd_state (active_backend_count,
-	// bound objects, descriptor table) is properly released. Without this,
-	// stale bound addresses and non-zero active_backend_count leak across tests
-	// running on the same OS thread, causing order-dependent failures.
 	simulator_deinit :: proc(sim: ^Simulator) {
 		for i in 0 ..< sim.spec.shard_count {
 			reactor_deinit(&sim.shards[i].reactor)
+		}
+		if sim.sim_io_world != nil {
+			free(sim.sim_io_world)
+			sim.sim_io_world = nil
+			sim.spec.simulation.sim_io_world = nil
 		}
 	}
 
