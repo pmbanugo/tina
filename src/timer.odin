@@ -3,7 +3,7 @@ package tina
 import "base:intrinsics"
 import "core:testing"
 
-TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256
+TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: #config(TINA_TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT, 256)
 
 Timer_Handle :: distinct u32
 TIMER_HANDLE_NONE :: Timer_Handle(0xFFFF_FFFF)
