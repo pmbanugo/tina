@@ -161,13 +161,10 @@ when TINA_SIMULATION_MODE {
 				earliest_deadline: u64 = max(u64)
 
 				for i in 0 ..< sim.spec.shard_count {
-					one_shot_deadline := timer_wheel_earliest_deadline(&sim.shards[i].timer_wheel)
-					if one_shot_deadline < earliest_deadline do earliest_deadline = one_shot_deadline
-
-					renewable_deadline_ns := timer_renewable_earliest_deadline(&sim.shards[i].timer_wheel)
-					if renewable_deadline_ns != max(u64) {
-						renewable_deadline := (renewable_deadline_ns + sim.tick_resolution_ns - 1) / sim.tick_resolution_ns
-						if renewable_deadline < earliest_deadline do earliest_deadline = renewable_deadline
+					timer_deadline_ns := timer_earliest_deadline(&sim.shards[i].timer_wheel)
+					if timer_deadline_ns != max(u64) {
+						timer_deadline_tick := (timer_deadline_ns + sim.tick_resolution_ns - 1) / sim.tick_resolution_ns
+						if timer_deadline_tick < earliest_deadline do earliest_deadline = timer_deadline_tick
 					}
 				}
 

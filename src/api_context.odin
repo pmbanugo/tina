@@ -279,27 +279,27 @@ ctx_self_handle :: #force_inline proc(ctx: TinaContext) -> Handle {
 	return ctx_invocation(ctx).self_handle
 }
 
-// Acquire a pre-allocated renewable deadline slot. Returns a handle.
+// Acquire a pre-allocated timer slot. Returns a handle.
 // Strictly zero-dynamic allocation.
 @(require_results)
-ctx_acquire_renewable_deadline :: #force_inline proc(
+ctx_timer_acquire :: #force_inline proc(
 	ctx: TinaContext,
 ) -> Timer_Handle {
 	invocation := ctx_invocation_require_self_handle(ctx)
-	return timer_acquire_renewable(&invocation.shard.timer_wheel, invocation.self_handle)
+	return timer_acquire(&invocation.shard.timer_wheel, invocation.self_handle)
 }
 
-// Release an acquired renewable deadline slot back to the pool.
-ctx_release_renewable_deadline :: #force_inline proc(
+// Release an acquired timer slot back to the pool.
+ctx_timer_release :: #force_inline proc(
 	ctx: TinaContext,
 	handle: Timer_Handle,
 ) {
 	invocation := ctx_invocation_require_self_handle(ctx)
-	timer_release_renewable(&invocation.shard.timer_wheel, handle)
+	timer_release(&invocation.shard.timer_wheel, handle)
 }
 
-// Re-arm an existing renewable deadline with a new duration. O(1) field update.
-ctx_rearm_renewable_deadline :: #force_inline proc(
+// Re-arm an existing timer with a new duration.
+ctx_timer_rearm :: #force_inline proc(
 	ctx: TinaContext,
 	handle: Timer_Handle,
 	duration_ns: u64,
@@ -307,7 +307,7 @@ ctx_rearm_renewable_deadline :: #force_inline proc(
 	correlation: Correlation_Id,
 ) {
 	invocation := ctx_invocation_require_self_handle(ctx)
-	timer_rearm_renewable(
+	timer_rearm(
 		&invocation.shard.timer_wheel,
 		handle,
 		invocation.current_time_ns + duration_ns,
@@ -316,13 +316,13 @@ ctx_rearm_renewable_deadline :: #force_inline proc(
 	)
 }
 
-// Cancel (disarm) a renewable deadline. O(1) bit clear.
-ctx_cancel_renewable_deadline :: #force_inline proc(
+// Cancel (disarm) a timer.
+ctx_timer_cancel :: #force_inline proc(
 	ctx: TinaContext,
 	handle: Timer_Handle,
 ) {
 	invocation := ctx_invocation_require_self_handle(ctx)
-	timer_cancel_renewable(&invocation.shard.timer_wheel, handle)
+	timer_cancel(&invocation.shard.timer_wheel, handle)
 }
 
 // =================================

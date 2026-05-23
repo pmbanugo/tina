@@ -484,7 +484,7 @@ main :: proc() {
 			phase_2_threshold = 2,
 		},
 		pool_slot_count = 4096,
-		timer_spoke_count = 1024,
+
 		timer_entry_count = 1024,
 		log_ring_size = 65536,
 		default_ring_size = 32,

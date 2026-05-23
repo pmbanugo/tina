@@ -3,128 +3,271 @@ package tina
 import "base:intrinsics"
 import "core:testing"
 
-TIMER_DEFAULT_SPOKE_COUNT :: 4096 // TODO: make this configuration via compile/build flag
-TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256 // TODO: make this configuration via compile/build flag
+TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT :: 256
 
 Timer_Handle :: distinct u32
 TIMER_HANDLE_NONE :: Timer_Handle(0xFFFF_FFFF)
 
-Timer_Entry :: struct {
-	deliver_at:  u64,
-	next:        u32,
-	correlation: Correlation_Id,
-	target:      Handle,
-	tag:         Message_Tag,
-}
+// Marks an unarmed or never-expiring slot.
+TIMER_DEADLINE_NONE :: max(u64)
+
+// High bit of the deadline distinguishes reserved (renewable) from one-shot.
+// When set, the slot survives expiration (the caller must release it explicitly).
+// When clear, the slot is auto-freed on expiration.
+TIMER_RESERVED_BIT :: u64(1 << 63)
+
+// Masks out the reserved bit to extract the actual deadline for comparison.
+TIMER_DEADLINE_MASK :: ~TIMER_RESERVED_BIT
+
 
 Timer_Wheel :: struct {
-	spokes:         []u32,
-	entries:        []Timer_Entry,
-	spoke_mask:     u64,
-	last_tick:      u64,
-	free_head:      u32,
-	resident_count: u32,
+	// SoA parallel arrays — indexed by slot index
+	deadlines:         []u64,
+	targets:           []Handle,
+	tags:              []Message_Tag,
+	correlations:      []Correlation_Id,
 
-	// --- Renewable deadlines ---
-	renewable_deliver_at:  []u64,
-	renewable_target:      []Handle,
-	renewable_tag:         []Message_Tag,
-	renewable_correlation: []Correlation_Id,
-	renewable_armed_words: []u64,          // bit N = slot N is armed
-	renewable_free_head:          u32,
-	renewable_capacity:           u32,
-	renewable_armed_count:        u32,
-	renewable_earliest_deadline_ns: u64,
+	// Bitmap: bit N = slot N is armed
+	armed_words:       []u64,
+
+	// Lifecycle
+	free_head:         u32,
+	capacity:          u32,
+	armed_count:       u32,
+	earliest_deadline: u64,
 }
 
 timer_wheel_init :: proc(
 	wheel: ^Timer_Wheel,
-	spoke_backing: []u32,
-	entry_backing: []Timer_Entry,
-	initial_tick: u64 = 0,
-) {
-	wheel.spokes = spoke_backing
-	wheel.spoke_mask = u64(len(spoke_backing) - 1)
-	wheel.entries = entry_backing
-	wheel.last_tick = initial_tick
-	wheel.free_head = POOL_NONE_INDEX
-	wheel.resident_count = 0
-	wheel.renewable_free_head = POOL_NONE_INDEX
-	wheel.renewable_capacity = 0
-	wheel.renewable_armed_count = 0
-	wheel.renewable_earliest_deadline_ns = max(u64)
-
-	for i in 0 ..< len(spoke_backing) {
-		wheel.spokes[i] = POOL_NONE_INDEX
-	}
-
-	// Intrusive LIFO pool setup
-	for i := len(entry_backing) - 1; i >= 0; i -= 1 {
-		wheel.entries[i].next = wheel.free_head
-		wheel.free_head = u32(i)
-	}
-}
-
-timer_wheel_init_renewable :: proc(
-	wheel: ^Timer_Wheel,
-	deliver_at_backing: []u64,
+	deadline_backing: []u64,
 	target_backing: []Handle,
 	tag_backing: []Message_Tag,
 	correlation_backing: []Correlation_Id,
 	armed_words_backing: []u64,
 ) {
-	capacity := u32(len(deliver_at_backing))
-	wheel.renewable_deliver_at = deliver_at_backing
-	wheel.renewable_target = target_backing
-	wheel.renewable_tag = tag_backing
-	wheel.renewable_correlation = correlation_backing
-	wheel.renewable_armed_words = armed_words_backing
-	wheel.renewable_capacity = capacity
-	wheel.renewable_armed_count = 0
-	wheel.renewable_free_head = POOL_NONE_INDEX
-	wheel.renewable_earliest_deadline_ns = max(u64)
+	wheel.deadlines = deadline_backing
+	wheel.targets = target_backing
+	wheel.tags = tag_backing
+	wheel.correlations = correlation_backing
+	wheel.armed_words = armed_words_backing
+	wheel.capacity = u32(len(deadline_backing))
+	wheel.armed_count = 0
+	wheel.earliest_deadline = max(u64)
+	wheel.free_head = POOL_NONE_INDEX
 
 	// Zero the armed bitmap
 	for i in 0 ..< len(armed_words_backing) {
-		wheel.renewable_armed_words[i] = 0
+		wheel.armed_words[i] = 0
 	}
 
-	// Build intrusive LIFO free list through deliver_at field
-	for i := int(capacity) - 1; i >= 0; i -= 1 {
-		wheel.renewable_deliver_at[i] = u64(wheel.renewable_free_head)
-		wheel.renewable_free_head = u32(i)
+	// Build intrusive LIFO free list through deadlines[].
+	// Iterate backwards so slot 0 ends up as the head.
+	for i := int(wheel.capacity) - 1; i >= 0; i -= 1 {
+		wheel.deadlines[i] = u64(wheel.free_head)
+		wheel.free_head = u32(i)
 	}
 }
 
 @(private = "package")
-timer_wheel_reset :: proc(wheel: ^Timer_Wheel, current_tick: u64) {
-	for i in 0 ..< len(wheel.spokes) {
-		wheel.spokes[i] = POOL_NONE_INDEX
+timer_wheel_reset :: proc(wheel: ^Timer_Wheel) {
+	// Zero the armed bitmap
+	for i in 0 ..< len(wheel.armed_words) {
+		wheel.armed_words[i] = 0
 	}
-	wheel.last_tick = current_tick
+	wheel.armed_count = 0
+	wheel.earliest_deadline = max(u64)
+
+	// Rebuild intrusive LIFO free list through deadlines[]
 	wheel.free_head = POOL_NONE_INDEX
-	wheel.resident_count = 0
-
-	for i := len(wheel.entries) - 1; i >= 0; i -= 1 {
-		wheel.entries[i].next = wheel.free_head
+	for i := int(wheel.capacity) - 1; i >= 0; i -= 1 {
+		wheel.deadlines[i] = u64(wheel.free_head)
 		wheel.free_head = u32(i)
-	}
-
-	// Reset renewable deadlines
-	for i in 0 ..< len(wheel.renewable_armed_words) {
-		wheel.renewable_armed_words[i] = 0
-	}
-	wheel.renewable_armed_count = 0
-	wheel.renewable_free_head = POOL_NONE_INDEX
-	wheel.renewable_earliest_deadline_ns = max(u64)
-	for i := int(wheel.renewable_capacity) - 1; i >= 0; i -= 1 {
-		wheel.renewable_deliver_at[i] = u64(wheel.renewable_free_head)
-		wheel.renewable_free_head = u32(i)
 	}
 }
 
-// Registers a timer that will enqueue a message with the specified tag back to this Isolate.
-// The duration is specified in nanoseconds.
+// Reserve a slot for a renewable timer. The slot is allocated but not armed.
+// The caller must later call timer_rearm to arm it, and timer_release to free it.
+@(private = "package")
+timer_acquire :: proc(
+	wheel: ^Timer_Wheel,
+	target: Handle,
+) -> Timer_Handle {
+	if wheel.free_head == POOL_NONE_INDEX {
+		return TIMER_HANDLE_NONE
+	}
+
+	index := wheel.free_head
+	wheel.free_head = u32(wheel.deadlines[index])
+
+	// Mark as reserved but not armed (TIMER_DEADLINE_NONE already has bit 63 set)
+	wheel.deadlines[index] = TIMER_DEADLINE_NONE | TIMER_RESERVED_BIT
+	wheel.targets[index] = target
+	wheel.tags[index] = Message_Tag(0)
+	wheel.correlations[index] = Correlation_Id(0)
+
+	// Ensure armed bit is cleared
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	wheel.armed_words[word_index] &= ~bit_mask
+
+	return Timer_Handle(index)
+}
+
+// Schedule a one-shot timer. The slot is auto-freed on expiration.
+@(private = "package")
+timer_schedule :: proc(
+	wheel: ^Timer_Wheel,
+	deadline: u64,
+	target: Handle,
+	tag: Message_Tag,
+	correlation: Correlation_Id,
+) -> Timer_Handle {
+	if wheel.free_head == POOL_NONE_INDEX {
+		return TIMER_HANDLE_NONE
+	}
+
+	index := wheel.free_head
+	wheel.free_head = u32(wheel.deadlines[index])
+
+	// Store deadline without TIMER_RESERVED_BIT — marks this as one-shot (auto-free on expiration)
+	wheel.deadlines[index] = deadline & TIMER_DEADLINE_MASK
+	wheel.targets[index] = target
+	wheel.tags[index] = tag
+	wheel.correlations[index] = correlation
+
+	// Set armed bit
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	wheel.armed_words[word_index] |= bit_mask
+	wheel.armed_count += 1
+
+	if deadline < wheel.earliest_deadline {
+		wheel.earliest_deadline = deadline
+	}
+
+	return Timer_Handle(index)
+}
+
+// Re-arm a reserved timer with a new deadline, tag, and correlation.
+@(private = "package")
+timer_rearm :: proc(
+	wheel: ^Timer_Wheel,
+	handle: Timer_Handle,
+	deadline: u64,
+	tag: Message_Tag,
+	correlation: Correlation_Id,
+) {
+	if handle == TIMER_HANDLE_NONE {
+		return
+	}
+	index := u32(handle)
+	if index >= wheel.capacity {
+		return
+	}
+
+	// Preserve the RESERVED_BIT so the slot survives expiration
+	wheel.deadlines[index] = deadline | TIMER_RESERVED_BIT
+	wheel.tags[index] = tag
+	wheel.correlations[index] = correlation
+
+	// Set armed bit if not already set
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	if (wheel.armed_words[word_index] & bit_mask) == 0 {
+		wheel.armed_words[word_index] |= bit_mask
+		wheel.armed_count += 1
+	}
+
+	masked_deadline := deadline & TIMER_DEADLINE_MASK
+	if masked_deadline < wheel.earliest_deadline {
+		wheel.earliest_deadline = masked_deadline
+	}
+}
+
+// Disarm a reserved timer without releasing the slot.
+@(private = "package")
+timer_cancel :: proc(
+	wheel: ^Timer_Wheel,
+	handle: Timer_Handle,
+) {
+	if handle == TIMER_HANDLE_NONE {
+		return
+	}
+	index := u32(handle)
+	if index >= wheel.capacity {
+		return
+	}
+
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	if (wheel.armed_words[word_index] & bit_mask) != 0 {
+		wheel.armed_words[word_index] &= ~bit_mask
+		wheel.armed_count -= 1
+	}
+}
+
+// Release a reserved slot back to the free list.
+// If the timer was armed, it is disarmed first.
+@(private = "package")
+timer_release :: proc(
+	wheel: ^Timer_Wheel,
+	handle: Timer_Handle,
+) {
+	if handle == TIMER_HANDLE_NONE {
+		return
+	}
+	index := u32(handle)
+	if index >= wheel.capacity {
+		return
+	}
+
+	// Disarm if armed
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	if (wheel.armed_words[word_index] & bit_mask) != 0 {
+		wheel.armed_words[word_index] &= ~bit_mask
+		wheel.armed_count -= 1
+	}
+
+	// Clear fields
+	wheel.targets[index] = HANDLE_NONE
+	wheel.tags[index] = Message_Tag(0)
+	wheel.correlations[index] = Correlation_Id(0)
+
+	// Push index onto free list
+	wheel.deadlines[index] = u64(wheel.free_head)
+	wheel.free_head = index
+}
+
+// Cancel and release a one-shot timer in a single operation.
+@(private = "package")
+timer_cancel_and_release :: proc(
+	wheel: ^Timer_Wheel,
+	handle: Timer_Handle,
+) {
+	if handle == TIMER_HANDLE_NONE {
+		return
+	}
+	index := u32(handle)
+	if index >= wheel.capacity {
+		return
+	}
+
+	// Disarm if armed
+	word_index := bitmap_word_index_from_bit_index(index)
+	bit_mask := bitmap_mask_from_bit_index(index)
+	if (wheel.armed_words[word_index] & bit_mask) != 0 {
+		wheel.armed_words[word_index] &= ~bit_mask
+		wheel.armed_count -= 1
+	}
+
+	// Push index onto free list
+	wheel.deadlines[index] = u64(wheel.free_head)
+	wheel.free_head = index
+}
+
+// Registers a one-shot timer that will enqueue a message with the specified tag
+// back to this Isolate. The duration is specified in nanoseconds.
 ctx_register_timer :: proc(ctx: TinaContext, duration_ns: u64, tag: Message_Tag) {
 	invocation := ctx_invocation_require_self_handle(ctx)
 	shard := invocation.shard
@@ -139,13 +282,11 @@ ctx_register_timer :: proc(ctx: TinaContext, duration_ns: u64, tag: Message_Tag)
 		)
 		return
 	}
-	// Convert nanoseconds to ticks
-	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
-	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, invocation.self_handle, tag, CORRELATION_ID_NONE)
+	timer_schedule(wheel, shard.current_time_ns + duration_ns, invocation.self_handle, tag, CORRELATION_ID_NONE)
 }
 
-// Registers a timer with an explicit correlation token so the receiver can
-// reject stale lazy-cancelled expirations in O(1).
+// Registers a one-shot timer with an explicit correlation token so the receiver
+// can reject stale lazy-cancelled expirations in O(1).
 ctx_register_timer_with_correlation :: proc(
 	ctx: TinaContext,
 	duration_ns: u64,
@@ -165,10 +306,7 @@ ctx_register_timer_with_correlation :: proc(
 		)
 		return
 	}
-
-	// Convert nanoseconds to ticks.
-	delay_ticks := (duration_ns + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
-	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, invocation.self_handle, tag, correlation)
+	timer_schedule(wheel, shard.current_time_ns + duration_ns, invocation.self_handle, tag, correlation)
 }
 
 @(private = "package")
@@ -183,279 +321,35 @@ _register_system_timer :: proc(
 	if wheel.free_head == POOL_NONE_INDEX {
 		panic("[PANIC] Timer pool exhausted! Isolate will deadlock.")
 	}
-	_timer_wheel_insert(wheel, shard.current_tick + delay_ticks, target, tag, correlation)
+	deadline_ns := shard.current_time_ns + delay_ticks * shard.timer_resolution_ns
+	timer_schedule(wheel, deadline_ns, target, tag, correlation)
 }
 
-@(private = "package")
-_timer_wheel_insert :: #force_inline proc "contextless" (
-	wheel: ^Timer_Wheel,
-	deliver_at: u64,
-	target: Handle,
-	tag: Message_Tag,
-	correlation: Correlation_Id,
-) {
-	index := wheel.free_head
-	wheel.free_head = wheel.entries[index].next
-
-	wheel.entries[index] = Timer_Entry {
-		deliver_at  = deliver_at,
-		target      = target,
-		tag         = tag,
-		correlation = correlation,
-		next        = POOL_NONE_INDEX,
-	}
-
-	spoke_index := deliver_at & wheel.spoke_mask
-	wheel.entries[index].next = wheel.spokes[spoke_index]
-	wheel.spokes[spoke_index] = index
-	wheel.resident_count += 1
-}
-
-@(private = "package")
-timer_acquire_renewable :: proc(
-	wheel: ^Timer_Wheel,
-	target: Handle,
-) -> Timer_Handle {
-	if wheel.renewable_free_head == POOL_NONE_INDEX {
-		return TIMER_HANDLE_NONE
-	}
-
-	index := wheel.renewable_free_head
-	wheel.renewable_free_head = u32(wheel.renewable_deliver_at[index])
-
-	wheel.renewable_deliver_at[index] = 0
-	wheel.renewable_target[index] = target
-	wheel.renewable_tag[index] = Message_Tag(0)
-	wheel.renewable_correlation[index] = Correlation_Id(0)
-
-	// Ensure armed bit is cleared
-	word_index := bitmap_word_index_from_bit_index(index)
-	bit_mask := bitmap_mask_from_bit_index(index)
-	wheel.renewable_armed_words[word_index] &= ~bit_mask
-
-	return Timer_Handle(index)
-}
-
-@(private = "package")
-timer_release_renewable :: proc(
-	wheel: ^Timer_Wheel,
-	handle: Timer_Handle,
-) {
-	if handle == TIMER_HANDLE_NONE {
-		return
-	}
-	index := u32(handle)
-	if index >= wheel.renewable_capacity {
-		return
-	}
-
-	// Disarm if it was armed
-	word_index := bitmap_word_index_from_bit_index(index)
-	bit_mask := bitmap_mask_from_bit_index(index)
-	if (wheel.renewable_armed_words[word_index] & bit_mask) != 0 {
-		wheel.renewable_armed_words[word_index] &= ~bit_mask
-		wheel.renewable_armed_count -= 1
-	}
-
-	// Clear fields
-	wheel.renewable_target[index] = HANDLE_NONE
-	wheel.renewable_tag[index] = Message_Tag(0)
-	wheel.renewable_correlation[index] = Correlation_Id(0)
-
-	// Push index onto free list
-	wheel.renewable_deliver_at[index] = u64(wheel.renewable_free_head)
-	wheel.renewable_free_head = index
-}
-
-@(private = "package")
-timer_rearm_renewable :: proc(
-	wheel: ^Timer_Wheel,
-	handle: Timer_Handle,
-	deliver_at: u64,
-	tag: Message_Tag,
-	correlation: Correlation_Id,
-) {
-	if handle == TIMER_HANDLE_NONE {
-		return
-	}
-	index := u32(handle)
-	if index >= wheel.renewable_capacity {
-		return
-	}
-
-	wheel.renewable_deliver_at[index] = deliver_at
-	wheel.renewable_tag[index] = tag
-	wheel.renewable_correlation[index] = correlation
-
-	// Set bit in armed bitmap if not already armed
-	word_index := bitmap_word_index_from_bit_index(index)
-	bit_mask := bitmap_mask_from_bit_index(index)
-	if (wheel.renewable_armed_words[word_index] & bit_mask) == 0 {
-		wheel.renewable_armed_words[word_index] |= bit_mask
-		wheel.renewable_armed_count += 1
-	}
-
-	if deliver_at < wheel.renewable_earliest_deadline_ns {
-		wheel.renewable_earliest_deadline_ns = deliver_at
-	}
-}
-
-@(private = "package")
-timer_cancel_renewable :: proc(
-	wheel: ^Timer_Wheel,
-	handle: Timer_Handle,
-) {
-	if handle == TIMER_HANDLE_NONE {
-		return
-	}
-	index := u32(handle)
-	if index >= wheel.renewable_capacity {
-		return
-	}
-
-	// Clear bit in armed bitmap
-	word_index := bitmap_word_index_from_bit_index(index)
-	bit_mask := bitmap_mask_from_bit_index(index)
-	if (wheel.renewable_armed_words[word_index] & bit_mask) != 0 {
-		wheel.renewable_armed_words[word_index] &= ~bit_mask
-		wheel.renewable_armed_count -= 1
-	}
-}
-
-// POSSIBLE OPTIMISATION: The envelope construction (128 bytes on stack) + _enqueue copy could be
-// eliminated by allocating the pool slot first and writing directly into it. This avoids
-// a 128-byte stack write + 128-byte memcpy per expiration. Requires changing _enqueue's
-// interface to return a writable slot pointer, which has wider implications across the
-// messaging subsystem. Measure timer expiration throughput before pursuing.
+// Unified timer sweep: scans the armed bitmap for expired deadlines.
+// One-shot slots (RESERVED_BIT clear) are auto-freed on expiration.
+// Reserved slots (RESERVED_BIT set) survive expiration — the caller must release them.
 @(private = "package")
 _advance_timers :: proc(
 	shard: ^Shard,
 	expirations_max: u32 = TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT,
 ) {
 	wheel := &shard.timer_wheel
-	now := shard.current_tick
+	now_ns := shard.current_time_ns
 
-	if wheel.resident_count == 0 {
-		wheel.last_tick = now
+	if wheel.armed_count == 0 {
+		return
+	}
+
+	if now_ns < (wheel.earliest_deadline & TIMER_DEADLINE_MASK) {
+		return
 	}
 
 	expirations: u32 = 0
-
-	tick_loop: for wheel.last_tick < now {
-		if expirations >= expirations_max do break
-
-		tick := wheel.last_tick + 1
-		spoke_index := tick & wheel.spoke_mask
-		curr := wheel.spokes[spoke_index]
-		prev: u32 = POOL_NONE_INDEX
-
-		spoke_finished := true
-
-		for curr != POOL_NONE_INDEX {
-			entry := &wheel.entries[curr]
-			next := entry.next
-
-			if entry.deliver_at > tick {
-				prev = curr
-				curr = next
-				continue
-			}
-
-			if expirations >= expirations_max {
-				spoke_finished = false
-				break
-			}
-
-			// --- WAITING_FOR_IO Integration (§6.6.3 §12) ---
-			// Any timer expiration targeting an Isolate in Waiting_For_Io
-			// wakes it via io_sequence bump. Not gated on tag —
-			// user timers (e.g., CONNECT_TIMEOUT) must also wake I/O waiters.
-			//
-			// DESIGN NOTE — Why no backend_cancel:
-			// The io_sequence field is the structural safety guarantee for stale
-			// I/O completions. When we bump io_sequence here, the abandoned
-			// operation's completion will eventually arrive at
-			// reactor_collect_completions, fail the sequence check, and have
-			// its buffer freed by the stale-path reclamation. This is
-			// structurally safe regardless of platform cancel semantics:
-			//   - io_uring: kernel delivers CQE (success or -ECANCELED) → stale path frees buffer
-			//   - kqueue:   close() silently removes kevents, so _backend_control_close sweeps pending
-			//               operations and synthesizes -ECANCELED completions → stale path frees buffers
-			//   - SimulatedIO: operation completes on next tick_count advancement → stale path
-			//
-			// Explicit cancel was removed because it adds per-slot state
-			// (stored token) to the hot Isolate metadata for a control-plane
-			// operation that the existing structural guarantee already handles.
-			// The only cost: the buffer stays allocated until the backend
-			// naturally completes the stale operation (bounded, typically
-			// sub-millisecond). This is consistent with the ADR's statement:
-			// "structural safety does not depend on [backend_cancel]" (§6.6.3 §12, GRACEFUL_SHUTDOWN §3.4).
-			{
-				target_type := extract_type_id(entry.target)
-				target_slot := extract_slot(entry.target)
-				target_gen := extract_generation(entry.target)
-
-				if int(target_type) < len(shard.metadata) &&
-				   int(target_slot) < len(shard.metadata[target_type]) &&
-				   shard.metadata[target_type][target_slot].generation == target_gen {
-					soa_meta := shard.metadata[target_type]
-					if soa_meta[target_slot].state == .Waiting_For_Io {
-						soa_meta[target_slot].io_sequence += 1
-						_slot_set_state(shard, target_type, target_slot, .Runnable)
-					}
-				}
-			}
-
-			envelope: Message_Envelope
-			envelope.source = HANDLE_NONE
-			envelope.destination = entry.target
-			envelope.tag = entry.tag
-			envelope.correlation = entry.correlation
-
-			_enqueue_system_msg(shard, entry.target, &envelope)
-			expirations += 1
-
-			// Unlink from spoke
-			if prev == POOL_NONE_INDEX {
-				wheel.spokes[spoke_index] = next
-			} else {
-				wheel.entries[prev].next = next
-			}
-
-			// Push back onto the free list
-			entry.next = wheel.free_head
-			wheel.free_head = curr
-			wheel.resident_count -= 1
-			curr = next
-		}
-
-		if spoke_finished {
-			wheel.last_tick = tick
-		} else {
-			// Budget exhausted before we could finish evaluating this spoke.
-			// Do not advance last_tick so we resume this spoke on the next scheduler loop.
-			break tick_loop
-		}
-	}
-
-	// --- Renewable deadline sweep ---
-	// Scans the armed bitmap for expired renewable deadlines.
-	// Shares the expirations_max budget with the one-shot tick loop above.
-	if wheel.renewable_armed_count == 0 || expirations >= expirations_max {
-		return
-	}
-
-	now_ns := shard.current_time_ns
-
-	if now_ns < wheel.renewable_earliest_deadline_ns {
-		return
-	}
-
 	next_earliest_deadline: u64 = max(u64)
 	finished := true
 
-	for word_index in 0 ..< len(wheel.renewable_armed_words) {
-		word := wheel.renewable_armed_words[word_index]
+	for word_index in 0 ..< len(wheel.armed_words) {
+		word := wheel.armed_words[word_index]
 		for word != 0 {
 			if expirations >= expirations_max {
 				finished = false
@@ -465,16 +359,20 @@ _advance_timers :: proc(
 			bit_index := u32(intrinsics.count_trailing_zeros(word))
 			slot_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, bit_index)
 
-			if wheel.renewable_deliver_at[slot_index] <= now_ns {
-				// Clear bit in word and in the backing array
-				word &= word - 1
+			raw_deadline := wheel.deadlines[slot_index]
+			masked_deadline := raw_deadline & TIMER_DEADLINE_MASK
+
+			if masked_deadline <= now_ns {
+				// Expired — clear bit in the backing array and decrement count
 				bit_mask := bitmap_mask_from_word_bit_index(bit_index)
-				wheel.renewable_armed_words[word_index] &= ~bit_mask
-				wheel.renewable_armed_count -= 1
+				wheel.armed_words[word_index] &= ~bit_mask
+				wheel.armed_count -= 1
 
-				target := wheel.renewable_target[slot_index]
+				target := wheel.targets[slot_index]
 
-				// Wake-if-waiting-for-io (same pattern as one-shot timers)
+				// Wake-if-waiting-for-io (same pattern as before):
+				// Any timer expiration targeting an Isolate in Waiting_For_Io
+				// wakes it via io_sequence bump.
 				{
 					target_type := extract_type_id(target)
 					target_slot := extract_slot(target)
@@ -494,16 +392,24 @@ _advance_timers :: proc(
 				envelope: Message_Envelope
 				envelope.source = HANDLE_NONE
 				envelope.destination = target
-				envelope.tag = wheel.renewable_tag[slot_index]
-				envelope.correlation = wheel.renewable_correlation[slot_index]
+				envelope.tag = wheel.tags[slot_index]
+				envelope.correlation = wheel.correlations[slot_index]
 
 				_enqueue_system_msg(shard, target, &envelope)
 				expirations += 1
-			} else {
-				if wheel.renewable_deliver_at[slot_index] < next_earliest_deadline {
-					next_earliest_deadline = wheel.renewable_deliver_at[slot_index]
+
+				// Auto-free check: if not reserved (one-shot), push slot to free list
+				if (raw_deadline & TIMER_RESERVED_BIT) == 0 {
+					wheel.deadlines[slot_index] = u64(wheel.free_head)
+					wheel.free_head = slot_index
 				}
-				// Not expired — clear this bit from the local word to continue scanning
+
+				word &= word - 1
+			} else {
+				// Not expired — track next earliest deadline
+				if masked_deadline < next_earliest_deadline {
+					next_earliest_deadline = masked_deadline
+				}
 				word &= word - 1
 			}
 		}
@@ -513,57 +419,40 @@ _advance_timers :: proc(
 	}
 
 	if finished {
-		wheel.renewable_earliest_deadline_ns = next_earliest_deadline
+		wheel.earliest_deadline = next_earliest_deadline
 	} else {
-		// Budget exhausted. Force a scan on the next tick by using now_ns
-		wheel.renewable_earliest_deadline_ns = now_ns
+		// Budget exhausted before finishing scan. Force a rescan on the next tick.
+		wheel.earliest_deadline = now_ns
 	}
 
 	when TINA_RUNTIME_ASSERTIONS {
 		expected_armed_count: u32 = 0
-		for word in wheel.renewable_armed_words {
-			expected_armed_count += u32(intrinsics.count_ones(word))
+		for w in wheel.armed_words {
+			expected_armed_count += u32(intrinsics.count_ones(w))
 		}
 		assert(
-			wheel.renewable_armed_count == expected_armed_count,
-			"renewable_armed_count drift detected: armed_count does not match bitmap popcount",
+			wheel.armed_count == expected_armed_count,
+			"armed_count drift detected: armed_count does not match bitmap popcount",
 		)
 	}
 }
 
-// O(N) scan to find the earliest deadline across the hashed wheel.
-// Erased from production to prevent accidental hot-path usage.
+// O(N) bitmap scan to find the earliest armed deadline.
+// Simulation-only — erased from production to prevent accidental hot-path usage.
 when TINA_SIMULATION_MODE {
 	@(private = "package")
-	timer_wheel_earliest_deadline :: proc(wheel: ^Timer_Wheel) -> u64 {
-		if wheel.resident_count == 0 do return max(u64)
+	timer_earliest_deadline :: proc(wheel: ^Timer_Wheel) -> u64 {
+		if wheel.armed_count == 0 do return max(u64)
 
 		earliest: u64 = max(u64)
-		for spoke in wheel.spokes {
-			current := spoke
-			for current != POOL_NONE_INDEX {
-				entry := &wheel.entries[current]
-				if entry.deliver_at < earliest {
-					earliest = entry.deliver_at
-				}
-				current = entry.next
-			}
-		}
-		return earliest
-	}
-
-	@(private = "package")
-	timer_renewable_earliest_deadline :: proc(wheel: ^Timer_Wheel) -> u64 {
-		if wheel.renewable_armed_count == 0 do return max(u64)
-
-		earliest: u64 = max(u64)
-		for word_index in 0 ..< len(wheel.renewable_armed_words) {
-			word := wheel.renewable_armed_words[word_index]
+		for word_index in 0 ..< len(wheel.armed_words) {
+			word := wheel.armed_words[word_index]
 			for word != 0 {
 				bit_index := u32(intrinsics.count_trailing_zeros(word))
 				slot_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, bit_index)
-				if wheel.renewable_deliver_at[slot_index] < earliest {
-					earliest = wheel.renewable_deliver_at[slot_index]
+				raw_deadline := wheel.deadlines[slot_index] & TIMER_DEADLINE_MASK
+				if raw_deadline < earliest {
+					earliest = raw_deadline
 				}
 				word &= word - 1
 			}
@@ -571,6 +460,10 @@ when TINA_SIMULATION_MODE {
 		return earliest
 	}
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 @(test)
 test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
@@ -595,16 +488,18 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Arm_And_Expire_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			timer_handle := ctx_acquire_renewable_deadline(ctx)
+			wheel := &invocation.shard.timer_wheel
+
+			timer_handle := timer_acquire(wheel, invocation.self_handle)
 			testing.expect(
 				state.t,
 				timer_handle != TIMER_HANDLE_NONE,
-				"renewable deadline should acquire",
+				"timer should acquire",
 			)
-			ctx_rearm_renewable_deadline(
-				ctx,
+			timer_rearm(
+				wheel,
 				timer_handle,
-				5,
+				invocation.current_time_ns + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(7),
 			)
@@ -623,7 +518,7 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			invocation.shard.current_time_ns = 10
 			_advance_timers(invocation.shard)
 
-			ctx_release_renewable_deadline(ctx, timer_handle)
+			timer_release(wheel, timer_handle)
 		},
 	)
 
@@ -656,18 +551,20 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Rearm_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			timer_handle := ctx_acquire_renewable_deadline(ctx)
-			ctx_rearm_renewable_deadline(
-				ctx,
+			wheel := &invocation.shard.timer_wheel
+
+			timer_handle := timer_acquire(wheel, invocation.self_handle)
+			timer_rearm(
+				wheel,
 				timer_handle,
-				5,
+				invocation.current_time_ns + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(1),
 			)
-			ctx_rearm_renewable_deadline(
-				ctx,
+			timer_rearm(
+				wheel,
 				timer_handle,
-				10,
+				invocation.current_time_ns + 10,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 1),
 				Correlation_Id(9),
 			)
@@ -686,7 +583,7 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 			invocation.shard.current_time_ns = 30
 			_advance_timers(invocation.shard)
 
-			ctx_release_renewable_deadline(ctx, timer_handle)
+			timer_release(wheel, timer_handle)
 		},
 	)
 
@@ -722,20 +619,22 @@ test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^t
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Release_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			state.timer_handle_first = ctx_acquire_renewable_deadline(ctx)
-			ctx_rearm_renewable_deadline(
-				ctx,
+			wheel := &invocation.shard.timer_wheel
+
+			state.timer_handle_first = timer_acquire(wheel, invocation.self_handle)
+			timer_rearm(
+				wheel,
 				state.timer_handle_first,
-				5,
+				invocation.current_time_ns + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(3),
 			)
-			ctx_release_renewable_deadline(ctx, state.timer_handle_first)
-			state.timer_handle_second = ctx_acquire_renewable_deadline(ctx)
-			ctx_rearm_renewable_deadline(
-				ctx,
+			timer_release(wheel, state.timer_handle_first)
+			state.timer_handle_second = timer_acquire(wheel, invocation.self_handle)
+			timer_rearm(
+				wheel,
 				state.timer_handle_second,
-				7,
+				invocation.current_time_ns + 7,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 2),
 				Correlation_Id(4),
 			)
@@ -754,7 +653,7 @@ test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^t
 			invocation.shard.current_time_ns = 107
 			_advance_timers(invocation.shard)
 
-			ctx_release_renewable_deadline(ctx, state.timer_handle_second)
+			timer_release(wheel, state.timer_handle_second)
 		},
 	)
 
@@ -785,11 +684,13 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Wake_Test_State)user_data
 			invocation := ctx_invocation(ctx)
-			timer_handle := ctx_acquire_renewable_deadline(ctx)
-			ctx_rearm_renewable_deadline(
-				ctx,
+			wheel := &invocation.shard.timer_wheel
+
+			timer_handle := timer_acquire(wheel, invocation.self_handle)
+			timer_rearm(
+				wheel,
 				timer_handle,
-				5,
+				invocation.current_time_ns + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(11),
 			)
@@ -802,7 +703,7 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 			state.target_state = soa_meta[extract_slot(state.handle)].state
 			state.target_io_sequence = soa_meta[extract_slot(state.handle)].io_sequence
 
-			ctx_release_renewable_deadline(ctx, timer_handle)
+			timer_release(wheel, timer_handle)
 		},
 	)
 
@@ -838,22 +739,23 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 		proc(user_data: rawptr, ctx: TinaContext) {
 			state := cast(^Mixed_Expiry_Test_State)user_data
 			invocation := ctx_invocation(ctx)
+			wheel := &invocation.shard.timer_wheel
 
-			// Both handles will map to the same 64-bit word of renewable_armed_words bitmap
-			state.timer_handle_first = ctx_acquire_renewable_deadline(ctx)
-			state.timer_handle_second = ctx_acquire_renewable_deadline(ctx)
+			// Both handles will map to the same 64-bit word of armed_words bitmap
+			state.timer_handle_first = timer_acquire(wheel, invocation.self_handle)
+			state.timer_handle_second = timer_acquire(wheel, invocation.self_handle)
 
-			ctx_rearm_renewable_deadline(
-				ctx,
+			timer_rearm(
+				wheel,
 				state.timer_handle_first,
-				5,
+				invocation.current_time_ns + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(3),
 			)
-			ctx_rearm_renewable_deadline(
-				ctx,
+			timer_rearm(
+				wheel,
 				state.timer_handle_second,
-				10,
+				invocation.current_time_ns + 10,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 1),
 				Correlation_Id(4),
 			)
@@ -864,16 +766,15 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 			_advance_timers(invocation.shard)
 
 			// The first deadline should have fired, but the second must still be armed.
-			// Let's verify that the bitmap still has the second bit set, meaning it wasn't disarmed.
-			word := invocation.shard.timer_wheel.renewable_armed_words[0]
+			word := wheel.armed_words[0]
 			testing.expect(
 				state.t,
 				word != 0,
-				"Second timer bit in renewable_armed_words was incorrectly cleared",
+				"Second timer bit in armed_words was incorrectly cleared",
 			)
 			testing.expect_value(
 				state.t,
-				invocation.shard.timer_wheel.renewable_armed_count,
+				wheel.armed_count,
 				u32(1),
 			)
 
@@ -885,17 +786,17 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 			// Verify that the second timer has now also fired and count is zero
 			testing.expect_value(
 				state.t,
-				invocation.shard.timer_wheel.renewable_armed_words[0],
+				wheel.armed_words[0],
 				u64(0),
 			)
 			testing.expect_value(
 				state.t,
-				invocation.shard.timer_wheel.renewable_armed_count,
+				wheel.armed_count,
 				u32(0),
 			)
 
-			ctx_release_renewable_deadline(ctx, state.timer_handle_first)
-			ctx_release_renewable_deadline(ctx, state.timer_handle_second)
+			timer_release(wheel, state.timer_handle_first)
+			timer_release(wheel, state.timer_handle_second)
 		},
 	)
 
@@ -903,4 +804,3 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 	testing.expect_value(t, message.tag, Message_Tag(USER_MESSAGE_TAG_BASE))
 	testing.expect_value(t, message.correlation, Correlation_Id(3))
 }
-

@@ -353,8 +353,6 @@ HTTP_DEV_CONNECTION_SLOT_COUNT_DEFAULT :: 128
 @(private = "package")
 HTTP_DEV_TIMER_RESOLUTION_NS :: 1_000_000 // 1 ms
 @(private = "package")
-HTTP_DEV_TIMER_SPOKE_COUNT :: 1024
-@(private = "package")
 HTTP_DEV_LOG_RING_SIZE :: 4096
 @(private = "package")
 HTTP_DEV_TRANSFER_SLOT_COUNT :: 16
@@ -499,8 +497,8 @@ install_into_system_spec :: proc(
 		spec.scratch_arena_size = scratch_requirement
 	}
 
-	spec.timer_renewable_entry_count = max(
-		spec.timer_renewable_entry_count,
+	spec.timer_entry_count = max(
+		spec.timer_entry_count,
 		int(connection_slot_count_per_shard),
 	)
 
@@ -825,7 +823,6 @@ _make_base_system_spec :: proc(
 		transfer_slot_count       = HTTP_DEV_TRANSFER_SLOT_COUNT,
 		transfer_slot_size        = HTTP_DEV_TRANSFER_SLOT_SIZE,
 		fd_handoff_entry_count    = fd_handoff_entry_count,
-		timer_spoke_count         = HTTP_DEV_TIMER_SPOKE_COUNT,
 		timer_entry_count         = timer_entry_count,
 		fd_table_slot_count       = int(connection_slot_count) + 16, // listener + headroom
 		fd_entry_size             = size_of(tina.FD_Entry),
@@ -842,10 +839,9 @@ _derive_timer_entry_count :: proc "contextless" (
 	connection_slot_count: u32,
 	shard_count: u8,
 ) -> int {
-	// Renewable transport deadlines live in the core timer wheel's dedicated
-	// renewable pool, so the one-shot entry pool only needs headroom for sparse
-	// waits such as application parking, listener accept backoff, and route-owned
-	// timers.
+	// Both renewable (reserved) and one-shot timers share the unified timer pool.
+	// Budget includes connection deadlines plus headroom for application timers,
+	// listener accept backoff, and route-owned timers.
 	entry_count := u64(connection_slot_count) * 4
 	entry_count += u64(shard_count) * 64
 	if entry_count < 2048 {

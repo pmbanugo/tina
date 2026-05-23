@@ -27,8 +27,7 @@ when TINA_SIMULATION_MODE {
 			if shard.reactor.backend.pending_count > 0 do return false
 
 			// Check if any timers are registered
-			if shard.timer_wheel.resident_count > 0 do return false
-			if shard.timer_wheel.renewable_armed_count > 0 do return false
+			if shard.timer_wheel.armed_count > 0 do return false
 		}
 
 		// Check if any SimulatedNetwork channel has delayed messages in flight
@@ -57,31 +56,19 @@ when TINA_SIMULATION_MODE {
 		shard := &sim.shards[0]
 		deadline_handle := TIMER_HANDLE_NONE
 
-		spokes := make([]u32, 8)
-		defer delete(spokes)
-		entries := make([]Timer_Entry, 8)
-		defer delete(entries)
-		timer_wheel_init(&shard.timer_wheel, spokes, entries, 0)
-		renewable_deliver_at := make([]u64, 8)
-		defer delete(renewable_deliver_at)
-		renewable_target := make([]Handle, 8)
-		defer delete(renewable_target)
-		renewable_tag := make([]Message_Tag, 8)
-		defer delete(renewable_tag)
-		renewable_correlation := make([]Correlation_Id, 8)
-		defer delete(renewable_correlation)
-		renewable_armed_words := make([]u64, 1)
-		defer delete(renewable_armed_words)
-		timer_wheel_init_renewable(
-			&shard.timer_wheel,
-			renewable_deliver_at,
-			renewable_target,
-			renewable_tag,
-			renewable_correlation,
-			renewable_armed_words,
-		)
-		deadline_handle = timer_acquire_renewable(&shard.timer_wheel, make_handle(0, 1, 0, 1))
-		timer_rearm_renewable(
+		timer_deadlines := make([]u64, 8)
+		defer delete(timer_deadlines)
+		timer_targets := make([]Handle, 8)
+		defer delete(timer_targets)
+		timer_tags := make([]Message_Tag, 8)
+		defer delete(timer_tags)
+		timer_correlations := make([]Correlation_Id, 8)
+		defer delete(timer_correlations)
+		timer_armed_words := make([]u64, 1)
+		defer delete(timer_armed_words)
+		timer_wheel_init(&shard.timer_wheel, timer_deadlines, timer_targets, timer_tags, timer_correlations, timer_armed_words)
+		deadline_handle = timer_acquire(&shard.timer_wheel, make_handle(0, 1, 0, 1))
+		timer_rearm(
 			&shard.timer_wheel,
 			deadline_handle,
 			5,
@@ -95,7 +82,7 @@ when TINA_SIMULATION_MODE {
 			"active renewable deadline should keep simulator non-idle",
 		)
 
-		timer_release_renewable(&shard.timer_wheel, deadline_handle)
+		timer_release(&shard.timer_wheel, deadline_handle)
 		testing.expect(
 			t,
 			simulator_is_globally_idle(&sim),

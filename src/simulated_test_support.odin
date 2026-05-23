@@ -8,7 +8,6 @@ when TINA_SIMULATION_MODE {
 		transfer_slot_count:       int,
 		transfer_slot_size:        int,
 		fd_handoff_entry_count:    int,
-		timer_spoke_count:         int,
 		timer_entry_count:         int,
 		timer_resolution_ns:       u64,
 		fd_table_slot_count:       int,
@@ -25,7 +24,6 @@ when TINA_SIMULATION_MODE {
 		transfer_slot_count = 4,
 		transfer_slot_size = 1024,
 		fd_handoff_entry_count = 0,
-		timer_spoke_count = 64,
 		timer_entry_count = 64,
 		timer_resolution_ns = 1_000_000,
 		fd_table_slot_count = 16,
@@ -72,7 +70,6 @@ when TINA_SIMULATION_MODE {
 		if options.transfer_slot_count != 0 do opts.transfer_slot_count = options.transfer_slot_count
 		if options.transfer_slot_size != 0 do opts.transfer_slot_size = options.transfer_slot_size
 		opts.fd_handoff_entry_count = options.fd_handoff_entry_count
-		if options.timer_spoke_count != 0 do opts.timer_spoke_count = options.timer_spoke_count
 		if options.timer_entry_count != 0 do opts.timer_entry_count = options.timer_entry_count
 		if options.timer_resolution_ns != 0 do opts.timer_resolution_ns = options.timer_resolution_ns
 		if options.fd_table_slot_count != 0 do opts.fd_table_slot_count = options.fd_table_slot_count
@@ -92,7 +89,6 @@ when TINA_SIMULATION_MODE {
 			transfer_slot_count = opts.transfer_slot_count,
 			transfer_slot_size = opts.transfer_slot_size,
 			fd_handoff_entry_count = opts.fd_handoff_entry_count,
-			timer_spoke_count = opts.timer_spoke_count,
 			timer_entry_count = opts.timer_entry_count,
 			timer_resolution_ns = opts.timer_resolution_ns,
 			fd_table_slot_count = opts.fd_table_slot_count,

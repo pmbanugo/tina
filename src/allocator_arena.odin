@@ -276,37 +276,30 @@ hydrate_shard :: proc(
 	handoff_buffer := make([]FD_Handoff_Entry, spec.fd_handoff_entry_count, alloc)
 	fd_handoff_table_init(&shard.handoff_table, handoff_buffer)
 
-	alloc_data.current_name = "Timer_Wheel_Spokes"
-	spoke_buf := make([]u32, spec.timer_spoke_count, alloc)
+	alloc_data.current_name = "Timer_Wheel_Deadlines"
+	timer_deadlines := make([]u64, spec.timer_entry_count, alloc)
 
-	alloc_data.current_name = "Timer_Wheel_Entries"
-	entry_buf := make([]Timer_Entry, spec.timer_entry_count, alloc)
+	alloc_data.current_name = "Timer_Wheel_Targets"
+	timer_targets := make([]Handle, spec.timer_entry_count, alloc)
 
-	timer_wheel_init(&shard.timer_wheel, spoke_buf, entry_buf)
+	alloc_data.current_name = "Timer_Wheel_Tags"
+	timer_tags := make([]Message_Tag, spec.timer_entry_count, alloc)
 
-	// Renewable deadlines
-	if spec.timer_renewable_entry_count > 0 {
-		alloc_data.current_name = "Timer_Renewable_Deliver_At"
-		renewable_deliver_at := make([]u64, spec.timer_renewable_entry_count, alloc)
-		alloc_data.current_name = "Timer_Renewable_Target"
-		renewable_target := make([]Handle, spec.timer_renewable_entry_count, alloc)
-		alloc_data.current_name = "Timer_Renewable_Tag"
-		renewable_tag := make([]Message_Tag, spec.timer_renewable_entry_count, alloc)
-		alloc_data.current_name = "Timer_Renewable_Correlation"
-		renewable_correlation := make([]Correlation_Id, spec.timer_renewable_entry_count, alloc)
-		alloc_data.current_name = "Timer_Renewable_Armed_Words"
-		armed_word_count := bitmap_word_count_from_bit_count(spec.timer_renewable_entry_count)
-		renewable_armed_words := make([]u64, armed_word_count, alloc)
+	alloc_data.current_name = "Timer_Wheel_Correlations"
+	timer_correlations := make([]Correlation_Id, spec.timer_entry_count, alloc)
 
-		timer_wheel_init_renewable(
-			&shard.timer_wheel,
-			renewable_deliver_at,
-			renewable_target,
-			renewable_tag,
-			renewable_correlation,
-			renewable_armed_words,
-		)
-	}
+	alloc_data.current_name = "Timer_Wheel_Armed_Words"
+	timer_armed_word_count := bitmap_word_count_from_bit_count(spec.timer_entry_count)
+	timer_armed_words := make([]u64, timer_armed_word_count, alloc)
+
+	timer_wheel_init(
+		&shard.timer_wheel,
+		timer_deadlines,
+		timer_targets,
+		timer_tags,
+		timer_correlations,
+		timer_armed_words,
+	)
 
 	alloc_data.current_name = "Log_Ring_Buffer"
 	log_buf := make([]u8, spec.log_ring_size, alloc)
@@ -422,7 +415,6 @@ test_grand_arena :: proc(t: ^testing.T) {
 		reactor_buffer_slot_size  = REACTOR_SIZE,
 		transfer_slot_count       = TRANSFER_SLOTS,
 		transfer_slot_size        = TRANSFER_SIZE,
-		timer_spoke_count         = 64, // Power of 2 spoke count
 		timer_entry_count         = 64, // Timer entry pool capacity
 		supervision_groups_max    = 4,
 		fd_table_slot_count       = 16,

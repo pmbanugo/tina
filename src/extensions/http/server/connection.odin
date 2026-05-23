@@ -24,7 +24,7 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -
 		int(runtime.server.limits.request_line_size_max) +
 		int(runtime.server.limits.header_size_max)
 	connection.connection_state.shard_runtime = runtime
-	connection.connection_state.deadline_timer_handle = tina.ctx_acquire_renewable_deadline(ctx)
+	connection.connection_state.deadline_timer_handle = tina.ctx_timer_acquire(ctx)
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(
 			connection.connection_state.deadline_timer_handle != tina.TIMER_HANDLE_NONE,
@@ -1396,7 +1396,7 @@ _connection_begin_close :: proc(connection: ^HTTP_Connection, ctx: tina.TinaCont
 	if runtime != nil {
 		_idle_slot_remove(connection, ctx)
 		if state.deadline_timer_handle != tina.TIMER_HANDLE_NONE {
-			tina.ctx_release_renewable_deadline(ctx, state.deadline_timer_handle)
+			tina.ctx_timer_release(ctx, state.deadline_timer_handle)
 			state.deadline_timer_handle = tina.TIMER_HANDLE_NONE
 			state.deadline_ns = 0
 		}
@@ -2360,7 +2360,7 @@ test_stage_canned_response_arms_send_timeout :: proc(t: ^testing.T) {
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
 			state := cast(^Canned_Response_Test_State)user_data
-			state.connection.connection_state.deadline_timer_handle = tina.ctx_acquire_renewable_deadline(ctx)
+			state.connection.connection_state.deadline_timer_handle = tina.ctx_timer_acquire(ctx)
 			effect := _connection_stage_canned_response(
 				state.connection,
 				transmute([]u8)string(ERROR_RESPONSE_408_REQUEST_TIMEOUT),
@@ -2431,7 +2431,7 @@ test_drive_body_read_restarts_send_from_unsent_offset :: proc(t: ^testing.T) {
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
 			state := cast(^Drive_Body_Read_Test_State)user_data
-			state.connection.connection_state.deadline_timer_handle = tina.ctx_acquire_renewable_deadline(ctx)
+			state.connection.connection_state.deadline_timer_handle = tina.ctx_timer_acquire(ctx)
 			effect := _connection_drive_body_read(state.connection, ctx)
 			#partial switch io_effect in effect {
 			case tina.Effect_Io:

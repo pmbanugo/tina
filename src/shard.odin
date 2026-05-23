@@ -1842,7 +1842,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	shard.current_slot_index = 0
 	shard.current_msg_slot = POOL_NONE_INDEX
 
-	timer_wheel_reset(&shard.timer_wheel, shard.current_tick)
+	timer_wheel_reset(&shard.timer_wheel)
 
 	shard.next_correlation_id = 0
 	// Control Signal reset
@@ -1987,7 +1987,6 @@ _make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
 		transfer_slot_size         = 1024,
 		fd_table_slot_count        = 8,
 		fd_entry_size              = size_of(FD_Entry),
-		timer_spoke_count          = 16,
 		timer_entry_count          = 16,
 		log_ring_size              = 16,
 		supervision_groups_max     = 4,

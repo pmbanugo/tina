@@ -165,7 +165,6 @@ when TINA_SIMULATION_MODE {
 			Sim_Test_Spec_Options {
 				reactor_buffer_slot_count = 8,
 				fd_handoff_entry_count = 4,
-				timer_spoke_count = 256,
 				timer_entry_count = 256,
 				supervision_groups_max = 8,
 			},
@@ -279,7 +278,6 @@ when TINA_SIMULATION_MODE {
 			Sim_Test_Spec_Options {
 				reactor_buffer_slot_count = 8,
 				fd_handoff_entry_count = 4,
-				timer_spoke_count = 256,
 				timer_entry_count = 256,
 				supervision_groups_max = 8,
 			},
@@ -379,7 +377,6 @@ when TINA_SIMULATION_MODE {
 			Sim_Test_Spec_Options {
 				reactor_buffer_slot_count = 8,
 				fd_handoff_entry_count = 4,
-				timer_spoke_count = 256,
 				timer_entry_count = 256,
 				supervision_groups_max = 8,
 			},
@@ -506,7 +503,6 @@ when TINA_SIMULATION_MODE {
 			Sim_Test_Spec_Options {
 				reactor_buffer_slot_count = 8,
 				fd_handoff_entry_count = 4,
-				timer_spoke_count = 256,
 				timer_entry_count = 256,
 				supervision_groups_max = 8,
 			},

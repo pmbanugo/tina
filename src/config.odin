@@ -181,9 +181,7 @@ SystemSpec :: struct {
 	transfer_slot_count:       int,
 	transfer_slot_size:        int,
 	fd_handoff_entry_count:    int,
-	timer_spoke_count:         int,
 	timer_entry_count:         int,
-	timer_renewable_entry_count: int,
 	fd_table_slot_count:       int,
 	fd_entry_size:             int,
 	log_ring_size:             int,
@@ -345,15 +343,6 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 
 	if spec.log_ring_size == 0 || (spec.log_ring_size & (spec.log_ring_size - 1)) != 0 {
 		fmt.eprintfln("[FATAL] log_ring_size (%v) must be a power of two", spec.log_ring_size)
-		return .ValueNotPowerOfTwo
-	}
-
-	if spec.timer_spoke_count == 0 ||
-	   (spec.timer_spoke_count & (spec.timer_spoke_count - 1)) != 0 {
-		fmt.eprintfln(
-			"[FATAL] timer_spoke_count (%v) must be a power of two",
-			spec.timer_spoke_count,
-		)
 		return .ValueNotPowerOfTwo
 	}
 
@@ -659,8 +648,8 @@ _validate_dio_config :: proc(spec: ^SystemSpec) -> SystemSpecError {
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
 	// 3 per type (Typed Arena, Isolate Metadata, Working Memory)
-	// + 25 static framework regions, including the SubRegion tracker array.
-	return (types_count * 3) + 25
+	// + 23 static framework regions, including the SubRegion tracker array.
+	return (types_count * 3) + 23
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
 	// 2-6. Slice headers for IsolateTypeDescriptor/isolate/working/metadata/free-head arrays
@@ -670,19 +659,17 @@ compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	// 10. Transfer Buffer Pool
 	// 11. Transfer Generations
 	// 12. FD Handoff Table
-	// 13. Timer Wheel Spokes
-	// 14. Timer Wheel Entries
-	// 15. Log Ring Buffer
-	// 16. Supervision Group Table
-	// 17. Scratch Arena
-	// 18. FD Table
-	// 19. Reactor Buffer Pool
-	// 20. Spare fixed region for optional platform/runtime allocation
-	// 21. Timer Renewable Deliver At
-	// 22. Timer Renewable Target
-	// 23. Timer Renewable Tag
-	// 24. Timer Renewable Correlation
-	// 25. Timer Renewable Armed Words
+	// 13. Timer Wheel Deadlines
+	// 14. Timer Wheel Targets
+	// 15. Timer Wheel Tags
+	// 16. Timer Wheel Correlations
+	// 17. Timer Wheel Armed Words
+	// 18. Log Ring Buffer
+	// 19. Supervision Group Table
+	// 20. Scratch Arena
+	// 21. FD Table
+	// 22. Reactor Buffer Pool
+	// 23. Spare fixed region for optional platform/runtime allocation
 }
 
 // Computes an upper-bound capacity aligned to a multiple of 8.
@@ -736,13 +723,11 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.transfer_slot_count * spec.transfer_slot_size
 	total += spec.transfer_slot_count * size_of(u16)
 	total += spec.fd_handoff_entry_count * size_of(FD_Handoff_Entry)
-	total += spec.timer_spoke_count * size_of(u32) // Spoke head array
-	total += spec.timer_entry_count * size_of(Timer_Entry) // Timer entry pool
-	total += spec.timer_renewable_entry_count * size_of(u64)              // renewable_deliver_at
-	total += spec.timer_renewable_entry_count * size_of(Handle)           // renewable_target
-	total += spec.timer_renewable_entry_count * size_of(Message_Tag)      // renewable_tag
-	total += spec.timer_renewable_entry_count * size_of(Correlation_Id)   // renewable_correlation
-	total += bitmap_word_count_from_bit_count(spec.timer_renewable_entry_count) * size_of(u64) // renewable_armed_words
+	total += spec.timer_entry_count * size_of(u64)            // deadlines
+	total += spec.timer_entry_count * size_of(Handle)          // targets
+	total += spec.timer_entry_count * size_of(Message_Tag)     // tags
+	total += spec.timer_entry_count * size_of(Correlation_Id)  // correlations
+	total += bitmap_word_count_from_bit_count(spec.timer_entry_count) * size_of(u64) // armed_words
 	total += spec.fd_table_slot_count * spec.fd_entry_size
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)
@@ -798,7 +783,6 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 		scratch_arena_size  = 2048, // Intentionally too small
 		pool_slot_count     = 1024,
 		log_ring_size       = 65536,
-		timer_spoke_count   = 4096,
 		timer_entry_count   = 64,
 		timer_resolution_ns = 1_000_000,
 		default_ring_size   = 16,
@@ -810,13 +794,6 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	spec.scratch_arena_size = 4096 // Exactly enough
 	err = validate_system_spec(&spec)
 	testing.expect_value(t, err, SystemSpecError.None)
-
-	// Test timer_spoke_count power-of-2 validation
-	spec.timer_spoke_count = 100 // Not power of 2
-	err = validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.ValueNotPowerOfTwo)
-
-	spec.timer_spoke_count = 4096 // Restore valid value
 
 	// Test reactor_buffer_slot_count exceeds 12-bit token capacity
 	spec.reactor_buffer_slot_count = 4095
@@ -867,7 +844,6 @@ test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
 		scratch_arena_size  = 1,
 		pool_slot_count     = 16,
 		log_ring_size       = 16,
-		timer_spoke_count   = 16,
 		timer_entry_count   = 16,
 		default_ring_size   = 16,
 	}
@@ -903,7 +879,6 @@ when TINA_SIMULATION_MODE {
 			shard_specs         = shard_specs[:],
 			pool_slot_count     = 1024,
 			log_ring_size       = 4096,
-			timer_spoke_count   = 1024,
 			timer_entry_count   = 64,
 			timer_resolution_ns = 1_000_000,
 			default_ring_size   = 16,

@@ -20,7 +20,7 @@ _connection_arm_or_rearm_deadline :: proc(
 	correlation := tina.Correlation_Id(state.request_token)
 
 	state.deadline_ns = tina.Monotonic_Time_NS(tina.ctx_current_time_ns(ctx) + duration_ns)
-	tina.ctx_rearm_renewable_deadline(ctx, state.deadline_timer_handle, duration_ns, tag, correlation)
+	tina.ctx_timer_rearm(ctx, state.deadline_timer_handle, duration_ns, tag, correlation)
 }
 
 @(private = "package")

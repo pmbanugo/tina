@@ -168,7 +168,6 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 				now_ns := os_monotonic_time_ns()
 				shard.current_time_ns = now_ns
 				shard.current_tick = now_ns / shard.timer_resolution_ns
-				shard.timer_wheel.last_tick = shard.current_tick
 				sync.atomic_store_explicit(&shard.heartbeat_tick, shard.current_tick, .Relaxed)
 			}
 		}

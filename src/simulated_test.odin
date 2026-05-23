@@ -206,7 +206,6 @@ when TINA_SIMULATION_MODE {
 			reactor_buffer_slot_size  = 4096,
 			transfer_slot_count       = 4,
 			transfer_slot_size        = 4096,
-			timer_spoke_count         = 1024,
 			timer_entry_count         = 1024,
 			fd_table_slot_count       = 16,
 			fd_entry_size             = size_of(FD_Entry),
