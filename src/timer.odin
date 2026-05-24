@@ -282,7 +282,7 @@ ctx_register_timer :: proc(ctx: TinaContext, duration_ns: u64, tag: Message_Tag)
 		)
 		return
 	}
-	timer_schedule(wheel, shard.current_time_ns + duration_ns, invocation.self_handle, tag, CORRELATION_ID_NONE)
+	timer_schedule(wheel, shard.current_tick + _duration_ns_to_ticks(duration_ns, shard.timer_resolution_ns), invocation.self_handle, tag, CORRELATION_ID_NONE)
 }
 
 // Registers a one-shot timer with an explicit correlation token so the receiver
@@ -306,7 +306,7 @@ ctx_register_timer_with_correlation :: proc(
 		)
 		return
 	}
-	timer_schedule(wheel, shard.current_time_ns + duration_ns, invocation.self_handle, tag, correlation)
+	timer_schedule(wheel, shard.current_tick + _duration_ns_to_ticks(duration_ns, shard.timer_resolution_ns), invocation.self_handle, tag, correlation)
 }
 
 @(private = "package")
@@ -321,8 +321,8 @@ _register_system_timer :: proc(
 	if wheel.free_head == POOL_NONE_INDEX {
 		panic("[PANIC] Timer pool exhausted! Isolate will deadlock.")
 	}
-	deadline_ns := shard.current_time_ns + delay_ticks * shard.timer_resolution_ns
-	timer_schedule(wheel, deadline_ns, target, tag, correlation)
+	deadline_tick := shard.current_tick + delay_ticks
+	timer_schedule(wheel, deadline_tick, target, tag, correlation)
 }
 
 // Unified timer sweep: scans the armed bitmap for expired deadlines.
@@ -334,13 +334,13 @@ _advance_timers :: proc(
 	expirations_max: u32 = TIMER_EXPIRATIONS_PER_TICK_MAX_DEFAULT,
 ) {
 	wheel := &shard.timer_wheel
-	now_ns := shard.current_time_ns
+	now_tick := shard.current_tick
 
 	if wheel.armed_count == 0 {
 		return
 	}
 
-	if now_ns < (wheel.earliest_deadline & TIMER_DEADLINE_MASK) {
+	if now_tick < (wheel.earliest_deadline & TIMER_DEADLINE_MASK) {
 		return
 	}
 
@@ -362,7 +362,7 @@ _advance_timers :: proc(
 			raw_deadline := wheel.deadlines[slot_index]
 			masked_deadline := raw_deadline & TIMER_DEADLINE_MASK
 
-			if masked_deadline <= now_ns {
+			if masked_deadline <= now_tick {
 				// Expired — clear bit in the backing array and decrement count
 				bit_mask := bitmap_mask_from_word_bit_index(bit_index)
 				wheel.armed_words[word_index] &= ~bit_mask
@@ -422,7 +422,7 @@ _advance_timers :: proc(
 		wheel.earliest_deadline = next_earliest_deadline
 	} else {
 		// Budget exhausted before finishing scan. Force a rescan on the next tick.
-		wheel.earliest_deadline = now_ns
+		wheel.earliest_deadline = now_tick
 	}
 
 	when TINA_RUNTIME_ASSERTIONS {
@@ -499,23 +499,21 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_time_ns + 5,
+				invocation.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(7),
-			)
+				)
 
-			invocation.shard.current_tick = 9
-			invocation.shard.current_time_ns = 9
-			_advance_timers(invocation.shard)
-			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
-			testing.expect_value(
+				invocation.shard.current_tick = 9
+				_advance_timers(invocation.shard)
+				soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
+				testing.expect_value(
 				state.t,
 				soa_meta[extract_slot(state.handle)].inbox_count,
 				u16(0),
-			)
+				)
 
-			invocation.shard.current_tick = 10
-			invocation.shard.current_time_ns = 10
+				invocation.shard.current_tick = 10
 			_advance_timers(invocation.shard)
 
 			timer_release(wheel, timer_handle)
@@ -557,30 +555,28 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 			timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_time_ns + 5,
+				invocation.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(1),
-			)
-			timer_rearm(
+				)
+				timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_time_ns + 10,
+				invocation.current_tick + 10,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 1),
 				Correlation_Id(9),
-			)
+				)
 
-			invocation.shard.current_tick = 25
-			invocation.shard.current_time_ns = 25
-			_advance_timers(invocation.shard)
-			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
-			testing.expect_value(
+				invocation.shard.current_tick = 25
+				_advance_timers(invocation.shard)
+				soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
+				testing.expect_value(
 				state.t,
 				soa_meta[extract_slot(state.handle)].inbox_count,
 				u16(0),
-			)
+				)
 
-			invocation.shard.current_tick = 30
-			invocation.shard.current_time_ns = 30
+				invocation.shard.current_tick = 30
 			_advance_timers(invocation.shard)
 
 			timer_release(wheel, timer_handle)
@@ -625,32 +621,30 @@ test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^t
 			timer_rearm(
 				wheel,
 				state.timer_handle_first,
-				invocation.current_time_ns + 5,
+				invocation.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(3),
-			)
-			timer_release(wheel, state.timer_handle_first)
-			state.timer_handle_second = timer_acquire(wheel, invocation.self_handle)
-			timer_rearm(
+				)
+				timer_release(wheel, state.timer_handle_first)
+				state.timer_handle_second = timer_acquire(wheel, invocation.self_handle)
+				timer_rearm(
 				wheel,
 				state.timer_handle_second,
-				invocation.current_time_ns + 7,
+				invocation.current_tick + 7,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 2),
 				Correlation_Id(4),
-			)
+				)
 
-			invocation.shard.current_tick = 106
-			invocation.shard.current_time_ns = 106
-			_advance_timers(invocation.shard)
-			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
-			testing.expect_value(
+				invocation.shard.current_tick = 106
+				_advance_timers(invocation.shard)
+				soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
+				testing.expect_value(
 				state.t,
 				soa_meta[extract_slot(state.handle)].inbox_count,
 				u16(0),
-			)
+				)
 
-			invocation.shard.current_tick = 107
-			invocation.shard.current_time_ns = 107
+				invocation.shard.current_tick = 107
 			_advance_timers(invocation.shard)
 
 			timer_release(wheel, state.timer_handle_second)
@@ -690,13 +684,12 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 			timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_time_ns + 5,
+				invocation.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(11),
-			)
+				)
 
-			invocation.shard.current_tick = 55
-			invocation.shard.current_time_ns = 55
+				invocation.shard.current_tick = 55
 			_advance_timers(invocation.shard)
 
 			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
@@ -748,21 +741,20 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 			timer_rearm(
 				wheel,
 				state.timer_handle_first,
-				invocation.current_time_ns + 5,
+				invocation.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(3),
-			)
-			timer_rearm(
+				)
+				timer_rearm(
 				wheel,
 				state.timer_handle_second,
-				invocation.current_time_ns + 10,
+				invocation.current_tick + 10,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 1),
 				Correlation_Id(4),
-			)
+				)
 
-			// Advance past the first deadline but before the second
-			invocation.shard.current_tick = 106
-			invocation.shard.current_time_ns = 106
+				// Advance past the first deadline but before the second
+				invocation.shard.current_tick = 106
 			_advance_timers(invocation.shard)
 
 			// The first deadline should have fired, but the second must still be armed.
@@ -780,7 +772,6 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 
 			// Now advance past the second deadline
 			invocation.shard.current_tick = 111
-			invocation.shard.current_time_ns = 111
 			_advance_timers(invocation.shard)
 
 			// Verify that the second timer has now also fired and count is zero

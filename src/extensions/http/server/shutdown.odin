@@ -19,7 +19,7 @@ _connection_arm_or_rearm_deadline :: proc(
 	state := &connection.connection_state
 	correlation := tina.Correlation_Id(state.request_token)
 
-	state.deadline_ns = tina.Monotonic_Time_NS(tina.ctx_current_time_ns(ctx) + duration_ns)
+	state.deadline_ns = tina.Monotonic_Time_NS(u64(tina.ctx_monotonic_time_ns(ctx)) + duration_ns)
 	tina.ctx_timer_rearm(ctx, state.deadline_timer_handle, duration_ns, tag, correlation)
 }
 
@@ -180,7 +180,7 @@ _connection_timeout_is_current :: proc(connection: ^HTTP_Connection, ctx: tina.T
 	state := &connection.connection_state
 	if state.deadline_ns == 0 do return false
 	if correlation != tina.Correlation_Id(state.request_token) do return false
-	return tina.ctx_current_time_ns(ctx) >= u64(state.deadline_ns)
+	return tina.ctx_monotonic_time_ns(ctx) >= state.deadline_ns
 }
 
 @(private = "package")

@@ -16,7 +16,6 @@ Isolate_Invocation :: struct {
 	scratch_arena:          mem.Arena,
 	timer_resolution_ns:    u64,
 	current_tick:           u64,
-	current_time_ns:        u64,
 	type_id:                u16,
 	slot_index:             u32,
 	shard_id:               Shard_Id,
@@ -310,7 +309,7 @@ ctx_timer_rearm :: #force_inline proc(
 	timer_rearm(
 		&invocation.shard.timer_wheel,
 		handle,
-		invocation.current_time_ns + duration_ns,
+		invocation.current_tick + _duration_ns_to_ticks(duration_ns, invocation.timer_resolution_ns),
 		tag,
 		correlation,
 	)

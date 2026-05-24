@@ -166,7 +166,6 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			// FIRST-TIME BOOT PATH
 			when !TINA_SIMULATION_MODE {
 				now_ns := os_monotonic_time_ns()
-				shard.current_time_ns = now_ns
 				shard.current_tick = now_ns / shard.timer_resolution_ns
 				sync.atomic_store_explicit(&shard.heartbeat_tick, shard.current_tick, .Relaxed)
 			}

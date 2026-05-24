@@ -394,12 +394,10 @@ when TINA_SIMULATION_MODE {
 		// past the timeout threshold, while keeping ACK path fast.
 		for round in u64(0) ..< (FD_HANDOFF_TIMEOUT_TICKS + 8) {
 			sim.shards[0].current_tick = round
-			sim.shards[0].current_time_ns = round * sim.tick_resolution_ns
 			sim.network.channels[0][1].delay_ticks = u32(FD_HANDOFF_TIMEOUT_TICKS + 4)
 			scheduler_tick(&sim.shards[0])
 
 			sim.shards[1].current_tick = round
-			sim.shards[1].current_time_ns = round * sim.tick_resolution_ns
 			sim.network.channels[1][0].delay_ticks = 0
 			scheduler_tick(&sim.shards[1])
 		}
@@ -518,12 +516,10 @@ when TINA_SIMULATION_MODE {
 
 		for round in u64(0) ..< (FD_HANDOFF_TIMEOUT_TICKS + 8) {
 			sim.shards[0].current_tick = round
-			sim.shards[0].current_time_ns = round * sim.tick_resolution_ns
 			sim.network.channels[0][1].delay_ticks = 0
 			scheduler_tick(&sim.shards[0])
 
 			sim.shards[1].current_tick = round
-			sim.shards[1].current_time_ns = round * sim.tick_resolution_ns
 			sim.network.channels[1][0].delay_ticks = u32(FD_HANDOFF_TIMEOUT_TICKS + 4)
 			scheduler_tick(&sim.shards[1])
 		}

@@ -44,13 +44,11 @@ test_with_context :: proc(
 		id                     = extract_shard_id(config.self_handle),
 		timer_resolution_ns    = config.timer_resolution_ns,
 		current_tick           = u64(config.monotonic_time_ns) / max(u64(config.timer_resolution_ns), u64(1)),
-		current_time_ns        = u64(config.monotonic_time_ns),
 		watchdog_state_pointer = &watchdog_state,
 	}
 	if shard.timer_resolution_ns == 0 {
 		shard.timer_resolution_ns = 1
 		shard.current_tick = u64(config.monotonic_time_ns)
-		shard.current_time_ns = u64(config.monotonic_time_ns)
 	}
 
 	timer_deadlines := make([]u64, 16)
@@ -83,7 +81,6 @@ test_with_context :: proc(
 		flags                  = config.flags,
 		timer_resolution_ns    = shard.timer_resolution_ns,
 		current_tick           = u64(config.monotonic_time_ns) / shard.timer_resolution_ns,
-		current_time_ns        = u64(config.monotonic_time_ns),
 		type_id                = extract_type_id(config.self_handle),
 		slot_index             = extract_slot(config.self_handle),
 		shard_id               = shard.id,
@@ -119,12 +116,10 @@ test_with_local_context :: proc(
 		id                     = extract_shard_id(config.target_handle),
 		timer_resolution_ns    = config.timer_resolution_ns,
 		current_tick           = config.current_tick,
-		current_time_ns        = config.current_tick * max(u64(config.timer_resolution_ns), u64(1)),
 		watchdog_state_pointer = &watchdog_state,
 	}
 	if shard.timer_resolution_ns == 0 {
 		shard.timer_resolution_ns = 1
-		shard.current_time_ns = config.current_tick
 	}
 
 	pool_backing := make([]u8, MESSAGE_ENVELOPE_SIZE * 8)
@@ -202,7 +197,6 @@ test_with_local_context :: proc(
 		flags                  = config.flags,
 		timer_resolution_ns    = shard.timer_resolution_ns,
 		current_tick           = config.current_tick,
-		current_time_ns        = shard.current_time_ns,
 		type_id                = extract_type_id(config.self_handle),
 		slot_index             = extract_slot(config.self_handle),
 		shard_id               = shard.id,

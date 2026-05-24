@@ -8,6 +8,14 @@ SENDFILE_ALL_BYTES: u32 : max(u32)
 
 Monotonic_Time_NS :: distinct u64
 
+// Converts a duration in nanoseconds to ticks, rounding up so the timer fires
+// at or after the requested duration. Uses the standard unsigned ceil division
+// identity: ceil(a/b) = (a + b - 1) / b.
+@(private = "package")
+_duration_ns_to_ticks :: #force_inline proc "contextless" (duration_ns: u64, timer_resolution_ns: u64) -> u64 {
+	return (duration_ns + timer_resolution_ns - 1) / timer_resolution_ns
+}
+
 Supervision_Group_Id :: distinct u16
 SUPERVISION_GROUP_ID_NONE :: Supervision_Group_Id(0xFFFF)
 SUPERVISION_GROUP_ID_ROOT :: Supervision_Group_Id(0)
@@ -149,11 +157,6 @@ bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 ctx_monotonic_time_ns :: #force_inline proc(ctx: TinaContext) -> Monotonic_Time_NS {
 	invocation := ctx_invocation(ctx)
 	return Monotonic_Time_NS(invocation.current_tick * invocation.timer_resolution_ns)
-}
-
-// Retrieves the raw current time (in nanoseconds) from the scheduler.
-ctx_current_time_ns :: #force_inline proc(ctx: TinaContext) -> u64 {
-	return ctx_invocation(ctx).current_time_ns
 }
 
 ctx_timer_resolution_ns :: #force_inline proc(ctx: TinaContext) -> u64 {
