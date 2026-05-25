@@ -155,6 +155,13 @@ The echo example runs a two-shard TCP server. A chaos client crashes after a few
 | [`examples/`](./examples) | Runnable examples with detailed walkthroughs |
 | [`src/README_DST.md`](./src/README_DST.md) | Deterministic Simulation Testing — writing tests, fault injection, reproducing failures |
 
+## Extensions and Tools
+
+Tina's core provides primitives that can be used to compose different types of solutions. However, there are packages for a few of the things I use or get asked for. They're called *extensions*, located in [./src/extensions](./src/extensions) folder. Currently there are:
+
+1. **Tina HTTP**: A HTTP/1.1 web server library
+2. **Datastar**: An experimental SDK for [Datastar](https://data-star.dev/), a hypermedia framework for building reactive web apps
+
 ## Production Readiness & Status
 
 **Status: Early but Functionally Stable.**
