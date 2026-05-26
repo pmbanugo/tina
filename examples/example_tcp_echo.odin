@@ -17,10 +17,10 @@ DEMO_ECHO_CHAOS_CRASH_AFTER :: #config(TINA_DEMO_ECHO_CHAOS_CRASH_AFTER, 2)
 // ============================================================================
 // Type Identifiers and Message Tags
 // ============================================================================
-SERVER_LISTENER_ISOLATE_TYPE: u8 : 0
-SERVER_CONN_ISOLATE_TYPE: u8 : 1
-CLIENT_ISOLATE_TYPE: u8 : 2
-CHAOS_ISOLATE_TYPE: u8 : 3
+SERVER_LISTENER_ISOLATE_TYPE :: 0
+SERVER_CONN_ISOLATE_TYPE :: 1
+CLIENT_ISOLATE_TYPE :: 2
+CHAOS_ISOLATE_TYPE :: 3
 
 TAG_CLIENT_TIMER: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 1
 
@@ -484,7 +484,6 @@ main :: proc() {
 			phase_2_threshold = 2,
 		},
 		pool_slot_count = 4096,
-
 		timer_entry_count = 1024,
 		log_ring_size = 65536,
 		default_ring_size = 32,
