@@ -96,6 +96,7 @@ Shard_Counters :: struct {
 	mailbox_full_drops:        u64,
 	io_buffer_exhaustions:     u64,
 	io_submission_exhaustions: u64,
+	io_awaiting_count:         u64,
 	io_stale_completions:      u64, // TODO: In simulation, consider verifying that this counter
 	// equals the number of timer-wakes + shutdown-wakes that
 	// interrupted WAITING_FOR_IO Isolates. A mismatch would indicate
@@ -492,12 +493,32 @@ _dispatchable_find_next_slot :: proc "contextless" (
 }
 
 @(private = "package")
+_slot_track_io_awaiting_transition :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	old_state: Isolate_State,
+	new_state: Isolate_State,
+) {
+	if old_state == new_state {
+		return
+	}
+	if old_state == .Waiting_For_Io {
+		if shard.counters.io_awaiting_count > 0 {
+			shard.counters.io_awaiting_count -= 1
+		}
+	} else if new_state == .Waiting_For_Io {
+		shard.counters.io_awaiting_count += 1
+	}
+}
+
+@(private = "package")
 _slot_set_state :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_id: u16,
 	slot_index: u32,
 	state: Isolate_State,
 ) {
+	old_state := shard.metadata[type_id][slot_index].state
+	_slot_track_io_awaiting_transition(shard, old_state, state)
 	shard.metadata[type_id][slot_index].state = state
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
@@ -509,8 +530,10 @@ _slot_set_waiting_for_reply :: #force_inline proc "contextless" (
 	slot_index: u32,
 	correlation_id: Correlation_Id,
 ) {
-	shard.metadata[type_id][slot_index].pending_correlation = correlation_id
-	shard.metadata[type_id][slot_index].state = .Waiting_For_Reply
+	meta := &shard.metadata[type_id][slot_index]
+	_slot_track_io_awaiting_transition(shard, meta.state, .Waiting_For_Reply)
+	meta.pending_correlation = correlation_id
+	meta.state = .Waiting_For_Reply
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
 
@@ -579,6 +602,7 @@ _slot_set_io_completion_ready :: #force_inline proc "contextless" (
 	meta.io_result = completion_result
 	meta.io_buffer_index = buffer_index
 	if meta.state == .Waiting_For_Io {
+		_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
 		meta.state = .Runnable
 	}
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
@@ -596,6 +620,7 @@ _slot_set_io_submit_failure :: #force_inline proc "contextless" (
 	meta.io_completion_tag = completion_tag
 	meta.io_result = completion_result
 	meta.io_buffer_index = BUFFER_INDEX_NONE
+	_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
 	meta.state = .Runnable
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
@@ -890,7 +915,9 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 
 	for turn_work_budget_count > 0 && scanned_type_count < type_count {
 		if dispatch_since_io_service_count >= io_service_interval_count {
-			reactor_service_nonblocking(&shard.reactor, shard)
+			if shard.counters.io_awaiting_count > 0 {
+				reactor_service_nonblocking(&shard.reactor, shard)
+			}
 			dispatch_since_io_service_count = 0
 		}
 
@@ -932,7 +959,9 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 		dispatch_since_io_service_count += dispatched_count
 
 		if dispatch_since_io_service_count >= io_service_interval_count {
-			reactor_service_nonblocking(&shard.reactor, shard)
+			if shard.counters.io_awaiting_count > 0 {
+				reactor_service_nonblocking(&shard.reactor, shard)
+			}
 			dispatch_since_io_service_count = 0
 		}
 	}
@@ -961,7 +990,9 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	// Step 2: Initial nonblocking I/O service point
 	// ========================================================================
-	reactor_service_nonblocking(&shard.reactor, shard)
+	if shard.counters.io_awaiting_count > 0 {
+		reactor_service_nonblocking(&shard.reactor, shard)
+	}
 
 	// ========================================================================
 	// Step 3: Replenish credits and run weighted dispatch
@@ -973,7 +1004,9 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// Step 4: Final I/O service point and handoff scans
 	// ========================================================================
 	reactor_flush_submissions(&shard.reactor, shard)
-	reactor_service_nonblocking(&shard.reactor, shard)
+	if reactor_has_io_work(&shard.reactor) {
+		reactor_service_nonblocking(&shard.reactor, shard)
+	}
 	_fd_handoff_retry_scan(shard)
 	_fd_handoff_timeout_scan(shard, now)
 
@@ -1763,6 +1796,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		}
 	}
 	shard.reactor.pending_count = 0
+	shard.reactor.io_in_flight_count = 0
 
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]
@@ -1834,6 +1868,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	for word_index in 0 ..< len(shard.dispatch_ready_type_words) {
 		shard.dispatch_ready_type_words[word_index] = 0
 	}
+	shard.counters.io_awaiting_count = 0
 	shard.dispatch_type_cursor = 0
 	shard.current_type_id = 0
 	shard.current_slot_index = 0
@@ -2009,6 +2044,44 @@ _make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
 	carve_err := hydrate_shard(arena, &spec, shard)
 	testing.expect_value(t, carve_err, mem.Allocator_Error.None)
 	return shard, arena
+}
+
+@(test)
+test_io_awaiting_count_tracks_slot_state_transitions :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+
+	shard.metadata = make([]#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata)
+	shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata[0])
+
+	_slot_set_state(shard, 0, 0, .Runnable)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
+
+	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
+
+	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
+
+	_slot_set_io_completion_ready(shard, 0, 0, IO_TAG_RECV_COMPLETE, 8, 3)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
+	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
+
+	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
+
+	_slot_set_io_submit_failure(shard, 0, 0, IO_TAG_RECV_COMPLETE, i32(IO_ERR_RESOURCE_EXHAUSTED))
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
+	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
+
+	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
+
+	_slot_set_waiting_for_reply(shard, 0, 0, 7)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
+	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Waiting_For_Reply)
 }
 
 @(test)

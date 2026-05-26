@@ -275,6 +275,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
 
 	// Step 4: Free arena slot & push back to free list
+	_slot_track_io_awaiting_transition(shard, soa_meta[slot_index].state, .Unallocated)
 	soa_meta[slot_index].state = .Unallocated
 	soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
 	shard.isolate_free_heads[type_id] = slot_index

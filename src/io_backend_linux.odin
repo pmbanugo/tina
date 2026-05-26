@@ -337,12 +337,15 @@ when !TINA_SIMULATION_MODE {
 			wait_number = 1
 		}
 
-		_, submit_err := uring.submit(&backend.ring, wait_number, time_spec_pointer)
-		if submit_err != nil &&
-		   submit_err != .NONE &&
-		   submit_err != .ETIME &&
-		   submit_err != .EINTR {
-			return 0, .System_Error
+		needs_submit := backend.unqueued_count > 0 || timeout_ns != 0
+		if needs_submit {
+			_, submit_err := uring.submit(&backend.ring, wait_number, time_spec_pointer)
+			if submit_err != nil &&
+			   submit_err != .NONE &&
+			   submit_err != .ETIME &&
+			   submit_err != .EINTR {
+				return 0, .System_Error
+			}
 		}
 
 		// Harvest CQEs. Keep the temporary harvest buffer aligned with the reactor

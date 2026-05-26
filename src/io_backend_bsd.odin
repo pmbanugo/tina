@@ -41,7 +41,9 @@ when !TINA_SIMULATION_MODE {
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_POSIX_PENDING)
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_POSIX_COMPLETED)
 	#assert(REACTOR_COMPLETION_BATCH_COUNT <= MAX_POSIX_COMPLETED)
+	MAX_POSIX_FD_IO_STATES :: 4096
 	POSIX_WAKE_IDENT :: 69
+	POSIX_EDGE_EVENT_UDATA_FLAG :: uintptr(1) << 63
 
 	@(private = "file")
 	_posix_map_socket_startup_error :: #force_inline proc "contextless" (err: posix.Errno) -> Backend_Error {
@@ -96,8 +98,27 @@ when !TINA_SIMULATION_MODE {
 
 	Pending_Posix_Op_Flag :: enum u8 {
 		Connect_In_Progress,
+		Edge_Clear,
 	}
 	Pending_Posix_Op_Flags :: bit_set[Pending_Posix_Op_Flag;u8]
+
+	Posix_FD_IO_State_Flag :: enum u8 {
+		Write_Edge_Clear,
+	}
+	Posix_FD_IO_State_Flags :: bit_set[Posix_FD_IO_State_Flag;u8]
+
+	Posix_FD_IO_State :: struct {
+		read_deferred_streak:  u8,
+		write_deferred_streak: u8,
+		write_ready_streak:    u8,
+		flags:                 Posix_FD_IO_State_Flags,
+		_padding:              [4]u8,
+	}
+
+	Posix_Stream_Tracking :: struct {
+		state:  ^Posix_FD_IO_State,
+		filter: kq.Filter,
+	}
 
 	Pending_Posix_Op :: struct {
 		token:         Submission_Token,
@@ -115,6 +136,7 @@ when !TINA_SIMULATION_MODE {
 		_padding:         u16,
 		kq_fd:           OS_FD,
 		pending:         [MAX_POSIX_PENDING]Pending_Posix_Op,
+		fd_io_states:    [MAX_POSIX_FD_IO_STATES]Posix_FD_IO_State,
 		pending_count:   u16,
 		completed:       [MAX_POSIX_COMPLETED]Raw_Completion,
 		completed_count: u16,
@@ -179,7 +201,19 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		for &sub in submissions {
-			result, immediate := _try_syscall(backend, &sub)
+			tracking := _posix_stream_tracking(backend, &sub.operation)
+			result: Raw_Completion
+			immediate: bool
+			if _posix_tracking_should_skip_optimistic_try(tracking) {
+				result = Raw_Completion {
+					token = sub.token,
+					extra = nil,
+				}
+				immediate = false
+			} else {
+				result, immediate = _try_syscall(backend, &sub)
+				_posix_tracking_note_optimistic_result(tracking, immediate)
+			}
 
 			if immediate {
 				backend.completed[backend.completed_count] = result
@@ -283,12 +317,12 @@ when !TINA_SIMULATION_MODE {
 				continue
 			}
 
+			pending_index, token, found_pending := _find_pending_by_event(backend, event)
+
 			// EV_ERROR: changelist registration error propagated back through kevent.
 			// The data field carries the errno specifically when this flag is set.
 			if .Error in event.flags {
-				token := Submission_Token(u64(uintptr(event.udata)))
-				pending_index := _find_pending(backend, token)
-				if pending_index >= 0 {
+				if found_pending {
 					out = _posix_deliver_completion(
 						backend,
 						completions,
@@ -296,14 +330,12 @@ when !TINA_SIMULATION_MODE {
 						output_max,
 						Raw_Completion{token = token, result = -i32(posix.Errno(event.data))},
 					)
-					_remove_pending(backend, u16(pending_index))
+					_remove_pending(backend, pending_index)
 				}
 				continue
 			}
 
-			token := Submission_Token(u64(uintptr(event.udata)))
-			pending_index := _find_pending(backend, token)
-			if pending_index < 0 {
+			if !found_pending {
 				continue
 			}
 
@@ -343,11 +375,14 @@ when !TINA_SIMULATION_MODE {
 				token     = pop.token,
 				operation = pop.operation,
 			}
+			tracking := _posix_stream_tracking(backend, &pop.operation)
 			result, immediate := _try_syscall(backend, &sub)
+			_posix_tracking_note_optimistic_result(tracking, immediate)
 
 			if immediate {
+				_posix_tracking_note_readiness_success(tracking)
 				out = _posix_deliver_completion(backend, completions, out, output_max, result)
-				_remove_pending(backend, u16(pending_index))
+				_remove_pending(backend, pending_index)
 			} else if event_has_eof {
 				// Peer closed but syscall returned EWOULDBLOCK — complete as EOF.
 				// Re-registering would be pointless: no further data will arrive.
@@ -358,9 +393,12 @@ when !TINA_SIMULATION_MODE {
 					output_max,
 					Raw_Completion{token = pop.token, result = 0},
 				)
-				_remove_pending(backend, u16(pending_index))
+				_remove_pending(backend, pending_index)
+			} else if .Edge_Clear in pop.flags {
+				// EV_CLEAR remains armed. The next kernel edge will wake this pending op.
+				continue
 			} else {
-			// Still not ready — re-register ONESHOT.
+				// Still not ready — re-register ONESHOT.
 				rearm_error := _register_kqueue(backend, pop)
 				if rearm_error != .None {
 					// Re-registration failed — complete as error to avoid stranding
@@ -372,7 +410,7 @@ when !TINA_SIMULATION_MODE {
 						output_max,
 						Raw_Completion{token = pop.token, result = -i32(posix.Errno.EIO)},
 					)
-					_remove_pending(backend, u16(pending_index))
+					_remove_pending(backend, pending_index)
 				}
 			}
 		}
@@ -634,6 +672,7 @@ when !TINA_SIMULATION_MODE {
 		fd: OS_FD,
 	) -> Backend_Error {
 		_sweep_pending_for_fd(backend, fd)
+		_posix_forget_fd_io_state(backend, fd)
 
 		if posix.close(posix.FD(fd)) != .OK {
 			return .System_Error
@@ -1022,20 +1061,180 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
+	_posix_stream_op_metadata :: proc "contextless" (
+		op: ^Submission_Operation,
+	) -> (
+		OS_FD,
+		kq.Filter,
+		bool,
+	) {
+		#partial switch o in op^ {
+		case Submission_Op_Send:
+			return o.fd_socket, .Write, true
+		case Submission_Op_Recv:
+			return o.fd_socket, .Read, true
+		case:
+			return OS_FD_INVALID, .Read, false
+		}
+	}
+
+	@(private = "file")
+	_posix_fd_io_state :: proc "contextless" (
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+	) -> ^Posix_FD_IO_State {
+		fd_index := i32(fd)
+		if fd_index < 0 || fd_index >= MAX_POSIX_FD_IO_STATES {
+			return nil
+		}
+		return &backend.fd_io_states[fd_index]
+	}
+
+	@(private = "file")
+	_posix_forget_fd_io_state :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) {
+		state := _posix_fd_io_state(backend, fd)
+		if state != nil {
+			state^ = Posix_FD_IO_State{}
+		}
+	}
+
+	@(private = "file")
+	_posix_stream_tracking :: proc "contextless" (
+		backend: ^Platform_Backend,
+		op: ^Submission_Operation,
+	) -> Posix_Stream_Tracking {
+		fd, filter, ok := _posix_stream_op_metadata(op)
+		if !ok {
+			return {}
+		}
+		state := _posix_fd_io_state(backend, fd)
+		if state == nil {
+			return {}
+		}
+		return Posix_Stream_Tracking{state = state, filter = filter}
+	}
+
+	@(private = "file")
+	_posix_tracking_should_skip_optimistic_try :: proc "contextless" (
+		tracking: Posix_Stream_Tracking,
+	) -> bool {
+		if tracking.state == nil {
+			return false
+		}
+		threshold := u8(REACTOR_POSIX_OPTIMISTIC_SKIP_DEFERRED_STREAK_COUNT)
+		if tracking.filter == .Read {
+			return tracking.state.read_deferred_streak >= threshold
+		}
+		return tracking.state.write_deferred_streak >= threshold
+	}
+
+	@(private = "file")
+	_posix_tracking_note_optimistic_result :: proc "contextless" (
+		tracking: Posix_Stream_Tracking,
+		immediate: bool,
+	) {
+		if tracking.state == nil {
+			return
+		}
+
+		if tracking.filter == .Read {
+			if immediate {
+				tracking.state.read_deferred_streak = 0
+			} else if tracking.state.read_deferred_streak < max(u8) {
+				tracking.state.read_deferred_streak += 1
+			}
+		} else {
+			if immediate {
+				tracking.state.write_deferred_streak = 0
+			} else if tracking.state.write_deferred_streak < max(u8) {
+				tracking.state.write_deferred_streak += 1
+			}
+		}
+	}
+
+	@(private = "file")
+	_posix_tracking_note_readiness_success :: proc "contextless" (
+		tracking: Posix_Stream_Tracking,
+	) {
+		if tracking.state == nil {
+			return
+		}
+
+		if tracking.filter == .Read {
+			return
+		}
+
+		threshold := u8(REACTOR_POSIX_WRITE_EDGE_CLEAR_READY_STREAK_COUNT)
+		if tracking.state.write_ready_streak < max(u8) {
+			tracking.state.write_ready_streak += 1
+		}
+		if tracking.state.write_ready_streak >= threshold {
+			tracking.state.flags += {.Write_Edge_Clear}
+		}
+	}
+
+	@(private = "file")
+	_posix_should_use_edge_clear :: proc "contextless" (
+		backend: ^Platform_Backend,
+		pending: ^Pending_Posix_Op,
+	) -> bool {
+		fd, filter, ok := _posix_stream_op_metadata(&pending.operation)
+		if !ok {
+			return false
+		}
+		state := _posix_fd_io_state(backend, fd)
+		if state == nil {
+			return false
+		}
+		if filter == .Read {
+			return false
+		}
+		return .Write_Edge_Clear in state.flags
+	}
+
+	@(private = "file")
+	_posix_edge_event_udata :: proc "contextless" (fd: OS_FD, filter: kq.Filter) -> uintptr {
+		filter_bit := uintptr(0)
+		if filter == .Write {
+			filter_bit = 1
+		}
+		return POSIX_EDGE_EVENT_UDATA_FLAG | (filter_bit << 32) | uintptr(u32(i32(fd)))
+	}
+
+	@(private = "file")
+	_posix_edge_event_decode :: proc "contextless" (event_data: uintptr) -> (OS_FD, kq.Filter) {
+		fd := OS_FD(event_data & 0xFFFF_FFFF)
+		filter: kq.Filter = .Read
+		if ((event_data >> 32) & 1) != 0 {
+			filter = .Write
+		}
+		return fd, filter
+	}
+
+	@(private = "file")
 	_register_kqueue :: proc(backend: ^Platform_Backend, pending: ^Pending_Posix_Op) -> Backend_Error {
 		// Close operations don't need kqueue registration.
 		if _, is_close := pending.operation.(Submission_Op_Close); is_close {
 			return .None
 		}
 
+		event_data := rawptr(uintptr(pending.token))
 		ev := [1]kq.KEvent {
 			{
 				ident = pending.kqueue_ident,
 				filter = pending.kqueue_filter,
 				flags = {.Add, .Enable, .One_Shot},
-				udata = rawptr(uintptr(u64(pending.token))),
+				udata = event_data,
 			},
 		}
+		if _posix_should_use_edge_clear(backend, pending) {
+			ev[0].flags = {.Add, .Enable, .Clear}
+			pending.flags += {.Edge_Clear}
+			ev[0].udata = rawptr(_posix_edge_event_udata(pending.subject_fd, pending.kqueue_filter))
+		} else {
+			pending.flags -= {.Edge_Clear}
+		}
+
 		time_spec: posix.timespec
 		_, kerr := kq.kevent(kq.KQ(backend.kq_fd), ev[:], nil, &time_spec)
 		if kerr != nil {
@@ -1045,13 +1244,55 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_find_pending :: proc(backend: ^Platform_Backend, token: Submission_Token) -> i32 {
+	_find_pending :: proc "contextless" (backend: ^Platform_Backend, token: Submission_Token) -> i32 {
 		for i: u16 = 0; i < backend.pending_count; i += 1 {
 			if backend.pending[i].token == token {
 				return i32(i)
 			}
 		}
 		return -1
+	}
+
+	@(private = "file")
+	_find_pending_by_fd_filter :: proc "contextless" (
+		backend: ^Platform_Backend,
+		fd: OS_FD,
+		filter: kq.Filter,
+	) -> i32 {
+		for i: u16 = 0; i < backend.pending_count; i += 1 {
+			if backend.pending[i].subject_fd == fd && backend.pending[i].kqueue_filter == filter {
+				return i32(i)
+			}
+		}
+		return -1
+	}
+
+	@(private = "file")
+	_find_pending_by_event :: proc "contextless" (
+		backend: ^Platform_Backend,
+		event: ^kq.KEvent,
+	) -> (
+		u16,
+		Submission_Token,
+		bool,
+	) {
+		event_data := uintptr(event.udata)
+		if (event_data & POSIX_EDGE_EVENT_UDATA_FLAG) != 0 {
+			fd, filter := _posix_edge_event_decode(event_data)
+			pending_index := _find_pending_by_fd_filter(backend, fd, filter)
+			if pending_index >= 0 {
+				index := u16(pending_index)
+				return index, backend.pending[index].token, true
+			}
+			return 0, 0, false
+		}
+
+		token := Submission_Token(u64(event_data))
+		pending_index := _find_pending(backend, token)
+		if pending_index >= 0 {
+			return u16(pending_index), token, true
+		}
+		return 0, 0, false
 	}
 
 	@(private = "file")
@@ -1190,27 +1431,29 @@ when !TINA_SIMULATION_MODE {
 
 	@(test)
 	test_posix_backend_control_dup_sets_cloexec_and_returns_distinct_fd :: proc(t: ^testing.T) {
-		backend: Platform_Backend
+		backend := new(Platform_Backend)
+		defer free(backend)
+
 		config := Backend_Config {
 			queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
 		}
-		backend_init_error := backend_init(&backend, config)
+		backend_init_error := backend_init(backend, config)
 		testing.expect_value(t, backend_init_error, Backend_Error.None)
-		defer backend_deinit(&backend)
+		defer backend_deinit(backend)
 
-		fd, socket_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		fd, socket_error := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, socket_error, Backend_Error.None)
 
-		dup_fd, dup_error := backend_control_dup(&backend, fd)
+		dup_fd, dup_error := backend_control_dup(backend, fd)
 		testing.expect_value(t, dup_error, Backend_Error.None)
 		testing.expect(t, dup_fd != fd, "dup must return a distinct descriptor")
 
 		flags := posix.fcntl(posix.FD(dup_fd), .GETFD)
 		testing.expect(t, flags > 0, "dup fd must have close-on-exec set")
 
-		close_error := backend_control_close(&backend, fd)
+		close_error := backend_control_close(backend, fd)
 		testing.expect_value(t, close_error, Backend_Error.None)
-		close_dup_error := backend_control_close(&backend, dup_fd)
+		close_dup_error := backend_control_close(backend, dup_fd)
 		testing.expect_value(t, close_dup_error, Backend_Error.None)
 	}
 

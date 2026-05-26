@@ -46,7 +46,8 @@ Reactor :: struct {
 
 	// Hot Scalars
 	pending_count:       u16,
-	_padding:            [6]u8,
+	io_in_flight_count:  u32,
+	_padding:            [2]u8,
 }
 
 // Initialize the Reactor with memory carved from the Grand Arena.
@@ -59,6 +60,7 @@ reactor_init :: proc(
 	buffer_slot_count: u16,
 ) -> Backend_Error {
 	reactor.pending_count = 0
+	reactor.io_in_flight_count = 0
 
 	// Init buffer pool first — backend needs pool metadata for registered buffers.
 	fd_table_init(&reactor.fd_table, fd_backing)
@@ -85,6 +87,7 @@ reactor_init :: proc(
 reactor_deinit :: proc(reactor: ^Reactor) {
 	backend_deinit(&reactor.backend)
 	reactor.pending_count = 0
+	reactor.io_in_flight_count = 0
 }
 
 reactor_socket_error_label :: #force_inline proc "contextless" (err: Reactor_Socket_Error) -> string {
@@ -429,10 +432,17 @@ _reactor_completion_apply_recvfrom :: proc (
 }
 
 reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns: i64) {
+	if timeout_ns == 0 && reactor.io_in_flight_count == 0 {
+		return
+	}
+
 	completions: [MAX_REACTOR_COMPLETION_BATCH]Raw_Completion
 
 	count, err := backend_collect(&reactor.backend, completions[:], timeout_ns)
 	if err != .None || count == 0 do return
+
+	completed_count := min(u32(count), reactor.io_in_flight_count)
+	reactor.io_in_flight_count -= completed_count
 
 	for i in 0 ..< count {
 		completion := &completions[i]
@@ -492,6 +502,10 @@ reactor_service_nonblocking :: proc(reactor: ^Reactor, shard: ^Shard) {
 	reactor_flush_submissions_if_needed(reactor, shard)
 }
 
+reactor_has_io_work :: #force_inline proc "contextless" (reactor: ^Reactor) -> bool {
+	return reactor.pending_count > 0 || reactor.io_in_flight_count > 0
+}
+
 @(private = "file")
 _backend_error_to_io_error :: #force_inline proc "contextless" (err: Backend_Error) -> IO_Error {
 	#partial switch err {
@@ -513,6 +527,7 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 
 	// Fast-return on success
 	if err == .None {
+		reactor.io_in_flight_count += u32(reactor.pending_count)
 		reactor.pending_count = 0
 		return .None
 	}
@@ -1057,6 +1072,21 @@ test_backend_error_to_io_error_maps_resource_exhausted :: proc(t: ^testing.T) {
 		_backend_error_to_io_error(Backend_Error.System_Error),
 		IO_Error(IO_ERR_BACKEND_FAILURE),
 	)
+}
+
+@(test)
+test_reactor_has_io_work_tracks_pending_and_in_flight_counts :: proc(t: ^testing.T) {
+	reactor := new(Reactor)
+	defer free(reactor)
+
+	testing.expect(t, !reactor_has_io_work(reactor), "empty reactor must not report I/O work")
+
+	reactor.pending_count = 1
+	testing.expect(t, reactor_has_io_work(reactor), "pending submissions are I/O work")
+
+	reactor.pending_count = 0
+	reactor.io_in_flight_count = 1
+	testing.expect(t, reactor_has_io_work(reactor), "in-flight submissions are I/O work")
 }
 
 @(test)

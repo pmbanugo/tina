@@ -186,6 +186,7 @@ when TINA_SIMULATION_MODE {
 
 		pool := &shard.reactor.buffer_pool
 		testing.expect_value(t, pool.free_count, pool.slot_count)
+		testing.expect_value(t, shard.reactor.io_in_flight_count, u32(0))
 
 		fmt.printfln(
 			"\n[TEST SUCCESS] io_sequence stale completion reclamation verified. Stale completions: %d, buffer pool: %d/%d free.",

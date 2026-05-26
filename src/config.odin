@@ -34,6 +34,12 @@ when TINA_ODIN_DEV {
 	SCHEDULER_TYPE_DISPATCH_BATCH_COUNT_MAX_DEFAULT :: 256
 	SCHEDULER_CREDIT_PER_WEIGHT_COUNT_DEFAULT :: 256
 	SCHEDULER_CREDIT_COUNT_MAX_DEFAULT :: 1024
+	// How many dispatches between I/O service points inside a single scheduler turn.
+	// Lower values reduce I/O completion latency (faster wakeup for Isolates waiting on I/O).
+	// Higher values reduce syscall overhead on BSD/kqueue (~13us per kevent poll on macOS M1).
+	// On Linux io_uring, the cost is near-zero (~3ns shared-memory read) when no I/O is in
+	// flight, so this value primarily affects BSD. The service point is also gated on
+	// io_awaiting_count > 0, meaning idle ticks skip the poll entirely regardless of interval.
 	SCHEDULER_IO_SERVICE_INTERVAL_COUNT_DEFAULT :: 128
 }
 
@@ -58,9 +64,48 @@ SCHEDULER_IO_SERVICE_INTERVAL_COUNT :: #config(
 	SCHEDULER_IO_SERVICE_INTERVAL_COUNT_DEFAULT,
 )
 
+// Maximum submissions accumulated before flushing to the backend.
+// Must be large enough to batch efficiently (io_uring: 31ns/op at 256 SQEs vs 332ns at 1),
+// but small enough to bound latency for pending completions.
 REACTOR_SUBMISSION_BATCH_COUNT :: #config(TINA_REACTOR_SUBMISSION_BATCH_COUNT, 256)
+// Maximum completions harvested per collect call. Sized symmetrically with submissions.
+// On Linux, copy_cqes reads shared memory at ~3ns when empty. On BSD, each kevent poll
+// costs ~13us regardless of result count, so larger batches amortize that floor cost.
 REACTOR_COMPLETION_BATCH_COUNT :: #config(TINA_REACTOR_COMPLETION_BATCH_COUNT, 256)
+// Trigger an early flush when pending submissions reach this count during dispatch,
+// rather than waiting for the end-of-turn flush at Step 4. Set to 75% of the
+// submission batch to balance latency (flush sooner) against batch efficiency
+// (fewer flushes per turn).
 REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT :: #config(TINA_REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT, 192)
+// BSD/kqueue only: after this many consecutive EAGAIN/EWOULDBLOCK results on a
+// stream direction, skip the optimistic syscall and register readiness directly.
+// Lower values reduce wasted syscalls under congestion; higher values preserve
+// the cheap immediate-success path for bursty sockets.
+//
+// Tuning: a failed optimistic recv costs ~288ns (macOS M1 Pro). After 2 consecutive
+// failures the backend skips the try and goes straight to kevent registration (~280ns).
+// Value of 1 is aggressive (one failure = skip); 3+ keeps trying longer but wastes
+// more cycles under sustained congestion. Default 2 balances responsiveness vs waste.
+REACTOR_POSIX_OPTIMISTIC_SKIP_DEFERRED_STREAK_COUNT :: #config(
+	TINA_REACTOR_POSIX_OPTIMISTIC_SKIP_DEFERRED_STREAK_COUNT,
+	2,
+)
+// BSD/kqueue write side only: after this many successful write-readiness cycles,
+// keep the write filter armed with EV_CLEAR instead of re-registering ONESHOT.
+// Reads intentionally stay ONESHOT because Tina currently performs one read per
+// completion; unread bytes could otherwise remain without a new edge.
+//
+// Tuning: EV_CLEAR saves ~440-500ns per cycle vs ONESHOT re-registration (macOS M1
+// Pro: EV_CLEAR cycle ~997ns, ONESHOT cycle ~1441ns). The threshold counts successful
+// write-readiness events before switching to EV_CLEAR. Default 2 means the FD must
+// produce two consecutive ready events before upgrading. Higher values delay the
+// transition and are more conservative. Read-side EV_CLEAR is deliberately disabled
+// because Tina's one-read-per-completion model may leave unread bytes in the socket,
+// and kqueue would not produce another edge for those remaining bytes.
+REACTOR_POSIX_WRITE_EDGE_CLEAR_READY_STREAK_COUNT :: #config(
+	TINA_REACTOR_POSIX_WRITE_EDGE_CLEAR_READY_STREAK_COUNT,
+	2,
+)
 REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT_DEFAULT :: REACTOR_SUBMISSION_BATCH_COUNT
 REACTOR_LINUX_SENDFILE_ENTRY_COUNT_DEFAULT :: (REACTOR_SUBMISSION_BATCH_COUNT + 7) / 8
 REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT :: #config(
@@ -96,6 +141,10 @@ REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
 #assert(REACTOR_COMPLETION_BATCH_COUNT <= int(max(u16)))
 #assert(REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT > 0)
 #assert(REACTOR_SUBMISSION_FLUSH_THRESHOLD_COUNT <= REACTOR_SUBMISSION_BATCH_COUNT)
+#assert(REACTOR_POSIX_OPTIMISTIC_SKIP_DEFERRED_STREAK_COUNT > 0)
+#assert(REACTOR_POSIX_OPTIMISTIC_SKIP_DEFERRED_STREAK_COUNT <= int(max(u8)))
+#assert(REACTOR_POSIX_WRITE_EDGE_CLEAR_READY_STREAK_COUNT > 0)
+#assert(REACTOR_POSIX_WRITE_EDGE_CLEAR_READY_STREAK_COUNT <= int(max(u8)))
 #assert(REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT > 0)
 #assert(REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT <= int(max(u16)))
 #assert(REACTOR_LINUX_SENDFILE_ENTRY_COUNT > 0)
