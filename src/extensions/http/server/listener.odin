@@ -38,10 +38,10 @@ _listener_log_startup_failure :: proc(
 }
 
 @(private = "package")
-_http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
+_http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
 	listener := cast(^HTTP_Listener)self
 	if len(args) < size_of(HTTP_Listener_Init_Args) {
-		return tina.Effect_Crash{reason = .Init_Failed}
+		return tina.transition_to_crash(.Init_Failed)
 	}
 
 	init_args := (cast(^HTTP_Listener_Init_Args)raw_data(args))^
@@ -59,7 +59,7 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 		init_args.server.ingress_mode,
 	)
 	if topology_error != .None {
-		return tina.Effect_Crash{reason = .Init_Failed}
+		return tina.transition_to_crash(.Init_Failed)
 	}
 
 	if topology.coordinator_mode_enabled {
@@ -77,10 +77,10 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 
 	listener.listen_fd = _listener_open_listen_socket(ctx, listener.shard_runtime, topology.bind_mode)
 	if listener.listen_fd == tina.FD_HANDLE_NONE {
-		return tina.Effect_Crash{reason = .Init_Failed}
+		return tina.transition_to_crash(.Init_Failed)
 	}
 
-	return _listener_accept_effect(listener)
+	return _listener_accept_effect(listener, ctx)
 }
 
 @(private = "package")
@@ -88,7 +88,7 @@ _http_listener_handler :: proc(
 	self: rawptr,
 	message: ^tina.Message,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	listener := cast(^HTTP_Listener)self
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(listener != nil, "_http_listener_handler: listener is nil")
@@ -98,15 +98,15 @@ _http_listener_handler :: proc(
 	switch message.tag {
 	case tina.TAG_SHUTDOWN:
 		listener.shard_runtime.draining = true
-		return tina.Effect_Io{operation = tina.IoOp_Close{fd = listener.listen_fd}}
+		return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = listener.listen_fd}))
 
 	case tina.IO_TAG_ACCEPT_COMPLETE:
 		client_fd := message.io.fd
 		if listener.shard_runtime.draining {
 			if client_fd != tina.FD_HANDLE_NONE {
-				return tina.Effect_Io{operation = tina.IoOp_Close{fd = client_fd}}
+				return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = client_fd}))
 			}
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 
 		result := message.io.result
@@ -115,14 +115,14 @@ _http_listener_handler :: proc(
 				dispatch_result := _listener_dispatch_connection(listener, ctx, client_fd)
 				if dispatch_result == .Local_Spawned || dispatch_result == .Handoff_Offered {
 					listener.shard_runtime.accept_backoff_ns = 50_000_000
-					return _listener_accept_effect(listener)
+					return _listener_accept_effect(listener, ctx)
 				}
 				if dispatch_result == .Local_Capacity_Full {
 					_ = _listener_evict_idle_connection(listener, ctx)
 				}
-				return tina.Effect_Io{operation = tina.IoOp_Close{fd = client_fd}}
+				return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = client_fd}))
 			}
-			return _listener_accept_effect(listener)
+			return _listener_accept_effect(listener, ctx)
 		}
 
 		if _listener_accept_fd_exhausted(result) {
@@ -142,28 +142,28 @@ _http_listener_handler :: proc(
 			)
 			tina.ctx_register_timer(ctx, listener.shard_runtime.accept_backoff_ns, TAG_ACCEPT_BACKOFF)
 			_ = _listener_evict_idle_connection(listener, ctx)
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 
-		return _listener_accept_effect(listener)
+		return _listener_accept_effect(listener, ctx)
 
 	case TAG_ACCEPT_BACKOFF:
 		if listener.shard_runtime.draining {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
-		return _listener_accept_effect(listener)
+		return _listener_accept_effect(listener, ctx)
 
 	case tina.IO_TAG_CLOSE_COMPLETE:
 		if message.io.fd == listener.listen_fd {
-			return tina.Effect_Done{}
+			return tina.ISOLATE_TRANSITION_DONE
 		}
 		if listener.shard_runtime.draining {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
-		return _listener_accept_effect(listener)
+		return _listener_accept_effect(listener, ctx)
 
 	case:
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 }
 
@@ -389,8 +389,8 @@ _listener_open_listen_socket :: proc(
 }
 
 @(private = "file")
-_listener_accept_effect :: #force_inline proc "contextless" (listener: ^HTTP_Listener) -> tina.Effect {
-	return tina.Effect_Io{operation = tina.IoOp_Accept{listen_fd = listener.listen_fd}}
+_listener_accept_effect :: #force_inline proc(listener: ^HTTP_Listener, ctx: tina.TinaContext) -> tina.Isolate_Transition {
+	return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = listener.listen_fd}))
 }
 
 @(private = "file")
@@ -429,23 +429,19 @@ test_listener_shutdown_close_completion_terminates_listener :: proc(t: ^testing.
 			shutdown_message: tina.Message
 			shutdown_message.tag = tina.TAG_SHUTDOWN
 			effect := _http_listener_handler(rawptr(state.listener), &shutdown_message, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				#partial switch close_op in io_effect.operation {
-				case tina.IoOp_Close:
-					testing.expect_value(state.t, close_op.fd, state.listener.listen_fd)
-				case:
-					testing.expect(state.t, false, "listener shutdown must close the listen socket")
-				}
+			testing.expect_value(state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			#partial switch close_op in tina.ctx_staged_io_operation(ctx) {
+			case tina.IoOp_Close:
+				testing.expect_value(state.t, close_op.fd, state.listener.listen_fd)
 			case:
-				testing.expect(state.t, false, "listener shutdown must return close I/O")
+				testing.expect(state.t, false, "listener shutdown must close the listen socket")
 			}
 
 			close_complete: tina.Message
 			close_complete.tag = tina.IO_TAG_CLOSE_COMPLETE
 			close_complete.io.fd = state.listener.listen_fd
 			effect = _http_listener_handler(rawptr(state.listener), &close_complete, ctx)
-			if _, ok := effect.(tina.Effect_Done); !ok {
+			if effect.kind != tina.Isolate_Transition_Kind.Done {
 				testing.expect(state.t, false, "listener must terminate when its listen socket close completes")
 			}
 		},

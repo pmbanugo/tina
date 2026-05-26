@@ -23,48 +23,55 @@ SUPERVISION_GROUP_ID_ROOT :: Supervision_Group_Id(0)
 // Solves the 0xFFFF bitwise truncation hazard by explicitly using the 255th slot
 SUPERVISION_SUBGROUP_TYPE_ID: Isolate_Type_Id : 255
 
-Crash_Reason :: enum u8 {
-	None                 = 0,
-	Spawn_Failed         = 1,
-	Unimplemented_Effect = 2,
-	Init_Failed          = 3,
+// Coarse fault classification for scheduler policy, counters, and logs.
+// This is intentionally not a detailed error transport channel. Rich
+// diagnostics belong in logs so the hot-path transition stays tiny.
+Isolate_Fault_Reason :: enum u8 {
+	None                     = 0,
+	Spawn_Failed             = 1,
+	Unimplemented_Transition = 2,
+	Init_Failed              = 3,
+	Contract_Violation       = 4,
 }
 
 Exit_Kind :: enum u8 {
-	Normal, // Child returned Effect_Done (clean shutdown)
-	Crashed, // Child returned Effect_Crash or panicked (Tier 1 / Tier 2)
+	Normal, // Child returned Isolate_Transition{kind = .Done} (clean shutdown)
+	Crashed, // Child returned Isolate_Transition{kind = .Crash} or panicked (Tier 1 / Tier 2)
 	Shutdown, // Child was torn down by supervisor strategy (recursion guard)
 }
 
-// Explicitly sized variants for the Effect tagged union. Empty structs (should) cost 0 bytes.
-Effect_Done :: struct {}
-Effect_Crash :: struct {
-	reason: Crash_Reason,
-}
-Effect_Yield :: struct {}
-Effect_Receive :: struct {}
-Effect_Call :: struct {
-	to:      Handle,
-	message: Message,
-	timeout: u64,
-}
-Effect_Reply :: struct {
-	message: Message,
-}
-Effect_Io :: struct {
-	operation: IoOp,
+Isolate_Transition_Kind :: enum u8 {
+	Done,
+	Yield,
+	Wait_Message,
+	Wait_Reply,
+	Wait_Io,
+	Crash,
 }
 
-// The state transition returned by an Isolate handler.
-// It tells the scheduler exactly what to do with the Isolate next (e.g., park, crash, wait for I/O).
-Effect :: union {
-	Effect_Done,
-	Effect_Crash,
-	Effect_Yield,
-	Effect_Receive,
-	Effect_Call,
-	Effect_Reply,
-	Effect_Io,
+// The scheduler only needs the next isolate state plus a coarse fault classification.
+Isolate_Transition :: struct {
+	kind:         Isolate_Transition_Kind,
+	fault_reason: Isolate_Fault_Reason,
+}
+
+#assert(size_of(Isolate_Transition) == 2)
+
+ISOLATE_TRANSITION_DONE :: Isolate_Transition{kind = .Done}
+ISOLATE_TRANSITION_YIELD :: Isolate_Transition{kind = .Yield}
+ISOLATE_TRANSITION_WAIT_MESSAGE :: Isolate_Transition{kind = .Wait_Message}
+ISOLATE_TRANSITION_WAIT_REPLY :: Isolate_Transition{kind = .Wait_Reply}
+ISOLATE_TRANSITION_WAIT_IO :: Isolate_Transition{kind = .Wait_Io}
+
+transition_to_crash :: #force_inline proc "contextless" (fault_reason: Isolate_Fault_Reason) -> Isolate_Transition {
+	return Isolate_Transition{kind = .Crash, fault_reason = fault_reason}
+}
+
+transition_to_wait_io_or_crash :: #force_inline proc "contextless" (result: Io_Submit_Result) -> Isolate_Transition {
+	if result == .ok {
+		return ISOLATE_TRANSITION_WAIT_IO
+	}
+	return transition_to_crash(.Contract_Violation)
 }
 
 Send_Result :: enum u8 {
@@ -72,6 +79,28 @@ Send_Result :: enum u8 {
 	mailbox_full,
 	pool_exhausted,
 	stale_handle,
+}
+
+Reply_Result :: enum u8 {
+	ok,
+	already_replied,
+	not_call_context,
+	mailbox_full,
+	pool_exhausted,
+	stale_handle,
+}
+
+Call_Result :: enum u8 {
+	ok,
+	already_staged,
+	mailbox_full,
+	stale_handle,
+	target_quarantined,
+}
+
+Io_Submit_Result :: enum u8 {
+	ok,
+	already_staged,
 }
 
 Spawn_Error :: enum u8 {
@@ -212,71 +241,86 @@ payload_offset_of :: #force_inline proc(self: ^$Isolate, buffer: []u8) -> u16 {
 	return u16(buf_start - base)
 }
 
-// Builds an Effect that sends data from an Isolate's buffer over a socket.
-// Computes payload_offset automatically from the buffer slice.
-io_send :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Effect {
-	return Effect_Io {
-		operation = IoOp_Send {
+// Stages a socket send from an Isolate-owned buffer for commit if the handler
+// returns Isolate_Transition{kind = .Wait_Io}.
+@(require_results)
+ctx_io_send :: #force_inline proc(
+	ctx: TinaContext,
+	self: ^$Isolate,
+	fd: FD_Handle,
+	buffer: []u8,
+) -> Io_Submit_Result {
+	return ctx_submit_io(
+		ctx,
+		IoOp_Send {
 			fd = fd,
 			payload_offset = payload_offset_of(self, buffer),
 			payload_size = u32(len(buffer)),
 		},
-	}
+	)
 }
 
-// Builds an Effect that writes data from an Isolate's buffer to a file descriptor at a byte offset.
-// Computes payload_offset automatically from the buffer slice.
-io_write :: #force_inline proc(
+// Stages write command to a file-descriptor, from an Isolate-owned buffer for commit
+// if the handler returns Isolate_Transition{kind = .Wait_Io}.
+@(require_results)
+ctx_io_write :: #force_inline proc(
+	ctx: TinaContext,
 	self: ^$Isolate,
 	fd: FD_Handle,
 	buffer: []u8,
 	offset: u64,
-) -> Effect {
-	return Effect_Io {
-		operation = IoOp_Write {
+) -> Io_Submit_Result {
+	return ctx_submit_io(
+		ctx,
+		IoOp_Write {
 			fd = fd,
 			payload_offset = payload_offset_of(self, buffer),
 			payload_size = u32(len(buffer)),
 			offset = offset,
 		},
-	}
+	)
 }
 
-// Builds an Effect that transfers file data directly to a socket via kernel zero-copy (sendfile).
-// No Isolate memory is involved — data flows from the file's page cache to the socket.
-// The caller manages offset progression: next offset = source_offset + completion.result.
-io_sendfile :: #force_inline proc "contextless" (
+// Stages a zero-copy sendfile operation for commit if the handler returns
+// Isolate_Transition{kind = .Wait_Io}.
+@(require_results)
+ctx_io_sendfile :: #force_inline proc(
+	ctx: TinaContext,
 	fd_socket: FD_Handle,
 	fd_file: FD_Handle,
 	source_offset: u64,
 	size: u32,
-) -> Effect {
-	return Effect_Io {
-		operation = IoOp_Sendfile {
+) -> Io_Submit_Result {
+	return ctx_submit_io(
+		ctx,
+		IoOp_Sendfile {
 			fd_file = fd_file,
 			fd_socket = fd_socket,
 			source_offset = source_offset,
 			size = size,
 		},
-	}
+	)
 }
 
-// Builds an Effect that sends data from an Isolate's buffer to a specific network address (UDP).
-// Computes payload_offset automatically from the buffer slice.
-io_sendto :: #force_inline proc(
+// Stages a UDP send from an Isolate-owned buffer for commit if the handler
+// returns Isolate_Transition{kind = .Wait_Io}.
+@(require_results)
+ctx_io_sendto :: #force_inline proc(
+	ctx: TinaContext,
 	self: ^$Isolate,
 	fd: FD_Handle,
 	buffer: []u8,
 	address: Socket_Address,
-) -> Effect {
-	return Effect_Io {
-		operation = IoOp_Sendto {
+) -> Io_Submit_Result {
+	return ctx_submit_io(
+		ctx,
+		IoOp_Sendto {
 			fd = fd,
 			address = address,
 			payload_offset = payload_offset_of(self, buffer),
 			payload_size = u32(len(buffer)),
 		},
-	}
+	)
 }
 
 // Constructs an IPv4 socket address.

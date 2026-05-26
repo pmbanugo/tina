@@ -136,7 +136,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	context.allocator = mem.arena_allocator(&child_invocation.working_arena)
 	context.temp_allocator = mem.arena_allocator(&child_invocation.scratch_arena)
 
-	effect := shard.type_descriptors[type_id].init_handler(
+	transition := shard.type_descriptors[type_id].init_handler(
 		isolate_pointer,
 		local_spec.args_payload[:local_spec.args_size],
 		child_ctx,
@@ -151,10 +151,10 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		soa_meta[slot].working_arena_offset = u32(child_invocation.working_arena.offset)
 	}
 
-	crash_effect, is_crash := effect.(Effect_Crash)
-	_, is_done := effect.(Effect_Done)
+	is_crash := transition.kind == .Crash
+	is_done := transition.kind == .Done
 	if is_crash {
-		reason_str := CRASH_REASONS_INTERPRETED[crash_effect.reason]
+		reason_str := ISOLATE_FAULT_REASONS_INTERPRETED[transition.fault_reason]
 		_shard_log(
 			shard,
 			child_handle,
@@ -168,7 +168,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 			child_handle,
 			.ERROR,
 			LOG_TAG_ISOLATE_CRASHED,
-			transmute([]u8)string("Init handler returned Effect_Done"),
+			transmute([]u8)string("Init handler returned Isolate_Transition{kind = .Done}"),
 		)
 	}
 	if is_crash || is_done {
@@ -189,7 +189,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 		_slot_add_shutdown_pending(shard, type_id, slot)
 	}
 
-	_interpret_effect(shard, type_id, slot, effect, &child_invocation)
+	_interpret_transition(shard, type_id, slot, transition, &child_invocation)
 	_dispatchable_refresh_slot(shard, type_id, slot)
 	return child_handle
 }
@@ -228,7 +228,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	// Step 2c: FD Table Cleanup
 	handle_to_match := make_handle(shard.id, type_id, slot_index, old_generation)
 	in_flight_fd := soa_meta[slot_index].io_fd
-	is_waiting_for_io := soa_meta[slot_index].state == .Waiting_For_Io
+	is_waiting_for_io := soa_meta[slot_index].state == .Wait_Io
 
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]

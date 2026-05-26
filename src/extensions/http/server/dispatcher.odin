@@ -3,10 +3,10 @@ package http_server
 import tina "../../.."
 
 @(private = "package")
-_http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
+_http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
 	dispatcher := cast(^HTTP_Dispatcher)self
 	if len(args) < size_of(HTTP_Dispatcher_Init_Args) {
-		return tina.Effect_Crash{reason = .Init_Failed}
+		return tina.transition_to_crash(.Init_Failed)
 	}
 
 	init_args := (cast(^HTTP_Dispatcher_Init_Args)raw_data(args))^
@@ -20,7 +20,7 @@ _http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -
 		init_args.connection_type_id,
 	)
 
-	return tina.Effect_Receive{}
+	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 @(private = "package")
@@ -28,7 +28,7 @@ _http_dispatcher_handler :: proc(
 	self: rawptr,
 	message: ^tina.Message,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	dispatcher := cast(^HTTP_Dispatcher)self
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(dispatcher != nil, "_http_dispatcher_handler: dispatcher is nil")
@@ -38,23 +38,23 @@ _http_dispatcher_handler :: proc(
 	switch message.tag {
 	case tina.TAG_SHUTDOWN:
 		dispatcher.shard_runtime.draining = true
-		return tina.Effect_Done{}
+		return tina.ISOLATE_TRANSITION_DONE
 
 	case tina.IO_TAG_ACCEPT_COMPLETE:
 		client_fd := message.io.fd
 		if client_fd == tina.FD_HANDLE_NONE {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if dispatcher.shard_runtime.draining {
-			return tina.Effect_Io{operation = tina.IoOp_Close{fd = client_fd}}
+			return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = client_fd}))
 		}
 		if _spawn_connection_local(dispatcher.shard_runtime, ctx, client_fd) {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		_ = _runtime_evict_idle_connection(dispatcher.shard_runtime, ctx)
-		return tina.Effect_Io{operation = tina.IoOp_Close{fd = client_fd}}
+		return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = client_fd}))
 
 	case:
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 }

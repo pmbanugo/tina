@@ -17,7 +17,7 @@ when TINA_SIMULATION_MODE {
 		run_count: u32,
 	}
 
-	starvation_coord_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
+	starvation_coord_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		// Spawn 300 workers to exceed one same-type dispatch batch.
 		for i in 0 ..< 300 {
 			spec := Spawn_Spec {
@@ -27,30 +27,30 @@ when TINA_SIMULATION_MODE {
 			}
 			_ = assert_spawn_success(ctx_spawn(ctx, spec), "StarvationWorker")
 		}
-		return Effect_Receive{}
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	starvation_coord_handler :: proc(
 		self: rawptr,
 		message: ^Message,
 		ctx: TinaContext,
-	) -> Effect {
-		return Effect_Receive{}
+	) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	starvation_worker_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Yield{}
+	starvation_worker_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_YIELD
 	}
 
 	starvation_worker_handler :: proc(
 		self: rawptr,
 		message: ^Message,
 		ctx: TinaContext,
-	) -> Effect {
+	) -> Isolate_Transition {
 		w := cast(^StarvationWorker)self
 		w.run_count += 1
 		// Yielding keeps us in .Runnable state, ensuring we always consume budget
-		return Effect_Yield{}
+		return ISOLATE_TRANSITION_YIELD
 	}
 
 	@(test)

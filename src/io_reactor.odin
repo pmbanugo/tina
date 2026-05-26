@@ -601,7 +601,7 @@ reactor_submit_io :: proc(
 	// already in WAITING_FOR_IO. The io_sequence mechanism assumes at most one
 	// in-flight operation per Isolate — if two were in flight, bumping the
 	// sequence would only invalidate one, leaving the other to corrupt state.
-	if meta.state == .Waiting_For_Io {
+	if meta.state == .Wait_Io {
 		if _, is_close := io_op.(IoOp_Close); is_close {
 			// A close supersedes the abandoned in-flight operation. Bump once to
 			// stale the older completion, then again below for the new close
@@ -1117,7 +1117,7 @@ test_close_submission_supersedes_waiting_io_sequence :: proc(t: ^testing.T) {
 	owner := make_handle(0, 1, 0, 1)
 	meta := &shard.metadata[1][0]
 	meta.generation = 1
-	meta.state = .Waiting_For_Io
+	meta.state = .Wait_Io
 	meta.io_sequence = 7
 
 	fd_handle, sock_err := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
@@ -1337,7 +1337,7 @@ emergency_print_stalled_io_snapshot :: proc "contextless" (shard: ^Shard) {
 	for type_index in 0 ..< len(shard.metadata) {
 		soa_meta := shard.metadata[type_index]
 		for slot_index in 0 ..< len(soa_meta) {
-			if soa_meta[slot_index].state == .Waiting_For_Io {
+			if soa_meta[slot_index].state == .Wait_Io {
 				buf: [128]u8
 				n := 0
 				n = _sig_append_str(buf[:], n, "[STALLED IO] Shard: ")

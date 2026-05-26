@@ -8,16 +8,16 @@ import "core:testing"
 HTTP_SENDFILE_CHUNK_SIZE_MAX :: #config(HTTP_SENDFILE_CHUNK_SIZE_MAX, 256 * 1024)
 
 @(private = "package")
-_http_connection_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
+_http_connection_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
 	connection := cast(^HTTP_Connection)self
 	if len(args) < size_of(HTTP_Connection_Init_Args) {
-		return tina.Effect_Crash{reason = .Init_Failed}
+		return tina.transition_to_crash(.Init_Failed)
 	}
 
 	init_args := (cast(^HTTP_Connection_Init_Args)raw_data(args))^
 	runtime := init_args.shard_runtime
 	if runtime == nil {
-		return tina.Effect_Crash{reason = .Init_Failed}
+		return tina.transition_to_crash(.Init_Failed)
 	}
 
 	frame_size :=
@@ -39,13 +39,16 @@ _http_connection_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -
 	_runtime_active_slot_add(connection, ctx)
 	_connection_begin_keep_alive_wait(connection, ctx)
 
-	return tina.Effect_Io {
-		operation = tina.IoOp_Recv {
-			fd = init_args.client_fd,
-			buffer_size_max = u32(runtime.server.limits.request_line_size_max) +
-			u32(runtime.server.limits.header_size_max),
-		},
-	}
+	return tina.transition_to_wait_io_or_crash(
+		tina.ctx_submit_io(
+			ctx,
+			tina.IoOp_Recv {
+				fd = init_args.client_fd,
+				buffer_size_max = u32(runtime.server.limits.request_line_size_max) +
+				u32(runtime.server.limits.header_size_max),
+			},
+		),
+	)
 }
 
 @(private = "file")
@@ -142,7 +145,7 @@ _http_connection_handler :: proc(
 	self: rawptr,
 	message: ^tina.Message,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	connection := cast(^HTTP_Connection)self
 	state := &connection.connection_state
 
@@ -156,13 +159,13 @@ _http_connection_handler :: proc(
 
 	case TAG_HEADER_TIMEOUT:
 		if state.state != .Recv_Headers {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if state.request.route_index != ROUTE_INDEX_NONE {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		state.response.flags += {.Close_After_Send, .Aborted}
 		return _connection_stage_canned_response(
@@ -173,10 +176,10 @@ _http_connection_handler :: proc(
 
 	case TAG_BODY_TIMEOUT:
 		if state.state != .Recv_Body_Streamed && state.state != .Recv_Body_Buffered {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		state.response.flags += {.Close_After_Send, .Aborted}
 		return _connection_stage_canned_response(
@@ -187,19 +190,19 @@ _http_connection_handler :: proc(
 
 	case TAG_SEND_TIMEOUT:
 		if state.state != .Sending {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		return _connection_begin_close(connection, ctx)
 
 	case TAG_IDLE_TIMEOUT:
 		if state.state != .Keep_Alive_Idle {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		return _connection_begin_close(connection, ctx)
 
@@ -211,16 +214,16 @@ _http_connection_handler :: proc(
 			)
 		}
 		if !state.shard_runtime.draining {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if !_connection_timeout_is_current(connection, ctx, message.correlation) {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		return _connection_begin_close(connection, ctx)
 
 	case TAG_EVICT:
 		if state.state != .Keep_Alive_Idle {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		state.response.flags += {.Close_After_Send}
 		return _connection_begin_close(connection, ctx)
@@ -256,17 +259,17 @@ _http_connection_handler :: proc(
 
 	case tina.IO_TAG_CLOSE_COMPLETE:
 		_connection_complete_close(connection, ctx)
-		return tina.Effect_Done{}
+		return tina.ISOLATE_TRANSITION_DONE
 
 	case:
 		if message.tag >= tina.USER_MESSAGE_TAG_BASE {
 			if state.state != .Application_Expectation {
 				_connection_store_pending_application_message(state, message)
-				return tina.Effect_Receive{}
+				return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 			}
 			return _connection_handle_application_mailbox_message(connection, message, ctx)
 		}
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 }
 
@@ -276,7 +279,7 @@ _connection_handle_recv_complete :: proc(
 	ctx: tina.TinaContext,
 	buffer_index: u16,
 	buffer_size: u32,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	buffer := tina.ctx_read_buffer(ctx, buffer_index, buffer_size)
@@ -287,12 +290,15 @@ _connection_handle_recv_complete :: proc(
 		if _connection_should_drain(runtime, ctx) {
 			return _connection_begin_close(connection, ctx)
 		}
-		return tina.Effect_Io {
-			operation = tina.IoOp_Recv {
-				fd = state.fd,
-				buffer_size_max = _recv_buffer_size_max(runtime),
-			},
-		}
+		return tina.transition_to_wait_io_or_crash(
+			tina.ctx_submit_io(
+				ctx,
+				tina.IoOp_Recv {
+					fd = state.fd,
+					buffer_size_max = _recv_buffer_size_max(runtime),
+				},
+			),
+		)
 	}
 
 	if _connection_should_drain(runtime, ctx) && state.response.egress_size == 0 {
@@ -307,7 +313,7 @@ _connection_process_header_bytes :: proc(
 	connection: ^HTTP_Connection,
 	buffer: []u8,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil {
@@ -331,12 +337,15 @@ _connection_process_header_bytes :: proc(
 		   state.parser.phase == .Trailers {
 			_connection_arm_body_timeout(connection, ctx)
 		}
-		return tina.Effect_Io {
-			operation = tina.IoOp_Recv {
-				fd = state.fd,
-				buffer_size_max = _recv_buffer_size_max(runtime),
-			},
-		}
+		return tina.transition_to_wait_io_or_crash(
+			tina.ctx_submit_io(
+				ctx,
+				tina.IoOp_Recv {
+					fd = state.fd,
+					buffer_size_max = _recv_buffer_size_max(runtime),
+				},
+			),
+		)
 
 	case .Headers_Done:
 		if _connection_should_drain(runtime, ctx) {
@@ -382,7 +391,7 @@ _connection_dispatch_match :: proc(
 	ctx: tina.TinaContext,
 	frame: []u8,
 	match_result: Match_Result,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	response := _connection_make_response(connection, ctx)
 	request := _connection_make_request(connection, frame, ctx)
@@ -410,7 +419,7 @@ _connection_dispatch_match :: proc(
 		return _dispatch_step(connection, step, ctx)
 	}
 
-	return tina.Effect_Receive{}
+	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 @(private = "file")
@@ -418,7 +427,7 @@ _connection_send_parse_error :: proc(
 	connection: ^HTTP_Connection,
 	parse_status: Parse_Status,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	connection.connection_state.response.flags += {.Close_After_Send, .Aborted}
 	bytes := parse_error_response_bytes(parse_status)
 	return _connection_stage_canned_response(connection, transmute([]u8)bytes, ctx)
@@ -431,7 +440,7 @@ _connection_send_not_found :: proc(
 	frame: []u8,
 	method: Method,
 	is_asterisk: bool,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	_ = frame
 	_ = method
 	_ = is_asterisk
@@ -445,7 +454,7 @@ _connection_handle_send_complete :: proc(
 	connection: ^HTTP_Connection,
 	bytes_sent: u32,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(
@@ -461,10 +470,13 @@ _connection_handle_send_complete :: proc(
 		if remaining > 0 {
 			start_offset := int(state.response.egress_size_sent)
 			_connection_arm_send_timeout(connection, ctx)
-			return tina.io_send(
-				connection,
-				state.fd,
-				connection.egress_buffer[start_offset:][:remaining],
+			return tina.transition_to_wait_io_or_crash(
+				tina.ctx_io_send(
+					ctx,
+					connection,
+					state.fd,
+					connection.egress_buffer[start_offset:][:remaining],
+				),
 			)
 		}
 	}
@@ -497,10 +509,10 @@ _connection_handle_sendfile_complete :: proc(
 	connection: ^HTTP_Connection,
 	bytes_sent: u32,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	if !state.sendfile_active {
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	if bytes_sent == 0 {
@@ -529,7 +541,7 @@ _connection_handle_sendfile_complete :: proc(
 _connection_drive_sendfile :: proc(
 	connection: ^HTTP_Connection,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	if !state.sendfile_active || state.sendfile_size_remaining == 0 {
 		state.sendfile_active = false
@@ -544,11 +556,14 @@ _connection_drive_sendfile :: proc(
 
 	state.state = .Sending
 	_connection_arm_send_timeout(connection, ctx)
-	return tina.io_sendfile(
-		state.fd,
-		state.sendfile_file_fd,
-		state.sendfile_offset,
-		u32(chunk_size),
+	return tina.transition_to_wait_io_or_crash(
+		tina.ctx_io_sendfile(
+			ctx,
+			state.fd,
+			state.sendfile_file_fd,
+			state.sendfile_offset,
+			u32(chunk_size),
+		),
 	)
 }
 
@@ -556,7 +571,7 @@ _connection_drive_sendfile :: proc(
 _connection_finalize_flushed_response :: proc(
 	connection: ^HTTP_Connection,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(
@@ -596,19 +611,22 @@ _connection_finalize_flushed_response :: proc(
 	}
 
 	_connection_begin_keep_alive_wait(connection, ctx)
-	return tina.Effect_Io {
-		operation = tina.IoOp_Recv {
-			fd = state.fd,
-			buffer_size_max = _recv_buffer_size_max(state.shard_runtime),
-		},
-	}
+	return tina.transition_to_wait_io_or_crash(
+		tina.ctx_submit_io(
+			ctx,
+			tina.IoOp_Recv {
+				fd = state.fd,
+				buffer_size_max = _recv_buffer_size_max(state.shard_runtime),
+			},
+		),
+	)
 }
 
 @(private = "file")
 _connection_continue_after_non_final_flush :: proc(
 	connection: ^HTTP_Connection,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(
@@ -660,7 +678,7 @@ _connection_stage_canned_response :: proc(
 	connection: ^HTTP_Connection,
 	response_bytes: []u8,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	copy(connection.egress_buffer[:], response_bytes)
 	state := &connection.connection_state
 	state.response.egress_size = Egress_Size(len(response_bytes))
@@ -673,7 +691,9 @@ _connection_stage_canned_response :: proc(
 	state.sendfile_size_remaining = 0
 	state.state = .Sending
 	_connection_arm_send_timeout(connection, ctx)
-	return tina.io_send(connection, state.fd, connection.egress_buffer[:len(response_bytes)])
+	return tina.transition_to_wait_io_or_crash(
+		tina.ctx_io_send(ctx, connection, state.fd, connection.egress_buffer[:len(response_bytes)]),
+	)
 }
 
 @(private = "package")
@@ -814,16 +834,16 @@ _connection_pending_application_message_take :: proc(
 _connection_dispatch_server_drain :: proc(
 	connection: ^HTTP_Connection,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil || state.request.route_index == ROUTE_INDEX_NONE {
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	descriptor := runtime.router.descriptors[state.request.route_index]
 	if descriptor.handler_kind != .Event {
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	request := _connection_make_request(connection, nil, ctx)
@@ -843,7 +863,7 @@ _connection_dispatch_server_drain :: proc(
 _connection_dispatch_peer_closed :: proc(
 	connection: ^HTTP_Connection,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime != nil && state.request.route_index != ROUTE_INDEX_NONE {
@@ -870,19 +890,19 @@ _connection_handle_application_mailbox_message :: proc(
 	connection: ^HTTP_Connection,
 	message: ^tina.Message,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if state.state != .Application_Expectation || runtime == nil {
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 	if state.request.route_index == ROUTE_INDEX_NONE {
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	descriptor := runtime.router.descriptors[state.request.route_index]
 	if descriptor.handler_kind != .Event {
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	is_timeout := message.tag == HTTP_INTERNAL_TAG_AWAIT_TIMEOUT
@@ -892,7 +912,7 @@ _connection_handle_application_mailbox_message :: proc(
 	case .Reply:
 		if is_timeout {
 			if state.application_correlation_id != message.correlation {
-				return tina.Effect_Receive{}
+				return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 			}
 			event := Route_Event(
 				Application_Reply {
@@ -915,13 +935,13 @@ _connection_handle_application_mailbox_message :: proc(
 			return _dispatch_step(connection, step, ctx)
 		}
 		if state.application_expected_source != message.user.source {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if state.application_expected_tag != message_tag {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if state.application_correlation_id != message.correlation {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		event := Route_Event(
 			Application_Reply {
@@ -947,11 +967,11 @@ _connection_handle_application_mailbox_message :: proc(
 		if !is_timeout {
 			if state.application_expected_source != tina.HANDLE_NONE &&
 			   state.application_expected_source != message.user.source {
-				return tina.Effect_Receive{}
+				return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 			}
 			if state.application_expected_tag != Message_Tag(0) &&
 			   state.application_expected_tag != message_tag {
-				return tina.Effect_Receive{}
+				return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 			}
 			event := Route_Event(
 				Application_Notification {
@@ -973,7 +993,7 @@ _connection_handle_application_mailbox_message :: proc(
 			return _dispatch_step(connection, step, ctx)
 		}
 		if state.application_correlation_id != message.correlation {
-			return tina.Effect_Receive{}
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		event := Route_Event(
 			Application_Reply {
@@ -996,7 +1016,7 @@ _connection_handle_application_mailbox_message :: proc(
 		return _dispatch_step(connection, step, ctx)
 	}
 
-	return tina.Effect_Receive{}
+	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 @(private = "file")
@@ -1004,7 +1024,7 @@ _dispatch_step :: proc(
 	connection: ^HTTP_Connection,
 	step: Route_Step,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	if step != .Expect_Application &&
 	   step != .Flush &&
@@ -1018,10 +1038,13 @@ _dispatch_step :: proc(
 		}
 		remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
 		start_offset := int(state.response.egress_size_sent)
-		return tina.io_send(
-			connection,
-			state.fd,
-			connection.egress_buffer[start_offset:][:remaining],
+		return tina.transition_to_wait_io_or_crash(
+			tina.ctx_io_send(
+				ctx,
+				connection,
+				state.fd,
+				connection.egress_buffer[start_offset:][:remaining],
+			),
 		)
 	}
 
@@ -1040,10 +1063,13 @@ _dispatch_step :: proc(
 				_connection_arm_send_timeout(connection, ctx)
 				remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
 				start_offset := int(state.response.egress_size_sent)
-				return tina.io_send(
-					connection,
-					state.fd,
-					connection.egress_buffer[start_offset:][:remaining],
+				return tina.transition_to_wait_io_or_crash(
+					tina.ctx_io_send(
+						ctx,
+						connection,
+						state.fd,
+						connection.egress_buffer[start_offset:][:remaining],
+					),
 				)
 			}
 			return _connection_begin_close(connection, ctx)
@@ -1055,10 +1081,13 @@ _dispatch_step :: proc(
 			state.state = .Sending
 			_connection_arm_send_timeout(connection, ctx)
 			start_offset := int(state.response.egress_size_sent)
-			return tina.io_send(
-				connection,
-				state.fd,
-				connection.egress_buffer[start_offset:][:remaining],
+			return tina.transition_to_wait_io_or_crash(
+				tina.ctx_io_send(
+					ctx,
+					connection,
+					state.fd,
+					connection.egress_buffer[start_offset:][:remaining],
+				),
 			)
 		}
 
@@ -1101,7 +1130,7 @@ _dispatch_step :: proc(
 				ctx,
 			)
 		}
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	case:
 		return _connection_begin_close(connection, ctx)
 	}
@@ -1134,7 +1163,7 @@ _connection_handle_body_recv_complete :: proc(
 	connection: ^HTTP_Connection,
 	buffer: []u8,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	if len(buffer) == 0 {
 		return _connection_drive_body_read(connection, ctx)
@@ -1158,7 +1187,7 @@ _connection_handle_body_recv_complete :: proc(
 _connection_drive_body_read :: proc(
 	connection: ^HTTP_Connection,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil || state.request.route_index == ROUTE_INDEX_NONE {
@@ -1182,10 +1211,13 @@ _connection_drive_body_read :: proc(
 		_connection_arm_send_timeout(connection, ctx)
 		start_offset := int(state.response.egress_size_sent)
 		remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
-		return tina.io_send(
-			connection,
-			state.fd,
-			connection.egress_buffer[start_offset:][:remaining],
+		return tina.transition_to_wait_io_or_crash(
+			tina.ctx_io_send(
+				ctx,
+				connection,
+				state.fd,
+				connection.egress_buffer[start_offset:][:remaining],
+			),
 		)
 	}
 
@@ -1221,12 +1253,15 @@ _connection_drive_body_read :: proc(
 
 	state.state = .Recv_Body_Streamed if descriptor.body_mode == .Streamed else .Recv_Body_Buffered
 	_connection_arm_body_timeout(connection, ctx)
-	return tina.Effect_Io {
-		operation = tina.IoOp_Recv {
-			fd = state.fd,
-			buffer_size_max = _recv_buffer_size_max(runtime),
-		},
-	}
+	return tina.transition_to_wait_io_or_crash(
+		tina.ctx_submit_io(
+			ctx,
+			tina.IoOp_Recv {
+				fd = state.fd,
+				buffer_size_max = _recv_buffer_size_max(runtime),
+			},
+		),
+	)
 }
 
 @(private = "file")
@@ -1234,7 +1269,7 @@ _connection_process_body_bytes :: proc(
 	connection: ^HTTP_Connection,
 	source: []u8,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime == nil || state.request.route_index == ROUTE_INDEX_NONE {
@@ -1390,7 +1425,7 @@ _connection_process_body_bytes :: proc(
 }
 
 @(private = "file")
-_connection_begin_close :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext) -> tina.Effect {
+_connection_begin_close :: proc(connection: ^HTTP_Connection, ctx: tina.TinaContext) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
 	if runtime != nil {
@@ -1402,7 +1437,7 @@ _connection_begin_close :: proc(connection: ^HTTP_Connection, ctx: tina.TinaCont
 		}
 	}
 	state.state = .Closing
-	return tina.Effect_Io{operation = tina.IoOp_Close{fd = state.fd}}
+	return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = state.fd}))
 }
 
 @(private = "file")
@@ -1495,13 +1530,9 @@ test_idle_peer_close_unlinks_idle_before_fd_close :: proc(t: ^testing.T) {
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
 			test_state := cast(^Close_Lifecycle_Test_State)user_data
 			effect := _http_connection_handler(rawptr(test_state.connection), test_state.message, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(test_state.t, false, "idle peer close must close the socket")
-				}
-			case:
-				testing.expect(test_state.t, false, "expected close effect")
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
+				testing.expect(test_state.t, false, "idle peer close must close the socket")
 			}
 		},
 	)
@@ -1681,11 +1712,11 @@ test_stale_notification_on_keep_alive_connection_is_dropped :: proc(t: ^testing.
 				)
 			}
 			park_effect := _dispatch_step(connection, step, ctx)
-			#partial switch _ in park_effect {
-			case tina.Effect_Receive:
-			case:
-				testing.expect(test_state.t, false, "Request_Start should park for notifications")
-			}
+			testing.expect_value(
+				test_state.t,
+				park_effect.kind,
+				tina.Isolate_Transition_Kind.Wait_Message,
+			)
 			testing.expect_value(test_state.t, route_state.dropped_count, u32(0))
 			testing.expect_value(test_state.t, route_state.accepted_count, u32(0))
 			testing.expect_value(
@@ -1707,15 +1738,11 @@ test_stale_notification_on_keep_alive_connection_is_dropped :: proc(t: ^testing.
 				&stale_message,
 				ctx,
 			)
-			#partial switch _ in stale_effect {
-			case tina.Effect_Receive:
-			case:
-				testing.expect(
-					test_state.t,
-					false,
-					"stale notification should be dropped and re-parked",
-				)
-			}
+			testing.expect_value(
+				test_state.t,
+				stale_effect.kind,
+				tina.Isolate_Transition_Kind.Wait_Message,
+			)
 			testing.expect_value(test_state.t, route_state.dropped_count, u32(1))
 			testing.expect_value(test_state.t, route_state.accepted_count, u32(0))
 			testing.expect_value(
@@ -1737,10 +1764,8 @@ test_stale_notification_on_keep_alive_connection_is_dropped :: proc(t: ^testing.
 				&correct_message,
 				ctx,
 			)
-			#partial switch _ in correct_effect {
-			case tina.Effect_Receive:
+			if correct_effect.kind == tina.Isolate_Transition_Kind.Wait_Message {
 				testing.expect(test_state.t, false, "valid notification should be handled")
-			case:
 			}
 		},
 	)
@@ -1818,15 +1843,11 @@ test_pending_application_message_is_preserved_until_expectation :: proc(t: ^test
 				&notification_message,
 				ctx,
 			)
-			#partial switch _ in stash_effect {
-			case tina.Effect_Receive:
-			case:
-				testing.expect(
-					test_state.t,
-					false,
-					"message outside Application_Expectation should be preserved and deferred",
-				)
-			}
+			testing.expect_value(
+				test_state.t,
+				stash_effect.kind,
+				tina.Isolate_Transition_Kind.Wait_Message,
+			)
 			testing.expect(
 				test_state.t,
 				connection.connection_state.application_pending_message_valid,
@@ -1839,20 +1860,12 @@ test_pending_application_message_is_preserved_until_expectation :: proc(t: ^test
 			connection.connection_state.application_timeout_ns = 1_000_000
 
 			effect := _dispatch_step(connection, .Expect_Application, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"deferred notification should dispatch to handler and close",
-					)
-				}
-			case:
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
 				testing.expect(
 					test_state.t,
 					false,
-					"deferred notification should produce close effect from handler",
+					"deferred notification should dispatch to handler and close",
 				)
 			}
 		},
@@ -1950,20 +1963,12 @@ test_pending_application_message_first_wins_when_multiple_arrive :: proc(t: ^tes
 			connection.connection_state.application_timeout_ns = 1_000_000
 
 			effect := _dispatch_step(connection, .Expect_Application, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"first deferred notification should be delivered and close",
-					)
-				}
-			case:
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
 				testing.expect(
 					test_state.t,
 					false,
-					"first deferred notification should dispatch before later arrivals",
+					"first deferred notification should be delivered and close",
 				)
 			}
 		},
@@ -2037,20 +2042,12 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 			shutdown_message: tina.Message
 			shutdown_message.tag = tina.TAG_SHUTDOWN
 			effect := _http_connection_handler(rawptr(connection), &shutdown_message, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"shutdown drain handler should return close",
-					)
-				}
-			case:
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
 				testing.expect(
 					test_state.t,
 					false,
-					"shutdown during Application_Expectation should dispatch Server_Drain",
+					"shutdown drain handler should return close",
 				)
 			}
 		},
@@ -2101,17 +2098,13 @@ test_shutdown_while_reading_headers_closes_immediately :: proc(t: ^testing.T) {
 			shutdown_message: tina.Message
 			shutdown_message.tag = tina.TAG_SHUTDOWN
 			effect := _http_connection_handler(rawptr(connection), &shutdown_message, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"shutdown while reading headers should close immediately",
-					)
-				}
-			case:
-				testing.expect(test_state.t, false, "expected close effect")
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
+				testing.expect(
+					test_state.t,
+					false,
+					"shutdown while reading headers should close immediately",
+				)
 			}
 		},
 	)
@@ -2187,27 +2180,22 @@ test_dispatch_step_flush_non_final_dispatches_send_ready_without_io :: proc(t: ^
 
 	Dispatch_Flush_Test_State :: struct {connection: ^HTTP_Connection, t: ^testing.T}
 	dispatch_flush_test_state := Dispatch_Flush_Test_State {connection = &connection, t = t}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
-		rawptr(&dispatch_flush_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Dispatch_Flush_Test_State)user_data
-			effect := _dispatch_step(test_state.connection, .Flush, ctx)
-			#partial switch _ in effect {
-			case tina.Effect_Io:
-				operation := effect.(tina.Effect_Io).operation
-				if _, ok := operation.(tina.IoOp_Close); !ok {
+		tina.test_with_context(
+			tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+			rawptr(&dispatch_flush_test_state),
+			proc(user_data: rawptr, ctx: tina.TinaContext) {
+				test_state := cast(^Dispatch_Flush_Test_State)user_data
+				effect := _dispatch_step(test_state.connection, .Flush, ctx)
+				testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+				if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
 					testing.expect(
 						test_state.t,
 						false,
 						"non-final flush with no bytes should re-enter route via Send_Ready",
 					)
 				}
-			case:
-				testing.expect(test_state.t, false, "expected close after Send_Ready handler")
-			}
-		},
-	)
+			},
+		)
 	testing.expect_value(t, route_state_storage[0].send_ready_count, u32(1))
 }
 
@@ -2253,23 +2241,18 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 
 	Dispatch_Flush_Final_Test_State :: struct {connection: ^HTTP_Connection, t: ^testing.T}
 	dispatch_flush_final_test_state := Dispatch_Flush_Final_Test_State {connection = &connection, t = t}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
-		rawptr(&dispatch_flush_final_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Dispatch_Flush_Final_Test_State)user_data
-			effect := _dispatch_step(test_state.connection, .Flush_Final, ctx)
-			#partial switch _ in effect {
-			case tina.Effect_Io:
-				operation := effect.(tina.Effect_Io).operation
-				if _, ok := operation.(tina.IoOp_Close); !ok {
+		tina.test_with_context(
+			tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+			rawptr(&dispatch_flush_final_test_state),
+			proc(user_data: rawptr, ctx: tina.TinaContext) {
+				test_state := cast(^Dispatch_Flush_Final_Test_State)user_data
+				effect := _dispatch_step(test_state.connection, .Flush_Final, ctx)
+				testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+				if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
 					testing.expect(test_state.t, false, "final flush with close-after-send should close")
 				}
-			case:
-				testing.expect(test_state.t, false, "expected close effect")
-			}
-		},
-	)
+			},
+		)
 	testing.expect_value(t, route_state_storage[0].send_ready_count, u32(0))
 }
 
@@ -2307,20 +2290,15 @@ test_send_complete_with_sendfile_plan_transitions_to_sendfile_io :: proc(t: ^tes
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
 			test_state := cast(^Send_Complete_Test_State)user_data
 			effect := _connection_handle_send_complete(test_state.connection, 0, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				operation := io_effect.operation
-				#partial switch sendfile_op in operation {
-				case tina.IoOp_Sendfile:
-					testing.expect_value(test_state.t, sendfile_op.fd_socket, tina.FD_Handle(11))
-					testing.expect_value(test_state.t, sendfile_op.fd_file, tina.FD_Handle(22))
-					testing.expect_value(test_state.t, sendfile_op.source_offset, u64(0))
-					testing.expect(test_state.t, sendfile_op.size > 0)
-				case:
-					testing.expect(test_state.t, false, "expected IoOp_Sendfile")
-				}
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			#partial switch sendfile_op in tina.ctx_staged_io_operation(ctx) {
+			case tina.IoOp_Sendfile:
+				testing.expect_value(test_state.t, sendfile_op.fd_socket, tina.FD_Handle(11))
+				testing.expect_value(test_state.t, sendfile_op.fd_file, tina.FD_Handle(22))
+				testing.expect_value(test_state.t, sendfile_op.source_offset, u64(0))
+				testing.expect(test_state.t, sendfile_op.size > 0)
 			case:
-				testing.expect(test_state.t, false, "expected Effect_Io")
+				testing.expect(test_state.t, false, "expected IoOp_Sendfile")
 			}
 		},
 	)
@@ -2366,13 +2344,9 @@ test_stage_canned_response_arms_send_timeout :: proc(t: ^testing.T) {
 				transmute([]u8)string(ERROR_RESPONSE_408_REQUEST_TIMEOUT),
 				ctx,
 			)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Send); !ok {
-					testing.expect(state.t, false, "canned response should send bytes")
-				}
-			case:
-				testing.expect(state.t, false, "expected Effect_Io")
+			testing.expect_value(state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Send); !ok {
+				testing.expect(state.t, false, "canned response should send bytes")
 			}
 		},
 	)
@@ -2433,25 +2407,21 @@ test_drive_body_read_restarts_send_from_unsent_offset :: proc(t: ^testing.T) {
 			state := cast(^Drive_Body_Read_Test_State)user_data
 			state.connection.connection_state.deadline_timer_handle = tina.ctx_timer_acquire(ctx)
 			effect := _connection_drive_body_read(state.connection, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				#partial switch send_op in io_effect.operation {
-				case tina.IoOp_Send:
-					testing.expect_value(state.t, send_op.fd, tina.FD_Handle(41))
-					testing.expect_value(state.t, send_op.payload_size, u32(64))
-					testing.expect_value(
-						state.t,
-						send_op.payload_offset,
-						tina.payload_offset_of(
-							state.connection,
-							state.connection.egress_buffer[64:][:64],
-						),
-					)
-				case:
-					testing.expect(state.t, false, "expected IoOp_Send")
-				}
+			testing.expect_value(state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			#partial switch send_op in tina.ctx_staged_io_operation(ctx) {
+			case tina.IoOp_Send:
+				testing.expect_value(state.t, send_op.fd, tina.FD_Handle(41))
+				testing.expect_value(state.t, send_op.payload_size, u32(64))
+				testing.expect_value(
+					state.t,
+					send_op.payload_offset,
+					tina.payload_offset_of(
+						state.connection,
+						state.connection.egress_buffer[64:][:64],
+					),
+				)
 			case:
-				testing.expect(state.t, false, "expected Effect_Io")
+				testing.expect(state.t, false, "expected IoOp_Send")
 			}
 		},
 	)
@@ -2517,13 +2487,9 @@ test_send_complete_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
 			state := cast(^Peer_Closed_Error_Test_State)user_data
 			effect := _http_connection_handler(rawptr(state.connection), state.message, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(state.t, false, "send failure should close after Peer_Closed dispatch")
-				}
-			case:
-				testing.expect(state.t, false, "expected close effect")
+			testing.expect_value(state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
+				testing.expect(state.t, false, "send failure should close after Peer_Closed dispatch")
 			}
 		},
 	)
@@ -2587,13 +2553,9 @@ test_sendfile_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
 		proc(user_data: rawptr, ctx: tina.TinaContext) {
 			state := cast(^Sendfile_Error_Test_State)user_data
 			effect := _http_connection_handler(rawptr(state.connection), state.message, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(state.t, false, "sendfile failure should close after Peer_Closed dispatch")
-				}
-			case:
-				testing.expect(state.t, false, "expected close effect")
+			testing.expect_value(state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
+				testing.expect(state.t, false, "sendfile failure should close after Peer_Closed dispatch")
 			}
 		},
 	)
@@ -2641,22 +2603,18 @@ test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T)
 		input      = combined,
 		t          = t,
 	}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
-		rawptr(&process_header_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Process_Header_Test_State)user_data
-			effect := _connection_process_header_bytes(test_state.connection, test_state.input, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Send); !ok {
+		tina.test_with_context(
+			tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+			rawptr(&process_header_test_state),
+			proc(user_data: rawptr, ctx: tina.TinaContext) {
+				test_state := cast(^Process_Header_Test_State)user_data
+				effect := _connection_process_header_bytes(test_state.connection, test_state.input, ctx)
+				testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+				if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Send); !ok {
 					testing.expect(test_state.t, false, "simple request should stage and send a response")
 				}
-			case:
-				testing.expect(test_state.t, false, "expected send effect for simple request")
-			}
-		},
-	)
+			},
+		)
 
 	second_request_size := len(second_request)
 	testing.expect_value(
@@ -2724,17 +2682,13 @@ test_process_header_bytes_closes_when_core_shutdown_started_before_http_runtime_
 				test_state.request_bytes,
 				ctx,
 			)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Close); !ok {
-					testing.expect(
-						test_state.t,
-						false,
-						"core shutdown should close before dispatching a new request",
-					)
-				}
-			case:
-				testing.expect(test_state.t, false, "expected close effect")
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Close); !ok {
+				testing.expect(
+					test_state.t,
+					false,
+					"core shutdown should close before dispatching a new request",
+				)
 			}
 		},
 	)
@@ -2787,22 +2741,18 @@ test_finalize_flushed_response_processes_pipeline_tail_before_recv :: proc(t: ^t
 
 	Finalize_Flush_Test_State :: struct {connection: ^HTTP_Connection, t: ^testing.T}
 	finalize_flush_test_state := Finalize_Flush_Test_State {connection = &connection, t = t}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
-		rawptr(&finalize_flush_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
-			test_state := cast(^Finalize_Flush_Test_State)user_data
-			effect := _connection_finalize_flushed_response(test_state.connection, ctx)
-			#partial switch io_effect in effect {
-			case tina.Effect_Io:
-				if _, ok := io_effect.operation.(tina.IoOp_Send); !ok {
+		tina.test_with_context(
+			tina.Test_Context_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+			rawptr(&finalize_flush_test_state),
+			proc(user_data: rawptr, ctx: tina.TinaContext) {
+				test_state := cast(^Finalize_Flush_Test_State)user_data
+				effect := _connection_finalize_flushed_response(test_state.connection, ctx)
+				testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+				if _, ok := tina.ctx_staged_io_operation(ctx).(tina.IoOp_Send); !ok {
 					testing.expect(test_state.t, false, "pipeline tail should be parsed and dispatched before recv")
 				}
-			case:
-				testing.expect(test_state.t, false, "expected immediate send effect from retained pipeline request")
-			}
-		},
-	)
+			},
+		)
 
 	testing.expect_value(t, connection.connection_state.state, Connection_Phase.Sending)
 }

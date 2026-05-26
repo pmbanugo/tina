@@ -8,7 +8,7 @@ when TINA_SIMULATION_MODE {
 	Exiter :: struct {}
 	Bystander :: struct {}
 
-	supervisor_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
+	supervisor_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		bystander_spec := Spawn_Spec {
 			type_id      = BYSTANDER_TYPE_ID,
 			group_id     = ctx_supervision_group_id(ctx),
@@ -23,27 +23,27 @@ when TINA_SIMULATION_MODE {
 		}
 		_ = assert_spawn_success(ctx_spawn(ctx, exiter_spec), "Exiter")
 
-		return Effect_Receive{}
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	supervisor_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	supervisor_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	exiter_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	exiter_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	exiter_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
-		return Effect_Done{}
+	exiter_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_DONE
 	}
 
-	bystander_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	bystander_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	bystander_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	bystander_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	@(test)
@@ -146,7 +146,7 @@ when TINA_SIMULATION_MODE {
 
 		shard := &sim.shards[0]
 
-		// Send a message to Exiter to trigger its handler (which returns Effect_Done)
+		// Send a message to Exiter to trigger its handler (which returns DONE)
 		exiter_handle := make_handle(
 			0,
 			u16(EXITER_TYPE_ID),
@@ -170,7 +170,7 @@ when TINA_SIMULATION_MODE {
 
 		// Bystander must still be alive — no escalation should have occurred
 		bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[0]
-		testing.expect_value(t, bystander_state, Isolate_State.Waiting)
+		testing.expect_value(t, bystander_state, Isolate_State.Wait_Message)
 	}
 
 	@(test)
@@ -324,8 +324,8 @@ when TINA_SIMULATION_MODE {
 		dynamic_bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[1]
 		exiter_state := shard.metadata[EXITER_TYPE_ID].state[0]
 
-		testing.expect_value(t, subgroup_bystander_state, Isolate_State.Waiting)
-		testing.expect_value(t, dynamic_bystander_state, Isolate_State.Waiting)
+		testing.expect_value(t, subgroup_bystander_state, Isolate_State.Wait_Message)
+		testing.expect_value(t, dynamic_bystander_state, Isolate_State.Wait_Message)
 		testing.expect_value(t, exiter_state, Isolate_State.Unallocated)
 	}
 

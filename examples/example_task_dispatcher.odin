@@ -56,7 +56,7 @@ WorkerIsolate :: struct {
 	dispatcher: tina.Handle,
 }
 
-worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
+worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
 	self := tina.self_as(WorkerIsolate, self_raw, ctx)
 
 	// 1. Parse the initialization arguments
@@ -85,14 +85,14 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina
 	)
 	tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
-	return tina.Effect_Receive{}
+	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 worker_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	using self := tina.self_as(WorkerIsolate, self_raw, ctx)
 	// log_buf: [128]u8
 
@@ -111,7 +111,7 @@ worker_handler :: proc(
 
 			// The supervisor tears it down and rebuilds from the boot spec.
 			// Old handle becomes permanently stale — sends to it return .stale_handle.
-			return tina.Effect_Crash{reason = .None}
+			return tina.transition_to_crash(.None)
 		}
 
 		// Happy Path: Do the job and report success.
@@ -129,10 +129,10 @@ worker_handler :: proc(
 			worker_id = id,
 		}
 		_ = tina.ctx_send(ctx, dispatcher, TAG_JOB_DONE, &done_msg)
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case:
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 }
 
@@ -147,7 +147,7 @@ DispatcherIsolate :: struct {
 	job_counter: u32,
 }
 
-dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
+dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
 	self := tina.self_as(DispatcherIsolate, self_raw, ctx)
 
 	tina.ctx_log(
@@ -180,14 +180,14 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 	// 2. Start the work loop (fires every 400ms)
 	tina.ctx_register_timer(ctx, 400 * 1_000_000, TAG_DISPATCH_TICK)
 
-	return tina.Effect_Receive{}
+	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 dispatcher_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	using self := tina.self_as(DispatcherIsolate, self_raw, ctx)
 	log_buf: [128]u8
 
@@ -223,7 +223,7 @@ dispatcher_handler :: proc(
 			)
 			tina.ctx_log(ctx, .DEBUG, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 		}
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case TAG_JOB_DONE:
 		msg := tina.payload_as(JobDoneMsg, message.user.payload[:])
@@ -234,7 +234,7 @@ dispatcher_handler :: proc(
 			msg.worker_id,
 		)
 		tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case TAG_DISPATCH_TICK:
 		for target_id in 0 ..< len(workers) {
@@ -281,10 +281,10 @@ dispatcher_handler :: proc(
 
 		// Re-arm the loop
 		tina.ctx_register_timer(ctx, 300 * 1_000_000, TAG_DISPATCH_TICK)
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case:
-		return tina.Effect_Receive{}
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 }
 

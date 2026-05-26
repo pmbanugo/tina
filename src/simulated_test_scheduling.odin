@@ -16,12 +16,12 @@ when TINA_SIMULATION_MODE {
 
 	SchedNoopIsolate :: struct {}
 
-	sched_noop_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Yield{}
+	sched_noop_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_YIELD
 	}
 
-	sched_noop_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
-		return Effect_Yield{}
+	sched_noop_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_YIELD
 	}
 
 	@(test)

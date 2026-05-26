@@ -48,9 +48,9 @@ Shard_State :: enum u8 {
 Isolate_State :: enum u8 {
 	Unallocated = 0,
 	Runnable,
-	Waiting,
-	Waiting_For_Reply,
-	Waiting_For_Io,
+	Wait_Message,
+	Wait_Reply,
+	Wait_Io,
 	Crashed,
 }
 Isolate_Flag :: enum u8 {
@@ -229,11 +229,11 @@ _wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot
 
 	for slot_index in 0 ..< slot_count {
 		state := states[slot_index]
-		if state == .Waiting {
+		if state == .Wait_Message {
 			_slot_set_state(shard, type_id, slot_index, .Runnable)
 			continue
 		}
-		if state == .Waiting_For_Io {
+		if state == .Wait_Io {
 			// Invalidate pending completion via io_sequence bump.
 			// No explicit backend_cancel — the stale completion will
 			// arrive naturally, fail the io_sequence check in
@@ -243,7 +243,7 @@ _wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot
 			_slot_set_state(shard, type_id, slot_index, .Runnable)
 			continue
 		}
-		if state == .Waiting_For_Reply {
+		if state == .Wait_Reply {
 			// Discard stale replies.
 			pending_correlations[slot_index] = 0
 			_slot_set_state(shard, type_id, slot_index, .Runnable)
@@ -286,7 +286,7 @@ _dispatch_kind_for_slot :: #force_inline proc "contextless" (
 	if .Shutdown_Pending in flags {
 		return .Shutdown
 	}
-	if inbox_count > 0 && (state == .Runnable || state == .Waiting) {
+	if inbox_count > 0 && (state == .Runnable || state == .Wait_Message) {
 		return .Inbox
 	}
 	if state == .Runnable {
@@ -501,11 +501,11 @@ _slot_track_io_awaiting_transition :: #force_inline proc "contextless" (
 	if old_state == new_state {
 		return
 	}
-	if old_state == .Waiting_For_Io {
+	if old_state == .Wait_Io {
 		if shard.counters.io_awaiting_count > 0 {
 			shard.counters.io_awaiting_count -= 1
 		}
-	} else if new_state == .Waiting_For_Io {
+	} else if new_state == .Wait_Io {
 		shard.counters.io_awaiting_count += 1
 	}
 }
@@ -531,9 +531,9 @@ _slot_set_waiting_for_reply :: #force_inline proc "contextless" (
 	correlation_id: Correlation_Id,
 ) {
 	meta := &shard.metadata[type_id][slot_index]
-	_slot_track_io_awaiting_transition(shard, meta.state, .Waiting_For_Reply)
+	_slot_track_io_awaiting_transition(shard, meta.state, .Wait_Reply)
 	meta.pending_correlation = correlation_id
-	meta.state = .Waiting_For_Reply
+	meta.state = .Wait_Reply
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
 
@@ -601,7 +601,7 @@ _slot_set_io_completion_ready :: #force_inline proc "contextless" (
 	meta.io_completion_tag = completion_tag
 	meta.io_result = completion_result
 	meta.io_buffer_index = buffer_index
-	if meta.state == .Waiting_For_Io {
+	if meta.state == .Wait_Io {
 		_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
 		meta.state = .Runnable
 	}
@@ -793,6 +793,11 @@ _dispatch_type_batch :: proc(
 		invocation.current_correlation = correlation
 		invocation.flags = ctx_flags
 		invocation.slot_index = slot_index
+		invocation.staged_call = {}
+		invocation.staged_io_operation = {}
+		invocation.staged_call_active = false
+		invocation.staged_io_active = false
+		invocation.reply_sent = false
 		ctx := invocation.context_token
 
 		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
@@ -832,7 +837,7 @@ _dispatch_type_batch :: proc(
 		context.allocator = mem.arena_allocator(&invocation.working_arena)
 		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
-		effect := type_descriptor.handler_fn(isolate_pointer, message_pointer, ctx)
+		transition := type_descriptor.handler_fn(isolate_pointer, message_pointer, ctx)
 
 		context.allocator = previous_allocator
 		context.temp_allocator = previous_temp_allocator
@@ -861,7 +866,7 @@ _dispatch_type_batch :: proc(
 			shard.current_msg_slot = POOL_NONE_INDEX
 		}
 
-		_interpret_effect(shard, u16(type_id), slot_index, effect, &invocation)
+		_interpret_transition(shard, u16(type_id), slot_index, transition, &invocation)
 		cursor = shard.dispatch_cursors[type_id]
 	}
 
@@ -1022,33 +1027,163 @@ scheduler_tick :: proc(shard: ^Shard) {
 	log_flush(shard)
 }
 
-// --- Effect Interpreter ---
+// --- Isolate State Transition Interpreter ---
 
 @(rodata, private = "package")
-CRASH_REASONS_INTERPRETED := [Crash_Reason]string {
-	.None                 = "Voluntary crash reason: None",
-	.Spawn_Failed         = "Voluntary crash reason: Spawn_Failed",
-	.Unimplemented_Effect = "Voluntary crash reason: Unimplemented_Effect",
-	.Init_Failed          = "Voluntary crash reason: Init_Failed",
+ISOLATE_FAULT_REASONS_INTERPRETED := [Isolate_Fault_Reason]string {
+	.None                     = "Voluntary isolate fault reason: None",
+	.Spawn_Failed             = "Voluntary isolate fault reason: Spawn_Failed",
+	.Unimplemented_Transition = "Voluntary isolate fault reason: Unimplemented_Transition",
+	.Init_Failed              = "Voluntary isolate fault reason: Init_Failed",
+	.Contract_Violation       = "Voluntary isolate fault reason: Contract_Violation",
 }
 
-_interpret_effect :: proc(
+@(private = "file")
+_transition_contract_violation :: proc(
 	shard: ^Shard,
 	type_id: u16,
 	slot: u32,
-	effect: Effect,
+	invocation: ^Isolate_Invocation,
+	message: string,
+) {
+	_shard_log(
+		shard,
+		invocation.self_handle,
+		.ERROR,
+		LOG_TAG_ISOLATE_CRASHED,
+		transmute([]u8)message,
+	)
+	_teardown_isolate(shard, type_id, slot, .Crashed)
+}
+
+@(private = "file")
+_commit_staged_call :: proc(
+	shard: ^Shard,
+	type_id: u16,
+	slot: u32,
 	invocation: ^Isolate_Invocation,
 ) {
-	soa_meta := shard.metadata[type_id]
-	switch e in effect {
-	case Effect_Done:
+	staged_call := invocation.staged_call
+	correlation_id := staged_call.envelope.correlation
+	invocation.staged_call_active = false
+
+	_slot_set_waiting_for_reply(shard, type_id, slot, correlation_id)
+	_register_system_timer(
+		shard,
+		invocation.self_handle,
+		_duration_ns_to_ticks(staged_call.timeout_ns, shard.timer_resolution_ns),
+		TAG_CALL_TIMEOUT,
+		correlation_id,
+	)
+
+	envelope := staged_call.envelope
+	envelope.source = invocation.self_handle
+	envelope.flags += {.Is_Call}
+	route_result := _route_envelope_user(shard, envelope.destination, &envelope)
+	if route_result != .ok {
+		timeout_env: Message_Envelope
+		timeout_env.source = HANDLE_NONE
+		timeout_env.destination = invocation.self_handle
+		timeout_env.tag = TAG_CALL_TIMEOUT
+		timeout_env.correlation = correlation_id
+		if _enqueue_system_msg(shard, invocation.self_handle, &timeout_env) != .ok {
+			shard.metadata[type_id][slot].pending_correlation = 0
+			_slot_set_state(shard, type_id, slot, .Runnable)
+		}
+	}
+}
+
+@(private = "file")
+_commit_staged_io :: proc(
+	shard: ^Shard,
+	type_id: u16,
+	slot: u32,
+	invocation: ^Isolate_Invocation,
+) {
+	operation := invocation.staged_io_operation
+	invocation.staged_io_active = false
+	err := reactor_submit_io(&shard.reactor, shard, invocation.self_handle, operation)
+	if err != IO_ERR_NONE {
+		if err == IO_ERR_RESOURCE_EXHAUSTED do shard.counters.io_buffer_exhaustions += 1
+		_slot_set_io_submit_failure(
+			shard,
+			type_id,
+			slot,
+			_io_op_to_completion_tag(operation),
+			i32(err),
+		)
+	} else {
+		_slot_set_state(shard, type_id, slot, .Wait_Io)
+	}
+}
+
+_interpret_transition :: proc(
+	shard: ^Shard,
+	type_id: u16,
+	slot: u32,
+	transition: Isolate_Transition,
+	invocation: ^Isolate_Invocation,
+) {
+	if invocation.staged_call_active && invocation.staged_io_active {
+		_transition_contract_violation(
+			shard,
+			type_id,
+			slot,
+			invocation,
+			"Handler staged both call and io in one invocation",
+		)
+		return
+	}
+
+	switch transition.kind {
+	case .Done:
+		if invocation.staged_call_active || invocation.staged_io_active {
+			_transition_contract_violation(
+				shard,
+				type_id,
+				slot,
+				invocation,
+				"Handler returned .Done with staged control-plane work",
+			)
+			return
+		}
 		_teardown_isolate(shard, type_id, slot, .Normal)
-	case Effect_Yield:
+	case .Yield:
+		if invocation.staged_call_active || invocation.staged_io_active {
+			_transition_contract_violation(
+				shard,
+				type_id,
+				slot,
+				invocation,
+				"Handler returned .Yield with staged control-plane work",
+			)
+			return
+		}
 		_slot_set_state(shard, type_id, slot, .Runnable)
-	case Effect_Receive:
-		_slot_set_state(shard, type_id, slot, .Waiting)
-	case Effect_Crash:
-		reason_str := CRASH_REASONS_INTERPRETED[e.reason]
+	case .Wait_Message:
+		if invocation.staged_call_active || invocation.staged_io_active {
+			_transition_contract_violation(
+				shard,
+				type_id,
+				slot,
+				invocation,
+				"Handler returned .Wait_Message with staged control-plane work",
+			)
+			return
+		}
+		_slot_set_state(shard, type_id, slot, .Wait_Message)
+	case .Crash:
+		if invocation.staged_call_active || invocation.staged_io_active {
+			_transition_contract_violation(
+				shard,
+				type_id,
+				slot,
+				invocation,
+				"Handler returned .Crash with staged control-plane work",
+			)
+			return
+		}
+		reason_str := ISOLATE_FAULT_REASONS_INTERPRETED[transition.fault_reason]
 		_shard_log(
 			shard,
 			invocation.self_handle,
@@ -1057,92 +1192,30 @@ _interpret_effect :: proc(
 			transmute([]u8)reason_str,
 		)
 		_teardown_isolate(shard, type_id, slot, .Crashed)
-	case Effect_Call:
-		shard.next_correlation_id += 1
-		if shard.next_correlation_id == 0 do shard.next_correlation_id = 1
-		correlation_id := shard.next_correlation_id
-
-		// Set state before fast-fail enqueue so the timeout message is accepted
-		_slot_set_waiting_for_reply(shard, type_id, slot, correlation_id)
-
-		// Quarantine Fast-Fail Check (§6.4.5.4 Step 4b)
-		destination_shard := extract_shard_id(e.to)
-		if destination_shard != shard.id &&
-		   !shard_mask_contains(&shard.peer_alive_mask, destination_shard) {
-			// Target is dead. Abort .call setup and fast-fail with an immediate timeout.
-			timeout_env: Message_Envelope
-			timeout_env.source = HANDLE_NONE
-			timeout_env.destination = invocation.self_handle
-			timeout_env.tag = TAG_CALL_TIMEOUT
-			timeout_env.correlation = correlation_id
-
-			_enqueue_system_msg(shard, invocation.self_handle, &timeout_env)
-			shard.counters.quarantine_drops += 1
-			return
-		}
-
-		timeout_ticks := (e.timeout + shard.timer_resolution_ns - 1) / shard.timer_resolution_ns
-		_register_system_timer(
-			shard,
-			invocation.self_handle,
-			timeout_ticks,
-			TAG_CALL_TIMEOUT,
-			correlation_id,
-		)
-
-		local_msg := e.message // Make "e.message" it addressable
-		envelope: Message_Envelope
-		envelope.source = invocation.self_handle
-		envelope.destination = e.to
-		envelope.correlation = correlation_id
-		envelope.flags += {.Is_Call}
-		envelope.tag = local_msg.tag
-		envelope.payload_size = local_msg.user.payload_size
-		copy(envelope.payload[:], local_msg.user.payload[:])
-
-		_route_envelope_user(shard, e.to, &envelope)
-
-	case Effect_Reply:
-		if .Is_Call not_in invocation.flags {
-			// if !(.Is_Call in ctx.flags) {
-			_shard_log(
-				shard,
-				invocation.self_handle,
-				.ERROR,
-				LOG_TAG_ISOLATE_CRASHED,
-				transmute([]u8)string("Reply effect without call context"),
-			)
-			_teardown_isolate(shard, type_id, slot, .Crashed)
-			return
-		}
-		_slot_set_state(shard, type_id, slot, .Waiting)
-
-		local_msg := e.message // Make "e.message" it addressable
-		envelope: Message_Envelope
-		envelope.source = invocation.self_handle
-		envelope.destination = invocation.current_message_source
-		envelope.correlation = invocation.current_correlation
-		envelope.flags += {.Is_Reply}
-		envelope.tag = local_msg.tag
-		envelope.payload_size = local_msg.user.payload_size
-		copy(envelope.payload[:], local_msg.user.payload[:])
-
-		_route_envelope_user(shard, invocation.current_message_source, &envelope)
-
-	case Effect_Io:
-		err := reactor_submit_io(&shard.reactor, shard, invocation.self_handle, e.operation)
-		if err != IO_ERR_NONE {
-			if err == IO_ERR_RESOURCE_EXHAUSTED do shard.counters.io_buffer_exhaustions += 1
-			_slot_set_io_submit_failure(
+	case .Wait_Reply:
+		if !invocation.staged_call_active || invocation.staged_io_active {
+			_transition_contract_violation(
 				shard,
 				type_id,
 				slot,
-				_io_op_to_completion_tag(e.operation),
-				i32(err),
+				invocation,
+				"Handler returned .Wait_Reply without exactly one staged call",
 			)
-		} else {
-			_slot_set_state(shard, type_id, slot, .Waiting_For_Io)
+			return
 		}
+		_commit_staged_call(shard, type_id, slot, invocation)
+	case .Wait_Io:
+		if !invocation.staged_io_active || invocation.staged_call_active {
+			_transition_contract_violation(
+				shard,
+				type_id,
+				slot,
+				invocation,
+				"Handler returned .Wait_Io without exactly one staged io submission",
+			)
+			return
+		}
+		_commit_staged_io(shard, type_id, slot, invocation)
 	}
 }
 
@@ -1223,7 +1296,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 
 	// Validation Only (No Mutation Yet)
 	if is_reply || is_timeout {
-		if soa_meta[slot].state != .Waiting_For_Reply ||
+		if soa_meta[slot].state != .Wait_Reply ||
 		   soa_meta[slot].pending_correlation != envelope.correlation {
 			shard.counters.stale_delivery_drops += 1
 			return .stale_handle
@@ -1280,7 +1353,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	soa_meta[slot].inbox_tail = pool_index
 	_slot_increment_inbox_count(shard, type_id, slot)
 
-	if soa_meta[slot].state == .Waiting {
+	if soa_meta[slot].state == .Wait_Message {
 		_slot_set_state(shard, type_id, slot, .Runnable)
 	}
 	return .ok
@@ -1612,7 +1685,7 @@ _inject_fd_handoff_accept :: proc "contextless" (
 	if soa_meta[target_slot.slot_index].state == .Unallocated || soa_meta[target_slot.slot_index].state == .Crashed {
 		return .Invalid_Target
 	}
-	if soa_meta[target_slot.slot_index].state == .Waiting_For_Io || soa_meta[target_slot.slot_index].io_completion_tag != IO_TAG_NONE {
+	if soa_meta[target_slot.slot_index].state == .Wait_Io || soa_meta[target_slot.slot_index].io_completion_tag != IO_TAG_NONE {
 		return .Target_Busy
 	}
 
@@ -2059,29 +2132,29 @@ test_io_awaiting_count_tracks_slot_state_transitions :: proc(t: ^testing.T) {
 	_slot_set_state(shard, 0, 0, .Runnable)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 
-	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
-	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
 	_slot_set_io_completion_ready(shard, 0, 0, IO_TAG_RECV_COMPLETE, 8, 3)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
 
-	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
 	_slot_set_io_submit_failure(shard, 0, 0, IO_TAG_RECV_COMPLETE, i32(IO_ERR_RESOURCE_EXHAUSTED))
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
 
-	_slot_set_state(shard, 0, 0, .Waiting_For_Io)
+	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
 	_slot_set_waiting_for_reply(shard, 0, 0, 7)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
-	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Waiting_For_Reply)
+	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Wait_Reply)
 }
 
 @(test)
@@ -2123,7 +2196,7 @@ test_dispatchable_refresh_slot_updates_type_summary :: proc(t: ^testing.T) {
 	shard.dispatch_credit_counts[0] = 1
 	_dispatchable_type_refresh(shard, 0)
 
-	shard.metadata[0][1].state = .Waiting_For_Io
+	shard.metadata[0][1].state = .Wait_Io
 	_dispatchable_refresh_slot(shard, 0, 1)
 
 	testing.expect_value(t, shard.dispatchable_slot_counts[0], u32(0))

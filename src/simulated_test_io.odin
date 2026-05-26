@@ -11,9 +11,9 @@ when TINA_SIMULATION_MODE {
 	//
 	// This test verifies the core safety invariant that makes explicit
 	// backend_cancel unnecessary:
-	//   1. An Isolate submits .recv and enters WAITING_FOR_IO
+	//   1. An Isolate submits .recv and enters WAIT_IO
 	//   2. A timer fires before I/O completes -> io_sequence bumped, state -> Runnable
-	//   3. The Isolate receives the timeout, returns .done
+	//   3. The Isolate receives the timeout, returns DONE
 	//   4. The stale I/O completion arrives later -> io_sequence mismatch -> buffer freed
 	//   5. After quiescence, the reactor buffer pool is whole (no leaks)
 
@@ -24,17 +24,17 @@ when TINA_SIMULATION_MODE {
 		fd:    FD_Handle,
 		state: enum u8 {
 			Init,
-			Waiting_For_Io,
+			Wait_Io,
 			Timed_Out,
 		},
 	}
 
-	io_timeout_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
+	io_timeout_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		iso := cast(^IoTimeoutIsolate)self
 
 		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
 		if err != .None {
-			return Effect_Crash{reason = .Init_Failed}
+			return transition_to_crash(.Init_Failed)
 		}
 		iso.fd = fd
 
@@ -44,19 +44,19 @@ when TINA_SIMULATION_MODE {
 			APP_TAG_IO_TIMEOUT,
 		)
 
-		iso.state = .Waiting_For_Io
-		return Effect_Io{operation = IoOp_Recv{fd = iso.fd, buffer_size_max = 512}}
+		iso.state = .Wait_Io
+		return transition_to_wait_io_or_crash(ctx_submit_io(ctx, IoOp_Recv{fd = iso.fd, buffer_size_max = 512}))
 	}
 
-	io_timeout_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
+	io_timeout_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
 		iso := cast(^IoTimeoutIsolate)self
 
 		if message.tag == APP_TAG_IO_TIMEOUT {
 			iso.state = .Timed_Out
-			return Effect_Done{}
+			return ISOLATE_TRANSITION_DONE
 		}
 
-		return Effect_Done{}
+		return ISOLATE_TRANSITION_DONE
 	}
 
 	@(test)
@@ -209,34 +209,37 @@ when TINA_SIMULATION_MODE {
 		send_buf: [32]u8,
 	}
 
-	write_crasher_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Yield{}
+	write_crasher_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_YIELD
 	}
 
-	write_crasher_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
-		if ctx_invocation(ctx).shard.current_tick == 1 do return Effect_Crash{reason = .None}
-		return Effect_Done{}
+	write_crasher_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+		if ctx_invocation(ctx).shard.current_tick == 1 do return transition_to_crash(.None)
+		return ISOLATE_TRANSITION_DONE
 	}
 
-	write_writer_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
+	write_writer_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		w := cast(^WriteWriterIsolate)self
 
 		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-		if err != .None do return Effect_Crash{reason = .Init_Failed}
+		if err != .None do return transition_to_crash(.Init_Failed)
 		w.fd = fd
 		w.send_buf[0] = 0x42
 
-		return Effect_Io {
-			operation = IoOp_Send {
-				fd = w.fd,
-				payload_offset = u16(offset_of(WriteWriterIsolate, send_buf)),
-				payload_size = 32,
-			},
-		}
+		return transition_to_wait_io_or_crash(
+			ctx_submit_io(
+				ctx,
+				IoOp_Send {
+					fd = w.fd,
+					payload_offset = u16(offset_of(WriteWriterIsolate, send_buf)),
+					payload_size = 32,
+				},
+			),
+		)
 	}
 
-	write_writer_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
-		return Effect_Done{}
+	write_writer_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_DONE
 	}
 
 	@(test)
@@ -338,17 +341,17 @@ when TINA_SIMULATION_MODE {
 		received_count: u8,
 	}
 
-	priority_test_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	priority_test_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	priority_test_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
+	priority_test_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
 		iso := cast(^PriorityTestIsolate)self
 		if iso.received_count < 4 {
 			iso.received_tags[iso.received_count] = message.tag
 			iso.received_count += 1
 		}
-		return Effect_Receive{}
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	@(test)

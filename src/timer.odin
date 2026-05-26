@@ -371,7 +371,7 @@ _advance_timers :: proc(
 				target := wheel.targets[slot_index]
 
 				// Wake-if-waiting-for-io (same pattern as before):
-				// Any timer expiration targeting an Isolate in Waiting_For_Io
+				// Any timer expiration targeting an Isolate in Wait_Io
 				// wakes it via io_sequence bump.
 				{
 					target_type := extract_type_id(target)
@@ -382,7 +382,7 @@ _advance_timers :: proc(
 					   int(target_slot) < len(shard.metadata[target_type]) &&
 					   shard.metadata[target_type][target_slot].generation == target_gen {
 						soa_meta := shard.metadata[target_type]
-						if soa_meta[target_slot].state == .Waiting_For_Io {
+						if soa_meta[target_slot].state == .Wait_Io {
 							soa_meta[target_slot].io_sequence += 1
 							_slot_set_state(shard, target_type, target_slot, .Runnable)
 						}
@@ -482,7 +482,7 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			target_handle       = test_state.handle,
 			current_tick        = 5,
 			timer_resolution_ns = 1,
-			target_state        = .Waiting,
+			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: TinaContext) {
@@ -543,7 +543,7 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 			target_handle       = test_state.handle,
 			current_tick        = 20,
 			timer_resolution_ns = 1,
-			target_state        = .Waiting,
+			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: TinaContext) {
@@ -609,7 +609,7 @@ test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^t
 			target_handle       = test_state.handle,
 			current_tick        = 100,
 			timer_resolution_ns = 1,
-			target_state        = .Waiting,
+			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: TinaContext) {
@@ -672,7 +672,7 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 			target_handle       = test_state.handle,
 			current_tick        = 50,
 			timer_resolution_ns = 1,
-			target_state        = .Waiting_For_Io,
+			target_state        = .Wait_Io,
 		},
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: TinaContext) {
@@ -726,7 +726,7 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 			target_handle       = test_state.handle,
 			current_tick        = 100,
 			timer_resolution_ns = 1,
-			target_state        = .Waiting,
+			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
 		proc(user_data: rawptr, ctx: TinaContext) {

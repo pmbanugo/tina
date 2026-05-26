@@ -18,7 +18,7 @@ import "core:mem"
 //
 // Phase 6 ownership: type definitions, install/wire, derivation math,
 // boot-time guards. The hot-path init/handler procedures are stubbed to
-// `Effect_Receive` here; Phase 7+ replaces them with the real state machines.
+// `ISOLATE_TRANSITION_WAIT_MESSAGE` here; Phase 7+ replaces them with the real state machines.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // `App` holds the user-declared route table.
@@ -1393,11 +1393,11 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 
 	// Build a single-shard spec by hand and pre-register one external type at
 	// id 0 so HTTP types cannot land at offset 0.
-	stub_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
-		return tina.Effect_Receive{}
+	stub_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
-	stub_handler :: proc(self: rawptr, message: ^tina.Message, ctx: tina.TinaContext) -> tina.Effect {
-		return tina.Effect_Receive{}
+	stub_handler :: proc(self: rawptr, message: ^tina.Message, ctx: tina.TinaContext) -> tina.Isolate_Transition {
+		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 	external_types := []tina.IsolateTypeDescriptor {
 		{

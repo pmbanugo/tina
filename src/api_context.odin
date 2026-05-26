@@ -4,6 +4,12 @@ import "core:mem"
 import "core:sync"
 
 @(private = "package")
+Staged_Call :: struct {
+	envelope:   Message_Envelope,
+	timeout_ns: u64,
+}
+
+@(private = "package")
 Isolate_Invocation :: struct {
 	previous:               ^Isolate_Invocation,
 	shard:                  ^Shard,
@@ -11,6 +17,8 @@ Isolate_Invocation :: struct {
 	self_handle:            Handle,
 	current_message_source: Handle,
 	current_correlation:    Correlation_Id,
+	staged_call:            Staged_Call,
+	staged_io_operation:    IoOp,
 	flags:                  Context_Flags,
 	working_arena:          mem.Arena,
 	scratch_arena:          mem.Arena,
@@ -19,6 +27,9 @@ Isolate_Invocation :: struct {
 	type_id:                u16,
 	slot_index:             u32,
 	shard_id:               Shard_Id,
+	staged_call_active:     bool,
+	staged_io_active:       bool,
+	reply_sent:             bool,
 }
 
 @(thread_local)
@@ -40,6 +51,21 @@ ctx_invocation :: #force_inline proc(ctx: TinaContext) -> ^Isolate_Invocation {
 		assert(ctx == invocation.context_token, "stale or foreign TinaContext")
 	}
 	return invocation
+}
+
+@(private = "file")
+_send_result_to_reply_result :: #force_inline proc "contextless" (result: Send_Result) -> Reply_Result {
+	switch result {
+	case .ok:
+		return .ok
+	case .mailbox_full:
+		return .mailbox_full
+	case .pool_exhausted:
+		return .pool_exhausted
+	case .stale_handle:
+		return .stale_handle
+	}
+	return .stale_handle
 }
 
 @(private = "package")
@@ -77,6 +103,61 @@ ctx_send_raw :: #force_inline proc(
 
 	response := _route_envelope_user(shard, to, &envelope)
 	return response
+}
+
+@(require_results)
+ctx_reply_raw :: #force_inline proc(
+	ctx: TinaContext,
+	$tag: Message_Tag,
+	payload: []u8,
+) -> Reply_Result {
+	#assert(
+		tag >= USER_MESSAGE_TAG_BASE,
+		"ctx_reply: Cannot forge system messages. Tag must be >= 0x0040.",
+	)
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_reply payload exceeds MAX_PAYLOAD_SIZE")
+	}
+
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.reply_sent {
+		return .already_replied
+	}
+	if .Is_Call not_in invocation.flags {
+		return .not_call_context
+	}
+
+	envelope: Message_Envelope
+	envelope.source = invocation.self_handle
+	envelope.destination = invocation.current_message_source
+	envelope.correlation = invocation.current_correlation
+	envelope.flags += {.Is_Reply}
+	envelope.tag = tag
+	envelope.payload_size = u16(len(payload))
+	copy(envelope.payload[:], payload)
+
+	result := _send_result_to_reply_result(
+		_route_envelope_user(invocation.shard, invocation.current_message_source, &envelope),
+	)
+	if result == .ok {
+		invocation.reply_sent = true
+	}
+	return result
+}
+
+@(require_results)
+ctx_reply_typed :: #force_inline proc(
+	ctx: TinaContext,
+	$tag: Message_Tag,
+	message: ^$T,
+) -> Reply_Result where size_of(T) <=
+	MAX_PAYLOAD_SIZE {
+	return ctx_reply_raw(ctx, tag, mem.byte_slice(message, size_of(T)))
+}
+
+ctx_reply :: proc {
+	ctx_reply_raw,
+	ctx_reply_typed,
 }
 
 // Reserves a shard-local correlation id for a logical parked wait.
@@ -141,6 +222,86 @@ ctx_transfer_send_with_correlation :: #force_inline proc(
 	(cast(^Transfer_Handle)&envelope.payload[0])^ = handle
 
 	return _route_envelope_system(shard, to, &envelope)
+}
+
+// Stages a request-reply call. The scheduler commits the staged envelope only if
+// the handler returns Isolate_Transition{kind = .Wait_Reply}.
+@(require_results)
+ctx_call_raw :: #force_inline proc(
+	ctx: TinaContext,
+	to: Handle,
+	$tag: Message_Tag,
+	payload: []u8,
+	timeout_ns: u64,
+) -> Call_Result {
+	#assert(
+		tag >= USER_MESSAGE_TAG_BASE,
+		"ctx_call: Cannot forge system messages. Tag must be >= 0x0040.",
+	)
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_call payload exceeds MAX_PAYLOAD_SIZE")
+		assert(timeout_ns > 0, "ctx_call timeout_ns must be > 0")
+	}
+
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active {
+		return .already_staged
+	}
+
+	shard := invocation.shard
+	target_shard_id := extract_shard_id(to)
+	if target_shard_id != shard.id {
+		if target_shard_id >= Shard_Id(shard.shard_count) {
+			return .stale_handle
+		}
+		if !shard_mask_contains(&shard.peer_alive_mask, target_shard_id) {
+			return .target_quarantined
+		}
+	} else {
+		target_type_id := extract_type_id(to)
+		target_slot_index := extract_slot(to)
+		if int(target_type_id) >= len(shard.metadata) {
+			return .stale_handle
+		}
+		target_meta := shard.metadata[target_type_id]
+		if int(target_slot_index) >= len(target_meta) {
+			return .stale_handle
+		}
+		if target_meta[target_slot_index].generation != extract_generation(to) {
+			return .stale_handle
+		}
+		if target_meta[target_slot_index].inbox_count >= shard.type_descriptors[target_type_id].mailbox_capacity {
+			return .mailbox_full
+		}
+	}
+
+	correlation_id := ctx_reserve_correlation_id(ctx)
+	invocation.staged_call_active = true
+	invocation.staged_call.timeout_ns = timeout_ns
+	invocation.staged_call.envelope = {}
+	invocation.staged_call.envelope.destination = to
+	invocation.staged_call.envelope.correlation = correlation_id
+	invocation.staged_call.envelope.tag = tag
+	invocation.staged_call.envelope.payload_size = u16(len(payload))
+	copy(invocation.staged_call.envelope.payload[:], payload)
+	return .ok
+}
+
+@(require_results)
+ctx_call_typed :: #force_inline proc(
+	ctx: TinaContext,
+	to: Handle,
+	$tag: Message_Tag,
+	message: ^$T,
+	timeout_ns: u64,
+) -> Call_Result where size_of(T) <=
+	MAX_PAYLOAD_SIZE {
+	return ctx_call_raw(ctx, to, tag, mem.byte_slice(message, size_of(T)), timeout_ns)
+}
+
+ctx_call :: proc {
+	ctx_call_raw,
+	ctx_call_typed,
 }
 
 ctx_transfer_send :: #force_inline proc(
@@ -423,6 +584,23 @@ ctx_transfer_read :: #force_inline proc(
 	shard.metadata[type_id][slot].pending_transfer_read = handle
 
 	return reactor_buffer_pool_write_slice(&shard.transfer_pool, index)
+}
+
+// Stages one asynchronous I/O submission. The scheduler commits it only if the
+// handler returns Isolate_Transition{kind = .Wait_Io}.
+@(require_results)
+ctx_submit_io :: #force_inline proc(ctx: TinaContext, operation: IoOp) -> Io_Submit_Result {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active {
+		return .already_staged
+	}
+	invocation.staged_io_operation = operation
+	invocation.staged_io_active = true
+	return .ok
+}
+
+ctx_staged_io_operation :: #force_inline proc(ctx: TinaContext) -> IoOp {
+	return ctx_invocation(ctx).staged_io_operation
 }
 
 // ============================================================================

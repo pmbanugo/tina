@@ -150,8 +150,8 @@ REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
 #assert(REACTOR_LINUX_SENDFILE_ENTRY_COUNT > 0)
 #assert(REACTOR_LINUX_SENDFILE_ENTRY_COUNT <= int(max(u16)))
 
-Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect
-Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect
+Init_Handler :: #type proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition
+Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition
 
 // Defines the behavior, memory footprint, and lifecycle functions for a specific Isolate type.
 IsolateTypeDescriptor :: struct {

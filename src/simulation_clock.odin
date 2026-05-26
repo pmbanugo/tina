@@ -19,7 +19,7 @@ when TINA_SIMULATION_MODE {
 					if shard.metadata[type_id].inbox_count[slot] > 0 do return false
 					if shard.metadata[type_id].io_completion_tag[slot] != IO_TAG_NONE do return false
 					if shard.metadata[type_id].state[slot] == .Runnable do return false
-					if shard.metadata[type_id].state[slot] == .Waiting_For_Io do return false
+					if shard.metadata[type_id].state[slot] == .Wait_Io do return false
 				}
 			}
 

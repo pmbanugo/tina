@@ -25,11 +25,11 @@ when TINA_SIMULATION_MODE {
 		fd: FD_Handle,
 	}
 
-	fd_handoff_listener_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
+	fd_handoff_listener_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		iso := cast(^FDHandoffListener)self
 		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
 		if err != .None {
-			return Effect_Crash{reason = .Init_Failed}
+			return transition_to_crash(.Init_Failed)
 		}
 
 		iso.listen_fd = fd
@@ -37,67 +37,67 @@ when TINA_SIMULATION_MODE {
 
 		bind_err := ctx_bind(ctx, fd, Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 8080})
 		if bind_err != .None {
-			return Effect_Crash{reason = .Init_Failed}
+			return transition_to_crash(.Init_Failed)
 		}
 		if ctx_listen(ctx, fd, 16) != .None {
-			return Effect_Crash{reason = .Init_Failed}
+			return transition_to_crash(.Init_Failed)
 		}
 
-		return Effect_Io{operation = IoOp_Accept{listen_fd = fd}}
+		return transition_to_wait_io_or_crash(ctx_submit_io(ctx, IoOp_Accept{listen_fd = fd}))
 	}
 
 	fd_handoff_listener_handler :: proc(
 		self: rawptr,
 		message: ^Message,
 		ctx: TinaContext,
-	) -> Effect {
+	) -> Isolate_Transition {
 		iso := cast(^FDHandoffListener)self
 		if message != nil && message.tag == IO_TAG_ACCEPT_COMPLETE {
 			iso.handoff_result = ctx_fd_handoff(ctx, iso.target_handle, message.io.fd)
 			iso.hand_offered = iso.handoff_result == .ok
-			return Effect_Receive{}
+			return ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
-		return Effect_Receive{}
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	fd_handoff_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	fd_handoff_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	fd_handoff_dispatcher_handler :: proc(
 		self: rawptr,
 		message: ^Message,
 		ctx: TinaContext,
-	) -> Effect {
+	) -> Isolate_Transition {
 		iso := cast(^FDHandoffDispatcher)self
 		if message != nil && message.tag == IO_TAG_ACCEPT_COMPLETE {
 			iso.received_accept = true
 			iso.client_fd = message.io.fd
 			iso.peer_port = message.io.peer_address.port
 		}
-		return Effect_Receive{}
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	fd_handoff_busy_dispatcher_init :: proc(
 		self: rawptr,
 		args: []u8,
 		ctx: TinaContext,
-	) -> Effect {
+	) -> Isolate_Transition {
 		iso := cast(^FDHandoffBusyDispatcher)self
 		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
 		if err != .None {
-			return Effect_Crash{reason = .Init_Failed}
+			return transition_to_crash(.Init_Failed)
 		}
 		iso.fd = fd
-		return Effect_Io{operation = IoOp_Recv{fd = fd, buffer_size_max = 64}}
+		return transition_to_wait_io_or_crash(ctx_submit_io(ctx, IoOp_Recv{fd = fd, buffer_size_max = 64}))
 	}
 
 	fd_handoff_busy_dispatcher_handler :: proc(
 		self: rawptr,
 		message: ^Message,
 		ctx: TinaContext,
-	) -> Effect {
-		return Effect_Receive{}
+	) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	@(test)

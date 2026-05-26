@@ -13,12 +13,12 @@ when TINA_SIMULATION_MODE {
 
 	HarnessNoopIsolate :: struct {}
 
-	harness_noop_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	harness_noop_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	harness_noop_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Effect {
-		return Effect_Receive{}
+	harness_noop_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	@(test)

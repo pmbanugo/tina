@@ -50,27 +50,27 @@ PublisherIsolate :: struct {
 	counter:          u32,
 }
 
-publisher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Effect {
+publisher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
 	self := tina.self_as(PublisherIsolate, self_raw, ctx)
 	self.subscriber_count = 0
 	self.counter = 0
 
 	publisher_handle = tina.ctx_self_handle(ctx)
 	tina.ctx_register_timer(ctx, SSE_TICK_INTERVAL_NS, TAG_PUBLISHER_TICK)
-	return tina.Effect_Receive{}
+	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 publisher_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
 	ctx: tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
 	self := tina.self_as(PublisherIsolate, self_raw, ctx)
 
 	switch message.tag {
 	case TAG_SUBSCRIBE:
 		if self.subscriber_count >= SUBSCRIBERS_MAX {
-			return tina.Effect_Receive{} // shed quietly; subscriber will time out
+			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE // shed quietly; subscriber will time out
 		}
 		msg := tina.payload_as(Sub_Msg, message.user.payload[:])
 		self.subscribers[self.subscriber_count] = Subscriber {
@@ -112,7 +112,7 @@ publisher_handler :: proc(
 		tina.ctx_register_timer(ctx, SSE_TICK_INTERVAL_NS, TAG_PUBLISHER_TICK)
 	}
 
-	return tina.Effect_Receive{}
+	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 // ─── HTTP routes ────────────────────────────────────────────────────────────
