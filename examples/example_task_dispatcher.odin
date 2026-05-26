@@ -15,8 +15,8 @@ DEMO_ABORT_ON_QUARANTINE :: #config(TINA_DEMO_ABORT_ON_QUARANTINE, false)
 // Type IDs & Message Tags
 // ============================================================================
 
-DISPATCHER_ISOLATE_TYPE: u8 : 0
-WORKER_ISOLATE_TYPE: u8 : 1
+DISPATCHER_ISOLATE_TYPE :: 0
+WORKER_ISOLATE_TYPE :: 1
 
 TAG_WORKER_READY: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 1
 TAG_JOB: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 2
@@ -116,7 +116,12 @@ worker_handler :: proc(
 
 		// Happy Path: Do the job and report success.
 		// str := fmt.bprintf(log_buf[:], "Worker %d: Completed Job %d.", id, msg.job_id)
-		str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "Worker %d: Completed Job %d.", id, msg.job_id)
+		str := fmt.bprintf(
+			tina.ctx_scratch_arena_bytes(ctx),
+			"Worker %d: Completed Job %d.",
+			id,
+			msg.job_id,
+		)
 		tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 		done_msg := JobDoneMsg {
@@ -339,7 +344,6 @@ main :: proc() {
 		shard_specs = shard_specs[:],
 		timer_resolution_ns = 1_000_000,
 		pool_slot_count = 4096,
-
 		timer_entry_count = 1024,
 		log_ring_size = 65536,
 		default_ring_size = 16,
