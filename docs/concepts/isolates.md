@@ -1,6 +1,6 @@
-# Isolates, Effects & Messaging
+# Isolates, Transitions & Messaging
 
-**An Isolate is a unit of concurrent work that receives messages, acts on those messages, and communicates intent to the scheduler by returning an Effect. Isolates share no memory. They reference each other by generational Handle and crash independently without affecting other Isolates.**
+**An Isolate is a unit of concurrent work that receives messages, acts on those messages, and communicates intent to the scheduler by returning an `Isolate_Transition`. Isolates share no memory. They reference each other by generational Handle and crash independently without affecting other Isolates.**
 
 ## What Is an Isolate?
 
@@ -22,8 +22,8 @@ The name **'Isolate'** explicitly defines its architectural guarantee — **faul
 
 Three artifacts per Isolate type:
 1. **The struct** — the Isolate's state. Lives in a typed arena. Should be 256–512 bytes for most cases, up to 4KB for protocol-heavy Isolates.
-2. **`init_handler`** — called once on spawn. Receives init args (up to 64 bytes), returns the initial Effect.
-3. **`handler_fn`** — called on every message/I/O completion. Returns an Effect telling the scheduler what to do next.
+2. **`init_handler`** — called once on spawn. Receives init args (up to 64 bytes), returns the initial `Isolate_Transition`.
+3. **`handler_fn`** — called on every message/I/O completion. Returns an `Isolate_Transition` telling the scheduler what to do next.
 
 ```odin
 MyWorker :: struct {
@@ -31,45 +31,45 @@ MyWorker :: struct {
     boss:   tina.Handle,
 }
 
-worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(MyWorker, self_raw, ctx)
     // ... initialize from args ...
-    return tina.Effect_Receive{}  // park, wait for messages
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE  // park, wait for messages
 }
 
-worker_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
+worker_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(MyWorker, self_raw, ctx)
     switch message.tag {
     case MY_TAG:
         // ... handle the message ...
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
 
 Both functions receive `rawptr` because the scheduler operates on heterogeneous typed arenas. Use `tina.self_as(T, self_raw, ctx)` for a debug-checked cast that validates the stride at runtime.
 
-## The Effect System
+## The Transition System
 
-Handlers return an **Effect** — a value describing what the Isolate wants, not how to schedule it. The scheduler interprets the Effect. This is the core abstraction that enables deterministic simulation: in production the Effect interpreter talks to io_uring/kqueue; in simulation it returns scripted completions. The Isolate code is identical.
+Handlers return an `Isolate_Transition` — a 2-byte value describing what the Isolate wants next, not how to schedule it. The scheduler interprets the transition. This is the core abstraction that enables deterministic simulation: in production the transition interpreter talks to io_uring/kqueue; in simulation it returns scripted completions. The Isolate code is identical.
 
-Seven variants:
+Seven possible states:
 
-| Effect | What it means |
+| Transition | What it means |
 |---|---|
-| `Effect_Done{}` | Deallocate me. Clean exit. |
-| `Effect_Crash{reason}` | Voluntary failure — "let it crash." Supervisor decides what happens. |
-| `Effect_Yield{}` | Run me again next tick. |
-| `Effect_Receive{}` | Park me until my mailbox has a message. |
-| `Effect_Call{to, message, timeout}` | Send a request and park until reply or timeout. |
-| `Effect_Reply{message}` | Reply to a pending `.call`, then park for next message. |
-| `Effect_Io{operation}` | Submit I/O to the reactor, park until completion. |
+| `ISOLATE_TRANSITION_DONE` | Deallocate me. Clean exit. |
+| `transition_to_crash(reason)` | Voluntary failure — "let it crash." Supervisor decides what happens. |
+| `ISOLATE_TRANSITION_YIELD` | Run me again next tick. |
+| `ISOLATE_TRANSITION_WAIT_MESSAGE` | Park me until my mailbox has a message. |
+| `ISOLATE_TRANSITION_WAIT_REPLY` | A call was staged via `ctx_call_*` — park until reply or timeout. |
+| `ISOLATE_TRANSITION_WAIT_IO` | I/O was staged via `ctx_submit_io` — park until completion. |
+| `transition_to_wait_io_or_crash(result)` | Submit staged I/O and park, or crash on contract violation. |
 
-**Every variant is a state transition**, not an action. Actions (sending messages, spawning Isolates, logging) are done via `ctx_*()` calls during the handler. Effects are returned at the end.
+**Every transition is a state notification**, not an action. Actions (sending messages, spawning Isolates, logging, submitting I/O) are done via `ctx_*()` calls during the handler. The transition is returned at the end.
 
-This split — actions via `ctx` calls, state transitions via Effect return — is what makes the API non-colored. You can send 100 messages and then park on I/O in a single handler invocation. No async/await, no callbacks, no colored functions.
+This split — actions via `ctx` calls, state transition via the return value — is what makes the API non-colored. You can send 100 messages, submit I/O, and park on completion in a single handler invocation. No async/await, no callbacks, no colored functions.
 
 ## Handles: Safe Identity Without Pointers
 
@@ -139,15 +139,15 @@ There is one channel per Shard-pair. For N Shards: N×(N-1) channels. Each is si
 The handler receives messages one at a time:
 
 ```odin
-handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
+handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     switch message.tag {
     case MY_TAG:
         msg := tina.payload_as(MyPayload, message.user.payload[:])
         // ... handle it ...
     case tina.TAG_SHUTDOWN:
-        return tina.Effect_Done{}
+        return tina.ISOLATE_TRANSITION_DONE
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
@@ -177,6 +177,6 @@ result := tina.ctx_spawn(ctx, spec)
 
 **Fixed-size envelopes limit inline payloads to 96 bytes.** Most messages fit easily (a Handle is 8 bytes, a typical request struct is 20–60 bytes). For larger payloads, the Transfer Buffer Pool provides a reference-passing mechanism. This keeps the common path cache-optimal.
 
-**One outstanding `.call` per Isolate.** An Isolate can have at most one pending `.call` at a time (structural consequence: the handler returns one Effect). If you need scatter-gather (multiple concurrent requests), decompose into multiple cooperating Isolates — one per concurrent call. However, you can build your own request-response protocol on top of the async messaging.
+**One outstanding `.call` per Isolate.** An Isolate can have at most one pending `.call` at a time (structural consequence: the handler returns one `Isolate_Transition`). If you need scatter-gather (multiple concurrent requests), decompose into multiple cooperating Isolates — one per concurrent call. However, you can build your own request-response protocol on top of the async messaging.
 
 **Init args are limited to 64 bytes.** Serialized into a fixed-size buffer on the `Spawn_Spec`. If you need to pass more state to a newly spawned Isolate, send a follow-up message after spawn. This keeps the spawn path allocation-free.

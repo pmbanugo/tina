@@ -69,8 +69,8 @@ Defines the behavior, memory footprint, and lifecycle functions for a specific I
 | `scratch_requirement_max` | `int` | `0` | Maximum scratch arena bytes this type needs. `SystemSpec.scratch_arena_size` must be >= this. |
 | `mailbox_capacity` | `u16` | `256` | Per-Isolate mailbox depth. If 0, the framework applies 256 at startup. |
 | `budget_weight` | `u16` | `1` | Scheduling weight. Higher = more messages processed per tick. If 0, the framework applies 1 at startup. |
-| `init_handler` | `Init_Handler` | — | `proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect`. Called once on spawn. |
-| `handler_fn` | `Handler_Fn` | — | `proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect`. Called on every message. |
+| `init_handler` | `Init_Handler` | — | `proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Isolate_Transition`. Called once on spawn. |
+| `handler_fn` | `Handler_Fn` | — | `proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Isolate_Transition`. Called on every message. |
 
 ---
 
@@ -382,12 +382,12 @@ import tina "../src"
 
 MyIsolate :: struct {}
 
-my_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
-    return tina.Effect_Receive{}
+my_init :: proc(self: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
-my_handler :: proc(self: rawptr, msg: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
-    return tina.Effect_Receive{}
+my_handler :: proc(self: rawptr, msg: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 main :: proc() {

@@ -2,7 +2,7 @@
 
 Build a complete, non-blocking TCP echo server with Tina. Two Isolate types — a Listener that accepts connections and a Connection that echoes data back — wired into a supervision tree.
 
-No async/await. No callbacks. No locks. Just state machines that return Effects.
+No async/await. No callbacks. No locks. Just state machines that return Isolate_Transitions.
 
 ## Overview
 
@@ -37,14 +37,14 @@ ServerListener :: struct {
 All socket setup happens here — in one shot, no multi-step init.
 
 ```odin
-listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(ServerListener, self_raw, ctx)
 
     // 1. Create a TCP socket.
     fd, err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
     if err != .None {
         // Can't open a socket — crash. The supervisor will restart us.
-        return tina.Effect_Crash{reason = .Init_Failed}
+        return tina.transition_to_crash(.Init_Failed)
     }
     self.listen_fd = fd
 
@@ -62,9 +62,9 @@ listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> t
     tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
     // 6. Park waiting for the first connection.
-    //    This is our initial parking Effect — the scheduler won't call us again
+    //    This is our initial parking transition — the scheduler won't call us again
     //    until a client connects.
-    return tina.Effect_Io{operation = tina.IoOp_Accept{listen_fd = self.listen_fd}}
+    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_fd}))
 }
 ```
 
@@ -77,7 +77,7 @@ listener_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(ServerListener, self_raw, ctx)
 
     switch message.tag {
@@ -105,17 +105,15 @@ listener_handler :: proc(
         }
 
         // Always loop back to accepting the next connection.
-        return tina.Effect_Io{
-            operation = tina.IoOp_Accept{listen_fd = self.listen_fd},
-        }
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_fd}))
 
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
 
-> **Key point:** The Listener never stops accepting. After spawning a Connection, it immediately returns `Effect_Io{IoOp_Accept{...}}` to wait for the next client. The Connection runs independently.
+> **Key point:** The Listener never stops accepting. After spawning a Connection, it immediately returns `ISOLATE_TRANSITION_WAIT_IO` (via `transition_to_wait_io_or_crash` + `ctx_submit_io`) to wait for the next client. The Connection runs independently.
 
 ---
 
@@ -151,7 +149,7 @@ ServerConnection :: struct {
 Called once when the Isolate is spawned. Sets up the socket and parks waiting for data.
 
 ```odin
-conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     // Cast the raw pointer to our typed struct. Debug builds verify the stride matches.
     self := tina.self_as(ServerConnection, self_raw, ctx)
 
@@ -164,12 +162,10 @@ conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.
 
     // Park this Isolate waiting for incoming data.
     // The scheduler wakes us when the kernel has bytes ready.
-    return tina.Effect_Io{
-        operation = tina.IoOp_Recv{
-            fd              = self.fd,
-            buffer_size_max = u32(len(self.buffer)),  // max bytes to read
-        },
-    }
+    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{
+        fd              = self.fd,
+        buffer_size_max = u32(len(self.buffer)),  // max bytes to read
+    }))
 }
 ```
 
@@ -182,7 +178,7 @@ conn_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(ServerConnection, self_raw, ctx)
 
     switch message.tag {
@@ -192,7 +188,7 @@ conn_handler :: proc(
         // message.io.result: bytes read (>0), 0 = EOF, <0 = error
         if message.io.result <= 0 {
             // EOF or error — close the socket and exit.
-            return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
         }
 
         // Read the received data from the reactor's buffer pool.
@@ -205,32 +201,30 @@ conn_handler :: proc(
         mem.copy(&self.buffer[0], raw_data(data), int(copy_len))
 
         // Echo it back. Tina does not allocate staging buffers for outbound I/O.
-        // io_send computes the byte offset of self.buffer within the arena slot,
+        // ctx_io_send computes the byte offset of self.buffer within the arena slot,
         // allowing the kernel to read directly from the Isolate's memory.
-        return tina.io_send(self, self.fd, self.buffer[:copy_len])
+        return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(ctx, self, self.fd, self.buffer[:copy_len]))
 
     // ---- Kernel finished sending our echo response ----
     case tina.IO_TAG_SEND_COMPLETE:
         if message.io.result < 0 {
             // Send failed — close and exit.
-            return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
         }
         // Send succeeded — go back to reading.
-        return tina.Effect_Io{
-            operation = tina.IoOp_Recv{
-                fd              = self.fd,
-                buffer_size_max = u32(len(self.buffer)),
-            },
-        }
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{
+            fd              = self.fd,
+            buffer_size_max = u32(len(self.buffer)),
+        }))
 
     // ---- Socket close completed ----
     case tina.IO_TAG_CLOSE_COMPLETE:
         // Return Done to tell the supervisor this Isolate has finished cleanly.
-        return tina.Effect_Done{}
+        return tina.ISOLATE_TRANSITION_DONE
 
     // ---- Anything else (e.g., user messages) — ignore and wait ----
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
@@ -238,7 +232,7 @@ conn_handler :: proc(
 **The read → echo → read loop:**
 
 ```
-  IoOp_Recv ──▶ IO_TAG_RECV_COMPLETE ──▶ io_send ──▶ IO_TAG_SEND_COMPLETE ──▶ IoOp_Recv ──▶ ...
+  IoOp_Recv ──▶ IO_TAG_RECV_COMPLETE ──▶ ctx_io_send ──▶ IO_TAG_SEND_COMPLETE ──▶ IoOp_Recv ──▶ ...
        │                                                                            │
        └────────────────────────────── the loop ────────────────────────────────────┘
 ```

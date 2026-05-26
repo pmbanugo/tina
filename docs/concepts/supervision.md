@@ -62,7 +62,7 @@ Example: `restart_count_max = 5, window_duration_ticks = 10_000` means "if this 
 | Type | Meaning |
 |---|---|
 | `.permanent` | Always restart, regardless of exit reason. |
-| `.transient` | Restart only on crash. Clean exit (`Effect_Done`) is not restarted. |
+| `.transient` | Restart only on crash. Clean exit (`ISOLATE_TRANSITION_DONE`) is not restarted. |
 | `.temporary` | Never restart. Used for one-shot tasks and connection handlers. |
 
 ### Defining the Supervision Tree

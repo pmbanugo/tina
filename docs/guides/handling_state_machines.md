@@ -35,17 +35,17 @@ Worker :: struct {
     boss:   tina.Handle,  // who to report results to
 }
 
-worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(Worker, self_raw, ctx)
     // ... parse init args, set self.id and self.boss ...
-    return tina.Effect_Receive{}  // park, waiting for messages
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE  // park, waiting for messages
 }
 
 worker_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(Worker, self_raw, ctx)
 
     switch message.tag {
@@ -61,11 +61,11 @@ worker_handler :: proc(
         _ = tina.ctx_send(ctx, self.boss, TAG_JOB_DONE, &done)
 
         // Park again, waiting for the next job.
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
     // ---- Anything else — ignore and wait ----
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
@@ -93,26 +93,24 @@ Connection :: struct {
     buffer: [256]u8,
 }
 
-conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(Connection, self_raw, ctx)
     // ... parse args, get target address ...
 
     self.state = .Connecting  // start in the Connecting phase
 
     // Initiate async connect.
-    return tina.Effect_Io{
-        operation = tina.IoOp_Connect{
-            fd      = self.fd,
-            address = tina.ipv4(127, 0, 0, 1, 9090),
-        },
-    }
+    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Connect{
+        fd      = self.fd,
+        address = tina.ipv4(127, 0, 0, 1, 9090),
+    }))
 }
 
 conn_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(Connection, self_raw, ctx)
 
     // ---- Switch on STATE first, then on message.tag within each state ----
@@ -124,15 +122,13 @@ conn_handler :: proc(
             if message.io.result < 0 {
                 // Connect failed — close and exit.
                 self.state = .Closing
-                return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
+                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
             }
             // Connected! Transition to Active, start reading.
             self.state = .Active
-            return tina.Effect_Io{
-                operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))},
-            }
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
         case:
-            return tina.Effect_Receive{}
+            return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
 
     case .Active:
@@ -141,23 +137,19 @@ conn_handler :: proc(
             if message.io.result <= 0 {
                 // EOF or error — close.
                 self.state = .Closing
-                return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
+                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
             }
             // Got data — process it, then read more.
             // ... handle the data ...
-            return tina.Effect_Io{
-                operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))},
-            }
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
 
         case tina.TAG_SHUTDOWN:
             // Graceful shutdown requested — transition to Draining.
             tina.ctx_shutdown(ctx, self.fd, .SHUT_WRITER)  // send TCP FIN
             self.state = .Draining
-            return tina.Effect_Io{
-                operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))},
-            }
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
         case:
-            return tina.Effect_Receive{}
+            return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
 
     case .Draining:
@@ -166,27 +158,25 @@ conn_handler :: proc(
             if message.io.result <= 0 {
                 // EOF — peer acknowledged close. Now close the socket.
                 self.state = .Closing
-                return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
+                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
             }
             // Still receiving data during drain — keep reading until EOF.
-            return tina.Effect_Io{
-                operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))},
-            }
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
         case:
-            return tina.Effect_Receive{}
+            return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
 
     case .Closing:
         switch message.tag {
         case tina.IO_TAG_CLOSE_COMPLETE:
             // Socket closed — we're done.
-            return tina.Effect_Done{}
+            return tina.ISOLATE_TRANSITION_DONE
         case:
-            return tina.Effect_Receive{}
+            return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
     }
 
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 ```
 
@@ -249,7 +239,7 @@ WorkerIsolate :: struct {
     dispatcher: tina.Handle,
 }
 
-worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(WorkerIsolate, self_raw, ctx)
 
     // Parse init args — the Dispatcher passed these when it spawned us.
@@ -275,14 +265,14 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tin
     )
     tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
-    return tina.Effect_Receive{}  // ready for jobs
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE  // ready for jobs
 }
 
 worker_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     using self := tina.self_as(WorkerIsolate, self_raw, ctx)
 
     switch message.tag {
@@ -292,16 +282,16 @@ worker_handler :: proc(
         // Simulate a crash on every 3rd job.
         if job.job_id % 3 == 0 {
             // The supervisor restarts us. We'll check in again with a new Handle.
-            return tina.Effect_Crash{reason = .None}
+            return tina.transition_to_crash(.None)
         }
 
         // Happy path — do the work, report done.
         done := JobDoneMsg{job_id = job.job_id, worker_id = id}
         _ = tina.ctx_send(ctx, dispatcher, TAG_JOB_DONE, &done)
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
@@ -317,7 +307,7 @@ DispatcherIsolate :: struct {
     job_counter: u32,
 }
 
-dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(DispatcherIsolate, self_raw, ctx)
 
     // Spawn the workers. We don't know their Handles yet!
@@ -343,14 +333,14 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) ->
 
     // Start a periodic dispatch timer (fires every 400ms).
     tina.ctx_register_timer(ctx, 400 * 1_000_000, TAG_DISPATCH_TICK)
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 dispatcher_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     using self := tina.self_as(DispatcherIsolate, self_raw, ctx)
 
     switch message.tag {
@@ -360,7 +350,7 @@ dispatcher_handler :: proc(
         msg := tina.payload_as(WorkerReadyMsg, message.user.payload[:])
         // Update our table with the Worker's current Handle.
         workers[msg.id] = msg.handle
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
     // ---- Time to dispatch jobs ----
     case TAG_DISPATCH_TICK:
@@ -389,10 +379,10 @@ dispatcher_handler :: proc(
 
         // Re-arm the timer for the next dispatch cycle.
         tina.ctx_register_timer(ctx, 400 * 1_000_000, TAG_DISPATCH_TICK)
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
@@ -401,7 +391,7 @@ dispatcher_handler :: proc(
 
 ```
 Tick 1:  Dispatcher sends Job #3 to Worker #0 (Handle = 0xAA)
-Tick 2:  Worker #0 crashes on Job #3 → Effect_Crash
+Tick 2:  Worker #0 crashes on Job #3 → transition_to_crash(.None)
 Tick 3:  Supervisor restarts Worker #0 → new Handle = 0xBB
 Tick 3:  Worker #0's init_handler sends TAG_WORKER_READY{id=0, handle=0xBB}
 Tick 4:  Dispatcher sends Job #6 to Worker #0 (Handle = 0xAA) → .stale_handle!

@@ -16,7 +16,7 @@ Deterministic simulation requires that no execution decision depends on anything
 2. **I/O completions.** The kernel returns I/O results in unpredictable order and timing.
 3. **Thread interleaving.** On a multi-core machine, the OS scheduler decides which core runs when.
 
-Tina's architecture already abstracts all three behind the scheduler loop. Isolates do not call the clock, do not perform I/O directly, and do not run on OS threads. They return `Effect` values, and the scheduler interprets them. In simulation mode, the interpreter is swapped — the Isolate code is identical in both modes.
+Tina's architecture already abstracts all three behind the scheduler loop. Isolates do not call the clock, do not perform I/O directly, and do not run on OS threads. They return `Isolate_Transition` values, and the scheduler interprets them. In simulation mode, the interpreter is swapped — the Isolate code is identical in both modes.
 
 | Subsystem | Production | Simulation |
 |---|---|---|
@@ -141,7 +141,7 @@ SystemSpec {
 }
 ```
 
-Your Isolate code is the same in both modes. The `Effect` interpreter is what changes.
+Your Isolate code is the same in both modes. The `Isolate_Transition` interpreter is what changes.
 
 ## Tradeoffs Accepted
 

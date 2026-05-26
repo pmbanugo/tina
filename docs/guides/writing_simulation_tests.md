@@ -28,17 +28,17 @@ TestDriver :: struct {
     round: u32,
 }
 
-driver_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+driver_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     // Register a timer to fire on the next tick — this drives the workload.
     tina.ctx_register_timer(ctx, 1_000_000, TAG_DRIVER_TICK)  // 1ms
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 driver_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(TestDriver, self_raw, ctx)
 
     switch message.tag {
@@ -51,13 +51,13 @@ driver_handler :: proc(
 
         // Re-arm the timer.
         tina.ctx_register_timer(ctx, 1_000_000, TAG_DRIVER_TICK)
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
     case tina.TAG_SHUTDOWN:
-        return tina.Effect_Done{}
+        return tina.ISOLATE_TRANSITION_DONE
 
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```

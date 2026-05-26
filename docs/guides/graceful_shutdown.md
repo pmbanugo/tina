@@ -62,7 +62,7 @@ Use this to stop accepting new work before `TAG_SHUTDOWN` arrives:
 case TAG_JOB:
     // Don't start new work if we're shutting down.
     if tina.ctx_is_shutting_down(ctx) {
-        return tina.Effect_Done{}
+        return tina.ISOLATE_TRANSITION_DONE
     }
     // ... process the job normally ...
 ```
@@ -78,26 +78,26 @@ worker_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(WorkerIsolate, self_raw, ctx)
 
     switch message.tag {
 
     // ---- Shutdown requested. No cleanup needed. Exit immediately. ----
     case tina.TAG_SHUTDOWN:
-        return tina.Effect_Done{}
+        return tina.ISOLATE_TRANSITION_DONE
 
     case TAG_JOB:
         // ... normal work ...
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
 
-That's it. One line: `return tina.Effect_Done{}`. The supervisor marks the Isolate as cleanly exited.
+That's it. One line: `return tina.ISOLATE_TRANSITION_DONE`. The supervisor marks the Isolate as cleanly exited.
 
 ---
 
@@ -124,7 +124,7 @@ drain_conn_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(DrainConnection, self_raw, ctx)
 
     switch self.state {
@@ -141,22 +141,18 @@ drain_conn_handler :: proc(
             // Transition to Draining. We need to read until EOF
             // so the peer knows we received their last bytes.
             self.state = .Draining
-            return tina.Effect_Io{
-                operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))},
-            }
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
 
         case tina.IO_TAG_RECV_COMPLETE:
             if message.io.result <= 0 {
                 self.state = .Closing
-                return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
+                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
             }
             // ... process data, echo back, etc ...
-            return tina.Effect_Io{
-                operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))},
-            }
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
 
         case:
-            return tina.Effect_Receive{}
+            return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
 
     // ---- Draining: read until EOF, discard data ----
@@ -167,15 +163,13 @@ drain_conn_handler :: proc(
                 // EOF (result == 0) or error (result < 0).
                 // Either way, the peer is done. Close the socket.
                 self.state = .Closing
-                return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
+                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
             }
             // Peer is still sending data. Keep reading until they stop.
             // We already sent FIN, so they know we're closing.
-            return tina.Effect_Io{
-                operation = tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))},
-            }
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
         case:
-            return tina.Effect_Receive{}
+            return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
 
     // ---- Closing: wait for the close syscall to complete ----
@@ -183,13 +177,13 @@ drain_conn_handler :: proc(
         switch message.tag {
         case tina.IO_TAG_CLOSE_COMPLETE:
             // Socket is closed. We're done.
-            return tina.Effect_Done{}
+            return tina.ISOLATE_TRANSITION_DONE
         case:
-            return tina.Effect_Receive{}
+            return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
     }
 
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 ```
 
@@ -210,7 +204,7 @@ TAG_SHUTDOWN received
        │               │
        │               ├─▶ IoOp_Close       ← close the socket
        │               │
-       │               └─▶ Effect_Done{}    ← Isolate exits cleanly
+       │               └─▶ ISOLATE_TRANSITION_DONE    ← Isolate exits cleanly
        │
        └── all within shutdown_timeout_ms ──┘
 ```
@@ -226,7 +220,7 @@ listener_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(ServerListener, self_raw, ctx)
 
     switch message.tag {
@@ -253,18 +247,16 @@ listener_handler :: proc(
 
         // If shutting down, stop accepting. Otherwise, accept the next connection.
         if tina.ctx_is_shutting_down(ctx) {
-            return tina.Effect_Done{}
+            return tina.ISOLATE_TRANSITION_DONE
         }
-        return tina.Effect_Io{
-            operation = tina.IoOp_Accept{listen_fd = self.listen_fd},
-        }
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_fd}))
 
     // ---- Shutdown signal (if we were parked waiting for accept, the I/O was cancelled) ----
     case tina.TAG_SHUTDOWN:
-        return tina.Effect_Done{}
+        return tina.ISOLATE_TRANSITION_DONE
 
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
@@ -299,10 +291,10 @@ If your Isolates do not finish within this window, Phase 3 bypasses user-space c
 
 | Isolate Type | On TAG_SHUTDOWN | Drain Work |
 |---|---|---|
-| Timer / Worker | `return Effect_Done{}` | None |
-| Listener | Stop accepting, `return Effect_Done{}` | None |
+| Timer / Worker | `return ISOLATE_TRANSITION_DONE` | None |
+| Listener | Stop accepting, `return ISOLATE_TRANSITION_DONE` | None |
 | Connection | `ctx_shutdown(fd, .SHUT_WRITER)` → read until EOF → close → done | Multi-step I/O |
-| Dispatcher | `return Effect_Done{}` | None (workers drain themselves) |
+| Dispatcher | `return ISOLATE_TRANSITION_DONE` | None (workers drain themselves) |
 
 | API | Purpose |
 |---|---|

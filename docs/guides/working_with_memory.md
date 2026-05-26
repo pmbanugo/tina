@@ -26,7 +26,7 @@ The scratch arena is for data that does not outlive the current handler call. Th
 The most common pattern. Use `tina.ctx_scratch_arena_bytes(ctx)` as the destination buffer for `fmt.bprintf`:
 
 ```odin
-handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Effect {
+handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(MyIsolate, self_raw, ctx)
 
     // Format a log string into the scratch arena's backing buffer.
@@ -35,7 +35,7 @@ handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext
         self.request_count, tina.ctx_shard_id(ctx))
     tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 ```
 
@@ -73,24 +73,24 @@ RouterIsolate :: struct {
     subscriber_count: u32,
 }
 
-router_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Effect {
+router_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
     self := tina.self_as(RouterIsolate, self_raw, ctx)
 
     // Get an Allocator backed by this Isolate's private working memory region.
     working := tina.ctx_working_arena(ctx)
 
     // Allocate a subscriber table. This memory survives across handler calls —
-    // it persists until the Isolate is torn down (crash, Effect_Done, or shutdown).
+    // it persists until the Isolate is torn down (crash, ISOLATE_TRANSITION_DONE, or shutdown).
     self.subscribers = new(SubscriberTable, working)
 
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 router_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
     ctx: ^tina.TinaContext,
-) -> tina.Effect {
+) -> tina.Isolate_Transition {
     self := tina.self_as(RouterIsolate, self_raw, ctx)
 
     // self.subscribers is still valid — working arena persists across handler calls.
@@ -98,9 +98,9 @@ router_handler :: proc(
     case TAG_SUBSCRIBE:
         sub := tina.payload_as(SubMsg, message.user.payload[:])
         // ... add to self.subscribers ...
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     case:
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 }
 ```
@@ -131,7 +131,7 @@ handle_result := tina.ctx_transfer_alloc(ctx)
 handle, ok := handle_result.(tina.Transfer_Handle)
 if !ok {
     // Pool exhausted — shed load or retry later.
-    return tina.Effect_Yield{}
+    return tina.ISOLATE_TRANSITION_YIELD
 }
 
 // 2. Write the large payload into the transfer slot.
@@ -152,14 +152,14 @@ case tina.TAG_TRANSFER:
     data, ok := read_result.([]u8)
     if !ok {
         // Stale handle — the slot was already freed.
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 
     // Copy what you need into your own memory.
     mem.copy(&self.staging[0], raw_data(data), len(data))
 
     // After this handler returns, the transfer slot is auto-freed.
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 ```
 
 ### The rule

@@ -179,14 +179,15 @@ Not `ctx_`-prefixed but part of the public API.
 | `init_args_of` | `init_args_of(args: ^$T) -> ([MAX_INIT_ARGS_SIZE]u8, u8)` | buffer + size | Serialize typed init args into a fixed-size buffer for `Spawn_Spec`. Compile-time asserts `size_of(T) <= 64`. |
 | `make_spawn_args` | `make_spawn_args(args: ^$T) -> (buf, size)` | buffer + size | Alias for `init_args_of`. Runtime assert instead of compile-time. |
 
-### I/O Effect Builders
+### I/O Submission Helpers
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `io_send` | `io_send(self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Effect` | `Effect_Io` | Build a send Effect. `buffer` must live inside the Isolate struct. |
-| `io_write` | `io_write(self: ^$Isolate, fd: FD_Handle, buffer: []u8, offset: u64) -> Effect` | `Effect_Io` | Build a write Effect at a byte offset. |
-| `io_sendto` | `io_sendto(self: ^$Isolate, fd: FD_Handle, buffer: []u8, address: Socket_Address) -> Effect` | `Effect_Io` | Build a sendto Effect (UDP). |
-| `io_sendfile` | `io_sendfile(fd_socket: FD_Handle, fd_file: FD_Handle, source_offset: u64, size: u32) -> Effect` | `Effect_Io` | Build a zero-copy sendfile Effect. No Isolate memory involved — data flows from file page cache to socket. Use `SENDFILE_ALL_BYTES` for `size` to send the entire file from `source_offset`. |
+| `ctx_submit_io` | `ctx_submit_io(ctx, operation: IoOp) -> Io_Submit_Result` | `Io_Submit_Result` | Stage an I/O operation for commit. The scheduler commits it only if the handler returns `Isolate_Transition{kind = .Wait_Io}`. |
+| `ctx_io_send` | `ctx_io_send(ctx, self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a socket send from an Isolate-owned buffer. `buffer` must live inside the Isolate struct. |
+| `ctx_io_write` | `ctx_io_write(ctx, self: ^$Isolate, fd: FD_Handle, buffer: []u8, offset: u64) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a write command to a file descriptor at a byte offset. |
+| `ctx_io_sendto` | `ctx_io_sendto(ctx, self: ^$Isolate, fd: FD_Handle, buffer: []u8, address: Socket_Address) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a UDP send. |
+| `ctx_io_sendfile` | `ctx_io_sendfile(ctx, fd_socket: FD_Handle, fd_file: FD_Handle, source_offset: u64, size: u32) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a zero-copy sendfile. No Isolate memory involved — data flows from file page cache to socket. Use `SENDFILE_ALL_BYTES` for `size` to send the entire file from `source_offset`. |
 | `payload_offset_of` | `payload_offset_of(self: ^$Isolate, buffer: []u8) -> u16` | `u16` | Compute byte offset of a buffer within an Isolate's stable memory. Debug-validated. |
 
 ### Address Construction
@@ -206,33 +207,42 @@ Not `ctx_`-prefixed but part of the public API.
 
 ## Key Types
 
-### `Effect`
+### `Isolate_Transition`
 
-Tagged union returned by `init_handler` and `handler_fn`. Tells the scheduler what to do next.
+A 2-byte value returned by `init_handler` and `handler_fn`. Tells the scheduler what state the Isolate should enter next.
 
 ```odin
-Effect :: union {
-    Effect_Done,      // Clean shutdown. Isolate is terminated.
-    Effect_Crash,     // Crash with reason. Triggers supervision.
-    Effect_Yield,     // Yield and re-enter handler on next tick.
-    Effect_Receive,   // Park until a message arrives.
-    Effect_Call,      // Send a message and park until reply or timeout.
-    Effect_Reply,     // Reply to a pending Call.
-    Effect_Io,        // Submit an async I/O operation.
+Isolate_Transition :: struct {
+    kind:         Isolate_Transition_Kind,
+    fault_reason: Isolate_Fault_Reason,
+}
+
+Isolate_Transition_Kind :: enum u8 {
+    Done,
+    Yield,
+    Wait_Message,
+    Wait_Reply,
+    Wait_Io,
+    Crash,
 }
 ```
 
-**Variant fields:**
+**Constants:**
 
-| Variant | Fields | Notes |
-|---------|--------|-------|
-| `Effect_Done` | — | Empty struct. |
-| `Effect_Crash` | `reason: Crash_Reason` | Triggers supervision strategy. |
-| `Effect_Yield` | — | Re-scheduled next tick. |
-| `Effect_Receive` | — | Parked until message enqueued. |
-| `Effect_Call` | `to: Handle`, `message: Message`, `timeout: u64` | Synchronous call with timeout. |
-| `Effect_Reply` | `message: Message` | Reply to a pending call. |
-| `Effect_Io` | `operation: IoOp` | Async I/O. Completion delivered as a message. |
+| Constant | Kind | Notes |
+|----------|------|-------|
+| `ISOLATE_TRANSITION_DONE` | `.Done` | Clean shutdown. Isolate is terminated. |
+| `ISOLATE_TRANSITION_YIELD` | `.Yield` | Re-scheduled next tick. |
+| `ISOLATE_TRANSITION_WAIT_MESSAGE` | `.Wait_Message` | Parked until message enqueued. |
+| `ISOLATE_TRANSITION_WAIT_REPLY` | `.Wait_Reply` | Parked until reply to a staged call arrives, or timeout. |
+| `ISOLATE_TRANSITION_WAIT_IO` | `.Wait_Io` | Parked until staged I/O operation completes. |
+
+**Helper functions:**
+
+| Call | Returns | Description |
+|------|---------|-------------|
+| `transition_to_crash(fault_reason: Isolate_Fault_Reason)` | `Isolate_Transition` | Build a crash transition with a fault reason. Triggers supervision. |
+| `transition_to_wait_io_or_crash(result: Io_Submit_Result)` | `Isolate_Transition` | If `result == .ok`, returns `ISOLATE_TRANSITION_WAIT_IO`. Otherwise crashes the isolate with `.Contract_Violation`. |
 
 ### `IoOp`
 
@@ -278,7 +288,7 @@ Spawn_Error :: enum u8 {
     arena_full,          // No memory for the Isolate's slot.
     group_full,          // Supervision group at dynamic child capacity.
     type_not_allocated,  // Type ID has no allocated slots on this Shard.
-    init_failed,         // init_handler returned an error Effect.
+    init_failed,         // init_handler returned transition_to_crash.
 }
 ```
 
@@ -351,14 +361,15 @@ Packed 64-bit generational handle. Bit layout:
 - Bits 47–28: `slot_index` (20 bits)
 - Bits 27–0: `generation` (28 bits)
 
-### `Crash_Reason`
+### `Isolate_Fault_Reason`
 
 ```odin
-Crash_Reason :: enum u8 {
-    None                 = 0,  // Generic / user-triggered crash.
-    Spawn_Failed         = 1,  // A spawned child failed.
-    Unimplemented_Effect = 2,  // Returned an unhandled Effect variant.
-    Init_Failed          = 3,  // Initialization failed.
+Isolate_Fault_Reason :: enum u8 {
+    None                     = 0,  // Generic / user-triggered crash.
+    Spawn_Failed             = 1,  // A spawned child failed.
+    Unimplemented_Transition = 2,  // Returned an unhandled transition kind.
+    Init_Failed              = 3,  // Initialization failed.
+    Contract_Violation       = 4,  // Staged action did not match transition kind.
 }
 ```
 
@@ -431,13 +442,13 @@ Handoff_Mode :: enum u8 {
 | `FD_HANDLE_NONE` | `FD_Handle(0)` | Sentinel for "no FD". |
 | `SUPERVISION_GROUP_ID_NONE` | `0xFFFF` | Sentinel for "no group". |
 | `SUPERVISION_GROUP_ID_ROOT` | `0` | Root group ID. |
-| `SENDFILE_ALL_BYTES` | `max(u32)` | Pass as `size` to `io_sendfile` to send the entire file from `source_offset`. |
+| `SENDFILE_ALL_BYTES` | `max(u32)` | Pass as `size` to `ctx_io_sendfile` to send the entire file from `source_offset`. |
 
 ### Function Type Signatures
 
 ```odin
-Init_Handler    :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Effect
-Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Effect
+Init_Handler    :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Isolate_Transition
+Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Isolate_Transition
 ```
 
 ### Boot
@@ -466,14 +477,14 @@ Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> 
 | `.arena_full` | Typed arena for this Isolate type has no free slots. Increase `slot_count`. |
 | `.group_full` | Supervision group reached `child_count_dynamic_max`. |
 | `.type_not_allocated` | `type_id` references a type with no allocated slots on this Shard. |
-| `.init_failed` | The spawned Isolate's `init_handler` returned `Effect_Crash`. |
+| `.init_failed` | The spawned Isolate's `init_handler` returned `transition_to_crash`. |
 
 ### `Restart_Type`
 
 | Value | Meaning |
 |-------|---------|
 | `.permanent` | Always restarted, regardless of exit reason. |
-| `.transient` | Restarted only on crash. Clean exit (`Effect_Done`) is not restarted. |
+| `.transient` | Restarted only on crash. Clean exit (`ISOLATE_TRANSITION_DONE`) is not restarted. |
 | `.temporary` | Never restarted. One-shot tasks, connection handlers. |
 
 ### `Handoff_Mode`
@@ -484,14 +495,15 @@ Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> 
 | `.Read_Only` | Child gets read access, parent retains write. |
 | `.Write_Only` | Child gets write access, parent retains read. |
 
-### `Crash_Reason`
+### `Isolate_Fault_Reason`
 
 | Value | Meaning |
 |-------|---------|
 | `.None` | Generic or user-triggered crash. |
 | `.Spawn_Failed` | A spawned child's `init_handler` failed. |
-| `.Unimplemented_Effect` | Handler returned an unhandled Effect variant. |
+| `.Unimplemented_Transition` | Handler returned an unhandled transition kind. |
 | `.Init_Failed` | This Isolate's own initialization failed. |
+| `.Contract_Violation` | Staged call or I/O does not match the returned transition kind. |
 
 ### `Backend_Error`
 

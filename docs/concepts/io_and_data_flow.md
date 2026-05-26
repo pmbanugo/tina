@@ -1,20 +1,20 @@
 # I/O, Buffers & Data Transfer
 
-**Isolates never call syscalls directly — they return `Effect_Io` values, and the scheduler submits I/O to the platform's completion engine. All framework-provided data (reactor buffers, transfer buffers) is valid for one handler call only — copy what you need, the scheduler reclaims the rest.**
+**Isolates never call syscalls directly — they submit I/O operations via context functions (`ctx_submit_io`, `ctx_io_send`, etc.), and the scheduler submits them to the platform's completion engine. All framework-provided data (reactor buffers, transfer buffers) is valid for one handler call only — copy what you need, the scheduler reclaims the rest.**
 
 ## The I/O Model
 
-Isolates never call syscalls. They never touch file descriptors directly. They return an `Effect_Io{operation}` value, and the scheduler handles the rest.
+Isolates never call syscalls. They never touch file descriptors directly. They submit an I/O operation via `ctx_submit_io()`, and the scheduler handles the rest.
 
 This abstraction is not just for ergonomics — it's the simulation seam. In production, the scheduler submits I/O to the platform's completion engine (`io_uring` on Linux, `kqueue` on macOS/BSD, `IOCP` on Windows). In simulation mode, the scheduler returns scripted completions from a deterministic engine. The Isolate code is identical in both modes.
 
 The I/O cycle:
 
 ```
-Handler returns Effect_Io{IoOp_Recv{fd, buffer_size_max}}
+Handler calls ctx_submit_io(ctx, IoOp_Recv{fd, buffer_size_max})
         │
         ▼
-Scheduler parks Isolate in WAITING_FOR_IO
+Scheduler parks Isolate in Wait_Io state
         │
         ▼
 Reactor submits to platform (io_uring/kqueue/IOCP)
@@ -51,38 +51,38 @@ This is a structural safety guarantee:
 When an I/O read operation completes, the data lands in a slot from the **reactor buffer pool** — a pre-allocated, Shard-owned pool of fixed-size buffers. You access the data via `ctx_read_buffer()`:
 
 ```odin
-case tina.IO_TAG_RECV_COMPLETE:
-    if message.io.result <= 0 {
-        // EOF or error
-        return tina.Effect_Io{operation = tina.IoOp_Close{fd = self.fd}}
-    }
+    case tina.IO_TAG_RECV_COMPLETE:
+        if message.io.result <= 0 {
+            // EOF or error
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
+        }
 
-    // Read the data from the reactor buffer pool.
-    // This slice is valid ONLY during this handler invocation.
-    recv_len := u32(message.io.result)
-    data := tina.ctx_read_buffer(ctx, message.io.buffer_index, recv_len)
+        // Read the data from the reactor buffer pool.
+        // This slice is valid ONLY during this handler invocation.
+        recv_len := u32(message.io.result)
+        data := tina.ctx_read_buffer(ctx, message.io.buffer_index, recv_len)
 
-    // Copy what you need into your Isolate's own memory.
-    // After this handler returns, the reactor buffer slot is freed.
-    mem.copy(&self.buffer[0], raw_data(data), int(recv_len))
+        // Copy what you need into your Isolate's own memory.
+        // After this handler returns, the reactor buffer slot is freed.
+        mem.copy(&self.buffer[0], raw_data(data), int(recv_len))
 
-    // Now self.buffer contains your data — it persists across handler calls.
-    return tina.io_send(self, self.fd, self.buffer[:recv_len])
+        // Now self.buffer contains your data — it persists across handler calls.
+        return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(ctx, self, self.fd, self.buffer[:recv_len]))
 ```
 
 **Why reactor-owned buffers?** If an Isolate crashes while I/O is in flight, the kernel (via io_uring or DMA) is still actively writing to that memory address. If the buffer lived in the Isolate's arena, the kernel would silently corrupt the next Isolate spawned in that slot. Reactor-owned pools structurally prevent this memory corruption.
 
 ### For outbound data: write from your Isolate's struct
 
-When sending data over a socket, you write to a buffer inside your Isolate struct and use `io_send()`:
+When sending data over a socket, you write to a buffer inside your Isolate struct and use `ctx_io_send()`:
 
 ```odin
 // Write data into the Isolate's own buffer
 copy(self.buffer[:], "hello"[:])
 
-// io_send computes the byte offset of self.buffer within the Isolate struct.
+// ctx_io_send computes the byte offset of self.buffer within the Isolate struct.
 // The reactor reads directly from the Isolate's arena slot during the write.
-return tina.io_send(self, self.fd, self.buffer[:5])
+return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(ctx, self, self.fd, self.buffer[:5]))
 ```
 
 No allocation. No copy to a staging buffer. The reactor reads directly from your struct. This works because the Isolate is parked during the I/O operation — its memory is stable.
@@ -101,7 +101,7 @@ handle_result := tina.ctx_transfer_alloc(ctx)
 handle, ok := handle_result.(tina.Transfer_Handle)
 if !ok {
     // Pool exhausted — shed load or retry later.
-    return tina.Effect_Yield{}
+    return tina.ISOLATE_TRANSITION_YIELD
 }
 
 // 2. Write your large payload into the transfer slot.
@@ -125,14 +125,14 @@ case tina.TAG_TRANSFER:
     data, ok := read_result.([]u8)
     if !ok {
         // Stale handle — the transfer slot was already freed.
-        return tina.Effect_Receive{}
+        return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
     }
 
     // Copy what you need into your own state.
     mem.copy(&self.staging[0], raw_data(data), len(data))
 
     // After this handler returns, the transfer slot is auto-freed.
-    return tina.Effect_Receive{}
+    return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 ```
 
 ### Transfer buffer lifecycle

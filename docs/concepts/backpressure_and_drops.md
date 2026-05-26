@@ -74,8 +74,8 @@ Send_Result :: enum u8 {
 The sender decides what to do with the result. This is policy, not mechanism:
 
 - **Fire-and-forget:** `_ = ctx_send(...)` — explicitly discard the result. The underscore is intentional: it documents that the developer chose to ignore backpressure, not that they forgot to check.
-- **Crash on failure:** `if result != .ok do return Effect_Crash{}` — the Isolate declares itself unable to continue without successful delivery.
-- **Retry on next tick:** Store the message in the Isolate's state and return `Effect_Yield{}` to try again on the next scheduler tick.
+- **Crash on failure:** `if result != .ok do return tina.transition_to_crash(.None)` — the Isolate declares itself unable to continue without successful delivery.
+- **Retry on next tick:** Store the message in the Isolate's state and return `ISOLATE_TRANSITION_YIELD` to try again on the next scheduler tick.
 - **Shed the work:** Drop the request and move on to the next item.
 
 ## Two Delivery Guarantees
@@ -84,19 +84,16 @@ Tina offers two message-sending mechanisms, each with different guarantees:
 
 **`ctx_send()` is UDP-like.** Best-effort delivery with immediate feedback. The message is either delivered to the target's mailbox (`.ok`) or it is not (`.mailbox_full`, `.pool_exhausted`, `.stale_handle`). There is no retry, no acknowledgment, no timeout. The sender knows the outcome immediately.
 
-**`Effect_Call` is RPC-like.** The sender returns and waits for a reply from the target, with a mandatory timeout. If the reply arrives, the sender wakes with the response. If the timeout expires, the sender wakes with a `TAG_CALL_TIMEOUT` message. This provides bounded-time request-response semantics — the sender never waits forever.
+**`ctx_call` is RPC-like.** The sender stages a call and returns `ISOLATE_TRANSITION_WAIT_REPLY`, waiting for a reply from the target with a mandatory timeout. If the reply arrives, the sender wakes with the response. If the timeout expires, the sender wakes with a `TAG_CALL_TIMEOUT` message. This provides bounded-time request-response semantics — the sender never waits forever.
 
 ```odin
 // Fire-and-forget: sender does not wait
 _ = ctx_send(ctx, target, MY_TAG, payload)
-return Effect_Receive{}
+return ISOLATE_TRANSITION_WAIT_MESSAGE
 
 // Request-response: sender waits until reply or timeout
-return Effect_Call{
-    to      = target,
-    message = request_message,
-    timeout = 5000,  // ticks
-}
+tina.ctx_call(ctx, target, MY_TAG, payload, 5_000_000_000)  // 5 second timeout
+return ISOLATE_TRANSITION_WAIT_REPLY
 ```
 
 The `.call` timeout is the reliability mechanism. If you need guaranteed delivery — if the message *must* arrive — use `.call` with a timeout and handle the timeout case, or build application-level acknowledgment on top of `ctx_send()`.
@@ -133,4 +130,4 @@ By dropping immediately, the failure stays local to the interaction. Shard A's o
 
 **Cross-shard messages are dropped on channel full, not buffered.** The sender learns via `Send_Result`. No secondary buffer absorbs the overflow. This preserves the shared-nothing isolation boundary: a slow consumer on one Shard cannot cause memory growth on another.
 
-**The `.call` timeout is the reliability mechanism for request-response.** If you need guaranteed delivery, use `Effect_Call` with a timeout and handle the timeout case. Alternatively, build application-level acknowledgments over `ctx_send()`. Tina provides the building blocks — bounded channels with immediate feedback — not a turnkey reliable delivery protocol.
+**The `.call` timeout is the reliability mechanism for request-response.** If you need guaranteed delivery, use `ctx_call` with a timeout and handle the timeout case. Alternatively, build application-level acknowledgments over `ctx_send()`. Tina provides the building blocks — bounded channels with immediate feedback — not a turnkey reliable delivery protocol.
