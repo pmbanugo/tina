@@ -197,8 +197,8 @@ ctx_current_tick :: #force_inline proc(ctx: TinaContext) -> u64 {
 }
 
 // Helper to safely cast an incoming message payload byte slice into a typed pointer.
-payload_as :: #force_inline proc($T: typeid, payload: []u8) -> ^T {
-	assert(size_of(T) <= len(payload), "Payload slice too small for type")
+payload_as :: #force_inline proc($T: typeid, payload: []u8, caller_location := #caller_location) -> ^T {
+	assert(size_of(T) <= len(payload), "Payload slice too small for type", caller_location)
 	return cast(^T)raw_data(payload)
 }
 
@@ -212,7 +212,7 @@ init_args_of :: #force_inline proc(args: ^$T) -> (payload: [MAX_INIT_ARGS_SIZE]u
 // Debug-checked cast from rawptr to a typed Isolate pointer.
 // Validates at runtime (under TINA_DEBUG_ASSERTS) that the registered stride
 // matches the target type, catching wrong-type casts before they corrupt memory.
-self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext) -> ^T {
+self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext, caller_location := #caller_location) -> ^T {
 	when TINA_RUNTIME_ASSERTIONS {
 		invocation := ctx_invocation(ctx)
 		shard := invocation.shard
@@ -221,6 +221,7 @@ self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext) ->
 		assert(
 			registered_stride == size_of(T),
 			"self_as: type stride mismatch — registered stride does not match target type size",
+			caller_location,
 		)
 	}
 	return cast(^T)self_raw
@@ -228,14 +229,15 @@ self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext) ->
 
 // Computes the byte offset of a buffer within an Isolate's stable memory region.
 // In debug builds, validates the slice actually lives inside the Isolate struct.
-payload_offset_of :: #force_inline proc(self: ^$Isolate, buffer: []u8) -> u16 {
+payload_offset_of :: #force_inline proc(self: ^$Isolate, buffer: []u8, caller_location := #caller_location) -> u16 {
 	base := uintptr(self)
 	buf_start := uintptr(raw_data(buffer))
 	when TINA_RUNTIME_ASSERTIONS {
-		assert(buf_start >= base, "payload_offset_of: buffer starts before isolate base")
+		assert(buf_start >= base, "payload_offset_of: buffer starts before isolate base", caller_location)
 		assert(
 			buf_start + uintptr(len(buffer)) <= base + size_of(Isolate),
 			"payload_offset_of: buffer extends past isolate end",
+			caller_location,
 		)
 	}
 	return u16(buf_start - base)
@@ -249,12 +251,13 @@ ctx_io_send :: #force_inline proc(
 	self: ^$Isolate,
 	fd: FD_Handle,
 	buffer: []u8,
+	caller_location := #caller_location,
 ) -> Io_Submit_Result {
 	return ctx_submit_io(
 		ctx,
 		IoOp_Send {
 			fd = fd,
-			payload_offset = payload_offset_of(self, buffer),
+			payload_offset = payload_offset_of(self, buffer, caller_location),
 			payload_size = u32(len(buffer)),
 		},
 	)
@@ -269,12 +272,13 @@ ctx_io_write :: #force_inline proc(
 	fd: FD_Handle,
 	buffer: []u8,
 	offset: u64,
+	caller_location := #caller_location,
 ) -> Io_Submit_Result {
 	return ctx_submit_io(
 		ctx,
 		IoOp_Write {
 			fd = fd,
-			payload_offset = payload_offset_of(self, buffer),
+			payload_offset = payload_offset_of(self, buffer, caller_location),
 			payload_size = u32(len(buffer)),
 			offset = offset,
 		},
@@ -311,13 +315,14 @@ ctx_io_sendto :: #force_inline proc(
 	fd: FD_Handle,
 	buffer: []u8,
 	address: Socket_Address,
+	caller_location := #caller_location,
 ) -> Io_Submit_Result {
 	return ctx_submit_io(
 		ctx,
 		IoOp_Sendto {
 			fd = fd,
 			address = address,
-			payload_offset = payload_offset_of(self, buffer),
+			payload_offset = payload_offset_of(self, buffer, caller_location),
 			payload_size = u32(len(buffer)),
 		},
 	)

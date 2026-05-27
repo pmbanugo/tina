@@ -37,20 +37,36 @@ tina_assertion_failure_proc :: proc(
 ) -> ! {
 	shard := g_current_shard_pointer
 	if shard != nil {
-		buf: [256]u8
+		buf: [1024]u8
 		n := _sig_append_str(buf[:], 0, "[SOFTWARE PANIC] Shard ")
 		n = _sig_append_u64(buf[:], n, u64(shard.id))
 		n = _sig_append_str(buf[:], n, ": ")
 		n = _sig_append_str(buf[:], n, prefix)
 		n = _sig_append_str(buf[:], n, message)
+		n = _sig_append_str(buf[:], n, " at ")
+		n = _sig_append_str(buf[:], n, loc.file_path)
+		n = _sig_append_str(buf[:], n, ":")
+		n = _sig_append_u64(buf[:], n, u64(loc.line))
+		n = _sig_append_str(buf[:], n, ":")
+		n = _sig_append_u64(buf[:], n, u64(loc.column))
+		n = _sig_append_str(buf[:], n, " in ")
+		n = _sig_append_str(buf[:], n, loc.procedure)
 		n = _sig_append_str(buf[:], n, "\n")
 		_write_stderr(buf[:n])
 		trigger_tier2_panic(shard)
 	} else {
-		buf: [256]u8
+		buf: [1024]u8
 		n := _sig_append_str(buf[:], 0, "[FATAL PANIC] Non-shard thread: ")
 		n = _sig_append_str(buf[:], n, prefix)
 		n = _sig_append_str(buf[:], n, message)
+		n = _sig_append_str(buf[:], n, " at ")
+		n = _sig_append_str(buf[:], n, loc.file_path)
+		n = _sig_append_str(buf[:], n, ":")
+		n = _sig_append_u64(buf[:], n, u64(loc.line))
+		n = _sig_append_str(buf[:], n, ":")
+		n = _sig_append_u64(buf[:], n, u64(loc.column))
+		n = _sig_append_str(buf[:], n, " in ")
+		n = _sig_append_str(buf[:], n, loc.procedure)
 		n = _sig_append_str(buf[:], n, "\n")
 		_write_stderr(buf[:n])
 		os_abort()

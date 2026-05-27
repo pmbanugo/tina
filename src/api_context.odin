@@ -110,13 +110,14 @@ ctx_reply_raw :: #force_inline proc(
 	ctx: TinaContext,
 	$tag: Message_Tag,
 	payload: []u8,
+	caller_location := #caller_location,
 ) -> Reply_Result {
 	#assert(
 		tag >= USER_MESSAGE_TAG_BASE,
 		"ctx_reply: Cannot forge system messages. Tag must be >= 0x0040.",
 	)
 	when TINA_RUNTIME_ASSERTIONS {
-		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_reply payload exceeds MAX_PAYLOAD_SIZE")
+		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_reply payload exceeds MAX_PAYLOAD_SIZE", caller_location)
 	}
 
 	invocation := ctx_invocation_require_self_handle(ctx)
@@ -150,9 +151,10 @@ ctx_reply_typed :: #force_inline proc(
 	ctx: TinaContext,
 	$tag: Message_Tag,
 	message: ^$T,
+	caller_location := #caller_location,
 ) -> Reply_Result where size_of(T) <=
 	MAX_PAYLOAD_SIZE {
-	return ctx_reply_raw(ctx, tag, mem.byte_slice(message, size_of(T)))
+	return ctx_reply_raw(ctx, tag, mem.byte_slice(message, size_of(T)), caller_location)
 }
 
 ctx_reply :: proc {
@@ -177,6 +179,7 @@ ctx_send_with_correlation :: #force_inline proc(
 	$tag: Message_Tag,
 	payload: []u8,
 	correlation_id: Correlation_Id,
+	caller_location := #caller_location,
 ) -> Send_Result {
 	#assert(
 		tag >= USER_MESSAGE_TAG_BASE,
@@ -186,6 +189,7 @@ ctx_send_with_correlation :: #force_inline proc(
 		assert(
 			len(payload) <= MAX_PAYLOAD_SIZE,
 			"ctx_send_with_correlation payload exceeds MAX_PAYLOAD_SIZE",
+			caller_location,
 		)
 	}
 	invocation := ctx_invocation_require_self_handle(ctx)
@@ -233,14 +237,15 @@ ctx_call_raw :: #force_inline proc(
 	$tag: Message_Tag,
 	payload: []u8,
 	timeout_ns: u64,
+	caller_location := #caller_location,
 ) -> Call_Result {
 	#assert(
 		tag >= USER_MESSAGE_TAG_BASE,
 		"ctx_call: Cannot forge system messages. Tag must be >= 0x0040.",
 	)
 	when TINA_RUNTIME_ASSERTIONS {
-		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_call payload exceeds MAX_PAYLOAD_SIZE")
-		assert(timeout_ns > 0, "ctx_call timeout_ns must be > 0")
+		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_call payload exceeds MAX_PAYLOAD_SIZE", caller_location)
+		assert(timeout_ns > 0, "ctx_call timeout_ns must be > 0", caller_location)
 	}
 
 	invocation := ctx_invocation_require_self_handle(ctx)
@@ -294,9 +299,10 @@ ctx_call_typed :: #force_inline proc(
 	$tag: Message_Tag,
 	message: ^$T,
 	timeout_ns: u64,
+	caller_location := #caller_location,
 ) -> Call_Result where size_of(T) <=
 	MAX_PAYLOAD_SIZE {
-	return ctx_call_raw(ctx, to, tag, mem.byte_slice(message, size_of(T)), timeout_ns)
+	return ctx_call_raw(ctx, to, tag, mem.byte_slice(message, size_of(T)), timeout_ns, caller_location)
 }
 
 ctx_call :: proc {
@@ -561,6 +567,7 @@ ctx_transfer_write :: proc {
 ctx_transfer_read :: #force_inline proc(
 	ctx: TinaContext,
 	handle: Transfer_Handle,
+	caller_location := #caller_location,
 ) -> Transfer_Read_Result {
 	invocation := ctx_invocation_require_self_handle(ctx)
 	shard := invocation.shard
@@ -579,6 +586,7 @@ ctx_transfer_read :: #force_inline proc(
 		assert(
 			shard.metadata[type_id][slot].pending_transfer_read == TRANSFER_HANDLE_NONE,
 			"ctx_transfer_read can only be called ONCE per handler invocation to prevent buffer leaks.",
+			caller_location,
 		)
 	}
 	shard.metadata[type_id][slot].pending_transfer_read = handle
