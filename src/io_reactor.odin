@@ -33,18 +33,15 @@ FD_HANDOFF_TIMEOUT_TICKS :: u64(16)
 // ============================================================================
 //
 // Bridges the Platform_Backend with the Shard's Isolate handles and memory.
-// It manages the FD table, the buffer pool, and accumulates I/O submissions
+// It manages the FD table, the I/O slot pools, and accumulates I/O submissions
 // for budgeted scheduler service points.
 
 Reactor :: struct {
 	backend:             Platform_Backend,
 	pending_submissions: [MAX_REACTOR_SUBMISSION_BATCH]Submission,
-
-	// Core Data Structures
 	fd_table:            FD_Table,
-	buffer_pool:         Reactor_Buffer_Pool,
-
-	// Hot Scalars
+	receive_pool:        IO_Slot_Pool,    // For recv/read/recvfrom (kernel writes here)
+	staging_pool:        IO_Slot_Pool,    // For claim-based sends (Isolate writes here)
 	pending_count:       u16,
 	io_in_flight_count:  u32,
 	_padding:            [2]u8,
@@ -55,32 +52,23 @@ reactor_init :: proc(
 	reactor: ^Reactor,
 	config: Backend_Config,
 	fd_backing: []FD_Entry,
-	buffer_backing: []u8,
-	buffer_slot_size: u32,
-	buffer_slot_count: u16,
+	receive_pool_config: IO_Slot_Pool_Config,
+	staging_pool_config: IO_Slot_Pool_Config,
 ) -> Backend_Error {
 	reactor.pending_count = 0
 	reactor.io_in_flight_count = 0
-
-	// Init buffer pool first — backend needs pool metadata for registered buffers.
 	fd_table_init(&reactor.fd_table, fd_backing)
-	reactor_buffer_pool_init(
-		&reactor.buffer_pool,
-		buffer_backing,
-		buffer_slot_size,
-		buffer_slot_count,
-	)
+	io_slot_pool_init(&reactor.receive_pool, receive_pool_config.backing_memory, receive_pool_config.slot_size, receive_pool_config.slot_count)
+	io_slot_pool_init(&reactor.staging_pool, staging_pool_config.backing_memory, staging_pool_config.slot_size, staging_pool_config.slot_count)
 
-	// Pass buffer pool metadata to backend for io_uring registered buffers.
 	backend_config := config
-	backend_config.buffer_base = raw_data(buffer_backing)
-	backend_config.buffer_slot_size = buffer_slot_size
-	backend_config.buffer_slot_count = buffer_slot_count
+	backend_config.backing_memory_base = raw_data(receive_pool_config.backing_memory)
+	backend_config.backing_memory_slot_size = receive_pool_config.slot_size
+	backend_config.backing_memory_slot_count = receive_pool_config.slot_count
 	backend_config.fd_slot_count = u16(len(fd_backing))
 
 	err := backend_init(&reactor.backend, backend_config)
 	if err != .None do return err
-
 	return .None
 }
 
@@ -351,29 +339,6 @@ _reactor_completion_close_stale_accept_fd :: proc "contextless" (
 }
 
 @(private = "file")
-_reactor_completion_reclaim_stale :: proc (
-	reactor: ^Reactor,
-	shard: ^Shard,
-	completion: ^Raw_Completion,
-	soa_meta: #soa[]Isolate_Metadata,
-	slot_index: u32,
-	buffer_index: u16,
-	op_tag: u8,
-) {
-	if buffer_index != BUFFER_INDEX_NONE {
-		reactor_buffer_pool_free(&reactor.buffer_pool, buffer_index)
-	}
-
-	_reactor_completion_close_on_completion(reactor, soa_meta, slot_index)
-
-	if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) {
-		_reactor_completion_close_stale_accept_fd(reactor, completion)
-	}
-
-	shard.counters.io_stale_completions += 1
-}
-
-@(private = "file")
 _reactor_completion_apply_accept :: proc (
 	reactor: ^Reactor,
 	shard: ^Shard,
@@ -432,17 +397,15 @@ _reactor_completion_apply_recvfrom :: proc (
 }
 
 reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns: i64) {
-	if timeout_ns == 0 && reactor.io_in_flight_count == 0 {
-		return
-	}
-
+	// Synthesized completions live in backend.completed even when
+	// io_in_flight_count is zero, so we cannot short-circuit on the
+	// count: the backend must still be called to drain them. The
+	// kernel call inside backend_collect is cheap with timeout_ns == 0
+	// and no in-flight ops.
 	completions: [MAX_REACTOR_COMPLETION_BATCH]Raw_Completion
 
 	count, err := backend_collect(&reactor.backend, completions[:], timeout_ns)
 	if err != .None || count == 0 do return
-
-	completed_count := min(u32(count), reactor.io_in_flight_count)
-	reactor.io_in_flight_count -= completed_count
 
 	for i in 0 ..< count {
 		completion := &completions[i]
@@ -453,45 +416,94 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		token_gen := submission_token_generation(token)
 		token_seq := submission_token_io_sequence(token)
 		buffer_index := submission_token_buffer_index(token)
-		op_tag := submission_token_operation_tag(token)
+		operation_kind := submission_token_operation_kind(token)
 
-		// Flat bounds check
+		// Every completion retires one in-flight op — unconditionally, before
+		// any branching. The ledger must balance regardless of provenance
+		// (kernel-delivered, synthesized, stale, or corrupt token).
+		if reactor.io_in_flight_count > 0 {
+			reactor.io_in_flight_count -= 1
+		}
+
+		// Bounds check — corrupt token, nothing safe to read from metadata.
 		if int(type_index) >= len(shard.metadata) do continue
 		soa_meta := shard.metadata[type_index]
 		if int(slot_index) >= len(soa_meta) do continue
 
-		// Flat routing firewall.
-		is_stale :=
-			u8(soa_meta[slot_index].generation) != token_gen ||
-			soa_meta[slot_index].io_sequence != token_seq
-
-		// Fast-fail the stale path to keep the valid path unnested.
-		if is_stale {
-			_reactor_completion_reclaim_stale(
-				reactor,
-				shard,
-				completion,
-				soa_meta,
-				slot_index,
-				buffer_index,
-				op_tag,
+		// No_Buffer: the kernel's provided buffer ring was empty for this recv.
+		// Re-submit transparently — the Isolate stays in Wait_IO and never
+		// sees the transient failure.
+		if .No_Buffer in completion.flags {
+			shard.counters.io_recv_no_buffers_count += 1
+			_reactor_resubmit_recv_after_no_buffer(
+				reactor, shard, soa_meta, type_index, slot_index,
 			)
 			continue
 		}
 
-		// Valid completion delivery.
+		// Classify: does this completion reach a live handler?
+		//
+		// The token carries an 8-bit projection of the 28-bit generation
+		// (token layout §5.2, bits [28..35]). Combined with io_sequence
+		// (8 bits), this gives 16-bit staleness discrimination — a false
+		// live requires the slot to cycle 256 generations AND land on the
+		// same io_sequence.
+		//
+		// .Synthesized is NOT checked here. It is provenance metadata
+		// ("where did this completion come from"), not disposition metadata
+		// ("what to do with it"). A synthesized completion for a dead
+		// Isolate has a bumped generation → classified dead. A synthesized
+		// completion for a live Isolate (e.g. _sweep_pending_for_fd cancelled
+		// a peer's pending op) has a matching generation → classified live
+		// and dispatched to the handler with result = -ECANCELED.
+		is_live :=
+			soa_meta[slot_index].state != .Unallocated &&
+			soa_meta[slot_index].state != .Pending_IO_Reuse &&
+			u8(soa_meta[slot_index].generation) == token_gen &&
+			soa_meta[slot_index].io_sequence == token_seq
+
+		if !is_live {
+			// Dead: single reclamation pipeline. Every dead-completion
+			// obligation is handled here — no other path, no helper function.
+			_io_slot_return_to_pool(
+				reactor, io_operation_pool_affinity(operation_kind), buffer_index,
+			)
+			_reactor_completion_close_on_completion(reactor, soa_meta, slot_index)
+
+			if soa_meta[slot_index].state == .Pending_IO_Reuse {
+				soa_meta[slot_index].io_operation_kind = .None
+				soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
+				soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+				// Route through _slot_set_state so io_awaiting_count is
+				// decremented and dispatchable bits are refreshed.
+				_slot_set_state(shard, u16(type_index), slot_index, .Unallocated)
+				soa_meta[slot_index].inbox_head = shard.isolate_free_heads[u16(type_index)]
+				shard.isolate_free_heads[u16(type_index)] = slot_index
+			}
+
+			if operation_kind == .Accept_Complete {
+				_reactor_completion_close_stale_accept_fd(reactor, completion)
+			}
+
+			shard.counters.io_stale_completions += 1
+			continue
+		}
+
+		// Live: dispatch to handler.
 		_slot_set_io_completion_ready(
 			shard,
 			u16(type_index),
 			slot_index,
-			Message_Tag(op_tag),
+			operation_kind,
 			completion.result,
 			buffer_index,
 		)
 
-		if op_tag == u8(IO_TAG_ACCEPT_COMPLETE) {
-			_reactor_completion_apply_accept(reactor, shard, soa_meta, type_index, slot_index, completion)
-		} else if op_tag == u8(IO_TAG_RECVFROM_COMPLETE) {
+		if operation_kind == .Accept_Complete {
+			_reactor_completion_apply_accept(
+				reactor, shard, soa_meta, type_index, slot_index, completion,
+			)
+		} else if operation_kind == .Recvfrom_Complete {
 			_reactor_completion_apply_recvfrom(soa_meta, slot_index, completion)
 		}
 	}
@@ -542,8 +554,24 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 		slot_index := submission_token_slot_index(sub.token)
 		buffer_index := submission_token_buffer_index(sub.token)
 
-		if buffer_index != BUFFER_INDEX_NONE {
-			reactor_buffer_pool_free(&reactor.buffer_pool, buffer_index)
+		// Flush failure: the SQE was never submitted to the kernel. Free
+		// buffer slots directly to their pool's free list, bypassing the
+		// provided buffer ring. On Linux with provided buffers active,
+		// _io_slot_return_to_pool would dispatch receive buffers through
+		// backend_replenish_recv_buffer — but the kernel never consumed
+		// the buffer from the ring, so replenishing would double-add the
+		// same buffer_id, corrupting the ring for subsequent recvs.
+		flush_operation_kind := submission_token_operation_kind(sub.token)
+		if buffer_index != IO_SLOT_INDEX_NONE {
+			flush_affinity := io_operation_pool_affinity(flush_operation_kind)
+			switch flush_affinity {
+			case .Receive:
+				io_slot_pool_free(&reactor.receive_pool, buffer_index)
+			case .Staging:
+				io_slot_pool_free(&reactor.staging_pool, buffer_index)
+			case .None:
+				// No pool slot — nothing to free
+			}
 		}
 
 		soa_meta := shard.metadata[type_index]
@@ -553,7 +581,7 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 				shard,
 				u16(type_index),
 				slot_index,
-				Message_Tag(submission_token_operation_tag(sub.token)),
+				flush_operation_kind,
 				i32(io_error),
 			)
 		}
@@ -574,12 +602,81 @@ reactor_flush_submissions_if_needed :: proc(reactor: ^Reactor, shard: ^Shard) {
 // I/O Submission Translation (§6.6.1 §4, §6.6.3 §6)
 // ============================================================================
 
+// Single boundary for receive-pool allocation. The kernel fills these slots
+// asynchronously, so we use the unzeroed variant and observe exhaustion at
+// the alloc site — not at the commit site — to keep counter attribution
+// accurate regardless of the caller's submission path.
+@(private, require_results)
+_reactor_alloc_receive_slot :: proc(reactor: ^Reactor, shard: ^Shard) -> (IO_Slot_Index, IO_Error) {
+	index, err := io_slot_pool_alloc_unzeroed(&reactor.receive_pool)
+	if err != .None {
+		shard.counters.io_receive_exhaustions += 1
+		return IO_SLOT_INDEX_NONE, IO_ERR_RESOURCE_EXHAUSTED
+	}
+	return index, IO_ERR_NONE
+}
+
+// Reconstructs and re-queues a recv submission after the kernel returned
+// -ENOBUFS (provided buffer ring empty). The Isolate remains in Wait_IO;
+// the recv will be flushed on the next submission cycle by which time other
+// completions will have replenished the ring.
+@(private = "file")
+_reactor_resubmit_recv_after_no_buffer :: proc(
+	reactor: ^Reactor,
+	shard: ^Shard,
+	soa_meta: #soa[]Isolate_Metadata,
+	type_index: u8,
+	slot_index: u32,
+) {
+	// Liveness re-check: between the ENOBUFS completion and this resubmit, a
+	// sibling completion processed in the same drain batch may have torn down
+	// the slot or invalidated its in-flight I/O. Today the single-threaded
+	// shard makes this rare, but the check is three cache-hot reads and makes
+	// the invariant self-documenting (and safe under (possible?) future
+	// multi-threaded completion handling).
+	// A non-Wait_Io slot must not be re-submitted.
+	if soa_meta[slot_index].state != .Wait_Io do return
+
+	fd_handle := soa_meta[slot_index].io_fd
+	if fd_handle == FD_HANDLE_NONE do return
+
+	os_fd, fd_err := fd_table_resolve(&reactor.fd_table, fd_handle)
+	if fd_err != .None do return
+
+	generation := u8(soa_meta[slot_index].generation)
+	io_sequence := soa_meta[slot_index].io_sequence
+	operation_kind := IO_Operation_Kind.Recv_Complete
+
+	submission: Submission
+	submission.data_pointer = nil
+	submission.data_size = reactor.receive_pool.slot_size
+	submission.operation = Submission_Op_Recv{fd_socket = os_fd}
+	submission.fixed_file_index = FIXED_FILE_INDEX_NONE
+
+	if backend_recv_uses_provided_buffers(&reactor.backend) {
+		submission.fixed_file_index = fd_handle_index(fd_handle)
+	}
+
+	submission.token = submission_token_pack(
+		type_index, slot_index, generation, io_sequence, IO_SLOT_INDEX_NONE, operation_kind,
+	)
+
+	if reactor.pending_count < MAX_REACTOR_SUBMISSION_BATCH {
+		reactor.pending_submissions[reactor.pending_count] = submission
+		reactor.pending_count += 1
+	}
+}
+
 // Translates user IoOp to Platform Submission. Returns IO_Error on failure.
 reactor_submit_io :: proc(
 	reactor: ^Reactor,
 	shard: ^Shard,
 	owner: Handle,
 	io_op: IoOp,
+	data_source: IO_Data_Source = .None,
+	payload_offset: u16 = 0,
+	payload_size: u32 = 0,
+	staging_slot_index: IO_Slot_Index = IO_SLOT_INDEX_NONE,
 ) -> IO_Error {
 	if reactor.pending_count >= MAX_REACTOR_SUBMISSION_BATCH {
 		flush_err := reactor_flush_submissions(reactor, shard)
@@ -623,53 +720,52 @@ reactor_submit_io :: proc(
 
 	submission: Submission
 	submission.fixed_file_index = FIXED_FILE_INDEX_NONE
-	submission_op_tag: u8
-	buffer_index: u16 = BUFFER_INDEX_NONE
+	submission_op_kind: IO_Operation_Kind
+	buffer_index: IO_Slot_Index = IO_SLOT_INDEX_NONE
 	target_fd: FD_Handle = FD_HANDLE_NONE
 
 	switch op in io_op {
 	case IoOp_Read:
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_READ_COMPLETE)
+		submission_op_kind = .Read_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
-		if alloc_error != IO_ERR_NONE do return alloc_error
+		alloc_index, alloc_err := _reactor_alloc_receive_slot(reactor, shard)
+		if alloc_err != IO_ERR_NONE do return alloc_err
 		buffer_index = alloc_index
 
-		submission.operation = Submission_Op_Read {
-			fd     = os_fd,
-			size   = op.buffer_size_max,
-			offset = op.offset,
-		}
+		submission.data_pointer = _io_slot_pool_pointer(&reactor.receive_pool, alloc_index)
+		submission.data_size = op.buffer_size_max
+		submission.operation = Submission_Op_Read{fd = os_fd, offset = op.offset}
 
 	case IoOp_Write:
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_WRITE_COMPLETE)
+		submission_op_kind = .Write_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _reactor_buffer_alloc_write(
-			reactor,
-			shard,
-			type_index,
-			slot_index,
-			op.payload_offset,
-			op.payload_size,
-		)
-		if alloc_error != IO_ERR_NONE do return alloc_error
-		buffer_index = alloc_index
-
-		submission.operation = Submission_Op_Write {
-			fd     = os_fd,
-			size   = op.payload_size,
-			offset = op.offset,
+		switch data_source {
+		case .Isolate_Struct:
+			source_ptr, source_error := _compute_source_pointer(shard, type_index, slot_index, payload_offset, payload_size)
+			if source_error != IO_ERR_NONE do return source_error
+			submission.data_pointer = source_ptr
+			submission.data_size = payload_size
+		case .Staging_Slot:
+			if payload_size > reactor.staging_pool.slot_size {
+				return IO_ERR_BOUNDS_VIOLATION
+			}
+			submission.data_pointer = _io_slot_pool_pointer(&reactor.staging_pool, staging_slot_index)
+			submission.data_size = payload_size
+			buffer_index = staging_slot_index
+		case .None:
+			return IO_ERR_INVALID_DATA_SOURCE
 		}
+		submission.operation = Submission_Op_Write{fd = os_fd, offset = op.offset}
 
 	case IoOp_Accept:
 		target_fd = op.listen_fd
-		submission_op_tag = u8(IO_TAG_ACCEPT_COMPLETE)
+		submission_op_kind = .Accept_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.listen_fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 		submission.operation = Submission_Op_Accept {
@@ -678,7 +774,7 @@ reactor_submit_io :: proc(
 
 	case IoOp_Connect:
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_CONNECT_COMPLETE)
+		submission_op_kind = .Connect_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 		submission.operation = Submission_Op_Connect {
@@ -688,84 +784,92 @@ reactor_submit_io :: proc(
 
 	case IoOp_Send:
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_SEND_COMPLETE)
+		submission_op_kind = .Send_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _reactor_buffer_alloc_write(
-			reactor,
-			shard,
-			type_index,
-			slot_index,
-			op.payload_offset,
-			op.payload_size,
-		)
-		if alloc_error != IO_ERR_NONE do return alloc_error
-		buffer_index = alloc_index
-
-		submission.operation = Submission_Op_Send {
-			fd_socket = os_fd,
-			size      = op.payload_size,
+		switch data_source {
+		case .Isolate_Struct:
+			source_ptr, source_error := _compute_source_pointer(shard, type_index, slot_index, payload_offset, payload_size)
+			if source_error != IO_ERR_NONE do return source_error
+			submission.data_pointer = source_ptr
+			submission.data_size = payload_size
+		case .Staging_Slot:
+			if payload_size > reactor.staging_pool.slot_size {
+				return IO_ERR_BOUNDS_VIOLATION
+			}
+			submission.data_pointer = _io_slot_pool_pointer(&reactor.staging_pool, staging_slot_index)
+			submission.data_size = payload_size
+			buffer_index = staging_slot_index
+		case .None:
+			return IO_ERR_INVALID_DATA_SOURCE
 		}
+		submission.operation = Submission_Op_Send{fd_socket = os_fd}
 
 	case IoOp_Recv:
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_RECV_COMPLETE)
+		submission_op_kind = .Recv_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
-		if alloc_error != IO_ERR_NONE do return alloc_error
-		buffer_index = alloc_index
-
-		submission.operation = Submission_Op_Recv {
-			fd_socket = os_fd,
-			size      = op.buffer_size_max,
+		// When the kernel manages the buffer ring, skip userspace alloc and
+		// let the backend apply IOSQE_BUFFER_SELECT. The CQE will carry the
+		// buffer_id, which the backend rewrites into the token's buffer_index.
+		if backend_recv_uses_provided_buffers(&reactor.backend) {
+			submission.data_pointer = nil
+			submission.data_size = reactor.receive_pool.slot_size
+		} else {
+			alloc_index, alloc_err := _reactor_alloc_receive_slot(reactor, shard)
+			if alloc_err != IO_ERR_NONE do return alloc_err
+			buffer_index = alloc_index
+			submission.data_pointer = _io_slot_pool_pointer(&reactor.receive_pool, alloc_index)
+			submission.data_size = op.buffer_size_max
 		}
+		submission.operation = Submission_Op_Recv{fd_socket = os_fd}
 
 	case IoOp_Sendto:
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_SENDTO_COMPLETE)
+		submission_op_kind = .Sendto_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Write)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _reactor_buffer_alloc_write(
-			reactor,
-			shard,
-			type_index,
-			slot_index,
-			op.payload_offset,
-			op.payload_size,
-		)
-		if alloc_error != IO_ERR_NONE do return alloc_error
-		buffer_index = alloc_index
-
-		submission.operation = Submission_Op_Sendto {
-			fd_socket = os_fd,
-			address   = op.address,
-			size      = op.payload_size,
+		switch data_source {
+		case .Isolate_Struct:
+			source_ptr, source_error := _compute_source_pointer(shard, type_index, slot_index, payload_offset, payload_size)
+			if source_error != IO_ERR_NONE do return source_error
+			submission.data_pointer = source_ptr
+			submission.data_size = payload_size
+		case .Staging_Slot:
+			if payload_size > reactor.staging_pool.slot_size {
+				return IO_ERR_BOUNDS_VIOLATION
+			}
+			submission.data_pointer = _io_slot_pool_pointer(&reactor.staging_pool, staging_slot_index)
+			submission.data_size = payload_size
+			buffer_index = staging_slot_index
+		case .None:
+			return IO_ERR_INVALID_DATA_SOURCE
 		}
+		submission.operation = Submission_Op_Sendto{fd_socket = os_fd, address = op.address}
 
 	case IoOp_Recvfrom:
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_RECVFROM_COMPLETE)
+		submission_op_kind = .Recvfrom_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Read)
 		if err != IO_ERR_NONE do return err
 
-		alloc_index, alloc_error := _reactor_buffer_alloc_read(reactor)
-		if alloc_error != IO_ERR_NONE do return alloc_error
+		alloc_index, alloc_err := _reactor_alloc_receive_slot(reactor, shard)
+		if alloc_err != IO_ERR_NONE do return alloc_err
 		buffer_index = alloc_index
 
-		submission.operation = Submission_Op_Recvfrom {
-			fd_socket = os_fd,
-			size      = op.buffer_size_max,
-		}
+		submission.data_pointer = _io_slot_pool_pointer(&reactor.receive_pool, alloc_index)
+		submission.data_size = op.buffer_size_max
+		submission.operation = Submission_Op_Recvfrom{fd_socket = os_fd}
 
 	case IoOp_Close:
 		// Keep the logical handle in metadata so the eventual close completion can
 		// identify which FD finished closing after the FD table entry is freed.
 		target_fd = op.fd
-		submission_op_tag = u8(IO_TAG_CLOSE_COMPLETE)
+		submission_op_kind = .Close_Complete
 		os_fd, err := _resolve_os_fd(reactor, op.fd, owner, .Any)
 		if err != IO_ERR_NONE do return err
 
@@ -777,7 +881,7 @@ reactor_submit_io :: proc(
 
 	case IoOp_Sendfile:
 		target_fd = op.fd_socket
-		submission_op_tag = u8(IO_TAG_SENDFILE_COMPLETE)
+		submission_op_kind = .Sendfile_Complete
 
 		file_os_fd, file_err := _resolve_os_fd(reactor, op.fd_file, owner, .Read)
 		if file_err != IO_ERR_NONE do return file_err
@@ -802,7 +906,7 @@ reactor_submit_io :: proc(
 		seq,
 		target_fd,
 		buffer_index,
-		submission_op_tag,
+		submission_op_kind,
 		submission,
 	)
 
@@ -814,37 +918,19 @@ reactor_submit_io :: proc(
 // ================
 
 @(private = "file")
-_reactor_buffer_alloc_read :: #force_inline proc (reactor: ^Reactor) -> (
-	u16,
-	IO_Error,
-) {
-	alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
-	if alloc_error != .None {
-		return BUFFER_INDEX_NONE, IO_ERR_RESOURCE_EXHAUSTED
-	}
-	return alloc_index, IO_ERR_NONE
-}
-
-@(private = "file")
-_reactor_buffer_alloc_write :: #force_inline proc(
-	reactor: ^Reactor,
+_compute_source_pointer :: #force_inline proc(
 	shard: ^Shard,
 	type_index: u16,
 	slot_index: u32,
 	payload_offset: u16,
 	payload_size: u32,
-) -> (
-	u16,
-	IO_Error,
-) {
-	return _alloc_and_copy_in(
-		reactor,
-		shard,
-		type_index,
-		slot_index,
-		payload_offset,
-		payload_size,
-	)
+) -> ([^]u8, IO_Error) {
+	stride := shard.type_descriptors[type_index].stride
+	if int(payload_offset) + int(payload_size) > stride {
+		return nil, IO_ERR_BOUNDS_VIOLATION
+	}
+	isolate_pointer := _get_isolate_ptr(shard, type_index, slot_index)
+	return cast([^]u8)(uintptr(isolate_pointer) + uintptr(payload_offset)), IO_ERR_NONE
 }
 
 @(private = "file")
@@ -856,20 +942,20 @@ _reactor_submission_finalize :: #force_inline proc (
 	generation: u8,
 	sequence: u8,
 	target_fd: FD_Handle,
-	buffer_index: u16,
-	submission_op_tag: u8,
+	buffer_index: IO_Slot_Index,
+	submission_op_kind: IO_Operation_Kind,
 	submission: Submission,
 ) {
 	submission_value := submission
 
 	if target_fd != FD_HANDLE_NONE &&
-	   submission_op_tag != u8(IO_TAG_CLOSE_COMPLETE) {
+	   submission_op_kind != .Close_Complete {
 		submission_value.fixed_file_index = fd_handle_index(target_fd)
 	}
 
 	if target_fd != FD_HANDLE_NONE &&
-	   submission_op_tag != u8(IO_TAG_ACCEPT_COMPLETE) &&
-	   submission_op_tag != u8(IO_TAG_CLOSE_COMPLETE) {
+	   submission_op_kind != .Accept_Complete &&
+	   submission_op_kind != .Close_Complete {
 		_ = fd_table_clear_fresh_accept(&reactor.fd_table, target_fd)
 	}
 
@@ -879,38 +965,31 @@ _reactor_submission_finalize :: #force_inline proc (
 		generation,
 		sequence,
 		buffer_index,
-		submission_op_tag,
+		submission_op_kind,
 	)
 	reactor.pending_submissions[reactor.pending_count] = submission_value
 	reactor.pending_count += 1
 	shard.metadata[type_index][slot_index].io_fd = target_fd
+	shard.metadata[type_index][slot_index].io_operation_kind = submission_op_kind
+	shard.metadata[type_index][slot_index].io_slot_index = buffer_index
+	shard.metadata[type_index][slot_index].flags -= {.IO_Completion_Ready}
 }
 
 @(private = "package")
-_io_op_to_completion_tag :: #force_inline proc(op: IoOp) -> Message_Tag {
+_io_op_to_operation_kind :: #force_inline proc(op: IoOp) -> IO_Operation_Kind {
 	switch _ in op {
-	case IoOp_Read:
-		return IO_TAG_READ_COMPLETE
-	case IoOp_Write:
-		return IO_TAG_WRITE_COMPLETE
-	case IoOp_Accept:
-		return IO_TAG_ACCEPT_COMPLETE
-	case IoOp_Connect:
-		return IO_TAG_CONNECT_COMPLETE
-	case IoOp_Send:
-		return IO_TAG_SEND_COMPLETE
-	case IoOp_Recv:
-		return IO_TAG_RECV_COMPLETE
-	case IoOp_Sendto:
-		return IO_TAG_SENDTO_COMPLETE
-	case IoOp_Recvfrom:
-		return IO_TAG_RECVFROM_COMPLETE
-	case IoOp_Close:
-		return IO_TAG_CLOSE_COMPLETE
-	case IoOp_Sendfile:
-		return IO_TAG_SENDFILE_COMPLETE
+	case IoOp_Read:     return .Read_Complete
+	case IoOp_Write:    return .Write_Complete
+	case IoOp_Accept:   return .Accept_Complete
+	case IoOp_Connect:  return .Connect_Complete
+	case IoOp_Send:     return .Send_Complete
+	case IoOp_Recv:     return .Recv_Complete
+	case IoOp_Sendto:   return .Sendto_Complete
+	case IoOp_Recvfrom: return .Recvfrom_Complete
+	case IoOp_Close:    return .Close_Complete
+	case IoOp_Sendfile: return .Sendfile_Complete
 	}
-	return IO_TAG_NONE
+	return .None
 }
 
 @(private = "file")
@@ -941,31 +1020,6 @@ _resolve_os_fd :: #force_inline proc(
 	return entry.os_fd, IO_ERR_NONE
 }
 
-@(private = "file")
-_alloc_and_copy_in :: #force_inline proc(
-	reactor: ^Reactor,
-	shard: ^Shard,
-	type_index: u16,
-	slot_index: u32,
-	offset: u16,
-	size: u32,
-) -> (
-	u16,
-	IO_Error,
-) {
-	stride := shard.type_descriptors[type_index].stride
-	if int(offset) + int(size) > stride do return BUFFER_INDEX_NONE, IO_ERR_BOUNDS_VIOLATION
-
-	alloc_index, alloc_error := reactor_buffer_pool_alloc(&reactor.buffer_pool)
-	if alloc_error != .None do return BUFFER_INDEX_NONE, IO_ERR_RESOURCE_EXHAUSTED
-
-	isolate_pointer := _get_isolate_ptr(shard, type_index, slot_index)
-	source_bytes := cast([^]u8)(uintptr(isolate_pointer) + uintptr(offset))
-	reactor_buffer_pool_write_bytes(&reactor.buffer_pool, alloc_index, source_bytes[:size])
-
-	return alloc_index, IO_ERR_NONE
-}
-
 // =====
 // Tests
 // =====
@@ -985,14 +1039,15 @@ test_reactor_init_deinit :: proc(t: ^testing.T) {
 
 	fd_backing: [16]FD_Entry
 	buffer_backing: [1024 * 2]u8 // 2 slots of 1KB
+	staging_backing: [1024]u8
 
 	reactor := new(Reactor)
 	defer free(reactor)
-	err := reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 2)
+	err := reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 2}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	testing.expect_value(t, err, Backend_Error.None)
 	testing.expect_value(t, reactor.pending_count, 0)
 	testing.expect_value(t, reactor.fd_table.slot_count, 16)
-	testing.expect_value(t, reactor.buffer_pool.slot_count, 2)
+	testing.expect_value(t, reactor.receive_pool.slot_count, 2)
 
 	reactor_deinit(reactor)
 }
@@ -1010,9 +1065,10 @@ test_reactor_control_socket_and_shutdown :: proc(t: ^testing.T) {
 	}
 	fd_backing: [4]FD_Entry
 	buffer_backing: [1024]u8
+	staging_backing: [1024]u8
 
 	reactor := new(Reactor)
-	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 1)
+	reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 1}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner_handle := make_handle(0, 1, 0, 1)
@@ -1102,9 +1158,10 @@ test_close_submission_supersedes_waiting_io_sequence :: proc(t: ^testing.T) {
 	}
 	fd_backing: [4]FD_Entry
 	buffer_backing: [1024]u8
+	staging_backing: [1024]u8
 
 	reactor := new(Reactor)
-	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 1)
+	reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 1}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	defer {reactor_deinit(reactor); free(reactor)}
 
 	shard := new(Shard)
@@ -1148,9 +1205,10 @@ test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
+	staging_backing: [1024]u8
 
 	reactor := new(Reactor)
-	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 4}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner := make_handle(0, 1, 0, 1)
@@ -1199,9 +1257,10 @@ test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
+	staging_backing: [1024]u8
 
 	reactor := new(Reactor)
-	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 4}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner := make_handle(0, 1, 0, 1)
@@ -1238,9 +1297,10 @@ test_close_submission_preserves_fd_handle_for_completion_identity :: proc(t: ^te
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
+	staging_backing: [1024]u8
 
 	reactor := new(Reactor)
-	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 4}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner := make_handle(0, 1, 0, 1)
@@ -1280,9 +1340,10 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	}
 	fd_backing: [8]FD_Entry
 	buffer_backing: [4096]u8
+	staging_backing: [1024]u8
 
 	reactor := new(Reactor)
-	reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+	reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 4}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	defer {reactor_deinit(reactor); free(reactor)}
 
 	owner := make_handle(0, 1, 0, 1)
@@ -1372,9 +1433,10 @@ when TINA_SIMULATION_MODE {
 
 		fd_backing: [8]FD_Entry
 		buffer_backing: [4096]u8
+		staging_backing: [1024]u8
 
 		reactor := new(Reactor)
-		reactor_init(reactor, config, fd_backing[:], buffer_backing[:], 1024, 4)
+		reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 4}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 		defer {reactor_deinit(reactor); free(reactor)}
 
 		// 2. Setup Mock Shard Metadata
@@ -1412,7 +1474,7 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(t, io_err, IO_ERR_NONE)
 
 		// Buffer should be allocated
-		testing.expect_value(t, reactor.buffer_pool.free_count, 3)
+		testing.expect_value(t, reactor.receive_pool.free_count, 3)
 
 		// Push to the OS kernel / Simulator
 		reactor_flush_submissions(reactor, shard)
@@ -1432,7 +1494,7 @@ when TINA_SIMULATION_MODE {
 		recovered := false
 		for i in 0 ..< 50 {
 			reactor_collect_completions(reactor, shard, 10_000_000) // 10ms wait
-			if reactor.buffer_pool.free_count == 4 {
+			if reactor.receive_pool.free_count == 4 {
 				recovered = true
 				break
 			}
@@ -1444,7 +1506,7 @@ when TINA_SIMULATION_MODE {
 			recovered,
 			"Reactor buffer leaked! The OS completion was lost or never generated.",
 		)
-		testing.expect_value(t, reactor.buffer_pool.free_count, 4)
+		testing.expect_value(t, reactor.receive_pool.free_count, 4)
 		testing.expect_value(t, shard.counters.io_stale_completions, 1)
 	}
 }

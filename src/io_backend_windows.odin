@@ -101,10 +101,6 @@ when !TINA_SIMULATION_MODE {
 	#assert(size_of(Win_Accept_Data) >= WIN_ACCEPTEX_MIN_BUF + size_of(OS_FD), "AcceptEx buffer too small for dual sockaddr_in6 + 16 padding")
 
 	_Platform_State :: struct {
-		buffer_base:      [^]u8,
-		buffer_slot_size: u32,
-		buffer_slot_count: u16,
-		_padding:         u16,
 		iocp:            win.HANDLE,
 		entries:         [MAX_WIN_OVERLAPPED]Win_Overlapped_Entry,
 		completed:       [MAX_WIN_COMPLETED]Raw_Completion,
@@ -129,9 +125,6 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		backend.iocp = iocp
-		backend.buffer_base = config.buffer_base
-		backend.buffer_slot_size = config.buffer_slot_size
-		backend.buffer_slot_count = config.buffer_slot_count
 		backend.completed_count = 0
 		backend.completed_read = 0
 
@@ -195,18 +188,12 @@ when !TINA_SIMULATION_MODE {
 
 			switch op in sub.operation {
 			case Submission_Op_Read:
-				buffer_pointer := submission_buffer_ptr(
-					backend.buffer_base,
-					backend.buffer_slot_size,
-					backend.buffer_slot_count,
-					sub.token,
-				)
 				entry.overlapped.Offset = win.DWORD(u64(op.offset) & 0xFFFFFFFF)
 				entry.overlapped.OffsetHigh = win.DWORD(u64(op.offset) >> 32)
 				ok := win.ReadFile(
 					win.HANDLE(uintptr(op.fd)),
-					buffer_pointer,
-					win.DWORD(op.size),
+					sub.data_pointer,
+					win.DWORD(sub.data_size),
 					nil,
 					&entry.overlapped,
 				)
@@ -223,18 +210,12 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Write:
-				buffer_pointer := submission_buffer_ptr(
-					backend.buffer_base,
-					backend.buffer_slot_size,
-					backend.buffer_slot_count,
-					sub.token,
-				)
 				entry.overlapped.Offset = win.DWORD(u64(op.offset) & 0xFFFFFFFF)
 				entry.overlapped.OffsetHigh = win.DWORD(u64(op.offset) >> 32)
 				ok := win.WriteFile(
 					win.HANDLE(uintptr(op.fd)),
-					buffer_pointer,
-					win.DWORD(op.size),
+					sub.data_pointer,
+					win.DWORD(sub.data_size),
 					nil,
 					&entry.overlapped,
 				)
@@ -344,15 +325,9 @@ when !TINA_SIMULATION_MODE {
 				entry.active = false
 
 			case Submission_Op_Send:
-				buffer_pointer := submission_buffer_ptr(
-					backend.buffer_base,
-					backend.buffer_slot_size,
-					backend.buffer_slot_count,
-					sub.token,
-				)
 				wsa_buf := win.WSABUF {
-					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(buffer_pointer),
+					len = win.ULONG(sub.data_size),
+					buf = (^win.CHAR)(sub.data_pointer),
 				}
 				rc := win.WSASend(
 					win.SOCKET(uintptr(op.fd_socket)),
@@ -375,15 +350,9 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Recv:
-				buffer_pointer := submission_buffer_ptr(
-					backend.buffer_base,
-					backend.buffer_slot_size,
-					backend.buffer_slot_count,
-					sub.token,
-				)
 				wsa_buf := win.WSABUF {
-					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(buffer_pointer),
+					len = win.ULONG(sub.data_size),
+					buf = (^win.CHAR)(sub.data_pointer),
 				}
 				flags: win.DWORD = 0
 				rc := win.WSARecv(
@@ -407,16 +376,10 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Sendto:
-				buffer_pointer := submission_buffer_ptr(
-					backend.buffer_base,
-					backend.buffer_slot_size,
-					backend.buffer_slot_count,
-					sub.token,
-				)
 				sockaddr, socklen := _win_socket_address_to_sockaddr(op.address)
 				wsa_buf := win.WSABUF {
-					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(buffer_pointer),
+					len = win.ULONG(sub.data_size),
+					buf = (^win.CHAR)(sub.data_pointer),
 				}
 				rc := win.WSASendTo(
 					win.SOCKET(uintptr(op.fd_socket)),
@@ -441,15 +404,9 @@ when !TINA_SIMULATION_MODE {
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Recvfrom:
-				buffer_pointer := submission_buffer_ptr(
-					backend.buffer_base,
-					backend.buffer_slot_size,
-					backend.buffer_slot_count,
-					sub.token,
-				)
 				wsa_buf := win.WSABUF {
-					len = win.ULONG(op.size),
-					buf = (^win.CHAR)(buffer_pointer),
+					len = win.ULONG(sub.data_size),
+					buf = (^win.CHAR)(sub.data_pointer),
 				}
 				flags: win.DWORD = 0
 				entry.op_data.recvfrom.peer_address = {}
@@ -966,6 +923,19 @@ when !TINA_SIMULATION_MODE {
 		// No-op: IOCP has no fixed-file table.
 	}
 
+	@(private = "package")
+	_backend_recv_uses_provided_buffers :: #force_inline proc "contextless" (backend: ^Platform_Backend) -> bool {
+		return false
+	}
+
+	@(private = "package")
+	_backend_replenish_recv_buffer :: #force_inline proc "contextless" (
+		backend: ^Platform_Backend,
+		buffer_index: IO_Slot_Index,
+	) {
+		// No provided buffer ring on Windows — receive pool free-list manages slots.
+	}
+
 	@(test)
 	test_windows_backend_control_dup_unsupported :: proc(t: ^testing.T) {
 		backend: Platform_Backend
@@ -1255,7 +1225,7 @@ when !TINA_SIMULATION_MODE {
 		testing.expect(t, fd != OS_FD_INVALID, "should get a valid socket")
 
 		// Submit close — exercises the IOCP path (close is synchronous but goes through submit)
-		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_CLOSE_COMPLETE))
+		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Close_Complete)
 		submissions := [1]Submission {
 			{token = token, operation = Submission_Op_Close{fd = fd}},
 		}
@@ -1293,7 +1263,7 @@ when !TINA_SIMULATION_MODE {
 
 		// Submit accept
 		accept_token := submission_token_pack(
-			0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_ACCEPT_COMPLETE),
+			0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Accept_Complete,
 		)
 		accept_submissions := [1]Submission {
 			{token = accept_token, operation = Submission_Op_Accept{listen_fd = listen_fd}},
@@ -1304,7 +1274,7 @@ when !TINA_SIMULATION_MODE {
 		client_fd, _ := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
 		connect_address := Socket_Address_Inet4{address = {127, 0, 0, 1}, port = bound_port}
 		connect_token := submission_token_pack(
-			0, 1, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_CONNECT_COMPLETE),
+			0, 1, 0, 0, IO_SLOT_INDEX_NONE, .Connect_Complete,
 		)
 		connect_submissions := [1]Submission {
 			{
@@ -1379,7 +1349,7 @@ when !TINA_SIMULATION_MODE {
 		client_fd, _ := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
 		connect_address := Socket_Address_Inet4{address = {127, 0, 0, 1}, port = bound_port}
 		token := submission_token_pack(
-			0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_CONNECT_COMPLETE),
+			0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Connect_Complete,
 		)
 		submissions := [1]Submission {
 			{
@@ -1419,9 +1389,9 @@ when !TINA_SIMULATION_MODE {
 		buffer_backing: [64 * 2]u8
 		config := Backend_Config {
 			queue_size        = DEFAULT_BACKEND_QUEUE_SIZE,
-			buffer_base       = &buffer_backing[0],
-			buffer_slot_size  = 64,
-			buffer_slot_count = 2,
+			backing_memory_base       = &buffer_backing[0],
+			backing_memory_slot_size  = 64,
+			backing_memory_slot_count = 2,
 		}
 		backend_init(backend, config)
 		defer { backend_deinit(backend); free(backend) }
@@ -1440,7 +1410,7 @@ when !TINA_SIMULATION_MODE {
 
 		// Submit accept
 		accept_token := submission_token_pack(
-			0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_ACCEPT_COMPLETE),
+			0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Accept_Complete,
 		)
 		accept_sub := [1]Submission {
 			{token = accept_token, operation = Submission_Op_Accept{listen_fd = listen_fd}},
@@ -1451,7 +1421,7 @@ when !TINA_SIMULATION_MODE {
 		client_fd, _ := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
 		connect_address := Socket_Address_Inet4{address = {127, 0, 0, 1}, port = bound_port}
 		connect_token := submission_token_pack(
-			0, 1, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_CONNECT_COMPLETE),
+			0, 1, 0, 0, IO_SLOT_INDEX_NONE, .Connect_Complete,
 		)
 		connect_sub := [1]Submission {
 			{
@@ -1489,27 +1459,27 @@ when !TINA_SIMULATION_MODE {
 		send_data := [4]u8{0xDE, 0xAD, 0xBE, 0xEF}
 		copy(buffer_backing[0:4], send_data[:])
 		send_token := submission_token_pack(
-			0, 2, 0, 0, 0, u8(IO_TAG_SEND_COMPLETE),
+			0, 2, 0, 0, 0, .Send_Complete,
 		)
 		send_sub := [1]Submission {
 			{
 				token = send_token,
+				data_size = 4,
 				operation = Submission_Op_Send{
 					fd_socket = client_fd,
-					size      = 4,
 				},
 			},
 		}
 
 		recv_token := submission_token_pack(
-			0, 3, 0, 0, 1, u8(IO_TAG_RECV_COMPLETE),
+			0, 3, 0, 0, 1, .Recv_Complete,
 		)
 		recv_sub := [1]Submission {
 			{
 				token = recv_token,
+				data_size = 64,
 				operation = Submission_Op_Recv{
 					fd_socket = server_fd,
-					size      = 64,
 				},
 			},
 		}
@@ -1561,7 +1531,7 @@ when !TINA_SIMULATION_MODE {
 		for i in 0 ..< 3 {
 			fd, _ := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
 			tokens[i] = submission_token_pack(
-				0, u32(i), 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_CLOSE_COMPLETE),
+				0, u32(i), 0, 0, IO_SLOT_INDEX_NONE, .Close_Complete,
 			)
 			submissions := [1]Submission {
 				{token = tokens[i], operation = Submission_Op_Close{fd = fd}},
@@ -1603,7 +1573,7 @@ when !TINA_SIMULATION_MODE {
 
 		// Submit close of an invalid FD — both closesocket and CloseHandle should fail
 		token := submission_token_pack(
-			0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_CLOSE_COMPLETE),
+			0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Close_Complete,
 		)
 		submissions := [1]Submission {
 			{token = token, operation = Submission_Op_Close{fd = OS_FD(uintptr(0xDEADBEEF))}},

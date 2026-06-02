@@ -36,11 +36,18 @@ Backend_Error :: enum u8 {
 Backend_Config :: struct {
 	queue_size:        u32, // submission/completion queue depth (default 256)
 	sim_config:        Simulation_IO_Config, // only used when TINA_SIM=true
-	// Buffer pool metadata for io_uring registered buffers (§6.6.2 §8).
-	// Set to nil/zero on non-Linux or when registered buffers are not desired.
-	buffer_base:       [^]u8, // buffer pool backing memory base address
-	buffer_slot_size:  u32, // bytes per slot
-	buffer_slot_count: u16, // number of slots
+	// Receive-pool memory layout, used for the registered-buffer optimization
+	// (io_uring IORING_REGISTER_BUFFERS / provided buffer rings, §6.6.2 §8).
+	// Currently consumed ONLY by the Linux backend; the BSD, Windows, and
+	// simulated backends ignore these fields (their _Platform_State no longer
+	// stores them). They live in the shared config rather
+	// than a Linux-only struct because they describe the receive pool itself,
+	// not a Linux concept: a future backend (e.g. Windows RIO) could register
+	// the same layout. Reactor populates them from the receive pool on every
+	// platform; non-Linux backends simply do not read them.
+	backing_memory_base:          [^]u8,
+	backing_memory_slot_size:     u32,
+	backing_memory_slot_count:    u16,
 	fd_slot_count:     u16, // number of fixed-file slots
 }
 
@@ -148,21 +155,6 @@ backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> B
 	return _backend_cancel(backend, token)
 }
 
-@(private = "package")
-submission_buffer_ptr :: #force_inline proc(
-	buffer_base: [^]u8,
-	buffer_slot_size: u32,
-	buffer_slot_count: u16,
-	token: Submission_Token,
-) -> [^]u8 {
-	buffer_index := u16((u64(token) >> 44) & 0x0FFF)
-	assert(buffer_base != nil, "buffer_base must be set for buffered submissions")
-	assert(buffer_index != BUFFER_INDEX_NONE, "buffered submission token must carry a buffer index")
-	assert(buffer_index < buffer_slot_count, "submission buffer index out of bounds")
-	buffer_offset := u64(buffer_index) * u64(buffer_slot_size)
-	return cast([^]u8)(uintptr(buffer_base) + uintptr(buffer_offset))
-}
-
 // Interrupt a blocking backend_collect from another thread.
 backend_wake :: proc(backend: ^Platform_Backend) {
 	_backend_wake(backend)
@@ -264,4 +256,25 @@ backend_unregister_fixed_fd :: #force_inline proc "contextless" (
 	slot_index: u16,
 ) {
 	_backend_unregister_fixed_fd(backend, slot_index)
+}
+
+// --- Provided Buffer Ring Hooks (io_uring provided buffer rings) ---
+// On Linux with a registered provided buffer ring, the kernel picks a receive
+// buffer from the ring instead of userspace allocating one from the pool.
+// On non-Linux backends, these are no-ops.
+
+// Returns true when the recv path should skip IO_Slot_Pool allocation and
+// let the kernel select a buffer from the provided ring.
+backend_recv_uses_provided_buffers :: #force_inline proc "contextless" (backend: ^Platform_Backend) -> bool {
+	return _backend_recv_uses_provided_buffers(backend)
+}
+
+// Returns a consumed buffer back to the provided buffer ring so the kernel
+// can reuse it for future recv operations. MUST only be called when
+// backend_recv_uses_provided_buffers returns true.
+backend_replenish_recv_buffer :: #force_inline proc "contextless" (
+	backend: ^Platform_Backend,
+	buffer_index: IO_Slot_Index,
+) {
+	_backend_replenish_recv_buffer(backend, buffer_index)
 }

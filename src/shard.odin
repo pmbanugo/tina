@@ -52,11 +52,19 @@ Isolate_State :: enum u8 {
 	Wait_Reply,
 	Wait_Io,
 	Crashed,
+	Pending_IO_Reuse, // Torn down, awaiting stale write I/O completion before slot reuse.
 }
 Isolate_Flag :: enum u8 {
 	Shutdown_Pending,
+	IO_Completion_Ready,
 }
 Isolate_Flags :: distinct bit_set[Isolate_Flag;u8]
+
+// Flags that must be cleared when a slot is allocated to a new Isolate.
+// Stale flag bits from a previous incarnation must not persist. When a
+// new flag variant is added, the author must decide: should it survive
+// slot reuse? If not, add it here.
+ISOLATE_FLAGS_CLEARED_ON_ALLOC :: Isolate_Flags{.IO_Completion_Ready}
 
 // Mutually Exclusive Control Signals from Watchdog
 Control_Signal :: enum u8 {
@@ -81,8 +89,9 @@ Isolate_Metadata :: struct {
 	working_arena_offset:  u32,
 	inbox_count:           u16,
 	group_id:              Supervision_Group_Id,
-	io_completion_tag:     IO_Completion_Tag,
-	io_buffer_index:       u16,
+	io_operation_kind:     IO_Operation_Kind,
+	io_slot_index:       IO_Slot_Index,
+	staging_slot_index:  IO_Slot_Index,
 	state:                 Isolate_State,
 	flags:                 Isolate_Flags, // Replaces shutdown_pending: u8
 	io_sequence:           u8,
@@ -94,7 +103,8 @@ Shard_Counters :: struct {
 	quarantine_drops:          u64,
 	pool_exhaustion_drops:     u64,
 	mailbox_full_drops:        u64,
-	io_buffer_exhaustions:     u64,
+	io_receive_exhaustions:    u64,
+	io_staging_exhaustions:    u64,
 	io_submission_exhaustions: u64,
 	io_awaiting_count:         u64,
 	io_stale_completions:      u64, // TODO: In simulation, consider verifying that this counter
@@ -102,6 +112,8 @@ Shard_Counters :: struct {
 	// interrupted WAITING_FOR_IO Isolates. A mismatch would indicate
 	// a stale completion was lost (buffer leak) or double-counted.
 	// Might require tracking a separate "io_wakes" counter to compare against.
+	io_recv_no_buffers_count:  u64,
+	staging_slot_leaks:        u64, // leak signal.
 	transfer_exhaustions:      u64,
 	transfer_stale_reads:      u64,
 	handoff_exhaustions:       u64,
@@ -173,7 +185,7 @@ Shard :: struct {
 	// --- Hot Embedded Structs (8-byte aligned) ---
 	log_ring:               Log_Ring_Buffer,
 	message_pool:           Message_Pool,
-	transfer_pool:          Reactor_Buffer_Pool,
+	transfer_pool:          IO_Slot_Pool,
 	counters:               Shard_Counters,
 
 	// --- Hot Scalars (Ordered largest to smallest) ---
@@ -275,12 +287,12 @@ _dispatch_kind_for_slot :: #force_inline proc "contextless" (
 	state: Isolate_State,
 	flags: Isolate_Flags,
 	inbox_count: u16,
-	io_completion_tag: IO_Completion_Tag,
+	io_operation_kind: IO_Operation_Kind,
 ) -> Dispatch_Kind {
-	if state == .Unallocated {
+	if state == .Unallocated || state == .Pending_IO_Reuse {
 		return .None
 	}
-	if io_completion_tag != IO_TAG_NONE {
+	if .IO_Completion_Ready in flags && io_operation_kind != .None {
 		return .Io_Completion
 	}
 	if .Shutdown_Pending in flags {
@@ -402,7 +414,7 @@ _dispatchable_refresh_slot :: #force_inline proc "contextless" (
 		soa_meta[slot_index].state,
 		soa_meta[slot_index].flags,
 		soa_meta[slot_index].inbox_count,
-		soa_meta[slot_index].io_completion_tag,
+		soa_meta[slot_index].io_operation_kind,
 	)
 	if dispatch_kind == .None {
 		_dispatchable_slot_set_absent(shard, type_id, slot_index)
@@ -501,11 +513,14 @@ _slot_track_io_awaiting_transition :: #force_inline proc "contextless" (
 	if old_state == new_state {
 		return
 	}
-	if old_state == .Wait_Io {
+	old_io_blocked := old_state == .Wait_Io || old_state == .Pending_IO_Reuse
+	new_io_blocked := new_state == .Wait_Io || new_state == .Pending_IO_Reuse
+
+	if old_io_blocked && !new_io_blocked {
 		if shard.counters.io_awaiting_count > 0 {
 			shard.counters.io_awaiting_count -= 1
 		}
-	} else if new_state == .Wait_Io {
+	} else if !old_io_blocked && new_io_blocked {
 		shard.counters.io_awaiting_count += 1
 	}
 }
@@ -538,13 +553,13 @@ _slot_set_waiting_for_reply :: #force_inline proc "contextless" (
 }
 
 @(private = "package")
-_slot_set_io_completion_tag :: #force_inline proc "contextless" (
+_slot_set_io_operation_kind :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_id: u16,
 	slot_index: u32,
-	completion_tag: IO_Completion_Tag,
+	operation_kind: IO_Operation_Kind,
 ) {
-	shard.metadata[type_id][slot_index].io_completion_tag = completion_tag
+	shard.metadata[type_id][slot_index].io_operation_kind = operation_kind
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
 
@@ -593,14 +608,15 @@ _slot_set_io_completion_ready :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_id: u16,
 	slot_index: u32,
-	completion_tag: IO_Completion_Tag,
+	operation_kind: IO_Operation_Kind,
 	completion_result: i32,
-	buffer_index: u16,
+	buffer_index: IO_Slot_Index,
 ) {
 	meta := &shard.metadata[type_id][slot_index]
-	meta.io_completion_tag = completion_tag
+	meta.io_operation_kind = operation_kind
 	meta.io_result = completion_result
-	meta.io_buffer_index = buffer_index
+	meta.io_slot_index = buffer_index
+	meta.flags += {.IO_Completion_Ready}
 	if meta.state == .Wait_Io {
 		_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
 		meta.state = .Runnable
@@ -613,16 +629,41 @@ _slot_set_io_submit_failure :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_id: u16,
 	slot_index: u32,
-	completion_tag: IO_Completion_Tag,
+	operation_kind: IO_Operation_Kind,
 	completion_result: i32,
 ) {
 	meta := &shard.metadata[type_id][slot_index]
-	meta.io_completion_tag = completion_tag
+	meta.io_operation_kind = operation_kind
 	meta.io_result = completion_result
-	meta.io_buffer_index = BUFFER_INDEX_NONE
+	meta.io_slot_index = IO_SLOT_INDEX_NONE
+	meta.flags += {.IO_Completion_Ready}
 	_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
 	meta.state = .Runnable
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+// Returns a buffer slot to its owning pool based on the operation's pool
+// affinity. For receive-pool buffers, handles provided buffer ring
+// replenishment when active on Linux.
+@(private = "package")
+_io_slot_return_to_pool :: #force_inline proc(
+	reactor: ^Reactor,
+	affinity: IO_Slot_Pool_Affinity,
+	slot_index: IO_Slot_Index,
+) {
+	if slot_index == IO_SLOT_INDEX_NONE do return
+	switch affinity {
+	case .Receive:
+		if backend_recv_uses_provided_buffers(&reactor.backend) {
+			backend_replenish_recv_buffer(&reactor.backend, slot_index)
+		} else {
+			io_slot_pool_free(&reactor.receive_pool, slot_index)
+		}
+	case .Staging:
+		io_slot_pool_free(&reactor.staging_pool, slot_index)
+	case .None:
+		// No pool slot involved — nothing to return
+	}
 }
 
 @(private = "file")
@@ -670,11 +711,11 @@ _dispatch_type_batch :: proc(
 	states := shard.metadata[type_id].state[:]
 	flags := shard.metadata[type_id].flags[:]
 	inbox_counts := shard.metadata[type_id].inbox_count[:]
-	io_completions := shard.metadata[type_id].io_completion_tag[:]
+	io_operation_kinds := shard.metadata[type_id].io_operation_kind[:]
 	generations := shard.metadata[type_id].generation[:]
 	io_results := shard.metadata[type_id].io_result[:]
 	io_fds := shard.metadata[type_id].io_fd[:]
-	io_buffer_indices := shard.metadata[type_id].io_buffer_index[:]
+	io_slot_indices := shard.metadata[type_id].io_slot_index[:]
 	io_peer_addresses := shard.metadata[type_id].io_peer_address[:]
 	working_arena_offsets := shard.metadata[type_id].working_arena_offset[:]
 	pending_transfer_reads := shard.metadata[type_id].pending_transfer_read[:]
@@ -725,7 +766,7 @@ _dispatch_type_batch :: proc(
 			states[slot_index],
 			flags[slot_index],
 			inbox_counts[slot_index],
-			io_completions[slot_index],
+			io_operation_kinds[slot_index],
 		)
 		if dispatch_kind == .None {
 			_dispatchable_slot_set_absent(shard, type_id, slot_index)
@@ -743,21 +784,23 @@ _dispatch_type_batch :: proc(
 		envelope_flags: Envelope_Flags = {}
 
 		is_io_completion := false
-		buffer_to_free: u16 = BUFFER_INDEX_NONE
+		buffer_to_free: IO_Slot_Index = IO_SLOT_INDEX_NONE
+		dispatch_io_operation_kind := IO_Operation_Kind.None
 
 		switch dispatch_kind {
 		case .None:
 		case .Io_Completion:
-			message.tag = io_completions[slot_index]
+			dispatch_io_operation_kind = io_operation_kinds[slot_index]
+			message.tag = Message_Tag(u16(dispatch_io_operation_kind))
 			message.correlation = CORRELATION_ID_NONE
 			message.io.result = io_results[slot_index]
 			message.io.fd = io_fds[slot_index]
-			message.io.buffer_index = io_buffer_indices[slot_index]
+			message.io.buffer_index = io_slot_indices[slot_index]
 			message.io.peer_address = io_peer_addresses[slot_index]
 
 			message_pointer = &message
 			is_io_completion = true
-			buffer_to_free = io_buffer_indices[slot_index]
+			buffer_to_free = io_slot_indices[slot_index]
 		case .Shutdown:
 			message.tag = TAG_SHUTDOWN
 			message.correlation = CORRELATION_ID_NONE
@@ -798,6 +841,22 @@ _dispatch_type_batch :: proc(
 		invocation.staged_call_active = false
 		invocation.staged_io_active = false
 		invocation.reply_sent = false
+		invocation.staged_io_data_source = .None
+		invocation.staged_io_payload_offset = 0
+		invocation.staged_io_payload_size = 0
+		// Re-dispatch boundary invariant: by the time the handler runs, the
+		// metadata field must be NONE. A non-NONE value here means a previous
+		// exit (auto-free, _commit_staged_io, or teardown) forgot to clear —
+		// a likely slot leak.
+		if shard.metadata[type_id][slot_index].staging_slot_index != IO_SLOT_INDEX_NONE {
+			shard.counters.staging_slot_leaks += 1
+			when TINA_RUNTIME_ASSERTIONS {
+				assert(
+					false,
+					"staging_slot_index must be cleared on re-dispatch (prior exit leaked)",
+				)
+			}
+		}
 		ctx := invocation.context_token
 
 		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
@@ -848,10 +907,12 @@ _dispatch_type_batch :: proc(
 		}
 
 		if is_io_completion {
-			io_completions[slot_index] = IO_TAG_NONE
+			io_operation_kinds[slot_index] = .None
+			flags[slot_index] -= {.IO_Completion_Ready}
 			io_peer_addresses[slot_index] = {}
-			if buffer_to_free != BUFFER_INDEX_NONE {
-				reactor_buffer_pool_free(&shard.reactor.buffer_pool, buffer_to_free)
+			if buffer_to_free != IO_SLOT_INDEX_NONE {
+				_io_slot_return_to_pool(&shard.reactor, io_operation_pool_affinity(dispatch_io_operation_kind), buffer_to_free)
+				io_slot_indices[slot_index] = IO_SLOT_INDEX_NONE
 			}
 		}
 
@@ -1102,17 +1163,37 @@ _commit_staged_io :: proc(
 ) {
 	operation := invocation.staged_io_operation
 	invocation.staged_io_active = false
-	err := reactor_submit_io(&shard.reactor, shard, invocation.self_handle, operation)
+
+	err := reactor_submit_io(
+		&shard.reactor,
+		shard,
+		invocation.self_handle,
+		operation,
+		invocation.staged_io_data_source,
+		invocation.staged_io_payload_offset,
+		invocation.staged_io_payload_size,
+		shard.metadata[type_id][slot].staging_slot_index,
+	)
 	if err != IO_ERR_NONE {
-		if err == IO_ERR_RESOURCE_EXHAUSTED do shard.counters.io_buffer_exhaustions += 1
 		_slot_set_io_submit_failure(
 			shard,
 			type_id,
 			slot,
-			_io_op_to_completion_tag(operation),
+			_io_op_to_operation_kind(operation),
 			i32(err),
 		)
+		// If staging slot was claimed but IO failed, free it
+		staging_slot := shard.metadata[type_id][slot].staging_slot_index
+		if staging_slot != IO_SLOT_INDEX_NONE {
+			io_slot_pool_free(&shard.reactor.staging_pool, staging_slot)
+			shard.metadata[type_id][slot].staging_slot_index = IO_SLOT_INDEX_NONE
+		}
 	} else {
+		// Staging claim is now owned by the in-flight I/O (kernel reads from it).
+		// metadata.io_slot_index carries it until the completion reclaims via
+		// _io_slot_return_to_pool. Clear the metadata mirror so the
+		// post-commit auto-free does not return the slot while the kernel holds it.
+		shard.metadata[type_id][slot].staging_slot_index = IO_SLOT_INDEX_NONE
 		_slot_set_state(shard, type_id, slot, .Wait_Io)
 	}
 }
@@ -1216,6 +1297,32 @@ _interpret_transition :: proc(
 			return
 		}
 		_commit_staged_io(shard, type_id, slot, invocation)
+	}
+
+	// Auto-free any staging slot that was claimed but never consumed by a
+	// committed I/O. Safe to run unconditionally on every exit path because
+	// _commit_staged_io clears staging_slot_index on both the success path
+	// (ownership transferred to the in-flight I/O via the kernel) and the
+	// submit-failure path (explicit free + clear in the failure arm).
+	// If we reach this block with staging_slot_index != IO_SLOT_INDEX_NONE,
+	// the handler claimed a slot but did not return .Wait_Io, so the claim
+	// was never submitted and must be returned to the staging pool.
+	staging_slot := shard.metadata[type_id][slot].staging_slot_index
+	if staging_slot != IO_SLOT_INDEX_NONE {
+		io_slot_pool_free(&shard.reactor.staging_pool, staging_slot)
+		shard.metadata[type_id][slot].staging_slot_index = IO_SLOT_INDEX_NONE
+	}
+
+	// Post-exit invariant: every path through _interpret_transition must
+	// leave the staging claim cleared. The block above is the only auto-free
+	// site; _commit_staged_io handles the .Wait_Io path internally. If a
+	// new transition kind is added without updating this invariant, the
+	// next re-dispatch will trip the entry assert.
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(
+			shard.metadata[type_id][slot].staging_slot_index == IO_SLOT_INDEX_NONE,
+			"staging_slot_index must be cleared on every exit from _interpret_transition",
+		)
 	}
 }
 
@@ -1685,15 +1792,17 @@ _inject_fd_handoff_accept :: proc "contextless" (
 	if soa_meta[target_slot.slot_index].state == .Unallocated || soa_meta[target_slot.slot_index].state == .Crashed {
 		return .Invalid_Target
 	}
-	if soa_meta[target_slot.slot_index].state == .Wait_Io || soa_meta[target_slot.slot_index].io_completion_tag != IO_TAG_NONE {
+	if soa_meta[target_slot.slot_index].state == .Wait_Io || soa_meta[target_slot.slot_index].io_operation_kind != .None {
 		return .Target_Busy
 	}
 
-	_slot_set_io_completion_tag(shard, target_slot.type_id, target_slot.slot_index, IO_TAG_ACCEPT_COMPLETE)
+	_slot_set_io_operation_kind(shard, target_slot.type_id, target_slot.slot_index, .Accept_Complete)
 	soa_meta[target_slot.slot_index].io_result = 0
 	soa_meta[target_slot.slot_index].io_fd = fd
-	soa_meta[target_slot.slot_index].io_buffer_index = BUFFER_INDEX_NONE
+	soa_meta[target_slot.slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 	soa_meta[target_slot.slot_index].io_peer_address = peer_address
+	soa_meta[target_slot.slot_index].flags += {.IO_Completion_Ready}
+	_dispatchable_refresh_slot(shard, target_slot.type_id, target_slot.slot_index)
 	return .None
 }
 
@@ -1709,18 +1818,20 @@ _clear_fd_handoff_accept :: proc "contextless" (
 	}
 
 	soa_meta := shard.metadata[target_slot.type_id]
-	if soa_meta[target_slot.slot_index].io_completion_tag != IO_TAG_ACCEPT_COMPLETE {
+	if soa_meta[target_slot.slot_index].io_operation_kind != .Accept_Complete {
 		return
 	}
 	if soa_meta[target_slot.slot_index].io_fd != fd {
 		return
 	}
 
-	_slot_set_io_completion_tag(shard, target_slot.type_id, target_slot.slot_index, IO_TAG_NONE)
+	_slot_set_io_operation_kind(shard, target_slot.type_id, target_slot.slot_index, .None)
 	soa_meta[target_slot.slot_index].io_result = 0
 	soa_meta[target_slot.slot_index].io_fd = FD_HANDLE_NONE
-	soa_meta[target_slot.slot_index].io_buffer_index = BUFFER_INDEX_NONE
+	soa_meta[target_slot.slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 	soa_meta[target_slot.slot_index].io_peer_address = Peer_Address{}
+	soa_meta[target_slot.slot_index].flags -= {.IO_Completion_Ready}
+	_dispatchable_refresh_slot(shard, target_slot.type_id, target_slot.slot_index)
 }
 
 @(private = "file")
@@ -1809,7 +1920,7 @@ _process_fd_handoff_abort :: proc "contextless" (shard: ^Shard, envelope: ^Messa
 	target_slot, ok := _resolve_target_slot(shard, envelope.destination)
 	if ok {
 		soa_meta := shard.metadata[target_slot.type_id]
-		if soa_meta[target_slot.slot_index].io_completion_tag == IO_TAG_ACCEPT_COMPLETE {
+		if soa_meta[target_slot.slot_index].io_operation_kind == .Accept_Complete {
 			fd := soa_meta[target_slot.slot_index].io_fd
 			_clear_fd_handoff_accept(shard, envelope.destination, fd)
 			reactor_internal_close_fd(&shard.reactor, fd)
@@ -1852,7 +1963,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
 
-	reactor_buffer_pool_reset(&shard.transfer_pool)
+	io_slot_pool_reset(&shard.transfer_pool)
 	for i in 0 ..< shard.transfer_pool.slot_count {
 		shard.transfer_generations[i] += 1
 		if shard.transfer_generations[i] == 0 do shard.transfer_generations[i] = 1
@@ -1863,9 +1974,18 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	// these buffers were allocated but never reached the OS kernel.
 	for i in 0 ..< shard.reactor.pending_count {
 		sub := &shard.reactor.pending_submissions[i]
+		type_index := submission_token_type_index(sub.token)
+		slot_index := submission_token_slot_index(sub.token)
 		buffer_index := submission_token_buffer_index(sub.token)
-		if buffer_index != BUFFER_INDEX_NONE {
-			reactor_buffer_pool_free(&shard.reactor.buffer_pool, buffer_index)
+		if buffer_index != IO_SLOT_INDEX_NONE {
+			_io_slot_return_to_pool(
+				&shard.reactor,
+				io_operation_pool_affinity(submission_token_operation_kind(sub.token)),
+				buffer_index,
+			)
+		}
+		if int(type_index) < len(shard.metadata) && int(slot_index) < len(shard.metadata[type_index]) {
+			shard.metadata[type_index][slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 		}
 	}
 	shard.reactor.pending_count = 0
@@ -1899,14 +2019,18 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		shard.dispatch_cursors[type_id] = 0
 
 		for slot := int(type_desc.slot_count) - 1; slot >= 0; slot -= 1 {
-			// SWEEP: Reclaim completed but undispatched I/O buffers before wiping metadata
-			if soa_meta[slot].io_completion_tag != IO_TAG_NONE {
-				if soa_meta[slot].io_buffer_index != BUFFER_INDEX_NONE {
-					reactor_buffer_pool_free(
-						&shard.reactor.buffer_pool,
-						soa_meta[slot].io_buffer_index,
-					)
-				}
+			// SWEEP: Reclaim completed but undispatched I/O buffers before wiping
+			// metadata. The IO_Completion_Ready flag is the authoritative discriminator
+			// — io_operation_kind is now set at submission time too
+			// (ADR §5.3), so checking the tag alone would free in-flight slots whose
+			// pool memory the kernel is still using.
+			if .IO_Completion_Ready in soa_meta[slot].flags &&
+			   soa_meta[slot].io_slot_index != IO_SLOT_INDEX_NONE {
+				_io_slot_return_to_pool(
+					&shard.reactor,
+					io_operation_pool_affinity(soa_meta[slot].io_operation_kind),
+					soa_meta[slot].io_slot_index,
+				)
 			}
 
 			new_generation := (soa_meta[slot].generation + 1) & 0x0FFFFFFF
@@ -1918,8 +2042,9 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			soa_meta[slot].inbox_tail = POOL_NONE_INDEX
 			soa_meta[slot].pending_correlation = 0
 			soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
-			soa_meta[slot].io_completion_tag = IO_TAG_NONE
+			soa_meta[slot].io_operation_kind = .None
 			soa_meta[slot].working_arena_offset = 0
+			soa_meta[slot].staging_slot_index = IO_SLOT_INDEX_NONE
 			soa_meta[slot].flags = {}
 
 			// Re-link the intrusive free list!
@@ -2061,12 +2186,17 @@ _alloc_handoff_test_entry :: proc(
 	return ref
 }
 
-@(private = "file")
+@(private = "package")
 _make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
+	return _make_teardown_test_shard_with_slots(t, 1)
+}
+
+@(private = "package")
+_make_teardown_test_shard_with_slots :: proc(t: ^testing.T, isolate_slot_count: int) -> (^Shard, ^Grand_Arena) {
 	types := [1]IsolateTypeDescriptor {
 		{
 			id                      = 0,
-			slot_count              = 1,
+			slot_count              = isolate_slot_count,
 			stride                  = 8,
 			soa_metadata_size       = size_of(Isolate_Metadata),
 			working_memory_size     = 0,
@@ -2090,6 +2220,8 @@ _make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
 		reactor_buffer_slot_size   = 1024,
 		transfer_slot_count        = 4,
 		transfer_slot_size         = 1024,
+		staging_slot_count         = 2,
+		staging_slot_size          = 1024,
 		fd_table_slot_count        = 8,
 		fd_entry_size              = size_of(FD_Entry),
 		timer_entry_count          = 16,
@@ -2138,14 +2270,14 @@ test_io_awaiting_count_tracks_slot_state_transitions :: proc(t: ^testing.T) {
 	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
-	_slot_set_io_completion_ready(shard, 0, 0, IO_TAG_RECV_COMPLETE, 8, 3)
+	_slot_set_io_completion_ready(shard, 0, 0, .Recv_Complete, 8, 3)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
 
 	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
-	_slot_set_io_submit_failure(shard, 0, 0, IO_TAG_RECV_COMPLETE, i32(IO_ERR_RESOURCE_EXHAUSTED))
+	_slot_set_io_submit_failure(shard, 0, 0, .Recv_Complete, i32(IO_ERR_RESOURCE_EXHAUSTED))
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
 
@@ -2155,6 +2287,18 @@ test_io_awaiting_count_tracks_slot_state_transitions :: proc(t: ^testing.T) {
 	_slot_set_waiting_for_reply(shard, 0, 0, 7)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Wait_Reply)
+
+	// Pending_IO_Reuse: transitioning from Wait_Io to Pending_IO_Reuse
+	// should NOT decrement the counter — the slot is still I/O-blocked.
+	_slot_set_state(shard, 0, 0, .Wait_Io)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
+
+	_slot_set_state(shard, 0, 0, .Pending_IO_Reuse)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
+
+	// Resolving Pending_IO_Reuse → Unallocated MUST decrement.
+	_slot_set_state(shard, 0, 0, .Unallocated)
+	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 }
 
 @(test)
@@ -2294,10 +2438,12 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 	testing.expect_value(t, shard.counters.handoff_control_send_failures, u64(1))
 
 	when TINA_SIMULATION_MODE {
-		target_shard := Shard {id = 0}
+		target_shard := new(Shard)
+		defer free(target_shard)
+		target_shard.id = 0
 		target_shard.sim_state.network = shard.sim_state.network
 		target_shard.sim_state.fault_config = shard.sim_state.fault_config
-		sim_network_drain(shard.sim_state.network, &target_shard, shard.id, 0)
+		sim_network_drain(shard.sim_state.network, target_shard, shard.id, 0)
 	} else {
 		outbound_ring := shard.outbound_rings[0]
 		spsc_ring_flush_producer(outbound_ring)

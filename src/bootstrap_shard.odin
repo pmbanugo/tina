@@ -251,8 +251,12 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		// in the free pool. A mismatch means a buffer leaked — either the
 		// io_sequence stale-path failed to free it, or teardown step 2b missed one.
 		assert(
-			shard.reactor.buffer_pool.free_count == shard.reactor.buffer_pool.slot_count,
+			shard.reactor.receive_pool.free_count == shard.reactor.receive_pool.slot_count,
 			"Reactor buffer pool leak: not all buffers reclaimed after shutdown drain",
+		)
+		assert(
+			shard.reactor.staging_pool.free_count == shard.reactor.staging_pool.slot_count,
+			"I/O Staging pool leak: not all staging slots reclaimed after shutdown drain",
 		)
 	}
 

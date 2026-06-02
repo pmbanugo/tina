@@ -27,9 +27,28 @@ Isolate_Invocation :: struct {
 	type_id:                u16,
 	slot_index:             u32,
 	shard_id:               Shard_Id,
-	staged_call_active:     bool,
-	staged_io_active:       bool,
-	reply_sent:             bool,
+	staged_call_active:        bool,
+	staged_io_active:          bool,
+	reply_sent:                bool,
+	staged_io_data_source:     IO_Data_Source, // Where write data comes from
+	staged_io_payload_offset:  u16,            // Offset within Isolate struct
+	staged_io_payload_size:    u32,            // Byte count of payload
+}
+
+// Read the active staging claim slot index. Returns IO_SLOT_INDEX_NONE if
+// no claim is active. The single source of truth is the metadata field;
+// the accessor exists to give the read a single canonical name and to make
+// the indirection searchable.
+@(require_results)
+_staging_claim_read :: #force_inline proc(ctx: TinaContext) -> IO_Slot_Index {
+	inv := ctx_invocation(ctx)
+	return inv.shard.metadata[inv.type_id][inv.slot_index].staging_slot_index
+}
+
+// Set or clear the active staging claim. Pass IO_SLOT_INDEX_NONE to clear.
+_staging_claim_write :: #force_inline proc(ctx: TinaContext, value: IO_Slot_Index) {
+	inv := ctx_invocation(ctx)
+	inv.shard.metadata[inv.type_id][inv.slot_index].staging_slot_index = value
 }
 
 @(thread_local)
@@ -518,7 +537,7 @@ ctx_working_arena_bytes :: #force_inline proc(ctx: TinaContext) -> []u8 {
 @(require_results)
 ctx_transfer_alloc :: #force_inline proc(ctx: TinaContext) -> Transfer_Alloc_Result {
 	shard := ctx_invocation(ctx).shard
-	index, err := reactor_buffer_pool_alloc(&shard.transfer_pool)
+	index, err := io_slot_pool_alloc(&shard.transfer_pool)
 	if err != .None {
 		shard.counters.transfer_exhaustions += 1
 		return Transfer_Alloc_Error.Pool_Exhausted
@@ -536,7 +555,7 @@ ctx_transfer_write_raw :: #force_inline proc(
 	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
-	if index >= shard.transfer_pool.slot_count || shard.transfer_generations[index] != gen {
+	if u16(index) >= shard.transfer_pool.slot_count || shard.transfer_generations[index] != gen {
 		return .Stale_Handle
 	}
 
@@ -544,7 +563,7 @@ ctx_transfer_write_raw :: #force_inline proc(
 		return .Bounds_Violation
 	}
 
-	reactor_buffer_pool_write_bytes(&shard.transfer_pool, index, data)
+	io_slot_pool_write_bytes(&shard.transfer_pool, index, data)
 	return .None
 }
 
@@ -574,7 +593,7 @@ ctx_transfer_read :: #force_inline proc(
 	index := transfer_handle_index(handle)
 	gen := transfer_handle_generation(handle)
 
-	if index >= shard.transfer_pool.slot_count || shard.transfer_generations[index] != gen {
+	if u16(index) >= shard.transfer_pool.slot_count || shard.transfer_generations[index] != gen {
 		shard.counters.transfer_stale_reads += 1
 		return Transfer_Read_Error.Stale_Handle
 	}
@@ -591,7 +610,7 @@ ctx_transfer_read :: #force_inline proc(
 	}
 	shard.metadata[type_id][slot].pending_transfer_read = handle
 
-	return reactor_buffer_pool_write_slice(&shard.transfer_pool, index)
+	return io_slot_pool_write_slice(&shard.transfer_pool, index)
 }
 
 // Stages one asynchronous I/O submission. The scheduler commits it only if the
@@ -603,12 +622,201 @@ ctx_submit_io :: #force_inline proc(ctx: TinaContext, operation: IoOp) -> Io_Sub
 		return .already_staged
 	}
 	invocation.staged_io_operation = operation
+	invocation.staged_io_data_source = .None
 	invocation.staged_io_active = true
 	return .ok
 }
 
 ctx_staged_io_operation :: #force_inline proc(ctx: TinaContext) -> IoOp {
 	return ctx_invocation(ctx).staged_io_operation
+}
+
+ctx_staged_io_payload_size :: #force_inline proc(ctx: TinaContext) -> u32 {
+	return ctx_invocation(ctx).staged_io_payload_size
+}
+
+ctx_staged_io_payload_offset :: #force_inline proc(ctx: TinaContext) -> u16 {
+	return ctx_invocation(ctx).staged_io_payload_offset
+}
+
+// Computes the byte offset of a data slice within an Isolate struct, with bounds validation.
+payload_offset_of :: #force_inline proc(self: ^$T, data: []u8) -> u16 {
+	base := uintptr(self)
+	data_start := uintptr(raw_data(data))
+	offset := data_start - base
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(data_start >= base, "data must point within Isolate struct")
+		assert(offset + uintptr(len(data)) <= uintptr(size_of(T)), "data must not exceed Isolate struct bounds")
+	}
+	return u16(offset)
+}
+
+// Zero-copy send from Isolate struct. A previously-claimed staging slot must
+// be committed via ctx_io_send_staged or released first — otherwise the
+// struct-source path returns .already_staged so the handler cannot accidentally
+// leak the staging claim into a different I/O.
+@(require_results)
+ctx_io_send :: #force_inline proc(
+	ctx: TinaContext,
+	self: ^$Isolate,
+	fd: FD_Handle,
+	data: []u8,
+) -> Io_Submit_Result {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active || _staging_claim_read(ctx) != IO_SLOT_INDEX_NONE {
+		return .already_staged
+	}
+	//if _staging_claim_read(ctx) != IO_SLOT_INDEX_NONE {
+		//return .already_staged
+	//}
+	invocation.staged_io_operation = IoOp_Send{fd = fd}
+	invocation.staged_io_data_source = .Isolate_Struct
+	invocation.staged_io_payload_offset = payload_offset_of(self, data)
+	invocation.staged_io_payload_size = u32(len(data))
+	invocation.staged_io_active = true
+	return .ok
+}
+
+// Zero-copy write from Isolate struct (file I/O). A previously-claimed
+// staging slot must be committed via ctx_io_send_staged first.
+@(require_results)
+ctx_io_write :: #force_inline proc(
+	ctx: TinaContext,
+	self: ^$Isolate,
+	fd: FD_Handle,
+	data: []u8,
+	offset: u64 = 0,
+) -> Io_Submit_Result {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active || _staging_claim_read(ctx) != IO_SLOT_INDEX_NONE {
+		return .already_staged
+	}
+	invocation.staged_io_operation = IoOp_Write{fd = fd, offset = offset}
+	invocation.staged_io_data_source = .Isolate_Struct
+	invocation.staged_io_payload_offset = payload_offset_of(self, data)
+	invocation.staged_io_payload_size = u32(len(data))
+	invocation.staged_io_active = true
+	return .ok
+}
+
+// Zero-copy sendto from Isolate struct. A previously-claimed staging slot
+// must be committed via ctx_io_send_staged first.
+@(require_results)
+ctx_io_sendto :: #force_inline proc(
+	ctx: TinaContext,
+	self: ^$Isolate,
+	fd: FD_Handle,
+	data: []u8,
+	address: Socket_Address,
+) -> Io_Submit_Result {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active {
+		return .already_staged
+	}
+	if _staging_claim_read(ctx) != IO_SLOT_INDEX_NONE {
+		return .already_staged
+	}
+	invocation.staged_io_operation = IoOp_Sendto{fd = fd, address = address}
+	invocation.staged_io_data_source = .Isolate_Struct
+	invocation.staged_io_payload_offset = payload_offset_of(self, data)
+	invocation.staged_io_payload_size = u32(len(data))
+	invocation.staged_io_active = true
+	return .ok
+}
+
+// Returns a writable slice from the I/O staging pool.
+// Returns nil if the staging pool is exhausted.
+// At most one staging slot can be claimed per handler invocation.
+@(require_results)
+ctx_claim_send_slot :: #force_inline proc(ctx: TinaContext) -> []u8 {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if _staging_claim_read(ctx) != IO_SLOT_INDEX_NONE {
+		return nil // Already claimed
+	}
+	shard := invocation.shard
+	index, err := io_slot_pool_alloc(&shard.reactor.staging_pool)
+	if err != .None {
+		shard.counters.io_staging_exhaustions += 1
+		return nil
+	}
+	_staging_claim_write(ctx, index)
+	return io_slot_pool_write_slice(&shard.reactor.staging_pool, index)
+}
+
+// Zero-copy send from staging slot
+@(require_results)
+ctx_io_send_staged :: #force_inline proc(
+	ctx: TinaContext,
+	fd: FD_Handle,
+	size: u32,
+) -> Io_Submit_Result {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active {
+		return .already_staged
+	}
+	if _staging_claim_read(ctx) == IO_SLOT_INDEX_NONE {
+		return .no_staging_slot
+	}
+	if size > invocation.shard.reactor.staging_pool.slot_size {
+		return .payload_too_large
+	}
+	invocation.staged_io_operation = IoOp_Send{fd = fd}
+	invocation.staged_io_data_source = .Staging_Slot
+	invocation.staged_io_payload_size = size
+	invocation.staged_io_active = true
+	return .ok
+}
+
+// Zero-copy write (file I/O) from a previously-claimed staging slot.
+// Size of the write must be <= staging_slot_size of the system.
+@(require_results)
+ctx_io_write_staged :: #force_inline proc(
+	ctx: TinaContext,
+	fd: FD_Handle,
+	size: u32,
+	offset: u64 = 0,
+) -> Io_Submit_Result {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active {
+		return .already_staged
+	}
+	if _staging_claim_read(ctx) == IO_SLOT_INDEX_NONE {
+		return .no_staging_slot
+	}
+	if size > invocation.shard.reactor.staging_pool.slot_size {
+		return .payload_too_large
+	}
+	invocation.staged_io_operation = IoOp_Write{fd = fd, offset = offset}
+	invocation.staged_io_data_source = .Staging_Slot
+	invocation.staged_io_payload_size = size
+	invocation.staged_io_active = true
+	return .ok
+}
+
+// Zero-copy sendto (UDP / connected datagram) from a previously-claimed
+// staging slot.
+@(require_results)
+ctx_io_sendto_staged :: #force_inline proc(
+	ctx: TinaContext,
+	fd: FD_Handle,
+	size: u32,
+	address: Socket_Address,
+) -> Io_Submit_Result {
+	invocation := ctx_invocation_require_self_handle(ctx)
+	if invocation.staged_call_active || invocation.staged_io_active {
+		return .already_staged
+	}
+	if _staging_claim_read(ctx) == IO_SLOT_INDEX_NONE {
+		return .no_staging_slot
+	}
+	if size > invocation.shard.reactor.staging_pool.slot_size {
+		return .payload_too_large
+	}
+	invocation.staged_io_operation = IoOp_Sendto{fd = fd, address = address}
+	invocation.staged_io_data_source = .Staging_Slot
+	invocation.staged_io_payload_size = size
+	invocation.staged_io_active = true
+	return .ok
 }
 
 // ============================================================================
@@ -718,10 +926,10 @@ ctx_close_fd :: #force_inline proc(ctx: TinaContext, fd: FD_Handle) -> Backend_E
 	return reactor_control_close(&invocation.shard.reactor, fd, invocation.self_handle)
 }
 
-ctx_read_buffer :: #force_inline proc(ctx: TinaContext, buffer_index: u16, size: u32) -> []u8 {
+ctx_read_io_slot :: #force_inline proc(ctx: TinaContext, slot_index: IO_Slot_Index, size: u32) -> []u8 {
 	shard := ctx_invocation(ctx).shard
 	if size <= 0 do return nil
-	return reactor_buffer_pool_read_slice(&shard.reactor.buffer_pool, buffer_index, size)
+	return io_slot_pool_read_slice(&shard.reactor.receive_pool, slot_index, size)
 }
 
 ctx_is_shutting_down :: #force_inline proc(ctx: TinaContext) -> bool {
@@ -768,8 +976,8 @@ ctx_getsockopt :: #force_inline proc(
 }
 
 @(private = "package")
-_transfer_pool_free :: #force_inline proc(shard: ^Shard, index: u16) {
-	reactor_buffer_pool_free(&shard.transfer_pool, index)
+_transfer_pool_free :: #force_inline proc(shard: ^Shard, index: IO_Slot_Index) {
+	io_slot_pool_free(&shard.transfer_pool, index)
 	shard.transfer_generations[index] += 1
 	if shard.transfer_generations[index] == 0 do shard.transfer_generations[index] = 1
 }

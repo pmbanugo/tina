@@ -39,7 +39,7 @@ Message :: struct {
 			peer_address: Peer_Address, // 28 bytes — peer address from accept/recvfrom
 			fd:           FD_Handle, // 4 bytes — which FD completed (or new client FD for accept)
 			result:       i32, // 4 bytes — bytes transferred or negative error
-			buffer_index: u16, // 2 bytes — reactor buffer pool index
+			buffer_index: IO_Slot_Index, // 2 bytes — reactor buffer pool index
 		},
 	},
 	tag:         Message_Tag,

@@ -5,6 +5,8 @@ when TINA_SIMULATION_MODE {
 		pool_slot_count:           int,
 		reactor_buffer_slot_count: int,
 		reactor_buffer_slot_size:  int,
+		staging_slot_count:        int,
+		staging_slot_size:         int,
 		transfer_slot_count:       int,
 		transfer_slot_size:        int,
 		fd_handoff_entry_count:    int,
@@ -21,6 +23,8 @@ when TINA_SIMULATION_MODE {
 		pool_slot_count = 256,
 		reactor_buffer_slot_count = 4,
 		reactor_buffer_slot_size = 1024,
+		staging_slot_count = 2,
+		staging_slot_size = 1024,
 		transfer_slot_count = 4,
 		transfer_slot_size = 1024,
 		fd_handoff_entry_count = 0,
@@ -67,6 +71,8 @@ when TINA_SIMULATION_MODE {
 		if options.pool_slot_count != 0 do opts.pool_slot_count = options.pool_slot_count
 		if options.reactor_buffer_slot_count != 0 do opts.reactor_buffer_slot_count = options.reactor_buffer_slot_count
 		if options.reactor_buffer_slot_size != 0 do opts.reactor_buffer_slot_size = options.reactor_buffer_slot_size
+		if options.staging_slot_count != 0 do opts.staging_slot_count = options.staging_slot_count
+		if options.staging_slot_size != 0 do opts.staging_slot_size = options.staging_slot_size
 		if options.transfer_slot_count != 0 do opts.transfer_slot_count = options.transfer_slot_count
 		if options.transfer_slot_size != 0 do opts.transfer_slot_size = options.transfer_slot_size
 		opts.fd_handoff_entry_count = options.fd_handoff_entry_count
@@ -86,6 +92,8 @@ when TINA_SIMULATION_MODE {
 			pool_slot_count = opts.pool_slot_count,
 			reactor_buffer_slot_count = opts.reactor_buffer_slot_count,
 			reactor_buffer_slot_size = opts.reactor_buffer_slot_size,
+			staging_slot_count = opts.staging_slot_count,
+			staging_slot_size = opts.staging_slot_size,
 			transfer_slot_count = opts.transfer_slot_count,
 			transfer_slot_size = opts.transfer_slot_size,
 			fd_handoff_entry_count = opts.fd_handoff_entry_count,

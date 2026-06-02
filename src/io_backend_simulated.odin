@@ -17,11 +17,18 @@ when TINA_SIMULATION_MODE {
 	MAX_SIMULATED_PENDING :: 1024
 	MAX_SIMULATED_DESCRIPTORS :: 4096
 	MAX_SIMULATED_OBJECTS :: 4096
+	// The completed ring buffers matured operations between Phase 1 (generation)
+	// and Phase 2 (drain to caller). Sized to 2× the drain batch so a single
+	// burst larger than one batch can be absorbed without immediate back-pressure.
+	// Cancel operations also push completions here between drain calls.
+	MAX_SIMULATED_COMPLETED :: REACTOR_COMPLETION_BATCH_COUNT * 2
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_SIMULATED_PENDING)
+	#assert(REACTOR_COMPLETION_BATCH_COUNT <= MAX_SIMULATED_COMPLETED, "completed ring must hold at least one drain batch")
 	SIM_DESCRIPTOR_NONE_INDEX :: u16(0xFFFF)
 	SIM_OBJECT_NONE_INDEX :: u16(0xFFFF)
 	SIM_ERR_BADF :: i32(-9)
 	SIM_ERR_NFILE :: i32(-24)
+	SIM_CANCEL_COMPLETE :: i32(0)
 
 	Sim_FD_Object :: struct {
 		ref_count:                    u16,
@@ -48,6 +55,7 @@ when TINA_SIMULATION_MODE {
 	Simulated_Operation :: struct {
 		token:          Submission_Token,
 		operation:      Submission_Operation,
+		data_size:      u32,
 		submitted_tick: u64,
 		delay_ticks:    u64,
 		descriptor_index: u16,
@@ -70,20 +78,27 @@ when TINA_SIMULATION_MODE {
 	}
 
 	_Platform_State :: struct {
-		pending:       [MAX_SIMULATED_PENDING]Simulated_Operation,
-		pending_count: u16,
-		prng:          Prng, // used only for reordering (order-dependent is OK)
-		seed:          u64, // original seed for per-op deterministic derivation
-		tick_count:    u64,
-		time_controlled: bool,
-		_padding:        [7]u8,
-		config:        Simulation_IO_Config,
-		sim_world:     ^Sim_IO_World, // shared context — set before backend_init
+		pending:           [MAX_SIMULATED_PENDING]Simulated_Operation,
+		pending_count:     u16,
+		completed:         [MAX_SIMULATED_COMPLETED]Raw_Completion,
+		completed_count:   u16,
+		completed_head:    u16,
+		completed_tail:    u16,
+		prng:              Prng, // used only for reordering (order-dependent is OK)
+		seed:              u64, // original seed for per-op deterministic derivation
+		tick_count:        u64,
+		time_controlled:   bool,
+		_padding:          [7]u8,
+		config:            Simulation_IO_Config,
+		sim_world:         ^Sim_IO_World, // shared context — set before backend_init
 	}
 
 	@(private = "package")
 	_backend_init :: proc(backend: ^Platform_Backend, config: Backend_Config) -> Backend_Error {
 		backend.pending_count = 0
+		backend.completed_count = 0
+		backend.completed_head = 0
+		backend.completed_tail = 0
 		backend.tick_count = 0
 		backend.time_controlled = false
 		backend.config = config.sim_config
@@ -162,6 +177,7 @@ when TINA_SIMULATION_MODE {
 			backend.pending[backend.pending_count] = Simulated_Operation {
 				token               = sub.token,
 				operation            = sub.operation,
+				data_size            = sub.data_size,
 				submitted_tick       = backend.tick_count,
 				delay_ticks          = delay,
 				descriptor_index     = descriptor_index,
@@ -184,24 +200,28 @@ when TINA_SIMULATION_MODE {
 		u32,
 		Backend_Error,
 	) {
+		// PHASE 1: Advance time, move ready ops from pending -> completed ring
 		if !backend.time_controlled {
 			backend.tick_count += 1
 		}
-		completed_count: u32 = 0
 
-		// Scan pending for operations whose delay has elapsed
 		i: u16 = 0
 		for i < backend.pending_count {
 			op := &backend.pending[i]
 
 			if backend.tick_count >= op.submitted_tick + op.delay_ticks {
-				if completed_count >= u32(len(completions)) {
-					break // output buffer full
+				// Back-pressure: if the completed ring is full, stop processing
+				// matured ops. They stay in pending and will be retried next tick.
+				// Without this guard the op would be removed from pending with no
+				// completion generated — a silent drop that permanently inflates
+				// io_in_flight_count and strands the Isolate in Wait_Io.
+				if backend.completed_count >= MAX_SIMULATED_COMPLETED {
+					break
 				}
 
-				completion := &completions[completed_count]
-				completion.token = op.token
-				completion.extra = nil
+				completion_ptr := &backend.completed[backend.completed_tail]
+				completion_ptr.token = op.token
+				completion_ptr.extra = nil
 
 				// Fault injection — hash-based derivation with a different phase
 				// to avoid correlation with delay (§6.6.2 §5.4)
@@ -214,18 +234,18 @@ when TINA_SIMULATION_MODE {
 						u64(backend.config.fault_rate.denominator),
 					)
 					if fault_val < threshold {
-						completion.result = _sim_sample_error(backend, op.token)
+						completion_ptr.result = _sim_sample_error(backend, op.token)
 					} else {
-						_sim_generate_success(backend, op, completion)
+						_sim_generate_success(backend, op, completion_ptr)
 					}
 				} else {
-					_sim_generate_success(backend, op, completion)
+					_sim_generate_success(backend, op, completion_ptr)
 				}
 
-				if completion.result >= 0 {
+				if completion_ptr.result >= 0 {
 					if _, ok := op.operation.(Submission_Op_Close); ok {
 						if !_sim_close_descriptor_index(backend, op.descriptor_index) {
-							completion.result = SIM_ERR_BADF
+							completion_ptr.result = SIM_ERR_BADF
 						}
 					}
 				}
@@ -235,9 +255,10 @@ when TINA_SIMULATION_MODE {
 					_sim_unpin_object(backend, op.object_index_second)
 				}
 
-				completed_count += 1
+				backend.completed_tail = (backend.completed_tail + 1) % MAX_SIMULATED_COMPLETED
+				backend.completed_count += 1
 
-				// Remove by swapping with last (order doesn't matter in pending array)
+				// Remove from pending (swap-with-last)
 				backend.pending_count -= 1
 				if i < backend.pending_count {
 					backend.pending[i] = backend.pending[backend.pending_count]
@@ -248,7 +269,16 @@ when TINA_SIMULATION_MODE {
 			}
 		}
 
-		// Optional reordering of completions
+		// PHASE 2: Drain completed ring into caller's buffer
+		completed_count: u32 = 0
+		for completed_count < u32(len(completions)) && backend.completed_count > 0 {
+			completions[completed_count] = backend.completed[backend.completed_head]
+			backend.completed_head = (backend.completed_head + 1) % MAX_SIMULATED_COMPLETED
+			backend.completed_count -= 1
+			completed_count += 1
+		}
+
+		// Optional reordering of completions (on caller's buffer)
 		if backend.config.reorder && completed_count > 1 {
 			for j: u32 = 0; j < completed_count - 1; j += 1 {
 				remaining := completed_count - j
@@ -292,6 +322,17 @@ when TINA_SIMULATION_MODE {
 				backend.pending_count -= 1
 				if i < backend.pending_count {
 					backend.pending[i] = backend.pending[backend.pending_count]
+				}
+				// Push synthetic completion to completed ring
+				if backend.completed_count < MAX_SIMULATED_COMPLETED {
+					backend.completed[backend.completed_tail] = Raw_Completion {
+						token  = token,
+						result = SIM_CANCEL_COMPLETE,
+						extra  = nil,
+						flags  = {.Synthesized},
+					}
+					backend.completed_tail = (backend.completed_tail + 1) % MAX_SIMULATED_COMPLETED
+					backend.completed_count += 1
 				}
 				return .None
 			}
@@ -472,6 +513,19 @@ when TINA_SIMULATION_MODE {
 	@(private = "package")
 	_backend_unregister_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16) {
 		// No-op: SimulatedIO has no kernel fixed-file table.
+	}
+
+	@(private = "package")
+	_backend_recv_uses_provided_buffers :: #force_inline proc "contextless" (backend: ^Platform_Backend) -> bool {
+		return false
+	}
+
+	@(private = "package")
+	_backend_replenish_recv_buffer :: #force_inline proc "contextless" (
+		backend: ^Platform_Backend,
+		buffer_index: IO_Slot_Index,
+	) {
+		// No provided buffer ring in simulation — receive pool free-list manages slots.
 	}
 
 	// --- Internal Helpers ---
@@ -769,9 +823,9 @@ when TINA_SIMULATION_MODE {
 	) {
 		switch _ in op.operation {
 		case Submission_Op_Read:
-			completion.result = i32(min(op.operation.(Submission_Op_Read).size, 128))
+			completion.result = i32(min(op.data_size, 128))
 		case Submission_Op_Write:
-			completion.result = i32(op.operation.(Submission_Op_Write).size)
+			completion.result = i32(op.data_size)
 		case Submission_Op_Accept:
 			object_index, object_ok := _sim_alloc_object(backend)
 			if !object_ok {
@@ -796,13 +850,13 @@ when TINA_SIMULATION_MODE {
 		case Submission_Op_Close:
 			completion.result = 0
 		case Submission_Op_Send:
-			completion.result = i32(op.operation.(Submission_Op_Send).size)
+			completion.result = i32(op.data_size)
 		case Submission_Op_Recv:
-			completion.result = i32(min(op.operation.(Submission_Op_Recv).size, 128))
+			completion.result = i32(min(op.data_size, 128))
 		case Submission_Op_Sendto:
-			completion.result = i32(op.operation.(Submission_Op_Sendto).size)
+			completion.result = i32(op.data_size)
 		case Submission_Op_Recvfrom:
-			completion.result = i32(min(op.operation.(Submission_Op_Recvfrom).size, 128))
+			completion.result = i32(min(op.data_size, 128))
 			completion.extra = Completion_Extra_Recvfrom {
 				peer_address = Socket_Address_Inet4{address = {10, 0, 0, 1}, port = 5000},
 			}
@@ -888,7 +942,7 @@ when TINA_SIMULATION_MODE {
 		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, sock_err, Backend_Error.None)
 
-		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, 3)
+		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, IO_Operation_Kind(3))
 		submissions := [1]Submission {
 			{
 				token = token,
@@ -929,9 +983,9 @@ when TINA_SIMULATION_MODE {
 		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, sock_err, Backend_Error.None)
 
-		token := submission_token_pack(1, 5, 0, 0, BUFFER_INDEX_NONE, 1)
+		token := submission_token_pack(1, 5, 0, 0, IO_SLOT_INDEX_NONE, IO_Operation_Kind(1))
 		submissions := [1]Submission {
-			{token = token, operation = Submission_Op_Recv{fd_socket = fd, size = 4096}},
+			{token = token, data_size = 4096, operation = Submission_Op_Recv{fd_socket = fd}},
 		}
 		backend_submit(&backend, submissions[:])
 		testing.expect_value(t, backend.pending_count, 1)
@@ -995,8 +1049,9 @@ when TINA_SIMULATION_MODE {
 			submissions: [4]Submission
 			for i in 0 ..< 4 {
 				submissions[i] = Submission {
-					token = submission_token_pack(0, u32(i), 0, 0, BUFFER_INDEX_NONE, 7),
-					operation = Submission_Op_Recv{fd_socket = fds[i], size = 1024},
+					token = submission_token_pack(0, u32(i), 0, 0, IO_SLOT_INDEX_NONE, IO_Operation_Kind(7)),
+					data_size = 1024,
+					operation = Submission_Op_Recv{fd_socket = fds[i]},
 				}
 			}
 			backend_submit(&backend, submissions[:])
@@ -1046,13 +1101,13 @@ when TINA_SIMULATION_MODE {
 
 		backend_set_current_tick(&backend, 7)
 
-		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, 5)
+		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, IO_Operation_Kind(5))
 		submissions := [1]Submission {
 			{
 				token = token,
+				data_size = 256,
 				operation = Submission_Op_Recv {
 					fd_socket = fd,
-					size      = 256,
 				},
 			},
 		}
@@ -1102,9 +1157,9 @@ when TINA_SIMULATION_MODE {
 		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, sock_err, Backend_Error.None)
 
-		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE))
+		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Recv_Complete)
 		submissions := [1]Submission {
-			{token = token, operation = Submission_Op_Recv{fd_socket = fd, size = 1024}},
+			{token = token, data_size = 1024, operation = Submission_Op_Recv{fd_socket = fd}},
 		}
 		backend_submit(&backend, submissions[:])
 
@@ -1196,9 +1251,9 @@ when TINA_SIMULATION_MODE {
 		dup_fd, dup_err := backend_control_dup(&backend, fd)
 		testing.expect_value(t, dup_err, Backend_Error.None)
 
-		token := submission_token_pack(2, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_RECV_COMPLETE))
+		token := submission_token_pack(2, 0, 0, 0, IO_SLOT_INDEX_NONE, .Recv_Complete)
 		submissions := [1]Submission {
-			{token = token, operation = Submission_Op_Recv{fd_socket = fd, size = 256}},
+			{token = token, data_size = 256, operation = Submission_Op_Recv{fd_socket = fd}},
 		}
 		sub_err := backend_submit(&backend, submissions[:])
 		testing.expect_value(t, sub_err, Backend_Error.None)
@@ -1237,7 +1292,7 @@ when TINA_SIMULATION_MODE {
 		listen_fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, sock_err, Backend_Error.None)
 
-		token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, u8(IO_TAG_ACCEPT_COMPLETE))
+		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Accept_Complete)
 		submissions := [1]Submission {
 			{token = token, operation = Submission_Op_Accept{listen_fd = listen_fd}},
 		}

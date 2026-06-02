@@ -84,7 +84,10 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -
 	soa_meta[slot].inbox_head = POOL_NONE_INDEX
 	soa_meta[slot].inbox_tail = POOL_NONE_INDEX
 	soa_meta[slot].inbox_count = 0
-	soa_meta[slot].io_completion_tag = IO_TAG_NONE
+	soa_meta[slot].io_operation_kind = .None
+	soa_meta[slot].io_slot_index = IO_SLOT_INDEX_NONE
+	soa_meta[slot].staging_slot_index = IO_SLOT_INDEX_NONE
+	soa_meta[slot].flags -= ISOLATE_FLAGS_CLEARED_ON_ALLOC
 
 	isolate_pointer := _get_isolate_ptr(shard, type_id, slot)
 	stride := shard.type_descriptors[type_id].stride
@@ -209,15 +212,27 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	soa_meta[slot_index].working_arena_offset = 0
 
 	// Step 2b: Reclaim pending I/O and Transfer buffers
-	if soa_meta[slot_index].io_completion_tag != IO_TAG_NONE {
-		if soa_meta[slot_index].io_buffer_index != BUFFER_INDEX_NONE {
-			reactor_buffer_pool_free(
-				&shard.reactor.buffer_pool,
-				soa_meta[slot_index].io_buffer_index,
+	has_io_tag := soa_meta[slot_index].io_operation_kind != .None
+	is_io_completion_ready := .IO_Completion_Ready in soa_meta[slot_index].flags
+
+	if has_io_tag {
+		// Completed-but-undispatched slots are owned by the scheduler and can be
+		// reclaimed here. In-flight slots are reclaimed by the eventual stale
+		// completion, because the token still carries the slot index.
+		if is_io_completion_ready && soa_meta[slot_index].io_slot_index != IO_SLOT_INDEX_NONE {
+			_io_slot_return_to_pool(
+				&shard.reactor,
+				io_operation_pool_affinity(soa_meta[slot_index].io_operation_kind),
+				soa_meta[slot_index].io_slot_index,
 			)
+			soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 		}
-		soa_meta[slot_index].io_completion_tag = IO_TAG_NONE
-		soa_meta[slot_index].io_buffer_index = BUFFER_INDEX_NONE
+		// Don't clear io_operation_kind yet if in-flight —
+		// needed for deferred reuse check below (§5.3)
+		if is_io_completion_ready {
+			soa_meta[slot_index].io_operation_kind = .None
+			soa_meta[slot_index].flags -= {.IO_Completion_Ready}
+		}
 	}
 	if soa_meta[slot_index].pending_transfer_read != TRANSFER_HANDLE_NONE {
 		transfer_index := transfer_handle_index(soa_meta[slot_index].pending_transfer_read)
@@ -225,54 +240,106 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 		soa_meta[slot_index].pending_transfer_read = TRANSFER_HANDLE_NONE
 	}
 
+	// Reclaim a claimed-but-uncommitted staging slot (ADR §5.5.3 — every exit
+	// path through the handler lifecycle must free the slot). If the slot has
+	// already been moved to the in-flight I/O via ctx_io_send_staged, the
+	// commit path cleared this field; io_slot_index carries the slot until
+	// the eventual completion reclaims it.
+	if soa_meta[slot_index].staging_slot_index != IO_SLOT_INDEX_NONE {
+		io_slot_pool_free(&shard.reactor.staging_pool, soa_meta[slot_index].staging_slot_index)
+		soa_meta[slot_index].staging_slot_index = IO_SLOT_INDEX_NONE
+	}
+
 	// Step 2c: FD Table Cleanup
 	handle_to_match := make_handle(shard.id, type_id, slot_index, old_generation)
 	in_flight_fd := soa_meta[slot_index].io_fd
-	is_waiting_for_io := soa_meta[slot_index].state == .Wait_Io
 
-	for i in 0 ..< shard.reactor.fd_table.slot_count {
-		entry := &shard.reactor.fd_table.entries[i]
-		if entry.reader_isolate == HANDLE_NONE && entry.writer_isolate == HANDLE_NONE {
-			continue
-		}
-		if entry.reader_isolate == handle_to_match || entry.writer_isolate == handle_to_match {
-			fd_h := fd_handle_make(u16(i), entry.generation)
+		for i in 0 ..< shard.reactor.fd_table.slot_count {
+			entry := &shard.reactor.fd_table.entries[i]
+			if entry.reader_isolate == HANDLE_NONE && entry.writer_isolate == HANDLE_NONE {
+				continue
+			}
+			if entry.reader_isolate == handle_to_match || entry.writer_isolate == handle_to_match {
+				fd_h := fd_handle_make(u16(i), entry.generation)
 
-			if is_waiting_for_io && fd_h == in_flight_fd {
-				fd_table_mark_close_on_completion(&shard.reactor.fd_table, fd_h)
-			} else {
-				reactor_internal_close_fd(&shard.reactor, fd_h)
+				if has_io_tag && !is_io_completion_ready && fd_h == in_flight_fd {
+					io_token := submission_token_pack(
+						u8(type_id),
+						slot_index,
+						u8(old_generation),
+						soa_meta[slot_index].io_sequence,
+						soa_meta[slot_index].io_slot_index,
+						soa_meta[slot_index].io_operation_kind,
+					)
+					// On kqueue, backend_cancel synthesizes a .Synthesized
+					// completion into backend.completed. On Linux/Windows
+					// the kernel delivers an equivalent cancellation
+					// completion (e.g. -ECANCELED CQE). Either way, the
+					// next reactor_collect_completions reclaims the
+					// buffer via the .Synthesized / stale / slot-gone
+					// branches in io_reactor.odin.
+					backend_cancel(&shard.reactor.backend, io_token)
+
+					if io_operation_pool_affinity(soa_meta[slot_index].io_operation_kind) == .Receive {
+						reactor_internal_close_fd(&shard.reactor, fd_h)
+					} else {
+						fd_table_mark_close_on_completion(&shard.reactor.fd_table, fd_h)
+					}
+				} else {
+					reactor_internal_close_fd(&shard.reactor, fd_h)
+				}
 			}
 		}
-	}
-
-	// Step 3: Drain mailbox
-	curr := soa_meta[slot_index].inbox_head
-	for curr != POOL_NONE_INDEX {
-		envelope := pool_get_ptr_unchecked(&shard.message_pool, curr)
-		next := envelope.next_in_mailbox
-
-		if envelope.tag == TAG_TRANSFER && envelope.payload_size >= size_of(Transfer_Handle) {
-			t_handle := (cast(^Transfer_Handle)&envelope.payload[0])^
-			index := transfer_handle_index(t_handle)
-			generation := transfer_handle_generation(t_handle)
-
-			if index < shard.transfer_pool.slot_count &&
-			   shard.transfer_generations[index] == generation {
-				_transfer_pool_free(shard, index)
-			}
-		}
-
-		pool_free_unchecked(&shard.message_pool, curr)
-		curr = next
-	}
-	soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
-	soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
-	soa_meta[slot_index].inbox_count = 0
 
 	// Extract supervision metadata BEFORE freeing the slot
 	group_id := soa_meta[slot_index].group_id
 	old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
+
+	// Step 2d: Deferred slot reuse for zero-copy writes (§5.3)
+	// If the Isolate has in-flight write I/O, defer slot reuse until the
+	// stale completion arrives — the kernel may still be reading from struct memory.
+	if has_io_tag && !is_io_completion_ready {
+		existing_op_kind := soa_meta[slot_index].io_operation_kind
+
+		// Struct-source writes are the only in-flight category whose buffer is the
+		// Isolate slot itself — the kernel reads directly from struct memory until
+		// the stale completion arrives, so slot reuse must be deferred (ADR §5.3).
+		// Pool affinity .Staging selects writes (send/write/sendto); io_slot_index
+		// == NONE then distinguishes a struct source (no pool slot) from a
+		// staging-slot write (pool slot present, reactor-owned). Reads write INTO
+		// the receive pool; non-data ops (accept/connect/close/sendfile) move
+		// nothing — neither touches struct memory, so both are safe to reuse now.
+		is_struct_source_write :=
+			io_operation_pool_affinity(existing_op_kind) == .Staging &&
+			soa_meta[slot_index].io_slot_index == IO_SLOT_INDEX_NONE
+
+		if is_struct_source_write {
+			_slot_track_io_awaiting_transition(shard, soa_meta[slot_index].state, .Pending_IO_Reuse)
+			soa_meta[slot_index].state = .Pending_IO_Reuse
+			_dispatchable_refresh_slot(shard, type_id, slot_index)
+
+			// Still drain mailbox and invoke supervision, but skip free list push
+			_drain_mailbox(shard, soa_meta, slot_index)
+
+			if group_id != SUPERVISION_GROUP_ID_NONE {
+				_on_child_exit(shard, group_id, old_handle, exit_kind)
+			}
+			return // Skip free list push — slot stays reserved until stale write completion
+		}
+		// No deferred reuse needed for these in-flight categories:
+		//   1. Reads (recv/read/recvfrom)       — kernel writes INTO the receive
+		//      pool, never the Isolate struct.
+		//   2. Staging-slot writes (claim API)  — kernel reads from reactor-owned
+		//      pool memory, freed via the token on stale completion.
+		//   3. Non-data ops (accept/connect/close/sendfile) — no data movement.
+		// In all three, the Isolate struct is never read by the kernel, so the
+		// slot is safe to reuse immediately.
+		soa_meta[slot_index].io_operation_kind = .None
+		soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
+	}
+
+	// Step 3: Drain mailbox
+	_drain_mailbox(shard, soa_meta, slot_index)
 
 	// Step 4: Free arena slot & push back to free list
 	_slot_track_io_awaiting_transition(shard, soa_meta[slot_index].state, .Unallocated)
@@ -285,6 +352,33 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	if group_id != SUPERVISION_GROUP_ID_NONE {
 		_on_child_exit(shard, group_id, old_handle, exit_kind)
 	}
+}
+
+// Drain all messages from an Isolate's mailbox, freeing transfer buffers.
+@(private = "file")
+_drain_mailbox :: proc(shard: ^Shard, soa_meta: #soa[]Isolate_Metadata, slot_index: u32) {
+	current := soa_meta[slot_index].inbox_head
+	for current != POOL_NONE_INDEX {
+		envelope := pool_get_ptr_unchecked(&shard.message_pool, current)
+		next := envelope.next_in_mailbox
+
+		if envelope.tag == TAG_TRANSFER && envelope.payload_size >= size_of(Transfer_Handle) {
+			transfer_handle := (cast(^Transfer_Handle)&envelope.payload[0])^
+			index := transfer_handle_index(transfer_handle)
+			generation := transfer_handle_generation(transfer_handle)
+
+			if u16(index) < shard.transfer_pool.slot_count &&
+			   shard.transfer_generations[index] == generation {
+				_transfer_pool_free(shard, index)
+			}
+		}
+
+		pool_free_unchecked(&shard.message_pool, current)
+		current = next
+	}
+	soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
+	soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
+	soa_meta[slot_index].inbox_count = 0
 }
 
 @(private = "package")

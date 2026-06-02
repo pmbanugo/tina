@@ -361,6 +361,10 @@ HTTP_DEV_TRANSFER_SLOT_SIZE :: 4096
 @(private = "package")
 HTTP_DEV_REACTOR_BUFFER_SLOT_SIZE :: 16384
 @(private = "package")
+HTTP_DEV_STAGING_SLOT_COUNT :: 4
+@(private = "package")
+HTTP_DEV_STAGING_SLOT_SIZE :: 4096
+@(private = "package")
 HTTP_DEV_SUPERVISION_GROUPS_MAX :: 4
 @(private = "package")
 HTTP_DEV_DEFAULT_RING_SIZE :: 16
@@ -820,6 +824,8 @@ _make_base_system_spec :: proc(
 		pool_slot_count           = pool_slot_count,
 		reactor_buffer_slot_count = reactor_buffer_slot_count,
 		reactor_buffer_slot_size  = HTTP_DEV_REACTOR_BUFFER_SLOT_SIZE,
+		staging_slot_count        = HTTP_DEV_STAGING_SLOT_COUNT,
+		staging_slot_size         = HTTP_DEV_STAGING_SLOT_SIZE,
 		transfer_slot_count       = HTTP_DEV_TRANSFER_SLOT_COUNT,
 		transfer_slot_size        = HTTP_DEV_TRANSFER_SLOT_SIZE,
 		fd_handoff_entry_count    = fd_handoff_entry_count,

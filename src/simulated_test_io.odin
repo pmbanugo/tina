@@ -154,6 +154,8 @@ when TINA_SIMULATION_MODE {
 			pool_slot_count           = 256,
 			reactor_buffer_slot_count = 8,
 			reactor_buffer_slot_size  = 1024,
+			staging_slot_count        = 2,
+			staging_slot_size         = 1024,
 			transfer_slot_count       = 4,
 			transfer_slot_size        = 1024,
 			timer_entry_count         = 256,
@@ -184,7 +186,7 @@ when TINA_SIMULATION_MODE {
 			"Expected at least one stale I/O completion from the timer-wake sequence",
 		)
 
-		pool := &shard.reactor.buffer_pool
+		pool := &shard.reactor.receive_pool
 		testing.expect_value(t, pool.free_count, pool.slot_count)
 		testing.expect_value(t, shard.reactor.io_in_flight_count, u32(0))
 
@@ -227,14 +229,7 @@ when TINA_SIMULATION_MODE {
 		w.send_buf[0] = 0x42
 
 		return transition_to_wait_io_or_crash(
-			ctx_submit_io(
-				ctx,
-				IoOp_Send {
-					fd = w.fd,
-					payload_offset = u16(offset_of(WriteWriterIsolate, send_buf)),
-					payload_size = 32,
-				},
-			),
+			ctx_io_send(ctx, w, w.fd, w.send_buf[:]),
 		)
 	}
 
@@ -299,6 +294,8 @@ when TINA_SIMULATION_MODE {
 			pool_slot_count           = 256,
 			reactor_buffer_slot_count = 8,
 			reactor_buffer_slot_size  = 1024,
+			staging_slot_count        = 2,
+			staging_slot_size         = 1024,
 			transfer_slot_count       = 4,
 			transfer_slot_size        = 1024,
 			timer_entry_count         = 256,
@@ -320,7 +317,7 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		shard := &sim.shards[0]
-		pool := &shard.reactor.buffer_pool
+		pool := &shard.reactor.receive_pool
 		testing.expect_value(t, pool.free_count, pool.slot_count)
 
 		fmt.printfln(
@@ -398,6 +395,8 @@ when TINA_SIMULATION_MODE {
 			pool_slot_count           = 256,
 			reactor_buffer_slot_count = 8,
 			reactor_buffer_slot_size  = 1024,
+			staging_slot_count        = 2,
+			staging_slot_size         = 1024,
 			transfer_slot_count       = 4,
 			transfer_slot_size        = 1024,
 			timer_entry_count         = 256,
@@ -416,16 +415,20 @@ when TINA_SIMULATION_MODE {
 
 		shard := &sim.shards[0]
 
-		buffer_index, buffer_error := reactor_buffer_pool_alloc(&shard.reactor.buffer_pool)
-		testing.expect_value(t, buffer_error, Buffer_Pool_Error.None)
+		buffer_index, buffer_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
+		testing.expect_value(t, buffer_error, IO_Slot_Pool_Error.None)
 
 		soa := shard.metadata[PRIORITY_TYPE_ID]
-		soa[0].io_completion_tag = IO_TAG_RECV_COMPLETE
-		soa[0].io_buffer_index = buffer_index
-		soa[0].io_result = 128
 		soa[0].state = .Runnable
 		soa[0].flags += {.Shutdown_Pending}
-		_dispatchable_refresh_slot(shard, u16(PRIORITY_TYPE_ID), 0)
+		_slot_set_io_completion_ready(
+			shard,
+			u16(PRIORITY_TYPE_ID),
+			0,
+			.Recv_Complete,
+			128,
+			buffer_index,
+		)
 
 		simulator_run(&sim)
 
@@ -434,7 +437,7 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(t, received.received_tags[0], IO_TAG_RECV_COMPLETE)
 		testing.expect_value(t, received.received_tags[1], TAG_SHUTDOWN)
 
-		pool := &shard.reactor.buffer_pool
+		pool := &shard.reactor.receive_pool
 		testing.expect_value(t, pool.free_count, pool.slot_count)
 
 		fmt.printfln(

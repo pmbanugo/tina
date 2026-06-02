@@ -277,12 +277,12 @@ _http_connection_handler :: proc(
 _connection_handle_recv_complete :: proc(
 	connection: ^HTTP_Connection,
 	ctx: tina.TinaContext,
-	buffer_index: u16,
+	buffer_index: tina.IO_Slot_Index,
 	buffer_size: u32,
 ) -> tina.Isolate_Transition {
 	state := &connection.connection_state
 	runtime := state.shard_runtime
-	buffer := tina.ctx_read_buffer(ctx, buffer_index, buffer_size)
+	buffer := tina.ctx_read_io_slot(ctx, buffer_index, buffer_size)
 	if state.state == .Recv_Body_Streamed || state.state == .Recv_Body_Buffered {
 		return _connection_handle_body_recv_complete(connection, buffer, ctx)
 	}
@@ -2411,10 +2411,10 @@ test_drive_body_read_restarts_send_from_unsent_offset :: proc(t: ^testing.T) {
 			#partial switch send_op in tina.ctx_staged_io_operation(ctx) {
 			case tina.IoOp_Send:
 				testing.expect_value(state.t, send_op.fd, tina.FD_Handle(41))
-				testing.expect_value(state.t, send_op.payload_size, u32(64))
+				testing.expect_value(state.t, tina.ctx_staged_io_payload_size(ctx), u32(64))
 				testing.expect_value(
 					state.t,
-					send_op.payload_offset,
+					tina.ctx_staged_io_payload_offset(ctx),
 					tina.payload_offset_of(
 						state.connection,
 						state.connection.egress_buffer[64:][:64],

@@ -66,6 +66,38 @@ test_with_context :: proc(
 	scratch_bytes := make([]u8, 4096)
 	defer delete(scratch_bytes)
 
+	// Allocate the metadata slot for self_handle. The ADR's staging_slot_index
+	// refactor moved the staging-claim source of truth from Isolate_Invocation
+	// into Isolate_Metadata, so any ctx helper that consults the claim (e.g.
+	// _staging_claim_read inside ctx_io_send) reads through
+	// shard.metadata[type_id][slot_index]. Tests that drive a struct-source
+	// IoOp_Send reach that read; without this allocation, the nil-slice bounds
+	// check trips before any testing.expect* call. Mirrors the metadata setup
+	// already performed by test_with_local_context.
+	self_type_id := extract_type_id(config.self_handle)
+	self_slot_index := extract_slot(config.self_handle)
+	self_slot_count := int(self_slot_index) + 1
+	type_descriptor_count := int(self_type_id) + 1
+
+	shard.type_descriptors = make([]IsolateTypeDescriptor, type_descriptor_count)
+	defer delete(shard.type_descriptors)
+	shard.metadata = make([]#soa[]Isolate_Metadata, type_descriptor_count)
+	defer delete(shard.metadata)
+	shard.metadata[self_type_id] = make(#soa[]Isolate_Metadata, self_slot_count)
+	defer delete(shard.metadata[self_type_id])
+
+	// Initialize the slot so incidental reads see sane zero values, not
+	// garbage. The dispatchable bitmap is not touched here — the tests in
+	// this helper do not run the dispatch cycle.
+	shard.metadata[self_type_id][self_slot_index] = Isolate_Metadata {
+		generation                       = extract_generation(config.self_handle),
+		staging_slot_index               = IO_SLOT_INDEX_NONE,
+		io_slot_index                    = IO_SLOT_INDEX_NONE,
+		io_operation_kind = .None,
+		flags                            = {},
+		state                            = .Runnable,
+	}
+
 	working_size := config.working_memory_size
 	if working_size == 0 do working_size = 4096
 	working_bytes := make([]u8, working_size)
@@ -81,8 +113,8 @@ test_with_context :: proc(
 		flags                  = config.flags,
 		timer_resolution_ns    = shard.timer_resolution_ns,
 		current_tick           = u64(config.monotonic_time_ns) / shard.timer_resolution_ns,
-		type_id                = extract_type_id(config.self_handle),
-		slot_index             = extract_slot(config.self_handle),
+		type_id                = self_type_id,
+		slot_index             = self_slot_index,
 		shard_id               = shard.id,
 	}
 	mem.arena_init(&invocation.scratch_arena, scratch_bytes)

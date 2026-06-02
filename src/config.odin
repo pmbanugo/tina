@@ -227,6 +227,8 @@ SystemSpec :: struct {
 	pool_slot_count:           int,
 	reactor_buffer_slot_count: int,
 	reactor_buffer_slot_size:  int,
+	staging_slot_count:        int,
+	staging_slot_size:         int,
 	transfer_slot_count:       int,
 	transfer_slot_size:        int,
 	fd_handoff_entry_count:    int,
@@ -400,6 +402,28 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 		fmt.eprintfln(
 			"[FATAL] reactor_buffer_slot_count (%v) exceeds 12-bit max (4094)",
 			spec.reactor_buffer_slot_count,
+		)
+		return .ValueOutOfBounds
+	}
+
+	// ADR §5.4 staging pool: independent of receive pool, must satisfy same constraints
+	if spec.staging_slot_count == 0 {
+		fmt.eprintfln("[FATAL] staging_slot_count (%v) must be > 0", spec.staging_slot_count)
+		return .ValueOutOfBounds
+	}
+	if spec.staging_slot_size <= 0 || (spec.staging_slot_size & (spec.staging_slot_size - 1)) != 0 {
+		fmt.eprintfln(
+			"[FATAL] staging_slot_size (%v) must be a positive power of two",
+			spec.staging_slot_size,
+		)
+		return .ValueNotPowerOfTwo
+	}
+	// IO_Slot_Pool.slot_count is u16; IO_SLOT_INDEX_NONE = 0x0FFF (4095) is the empty sentinel
+	// buffer_index in Submission_Token is 12 bits (& 0x0FFF), so max usable index is 4094
+	if spec.staging_slot_count > 4094 {
+		fmt.eprintfln(
+			"[FATAL] staging_slot_count (%v) exceeds 12-bit token capacity (4094)",
+			spec.staging_slot_count,
 		)
 		return .ValueOutOfBounds
 	}
@@ -769,6 +793,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 
 	total += spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE
 	total += spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size
+	total += spec.staging_slot_count * spec.staging_slot_size
 	total += spec.transfer_slot_count * spec.transfer_slot_size
 	total += spec.transfer_slot_count * size_of(u16)
 	total += spec.fd_handoff_entry_count * size_of(FD_Handoff_Entry)
@@ -835,6 +860,8 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 		timer_entry_count   = 64,
 		timer_resolution_ns = 1_000_000,
 		default_ring_size   = 16,
+		staging_slot_count  = 4,
+		staging_slot_size   = 1024,
 	}
 
 	err := validate_system_spec(&spec)
@@ -895,6 +922,8 @@ test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
 		log_ring_size       = 16,
 		timer_entry_count   = 16,
 		default_ring_size   = 16,
+		staging_slot_count  = 4,
+		staging_slot_size   = 1024,
 	}
 
 	err := validate_system_spec(&spec)
@@ -932,6 +961,8 @@ when TINA_SIMULATION_MODE {
 			timer_resolution_ns = 1_000_000,
 			default_ring_size   = 16,
 			simulation          = &sim_config,
+			staging_slot_count  = 4,
+			staging_slot_size   = 1024,
 		}
 
 		// Valid config should pass

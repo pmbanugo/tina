@@ -259,7 +259,7 @@ hydrate_shard :: proc(
 		"Transfer_Buffer_Pool",
 		spec.transfer_slot_count * spec.transfer_slot_size,
 	) or_return
-	reactor_buffer_pool_init(
+	io_slot_pool_init(
 		&shard.transfer_pool,
 		transfer_buf,
 		u32(spec.transfer_slot_size),
@@ -320,8 +320,14 @@ hydrate_shard :: proc(
 
 	rx_buf := grand_arena_alloc_slice(
 		arena,
-		"Reactor_Buffer_Pool",
+		"Reactor_Receive_Pool",
 		spec.reactor_buffer_slot_count * spec.reactor_buffer_slot_size,
+	) or_return
+
+	staging_buf := grand_arena_alloc_slice(
+		arena,
+		"Reactor_Staging_Pool",
+		spec.staging_slot_count * spec.staging_slot_size,
 	) or_return
 
 	backend_config := Backend_Config {
@@ -347,9 +353,8 @@ hydrate_shard :: proc(
 		&shard.reactor,
 		backend_config,
 		fd_buf,
-		rx_buf,
-		u32(spec.reactor_buffer_slot_size),
-		u16(spec.reactor_buffer_slot_count),
+		IO_Slot_Pool_Config{backing_memory = rx_buf, slot_size = u32(spec.reactor_buffer_slot_size), slot_count = u16(spec.reactor_buffer_slot_count)},
+		IO_Slot_Pool_Config{backing_memory = staging_buf, slot_size = u32(spec.staging_slot_size), slot_count = u16(spec.staging_slot_count)},
 	)
 	if reactor_err != .None {
 		return .Out_Of_Memory // Standardizing to allocator error to bubble up cleanly
@@ -415,6 +420,8 @@ test_grand_arena :: proc(t: ^testing.T) {
 		reactor_buffer_slot_size  = REACTOR_SIZE,
 		transfer_slot_count       = TRANSFER_SLOTS,
 		transfer_slot_size        = TRANSFER_SIZE,
+		staging_slot_count        = 2,
+		staging_slot_size         = 1024,
 		timer_entry_count         = 64, // Timer entry pool capacity
 		supervision_groups_max    = 4,
 		fd_table_slot_count       = 16,

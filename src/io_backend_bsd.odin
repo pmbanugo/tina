@@ -121,8 +121,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	Pending_Posix_Op :: struct {
-		token:         Submission_Token,
-		operation:     Submission_Operation,
+		submission:    Submission,
 		subject_fd:    OS_FD,
 		kqueue_ident:  uintptr,
 		kqueue_filter: kq.Filter,
@@ -130,10 +129,6 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	_Platform_State :: struct {
-		buffer_base:      [^]u8,
-		buffer_slot_size: u32,
-		buffer_slot_count: u16,
-		_padding:         u16,
 		kq_fd:           OS_FD,
 		pending:         [MAX_POSIX_PENDING]Pending_Posix_Op,
 		fd_io_states:    [MAX_POSIX_FD_IO_STATES]Posix_FD_IO_State,
@@ -155,9 +150,6 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		backend.kq_fd = OS_FD(kq_fd)
-		backend.buffer_base = config.buffer_base
-		backend.buffer_slot_size = config.buffer_slot_size
-		backend.buffer_slot_count = config.buffer_slot_count
 		backend.pending_count = 0
 		backend.completed_count = 0
 		backend.completed_read = 0
@@ -200,18 +192,18 @@ when !TINA_SIMULATION_MODE {
 			return .Queue_Full
 		}
 
-		for &sub in submissions {
-			tracking := _posix_stream_tracking(backend, &sub.operation)
+		for &submission in submissions {
+			tracking := _posix_stream_tracking(backend, &submission.operation)
 			result: Raw_Completion
 			immediate: bool
 			if _posix_tracking_should_skip_optimistic_try(tracking) {
 				result = Raw_Completion {
-					token = sub.token,
+					token = submission.token,
 					extra = nil,
 				}
 				immediate = false
 			} else {
-				result, immediate = _try_syscall(backend, &sub)
+				result, immediate = _try_syscall(backend, &submission)
 				_posix_tracking_note_optimistic_result(tracking, immediate)
 			}
 
@@ -220,13 +212,12 @@ when !TINA_SIMULATION_MODE {
 				backend.completed_count += 1
 			} else {
 				pending_flags: Pending_Posix_Op_Flags
-				if _is_connect_op(&sub.operation) {
+				if _is_connect_op(&submission.operation) {
 					pending_flags = {.Connect_In_Progress}
 				}
-				subject_fd, kq_ident, kq_filter := _submission_op_metadata(sub.operation)
+				subject_fd, kq_ident, kq_filter := _submission_op_metadata(submission.operation)
 				backend.pending[backend.pending_count] = Pending_Posix_Op {
-					token         = sub.token,
-					operation     = sub.operation,
+					submission    = submission,
 					subject_fd    = subject_fd,
 					kqueue_ident  = kq_ident,
 					kqueue_filter = kq_filter,
@@ -241,7 +232,7 @@ when !TINA_SIMULATION_MODE {
 					// executed real syscalls (optimistic try) that cannot be rolled back.
 					backend.pending_count -= 1
 					backend.completed[backend.completed_count] = Raw_Completion {
-						token  = sub.token,
+						token  = submission.token,
 						result = -i32(posix.Errno.EIO),
 						extra  = nil,
 					}
@@ -339,18 +330,18 @@ when !TINA_SIMULATION_MODE {
 				continue
 			}
 
-			pop := &backend.pending[pending_index]
+			pending_operation := &backend.pending[pending_index]
 			event_has_eof := .EOF in event.flags
 
 			// Connect completion: use getsockopt(SO_ERROR) instead of re-calling connect().
-			if .Connect_In_Progress in pop.flags {
+			if .Connect_In_Progress in pending_operation.flags {
 				conn_result := Raw_Completion {
-					token = pop.token,
+					token = pending_operation.submission.token,
 					extra = nil,
 				}
 				socket_error: posix.Errno
 				socket_error_size := posix.socklen_t(size_of(socket_error))
-				connect_fd := pop.operation.(Submission_Op_Connect).fd_socket
+				connect_fd := pending_operation.submission.operation.(Submission_Op_Connect).fd_socket
 				getsockopt_result := posix.getsockopt(
 					posix.FD(connect_fd),
 					posix.SOL_SOCKET,
@@ -371,12 +362,8 @@ when !TINA_SIMULATION_MODE {
 			}
 
 			// Non-connect: retry the syscall.
-			sub := Submission {
-				token     = pop.token,
-				operation = pop.operation,
-			}
-			tracking := _posix_stream_tracking(backend, &pop.operation)
-			result, immediate := _try_syscall(backend, &sub)
+			tracking := _posix_stream_tracking(backend, &pending_operation.submission.operation)
+			result, immediate := _try_syscall(backend, &pending_operation.submission)
 			_posix_tracking_note_optimistic_result(tracking, immediate)
 
 			if immediate {
@@ -391,15 +378,15 @@ when !TINA_SIMULATION_MODE {
 					completions,
 					out,
 					output_max,
-					Raw_Completion{token = pop.token, result = 0},
+					Raw_Completion{token = pending_operation.submission.token, result = 0},
 				)
 				_remove_pending(backend, pending_index)
-			} else if .Edge_Clear in pop.flags {
+			} else if .Edge_Clear in pending_operation.flags {
 				// EV_CLEAR remains armed. The next kernel edge will wake this pending op.
 				continue
 			} else {
 				// Still not ready — re-register ONESHOT.
-				rearm_error := _register_kqueue(backend, pop)
+				rearm_error := _register_kqueue(backend, pending_operation)
 				if rearm_error != .None {
 					// Re-registration failed — complete as error to avoid stranding
 					// this operation in pending forever with no kqueue wakeup.
@@ -408,7 +395,7 @@ when !TINA_SIMULATION_MODE {
 						completions,
 						out,
 						output_max,
-						Raw_Completion{token = pop.token, result = -i32(posix.Errno.EIO)},
+						Raw_Completion{token = pending_operation.submission.token, result = -i32(posix.Errno.EIO)},
 					)
 					_remove_pending(backend, pending_index)
 				}
@@ -424,7 +411,22 @@ when !TINA_SIMULATION_MODE {
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
 		for i: u16 = 0; i < backend.pending_count; i += 1 {
-			if backend.pending[i].token == token {
+			if backend.pending[i].submission.token == token {
+				// kqueue does not deliver a cancellation completion when a
+				// pending op is cancelled. Synthesize one (.Synthesized) so
+				// reactor_collect_completions can reclaim its buffer without
+				// dispatching the completion to a slot. This mirrors the
+				// Linux/Windows behaviour where the kernel delivers an
+				// equivalent completion (e.g. -ECANCELED CQE on io_uring).
+				if backend.completed_count < MAX_POSIX_COMPLETED {
+					backend.completed[backend.completed_count] = Raw_Completion {
+						token  = token,
+						result = -i32(posix.Errno.ECANCELED),
+						extra  = nil,
+						flags  = {.Synthesized},
+					}
+					backend.completed_count += 1
+				}
 				_remove_pending(backend, i)
 				return .None
 			}
@@ -712,6 +714,19 @@ when !TINA_SIMULATION_MODE {
 		// No-op: kqueue has no fixed-file table.
 	}
 
+	@(private = "package")
+	_backend_recv_uses_provided_buffers :: #force_inline proc "contextless" (backend: ^Platform_Backend) -> bool {
+		return false
+	}
+
+	@(private = "package")
+	_backend_replenish_recv_buffer :: #force_inline proc "contextless" (
+		backend: ^Platform_Backend,
+		buffer_index: IO_Slot_Index,
+	) {
+		// No provided buffer ring on BSD — receive pool free-list manages slots.
+	}
+
 	// ============================================================================
 	// Internal Helpers
 	// ============================================================================
@@ -762,24 +777,18 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_try_syscall :: proc(backend: ^Platform_Backend, sub: ^Submission) -> (Raw_Completion, bool) {
+	_try_syscall :: proc(backend: ^Platform_Backend, submission: ^Submission) -> (Raw_Completion, bool) {
 		result := Raw_Completion {
-			token = sub.token,
+			token = submission.token,
 			extra = nil,
 		}
 
-		switch op in sub.operation {
+		switch op in submission.operation {
 		case Submission_Op_Read:
-			buffer_pointer := submission_buffer_ptr(
-				backend.buffer_base,
-				backend.buffer_slot_size,
-				backend.buffer_slot_count,
-				sub.token,
-			)
 			n := posix.pread(
 				posix.FD(op.fd),
-				([^]byte)(buffer_pointer),
-				uint(op.size),
+				([^]byte)(submission.data_pointer),
+				uint(submission.data_size),
 				posix.off_t(op.offset),
 			)
 			if n < 0 {
@@ -794,16 +803,10 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Write:
-			buffer_pointer := submission_buffer_ptr(
-				backend.buffer_base,
-				backend.buffer_slot_size,
-				backend.buffer_slot_count,
-				sub.token,
-			)
 			n := posix.pwrite(
 				posix.FD(op.fd),
-				([^]byte)(buffer_pointer),
-				uint(op.size),
+				([^]byte)(submission.data_pointer),
+				uint(submission.data_size),
 				posix.off_t(op.offset),
 			)
 			if n < 0 {
@@ -855,6 +858,13 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Close:
+			// Sweep any pending ops on this FD before close(): on kqueue,
+			// close() silently removes kevents without firing events, so
+			// their buffers would otherwise be orphaned. The sweep
+			// synthesizes .Synthesized completions that the reactor's
+			// collection path reclaims.
+			_sweep_pending_for_fd(backend, op.fd)
+			_posix_forget_fd_io_state(backend, op.fd)
 			if posix.close(posix.FD(op.fd)) != .OK {
 				result.result = -i32(posix.errno())
 			} else {
@@ -863,13 +873,7 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Send:
-			buffer_pointer := submission_buffer_ptr(
-				backend.buffer_base,
-				backend.buffer_slot_size,
-				backend.buffer_slot_count,
-				sub.token,
-			)
-			n := posix.send(posix.FD(op.fd_socket), rawptr(buffer_pointer), uint(op.size), {.NOSIGNAL})
+			n := posix.send(posix.FD(op.fd_socket), rawptr(submission.data_pointer), uint(submission.data_size), {.NOSIGNAL})
 			if n < 0 {
 				errno := posix.errno()
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
@@ -882,13 +886,7 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Recv:
-			buffer_pointer := submission_buffer_ptr(
-				backend.buffer_base,
-				backend.buffer_slot_size,
-				backend.buffer_slot_count,
-				sub.token,
-			)
-			n := posix.recv(posix.FD(op.fd_socket), rawptr(buffer_pointer), uint(op.size), {})
+			n := posix.recv(posix.FD(op.fd_socket), rawptr(submission.data_pointer), uint(submission.data_size), {})
 			if n < 0 {
 				errno := posix.errno()
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
@@ -901,17 +899,11 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Sendto:
-			buffer_pointer := submission_buffer_ptr(
-				backend.buffer_base,
-				backend.buffer_slot_size,
-				backend.buffer_slot_count,
-				sub.token,
-			)
 			sa, sa_len := _socket_address_to_sockaddr(op.address)
 			n := posix.sendto(
 				posix.FD(op.fd_socket),
-				rawptr(buffer_pointer),
-				uint(op.size),
+				rawptr(submission.data_pointer),
+				uint(submission.data_size),
 				{.NOSIGNAL},
 				(^posix.sockaddr)(&sa),
 				sa_len,
@@ -928,18 +920,12 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Recvfrom:
-			buffer_pointer := submission_buffer_ptr(
-				backend.buffer_base,
-				backend.buffer_slot_size,
-				backend.buffer_slot_count,
-				sub.token,
-			)
 			peer_addr: posix.sockaddr_storage
 			addr_len := posix.socklen_t(size_of(peer_addr))
 			n := posix.recvfrom(
 				posix.FD(op.fd_socket),
-				rawptr(buffer_pointer),
-				uint(op.size),
+				rawptr(submission.data_pointer),
+				uint(submission.data_size),
 				{},
 				(^posix.sockaddr)(&peer_addr),
 				&addr_len,
@@ -1178,7 +1164,7 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		pending: ^Pending_Posix_Op,
 	) -> bool {
-		fd, filter, ok := _posix_stream_op_metadata(&pending.operation)
+		fd, filter, ok := _posix_stream_op_metadata(&pending.submission.operation)
 		if !ok {
 			return false
 		}
@@ -1214,11 +1200,11 @@ when !TINA_SIMULATION_MODE {
 	@(private = "file")
 	_register_kqueue :: proc(backend: ^Platform_Backend, pending: ^Pending_Posix_Op) -> Backend_Error {
 		// Close operations don't need kqueue registration.
-		if _, is_close := pending.operation.(Submission_Op_Close); is_close {
+		if _, is_close := pending.submission.operation.(Submission_Op_Close); is_close {
 			return .None
 		}
 
-		event_data := rawptr(uintptr(pending.token))
+		event_data := rawptr(uintptr(pending.submission.token))
 		ev := [1]kq.KEvent {
 			{
 				ident = pending.kqueue_ident,
@@ -1246,7 +1232,7 @@ when !TINA_SIMULATION_MODE {
 	@(private = "file")
 	_find_pending :: proc "contextless" (backend: ^Platform_Backend, token: Submission_Token) -> i32 {
 		for i: u16 = 0; i < backend.pending_count; i += 1 {
-			if backend.pending[i].token == token {
+			if backend.pending[i].submission.token == token {
 				return i32(i)
 			}
 		}
@@ -1282,7 +1268,7 @@ when !TINA_SIMULATION_MODE {
 			pending_index := _find_pending_by_fd_filter(backend, fd, filter)
 			if pending_index >= 0 {
 				index := u16(pending_index)
-				return index, backend.pending[index].token, true
+				return index, backend.pending[index].submission.token, true
 			}
 			return 0, 0, false
 		}
@@ -1304,20 +1290,21 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	// Sweep pending operations matching a given OS_FD.
-	// Synthesizes -ECANCELED completions for each match so the reactor's
-	// stale-path reclamation can free their buffers. Called before close()
-	// because on kqueue, close() silently removes kevents without firing events.
+	// Synthesizes -ECANCELED completions (flagged .Synthesized) for each
+	// match so the reactor's stale-path reclamation can free their buffers.
+	// Called before close() because on kqueue, close() silently removes
+	// kevents without firing events.
 	@(private = "file")
 	_sweep_pending_for_fd :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) {
 		i: u16 = 0
 		for i < backend.pending_count {
 			if backend.pending[i].subject_fd == fd {
-				// Synthesize cancellation completion
 				if backend.completed_count < MAX_POSIX_COMPLETED {
 					backend.completed[backend.completed_count] = Raw_Completion {
-						token  = backend.pending[i].token,
+						token  = backend.pending[i].submission.token,
 						result = -i32(posix.Errno.ECANCELED),
 						extra  = nil,
+						flags  = {.Synthesized},
 					}
 					backend.completed_count += 1
 				}
@@ -1455,6 +1442,120 @@ when !TINA_SIMULATION_MODE {
 		testing.expect_value(t, close_error, Backend_Error.None)
 		close_dup_error := backend_control_close(backend, dup_fd)
 		testing.expect_value(t, close_dup_error, Backend_Error.None)
+	}
+
+	// Regression test for the kqueue buffer-leak fix.
+	// On kqueue, close() silently removes kevents without firing events,
+	// and a kernel-side cancel is not delivered. Both _backend_cancel
+	// and _sweep_pending_for_fd must therefore synthesize a
+	// .Synthesized completion with result = -ECANCELED, so that
+	// reactor_collect_completions can reclaim the buffer instead of
+	// orphaning it.
+	@(test)
+	test_bsd_backend_cancel_synthesizes_completion :: proc(t: ^testing.T) {
+		backend := new(Platform_Backend)
+		defer free(backend)
+
+		config := Backend_Config{queue_size = DEFAULT_BACKEND_QUEUE_SIZE}
+		backend_init_error := backend_init(backend, config)
+		testing.expect_value(t, backend_init_error, Backend_Error.None)
+		defer backend_deinit(backend)
+
+		// We do not need real FDs to test the synthesis path; the
+		// synthesis logic never invokes a syscall. Use a sentinel FD.
+		fake_fd :: OS_FD(7)
+
+		test_token := submission_token_pack(
+			0,      // type_index
+			0,      // slot_index
+			1,      // generation
+			7,      // sequence
+			0,      // buffer_index
+			.Recv_Complete,
+		)
+
+		backend.pending[0].submission.token = test_token
+		backend.pending[0].submission.operation = Submission_Op_Recv {
+			fd_socket = fake_fd,
+		}
+		backend.pending[0].subject_fd = fake_fd
+		backend.pending[0].kqueue_filter = .Read
+		backend.pending_count = 1
+
+		cancel_err := backend_cancel(backend, test_token)
+		testing.expect_value(t, cancel_err, Backend_Error.None)
+
+		// The pending entry must be removed.
+		testing.expect_value(t, backend.pending_count, 0)
+
+		// A synthesized completion must be enqueued.
+		testing.expect_value(t, backend.completed_count, 1)
+
+		completion := &backend.completed[0]
+		testing.expect_value(t, completion.token, test_token)
+		testing.expect_value(t, completion.result, -i32(posix.Errno.ECANCELED))
+		testing.expect(
+			t,
+			.Synthesized in completion.flags,
+			"cancellation completion must have .Synthesized flag",
+		)
+	}
+
+	// Regression test for the kqueue close-submit fix.
+	// _sweep_pending_for_fd (called before posix.close() in
+	// _try_syscall:case Submission_Op_Close) must synthesize
+	// .Synthesized completions so their buffers are reclaimed.
+	@(test)
+	test_bsd_sweep_pending_for_fd_synthesizes_completions :: proc(t: ^testing.T) {
+		backend := new(Platform_Backend)
+		defer free(backend)
+
+		config := Backend_Config{queue_size = DEFAULT_BACKEND_QUEUE_SIZE}
+		backend_init_error := backend_init(backend, config)
+		testing.expect_value(t, backend_init_error, Backend_Error.None)
+		defer backend_deinit(backend)
+
+		// Two pending entries on a sentinel FD with distinct tokens.
+		fake_fd :: OS_FD(7)
+
+		token_a := submission_token_pack(0, 0, 1, 3, 0, .Recv_Complete)
+		token_b := submission_token_pack(0, 1, 1, 4, 0, .Recv_Complete)
+
+		backend.pending[0].submission.token = token_a
+		backend.pending[0].submission.operation = Submission_Op_Recv {
+			fd_socket = fake_fd,
+		}
+		backend.pending[0].subject_fd = fake_fd
+		backend.pending[0].kqueue_filter = .Read
+
+		backend.pending[1].submission.token = token_b
+		backend.pending[1].submission.operation = Submission_Op_Recv {
+			fd_socket = fake_fd,
+		}
+		backend.pending[1].subject_fd = fake_fd
+		backend.pending[1].kqueue_filter = .Read
+		backend.pending_count = 2
+
+		_sweep_pending_for_fd(backend, fake_fd)
+
+		// Both pending entries on the FD must be removed.
+		testing.expect_value(t, backend.pending_count, 0)
+
+		// Both synthesized completions must be enqueued with the
+		// .Synthesized flag.
+		testing.expect_value(t, backend.completed_count, 2)
+		for i in 0 ..< backend.completed_count {
+			testing.expect(
+				t,
+				.Synthesized in backend.completed[i].flags,
+				"sweep completion must have .Synthesized flag",
+			)
+			testing.expect_value(
+				t,
+				backend.completed[i].result,
+				-i32(posix.Errno.ECANCELED),
+			)
+		}
 	}
 
 }

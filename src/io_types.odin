@@ -35,24 +35,61 @@ fd_handle_generation :: #force_inline proc "contextless" (h: FD_Handle) -> u16 {
 	return u16(u32(h) >> 16)
 }
 
-// --- IO Completion Tags (§6.6.1 §5, §6.6.3 §7, PUBLIC_API_SURFACE §7.2) ---
+// --- IO Operation Kind (formerly IO_Completion_Tag) ---
+//
+// This is the single source of truth for I/O operation identity.
+// The u8 backing type matches the 8-bit op_kind field in Submission_Token.
+// Exhaustive switch on this enum forces every consumption site to handle
+// all variants — a compile-time guarantee that no new operation can be
+// added without deciding its pool affinity, FD close policy, and
+// completion behavior.
 
-// IO completion tags use Message_Tag for unified tag switching.
-// IO_Completion_Tag is kept as a type alias for internal Isolate metadata.
-@(private = "package")
-IO_Completion_Tag :: Message_Tag
+IO_Operation_Kind :: enum u8 {
+	None              = 0x00,
+	Read_Complete     = 0x10,
+	Write_Complete    = 0x11,
+	Accept_Complete   = 0x12,
+	Connect_Complete  = 0x13,
+	Send_Complete     = 0x14,
+	Recv_Complete     = 0x15,
+	Sendto_Complete   = 0x16,
+	Recvfrom_Complete = 0x17,
+	Close_Complete    = 0x18,
+	Sendfile_Complete = 0x19,
+}
 
-IO_TAG_NONE: Message_Tag : 0x0000
-IO_TAG_READ_COMPLETE: Message_Tag : 0x0010
-IO_TAG_WRITE_COMPLETE: Message_Tag : 0x0011
-IO_TAG_ACCEPT_COMPLETE: Message_Tag : 0x0012
-IO_TAG_CONNECT_COMPLETE: Message_Tag : 0x0013
-IO_TAG_SEND_COMPLETE: Message_Tag : 0x0014
-IO_TAG_RECV_COMPLETE: Message_Tag : 0x0015
-IO_TAG_SENDTO_COMPLETE: Message_Tag : 0x0016
-IO_TAG_RECVFROM_COMPLETE: Message_Tag : 0x0017
-IO_TAG_CLOSE_COMPLETE: Message_Tag : 0x0018
-IO_TAG_SENDFILE_COMPLETE: Message_Tag : 0x0019
+IO_Slot_Pool_Affinity :: enum u8 {
+	None,     // No pool slot involved (accept, connect, close, sendfile)
+	Receive,  // receive_pool: kernel writes here (read, recv, recvfrom)
+	Staging,  // staging_pool: user writes here (write, send, sendto)
+}
+
+io_operation_pool_affinity :: #force_inline proc "contextless" (
+	kind: IO_Operation_Kind,
+) -> IO_Slot_Pool_Affinity {
+	switch kind {
+	case .Read_Complete, .Recv_Complete, .Recvfrom_Complete:
+		return .Receive
+	case .Write_Complete, .Send_Complete, .Sendto_Complete:
+		return .Staging
+	case .None, .Accept_Complete, .Connect_Complete,
+	     .Close_Complete, .Sendfile_Complete:
+		return .None
+	}
+	return .None
+}
+
+IO_TAG_NONE              :: Message_Tag(IO_Operation_Kind.None)
+IO_TAG_READ_COMPLETE     :: Message_Tag(IO_Operation_Kind.Read_Complete)
+IO_TAG_WRITE_COMPLETE    :: Message_Tag(IO_Operation_Kind.Write_Complete)
+IO_TAG_ACCEPT_COMPLETE   :: Message_Tag(IO_Operation_Kind.Accept_Complete)
+IO_TAG_CONNECT_COMPLETE  :: Message_Tag(IO_Operation_Kind.Connect_Complete)
+IO_TAG_SEND_COMPLETE     :: Message_Tag(IO_Operation_Kind.Send_Complete)
+IO_TAG_RECV_COMPLETE     :: Message_Tag(IO_Operation_Kind.Recv_Complete)
+IO_TAG_SENDTO_COMPLETE   :: Message_Tag(IO_Operation_Kind.Sendto_Complete)
+IO_TAG_RECVFROM_COMPLETE :: Message_Tag(IO_Operation_Kind.Recvfrom_Complete)
+IO_TAG_CLOSE_COMPLETE    :: Message_Tag(IO_Operation_Kind.Close_Complete)
+IO_TAG_SENDFILE_COMPLETE :: Message_Tag(IO_Operation_Kind.Sendfile_Complete)
 
 // --- Socket Types (§6.6.3 §4, §9, §10) ---
 
@@ -169,10 +206,8 @@ IoOp_Read :: struct {
 }
 
 IoOp_Write :: struct {
-	fd:             FD_Handle,
-	payload_offset: u16,
-	payload_size:   u32,
-	offset:         u64,
+	fd:     FD_Handle,
+	offset: u64,
 }
 
 IoOp_Accept :: struct {
@@ -185,9 +220,7 @@ IoOp_Connect :: struct {
 }
 
 IoOp_Send :: struct {
-	fd:             FD_Handle,
-	payload_offset: u16,
-	payload_size:   u32,
+	fd: FD_Handle,
 }
 
 IoOp_Recv :: struct {
@@ -196,10 +229,8 @@ IoOp_Recv :: struct {
 }
 
 IoOp_Sendto :: struct {
-	fd:             FD_Handle,
-	address:        Socket_Address,
-	payload_offset: u16,
-	payload_size:   u32,
+	fd:      FD_Handle,
+	address: Socket_Address,
 }
 
 IoOp_Recvfrom :: struct {
@@ -372,11 +403,16 @@ Handoff_Mode :: enum u8 {
 //   [28..35] isolate_generation  u8    (8 bits)
 //   [36..43] io_sequence         u8    (8 bits)
 //   [44..55] buffer_index        u16   (12 bits)
-//   [56..63] operation_tag       u8    (8 bits)
+//   [56..63] operation_kind      u8    (8 bits)
 
 Submission_Token :: distinct u64
 
-BUFFER_INDEX_NONE :: u16(0x0FFF) // 12-bit max value (4095)
+// Distinct type for slot indices into IO_Slot_Pool slabs. Prevents the bare
+// u16 0x0FFF sentinel from being silently mixed with other u16 fields
+// (counts, offsets, sizes). The compiler enforces explicit conversion at
+// I/O boundaries (e.g. submission_token_pack, pool alloc return).
+IO_Slot_Index :: distinct u16
+IO_SLOT_INDEX_NONE :: IO_Slot_Index(0x0FFF) // 12-bit max value (4095)
 FIXED_FILE_INDEX_NONE :: u16(0xFFFF)
 
 submission_token_pack :: #force_inline proc(
@@ -384,8 +420,8 @@ submission_token_pack :: #force_inline proc(
 	slot_index: u32,
 	generation: u8,
 	sequence: u8,
-	buf_index: u16,
-	op_tag: u8,
+	buf_index: IO_Slot_Index,
+	op_kind: IO_Operation_Kind,
 ) -> Submission_Token {
 	return Submission_Token(
 		u64(type_index & 0xFF) |
@@ -393,7 +429,7 @@ submission_token_pack :: #force_inline proc(
 		(u64(generation & 0xFF) << 28) |
 		(u64(sequence & 0xFF) << 36) |
 		(u64(buf_index & 0x0FFF) << 44) |
-		(u64(op_tag & 0xFF) << 56),
+		(u64(op_kind) << 56),
 	)
 }
 
@@ -413,12 +449,12 @@ submission_token_io_sequence :: #force_inline proc(t: Submission_Token) -> u8 {
 	return u8((u64(t) >> 36) & 0xFF)
 }
 
-submission_token_buffer_index :: #force_inline proc(t: Submission_Token) -> u16 {
-	return u16((u64(t) >> 44) & 0x0FFF)
+submission_token_buffer_index :: #force_inline proc(t: Submission_Token) -> IO_Slot_Index {
+	return IO_Slot_Index((u64(t) >> 44) & 0x0FFF)
 }
 
-submission_token_operation_tag :: #force_inline proc(t: Submission_Token) -> u8 {
-	return u8((u64(t) >> 56) & 0xFF)
+submission_token_operation_kind :: #force_inline proc(t: Submission_Token) -> IO_Operation_Kind {
+	return IO_Operation_Kind((u64(t) >> 56) & 0xFF)
 }
 
 // --- Submission (§6.6.2 §4) ---
@@ -426,13 +462,11 @@ submission_token_operation_tag :: #force_inline proc(t: Submission_Token) -> u8 
 
 Submission_Op_Read :: struct {
 	fd:     OS_FD,
-	size:   u32,
 	offset: u64,
 }
 
 Submission_Op_Write :: struct {
 	fd:     OS_FD,
-	size:   u32,
 	offset: u64,
 }
 
@@ -451,23 +485,19 @@ Submission_Op_Close :: struct {
 
 Submission_Op_Send :: struct {
 	fd_socket: OS_FD,
-	size:      u32,
 }
 
 Submission_Op_Recv :: struct {
 	fd_socket: OS_FD,
-	size:      u32,
 }
 
 Submission_Op_Sendto :: struct {
 	fd_socket: OS_FD,
 	address:   Socket_Address,
-	size:      u32,
 }
 
 Submission_Op_Recvfrom :: struct {
 	fd_socket: OS_FD,
-	size:      u32,
 }
 
 Submission_Op_Sendfile :: struct {
@@ -493,6 +523,10 @@ Submission_Operation :: union {
 Submission :: struct {
 	token:            Submission_Token,
 	fixed_file_index: u16, // Index into io_uring fixed-file table (Linux only). FIXED_FILE_INDEX_NONE if unused.
+	// Resolved pointer: Isolate struct (writes) or pool slot (reads).
+    // nil for operations without data (accept, connect, close).
+	data_pointer:     [^]u8,
+	data_size:        u32, // Byte count for the data region. 0 when data_pointer is nil.
 	operation:        Submission_Operation,
 }
 
@@ -513,10 +547,21 @@ Completion_Extra :: union {
 	Completion_Extra_Recvfrom,
 }
 
+// Per-completion flag bits. Set by the backend to signal provenance to the
+// reactor's collection path. .Synthesized indicates the completion was
+// generated by the backend (e.g. on kqueue, to cancel a pending op whose
+// kernel-side counterpart was dropped) rather than delivered by the kernel.
+Completion_Flag :: enum u8 {
+	Synthesized = 0, // Diagnostic: backend-generated (kqueue cancel, SimulatedIO cancel), not kernel-delivered.
+	No_Buffer   = 1, // Control: kernel returned -ENOBUFS from provided buffer ring, needs re-submit.
+}
+Completion_Flags :: distinct bit_set[Completion_Flag; u8]
+
 Raw_Completion :: struct {
 	token:  Submission_Token,
 	result: i32,
 	extra:  Completion_Extra,
+	flags:  Completion_Flags,
 }
 
 // --- I/O Error Codes (§6.6.1 §8) ---
@@ -530,6 +575,15 @@ IO_ERR_AFFINITY_VIOLATION: IO_Error : -3
 IO_ERR_BOUNDS_VIOLATION: IO_Error : -4
 IO_ERR_SUBMISSION_FULL: IO_Error : -5
 IO_ERR_BACKEND_FAILURE: IO_Error : -6
+IO_ERR_INVALID_DATA_SOURCE: IO_Error : -7 // Send/write/sendto requires IO_Data_Source.Isolate_Struct or .Staging_Slot, not .None.
+
+// Where the write bytes come from.
+// Only relevant for send/write/sendto. Ignored for recv/read/accept/connect/close.
+IO_Data_Source :: enum u8 {
+	None,            // No data (recv, accept, connect, close, sendfile, read)
+	Isolate_Struct,  // Direct reference: reactor computes pointer from Isolate struct
+	Staging_Slot,    // Staging pool slot: reactor uses staging pool pointer
+}
 
 // --- Transfer Buffer Handle (§6.9 §8.2) ---
 // Layout: lower 16 bits = pool index, upper 16 bits = generation
@@ -537,12 +591,12 @@ Transfer_Handle :: distinct u32
 
 TRANSFER_HANDLE_NONE :: Transfer_Handle(0)
 
-transfer_handle_make :: #force_inline proc(index: u16, generation: u16) -> Transfer_Handle {
+transfer_handle_make :: #force_inline proc(index: IO_Slot_Index, generation: u16) -> Transfer_Handle {
 	return Transfer_Handle(u32(index) | (u32(generation) << 16))
 }
 
-transfer_handle_index :: #force_inline proc(h: Transfer_Handle) -> u16 {
-	return u16(u32(h) & 0xFFFF)
+transfer_handle_index :: #force_inline proc(h: Transfer_Handle) -> IO_Slot_Index {
+	return IO_Slot_Index(u32(h) & 0xFFFF)
 }
 
 transfer_handle_generation :: #force_inline proc(h: Transfer_Handle) -> u16 {
@@ -631,27 +685,27 @@ test_submission_token_round_trip :: proc(t: ^testing.T) {
 		generation = 0x78,
 		sequence = 0x9A,
 		buf_index = 0x0CDE, // Fits in 12 bits!
-		op_tag = 0xF0,
+		op_kind = IO_Operation_Kind(0xF0),
 	)
 
 	testing.expect_value(t, submission_token_type_index(token), 0x12)
 	testing.expect_value(t, submission_token_slot_index(token), 0x93456)
 	testing.expect_value(t, submission_token_generation(token), 0x78)
 	testing.expect_value(t, submission_token_io_sequence(token), 0x9A)
-	testing.expect_value(t, submission_token_buffer_index(token), 0x0CDE)
-	testing.expect_value(t, submission_token_operation_tag(token), 0xF0)
+	testing.expect_value(t, u16(submission_token_buffer_index(token)), 0x0CDE)
+	testing.expect_value(t, submission_token_operation_kind(token), IO_Operation_Kind(0xF0))
 }
 
 @(test)
 test_submission_token_zero :: proc(t: ^testing.T) {
-	token := submission_token_pack(0, 0, 0, 0, 0, 0)
+	token := submission_token_pack(0, 0, 0, 0, 0, .None)
 	testing.expect_value(t, u64(token), u64(0))
 }
 
 @(test)
 test_submission_token_buffer_none_sentinel :: proc(t: ^testing.T) {
-	token := submission_token_pack(0, 0, 0, 0, BUFFER_INDEX_NONE, 0)
-	testing.expect_value(t, submission_token_buffer_index(token), BUFFER_INDEX_NONE)
+	token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, .None)
+	testing.expect_value(t, submission_token_buffer_index(token), IO_SLOT_INDEX_NONE)
 }
 
 @(test)
@@ -660,24 +714,40 @@ test_peer_address_size :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_io_completion_tag_distinct :: proc(t: ^testing.T) {
-	// Ensure all tags are unique values
-	tags := [?]IO_Completion_Tag {
-		IO_TAG_NONE,
-		IO_TAG_READ_COMPLETE,
-		IO_TAG_WRITE_COMPLETE,
-		IO_TAG_ACCEPT_COMPLETE,
-		IO_TAG_CONNECT_COMPLETE,
-		IO_TAG_CLOSE_COMPLETE,
-		IO_TAG_SEND_COMPLETE,
-		IO_TAG_RECV_COMPLETE,
-		IO_TAG_SENDTO_COMPLETE,
-		IO_TAG_RECVFROM_COMPLETE,
-		IO_TAG_SENDFILE_COMPLETE,
+test_io_operation_kind_distinct :: proc(t: ^testing.T) {
+	// Ensure all IO_Operation_Kind raw values are unique
+	kinds := [?]IO_Operation_Kind {
+		.None,
+		.Read_Complete,
+		.Write_Complete,
+		.Accept_Complete,
+		.Connect_Complete,
+		.Close_Complete,
+		.Send_Complete,
+		.Recv_Complete,
+		.Sendto_Complete,
+		.Recvfrom_Complete,
+		.Sendfile_Complete,
 	}
-	for i in 0 ..< len(tags) {
-		for j in (i + 1) ..< len(tags) {
-			testing.expect(t, tags[i] != tags[j], "duplicate IO_Completion_Tag values")
+	for i in 0 ..< len(kinds) {
+		for j in (i + 1) ..< len(kinds) {
+			testing.expect(t, kinds[i] != kinds[j], "duplicate IO_Operation_Kind values")
 		}
 	}
+}
+
+@(test)
+test_io_operation_pool_affinity_exhaustive :: proc(t: ^testing.T) {
+	// Verify pool affinity classification is correct for every variant
+	testing.expect_value(t, io_operation_pool_affinity(.None), IO_Slot_Pool_Affinity.None)
+	testing.expect_value(t, io_operation_pool_affinity(.Read_Complete), IO_Slot_Pool_Affinity.Receive)
+	testing.expect_value(t, io_operation_pool_affinity(.Write_Complete), IO_Slot_Pool_Affinity.Staging)
+	testing.expect_value(t, io_operation_pool_affinity(.Accept_Complete), IO_Slot_Pool_Affinity.None)
+	testing.expect_value(t, io_operation_pool_affinity(.Connect_Complete), IO_Slot_Pool_Affinity.None)
+	testing.expect_value(t, io_operation_pool_affinity(.Send_Complete), IO_Slot_Pool_Affinity.Staging)
+	testing.expect_value(t, io_operation_pool_affinity(.Recv_Complete), IO_Slot_Pool_Affinity.Receive)
+	testing.expect_value(t, io_operation_pool_affinity(.Sendto_Complete), IO_Slot_Pool_Affinity.Staging)
+	testing.expect_value(t, io_operation_pool_affinity(.Recvfrom_Complete), IO_Slot_Pool_Affinity.Receive)
+	testing.expect_value(t, io_operation_pool_affinity(.Close_Complete), IO_Slot_Pool_Affinity.None)
+	testing.expect_value(t, io_operation_pool_affinity(.Sendfile_Complete), IO_Slot_Pool_Affinity.None)
 }

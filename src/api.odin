@@ -101,6 +101,8 @@ Call_Result :: enum u8 {
 Io_Submit_Result :: enum u8 {
 	ok,
 	already_staged,
+	no_staging_slot,  // ctx_claim_send_slot was not called or returned nil.
+	payload_too_large, // Payload size exceeds staging pool slot capacity.
 }
 
 Spawn_Error :: enum u8 {
@@ -227,64 +229,6 @@ self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext, ca
 	return cast(^T)self_raw
 }
 
-// Computes the byte offset of a buffer within an Isolate's stable memory region.
-// In debug builds, validates the slice actually lives inside the Isolate struct.
-payload_offset_of :: #force_inline proc(self: ^$Isolate, buffer: []u8, caller_location := #caller_location) -> u16 {
-	base := uintptr(self)
-	buf_start := uintptr(raw_data(buffer))
-	when TINA_RUNTIME_ASSERTIONS {
-		assert(buf_start >= base, "payload_offset_of: buffer starts before isolate base", caller_location)
-		assert(
-			buf_start + uintptr(len(buffer)) <= base + size_of(Isolate),
-			"payload_offset_of: buffer extends past isolate end",
-			caller_location,
-		)
-	}
-	return u16(buf_start - base)
-}
-
-// Stages a socket send from an Isolate-owned buffer for commit if the handler
-// returns Isolate_Transition{kind = .Wait_Io}.
-@(require_results)
-ctx_io_send :: #force_inline proc(
-	ctx: TinaContext,
-	self: ^$Isolate,
-	fd: FD_Handle,
-	buffer: []u8,
-	caller_location := #caller_location,
-) -> Io_Submit_Result {
-	return ctx_submit_io(
-		ctx,
-		IoOp_Send {
-			fd = fd,
-			payload_offset = payload_offset_of(self, buffer, caller_location),
-			payload_size = u32(len(buffer)),
-		},
-	)
-}
-
-// Stages write command to a file-descriptor, from an Isolate-owned buffer for commit
-// if the handler returns Isolate_Transition{kind = .Wait_Io}.
-@(require_results)
-ctx_io_write :: #force_inline proc(
-	ctx: TinaContext,
-	self: ^$Isolate,
-	fd: FD_Handle,
-	buffer: []u8,
-	offset: u64,
-	caller_location := #caller_location,
-) -> Io_Submit_Result {
-	return ctx_submit_io(
-		ctx,
-		IoOp_Write {
-			fd = fd,
-			payload_offset = payload_offset_of(self, buffer, caller_location),
-			payload_size = u32(len(buffer)),
-			offset = offset,
-		},
-	)
-}
-
 // Stages a zero-copy sendfile operation for commit if the handler returns
 // Isolate_Transition{kind = .Wait_Io}.
 @(require_results)
@@ -302,28 +246,6 @@ ctx_io_sendfile :: #force_inline proc(
 			fd_socket = fd_socket,
 			source_offset = source_offset,
 			size = size,
-		},
-	)
-}
-
-// Stages a UDP send from an Isolate-owned buffer for commit if the handler
-// returns Isolate_Transition{kind = .Wait_Io}.
-@(require_results)
-ctx_io_sendto :: #force_inline proc(
-	ctx: TinaContext,
-	self: ^$Isolate,
-	fd: FD_Handle,
-	buffer: []u8,
-	address: Socket_Address,
-	caller_location := #caller_location,
-) -> Io_Submit_Result {
-	return ctx_submit_io(
-		ctx,
-		IoOp_Sendto {
-			fd = fd,
-			address = address,
-			payload_offset = payload_offset_of(self, buffer, caller_location),
-			payload_size = u32(len(buffer)),
 		},
 	)
 }

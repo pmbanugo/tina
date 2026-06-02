@@ -57,7 +57,8 @@ when TINA_SIMULATION_MODE {
 		net.channels[0][1].delay_ticks = 3
 
 		// Create a minimal shard stub for source (shard 0)
-		source_shard: Shard
+		source_shard := new(Shard)
+		defer free(source_shard)
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{} // all disabled
@@ -68,7 +69,7 @@ when TINA_SIMULATION_MODE {
 			env := _make_test_envelope(i)
 			res := sim_network_enqueue(
 				&net,
-				&source_shard,
+				source_shard,
 				1,
 				env,
 				0,
@@ -111,7 +112,8 @@ when TINA_SIMULATION_MODE {
 		net, drop_prng := _make_test_network(16, context.temp_allocator)
 		net.drop_prng = &drop_prng
 
-		source_shard: Shard
+		source_shard := new(Shard)
+		defer free(source_shard)
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{}
@@ -121,7 +123,7 @@ when TINA_SIMULATION_MODE {
 		shard_mask_include(&net.partition_matrix[0], 1)
 
 		env := _make_test_envelope(42)
-		res := sim_network_enqueue(&net, &source_shard, 1, env, 0, source_shard.sim_state.fault_config)
+		res := sim_network_enqueue(&net, source_shard, 1, env, 0, source_shard.sim_state.fault_config)
 
 		// Should be dropped due to partition
 		testing.expect_value(t, res, Send_Result.stale_handle)
@@ -138,7 +140,8 @@ when TINA_SIMULATION_MODE {
 		net, drop_prng := _make_test_network(16, context.temp_allocator)
 		net.drop_prng = &drop_prng
 
-		source_shard: Shard
+		source_shard := new(Shard)
+		defer free(source_shard)
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{}
@@ -150,7 +153,7 @@ when TINA_SIMULATION_MODE {
 
 		// After heal, delivery should work
 		env := _make_test_envelope(99)
-		res := sim_network_enqueue(&net, &source_shard, 1, env, 0, source_shard.sim_state.fault_config)
+		res := sim_network_enqueue(&net, source_shard, 1, env, 0, source_shard.sim_state.fault_config)
 		testing.expect_value(t, res, Send_Result.ok)
 		testing.expect_value(t, net.channels[0][1].delay_queue.count, u32(1))
 	}
@@ -162,7 +165,8 @@ when TINA_SIMULATION_MODE {
 		net, drop_prng := _make_test_network(16, context.temp_allocator)
 		net.drop_prng = &drop_prng
 
-		source_shard: Shard
+		source_shard := new(Shard)
+		defer free(source_shard)
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{}
@@ -171,12 +175,12 @@ when TINA_SIMULATION_MODE {
 		// Enqueue msg A at tick 0 with 5-tick delay
 		net.channels[0][1].delay_ticks = 5
 		env_a := _make_test_envelope(1)
-		sim_network_enqueue(&net, &source_shard, 1, env_a, 0, source_shard.sim_state.fault_config)
+		sim_network_enqueue(&net, source_shard, 1, env_a, 0, source_shard.sim_state.fault_config)
 
 		// Change delay to 2 ticks and enqueue msg B at tick 1
 		net.channels[0][1].delay_ticks = 2
 		env_b := _make_test_envelope(2)
-		sim_network_enqueue(&net, &source_shard, 1, env_b, 1, source_shard.sim_state.fault_config)
+		sim_network_enqueue(&net, source_shard, 1, env_b, 1, source_shard.sim_state.fault_config)
 
 		// msg A deliver_at = 5, msg B deliver_at = 3
 		// But FIFO means B cannot be delivered before A

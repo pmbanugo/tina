@@ -16,13 +16,24 @@ when TINA_SIMULATION_MODE {
 
 			// Pool integrity checks (reactor buffer pool, message pool, transfer pool)
 			if .Pool_Integrity in flags {
-				pool := &shard.reactor.buffer_pool
+				pool := &shard.reactor.receive_pool
 				if pool.free_count > pool.slot_count {
 					fmt.eprintfln(
 						"[CHECKER] Shard %d: reactor buffer pool corruption — free_count (%d) > slot_count (%d)",
 						i,
 						pool.free_count,
 						pool.slot_count,
+					)
+					return true
+				}
+
+				stage_pool := &shard.reactor.staging_pool
+				if stage_pool.free_count > stage_pool.slot_count {
+					fmt.eprintfln(
+						"[CHECKER] Shard %d: staging pool corruption — free_count (%d) > slot_count (%d)",
+						i,
+						stage_pool.free_count,
+						stage_pool.slot_count,
 					)
 					return true
 				}

@@ -270,7 +270,8 @@ when TINA_SIMULATION_MODE {
 		total_quarantine: u64 = 0
 		total_pool_exhaustion: u64 = 0
 		total_mailbox_full: u64 = 0
-		total_io_buffer_exhaustion: u64 = 0
+		total_io_receive_exhaustion: u64 = 0
+		total_io_staging_exhaustion: u64 = 0
 		total_io_stale: u64 = 0
 		total_transfer_exhaustion: u64 = 0
 		total_transfer_stale: u64 = 0
@@ -282,7 +283,8 @@ when TINA_SIMULATION_MODE {
 			total_quarantine += c.quarantine_drops
 			total_pool_exhaustion += c.pool_exhaustion_drops
 			total_mailbox_full += c.mailbox_full_drops
-			total_io_buffer_exhaustion += c.io_buffer_exhaustions
+			total_io_receive_exhaustion += c.io_receive_exhaustions
+			total_io_staging_exhaustion += c.io_staging_exhaustions
 			total_io_stale += c.io_stale_completions
 			total_transfer_exhaustion += c.transfer_exhaustions
 			total_transfer_stale += c.transfer_stale_reads
@@ -297,9 +299,10 @@ when TINA_SIMULATION_MODE {
 			total_quarantine,
 		)
 		fmt.printfln(
-			"[SIM] I/O: stale_completions=%d, buffer_exhaustions=%d, transfer_exhaustions=%d, transfer_stale=%d",
+			"[SIM] I/O: stale_completions=%d, receive_exhaustions=%d, staging_exhaustions=%d, transfer_exhaustions=%d, transfer_stale=%d",
 			total_io_stale,
-			total_io_buffer_exhaustion,
+			total_io_receive_exhaustion,
+			total_io_staging_exhaustion,
 			total_transfer_exhaustion,
 			total_transfer_stale,
 		)

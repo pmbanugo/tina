@@ -17,7 +17,7 @@ when TINA_SIMULATION_MODE {
 
 				for slot in 0 ..< slot_count {
 					if shard.metadata[type_id].inbox_count[slot] > 0 do return false
-					if shard.metadata[type_id].io_completion_tag[slot] != IO_TAG_NONE do return false
+					if shard.metadata[type_id].io_operation_kind[slot] != .None do return false
 					if shard.metadata[type_id].state[slot] == .Runnable do return false
 					if shard.metadata[type_id].state[slot] == .Wait_Io do return false
 				}
@@ -25,6 +25,7 @@ when TINA_SIMULATION_MODE {
 
 			// Check if the SimulatedIO backend has pending completions
 			if shard.reactor.backend.pending_count > 0 do return false
+			if shard.reactor.backend.completed_count > 0 do return false
 
 			// Check if any timers are registered
 			if shard.timer_wheel.armed_count > 0 do return false

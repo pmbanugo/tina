@@ -204,6 +204,8 @@ when TINA_SIMULATION_MODE {
 			pool_slot_count           = 1024,
 			reactor_buffer_slot_count = 4,
 			reactor_buffer_slot_size  = 4096,
+			staging_slot_count        = 2,
+			staging_slot_size         = 1024,
 			transfer_slot_count       = 4,
 			transfer_slot_size        = 4096,
 			timer_entry_count         = 1024,
