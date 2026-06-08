@@ -112,7 +112,7 @@ Spawn_Error :: enum u8 {
 	init_failed,
 }
 Spawn_Result :: union {
-	Handle,
+	Isolate_Handle,
 	Spawn_Error,
 }
 
@@ -270,7 +270,7 @@ ipv6 :: #force_inline proc "contextless" (
 @(require_results)
 ctx_send_typed :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	$tag: Message_Tag,
 	message: ^$T,
 ) -> Send_Result where size_of(T) <=

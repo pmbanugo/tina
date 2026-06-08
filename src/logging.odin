@@ -32,7 +32,7 @@ Log_Record_Header :: struct {
 	tag:            Log_Tag,
 	_reserved_1:    u16,
 	timestamp:      u64,
-	isolate_handle: Handle,
+	isolate_handle: Isolate_Handle,
 }
 
 Log_Record_Header_Size :: u64(size_of(Log_Record_Header))
@@ -124,7 +124,7 @@ ctx_log :: proc {
 @(private = "package")
 _shard_log :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	source: Handle,
+	source: Isolate_Handle,
 	level: Log_Level,
 	tag: Log_Tag,
 	payload: []u8,

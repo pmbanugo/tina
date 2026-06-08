@@ -23,7 +23,7 @@ TIMER_DEADLINE_MASK :: ~TIMER_RESERVED_BIT
 Timer_Wheel :: struct {
 	// SoA parallel arrays — indexed by slot index
 	deadlines:         []u64,
-	targets:           []Handle,
+	targets:           []Isolate_Handle,
 	tags:              []Message_Tag,
 	correlations:      []Correlation_Id,
 
@@ -40,7 +40,7 @@ Timer_Wheel :: struct {
 timer_wheel_init :: proc(
 	wheel: ^Timer_Wheel,
 	deadline_backing: []u64,
-	target_backing: []Handle,
+	target_backing: []Isolate_Handle,
 	tag_backing: []Message_Tag,
 	correlation_backing: []Correlation_Id,
 	armed_words_backing: []u64,
@@ -90,7 +90,7 @@ timer_wheel_reset :: proc(wheel: ^Timer_Wheel) {
 @(private = "package")
 timer_acquire :: proc(
 	wheel: ^Timer_Wheel,
-	target: Handle,
+	target: Isolate_Handle,
 ) -> Timer_Handle {
 	if wheel.free_head == POOL_NONE_INDEX {
 		return TIMER_HANDLE_NONE
@@ -118,7 +118,7 @@ timer_acquire :: proc(
 timer_schedule :: proc(
 	wheel: ^Timer_Wheel,
 	deadline: u64,
-	target: Handle,
+	target: Isolate_Handle,
 	tag: Message_Tag,
 	correlation: Correlation_Id,
 ) -> Timer_Handle {
@@ -230,7 +230,7 @@ timer_release :: proc(
 	}
 
 	// Clear fields
-	wheel.targets[index] = HANDLE_NONE
+	wheel.targets[index] = ISOLATE_HANDLE_NONE
 	wheel.tags[index] = Message_Tag(0)
 	wheel.correlations[index] = Correlation_Id(0)
 
@@ -312,7 +312,7 @@ ctx_register_timer_with_correlation :: proc(
 @(private = "package")
 _register_system_timer :: proc(
 	shard: ^Shard,
-	target: Handle,
+	target: Isolate_Handle,
 	delay_ticks: u64,
 	tag: Message_Tag,
 	correlation: Correlation_Id,
@@ -390,7 +390,7 @@ _advance_timers :: proc(
 				}
 
 				envelope: Message_Envelope
-				envelope.source = HANDLE_NONE
+				envelope.source = ISOLATE_HANDLE_NONE
 				envelope.destination = target
 				envelope.tag = wheel.tags[slot_index]
 				envelope.correlation = wheel.correlations[slot_index]
@@ -469,7 +469,7 @@ when TINA_SIMULATION_MODE {
 test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 	Arm_And_Expire_Test_State :: struct {
 		t:      ^testing.T,
-		handle: Handle,
+		handle: Isolate_Handle,
 	}
 	test_state := Arm_And_Expire_Test_State {
 		t      = t,
@@ -523,14 +523,14 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 	testing.expect_value(t, message_count, u16(1))
 	testing.expect_value(t, message.tag, Message_Tag(USER_MESSAGE_TAG_BASE))
 	testing.expect_value(t, message.correlation, Correlation_Id(7))
-	testing.expect_value(t, message.user.source, HANDLE_NONE)
+	testing.expect_value(t, message.user.source, ISOLATE_HANDLE_NONE)
 }
 
 @(test)
 test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T) {
 	Rearm_Test_State :: struct {
 		t:      ^testing.T,
-		handle: Handle,
+		handle: Isolate_Handle,
 	}
 	test_state := Rearm_Test_State {
 		t      = t,
@@ -592,7 +592,7 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^testing.T) {
 	Release_Test_State :: struct {
 		t:                   ^testing.T,
-		handle:              Handle,
+		handle:              Isolate_Handle,
 		timer_handle_first:  Timer_Handle,
 		timer_handle_second: Timer_Handle,
 	}
@@ -658,7 +658,7 @@ test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^t
 @(test)
 test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 	Wake_Test_State :: struct {
-		handle:             Handle,
+		handle:             Isolate_Handle,
 		target_state:       Isolate_State,
 		target_io_sequence: u8,
 	}
@@ -709,7 +709,7 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 	Mixed_Expiry_Test_State :: struct {
 		t:                   ^testing.T,
-		handle:              Handle,
+		handle:              Isolate_Handle,
 		timer_handle_first:  Timer_Handle,
 		timer_handle_second: Timer_Handle,
 	}

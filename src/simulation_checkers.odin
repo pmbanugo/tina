@@ -97,7 +97,7 @@ when TINA_SIMULATION_MODE {
 				for slot in 0 ..< int(fd_table.slot_count) {
 					entry := &fd_table.entries[slot]
 					active :=
-						entry.reader_isolate != HANDLE_NONE || entry.writer_isolate != HANDLE_NONE
+						entry.reader_isolate != ISOLATE_HANDLE_NONE || entry.writer_isolate != ISOLATE_HANDLE_NONE
 					if active {
 						if entry.generation == 0 {
 							fmt.eprintfln(
@@ -137,7 +137,7 @@ when TINA_SIMULATION_MODE {
 					if entry.state == .In_Flight {
 						in_flight_count += 1
 						if entry.generation == 0 ||
-						   entry.target_handle == HANDLE_NONE ||
+						   entry.target_handle == ISOLATE_HANDLE_NONE ||
 						   entry.cleanup_fd == OS_FD_INVALID ||
 						   entry.deadline_tick == 0 {
 							fmt.eprintfln(

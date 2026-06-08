@@ -894,7 +894,7 @@ _response_prepare_next_message :: proc "contextless" (state: ^Response_State) {
 _stage_application_expectation :: proc "contextless" (
 	route_context: Route_Context,
 	kind: Application_Expectation_Kind,
-	source_handle: tina.Handle,
+	source_handle: tina.Isolate_Handle,
 	message_tag: Message_Tag,
 	correlation_id: tina.Correlation_Id,
 	timeout_ns: u64,
@@ -910,7 +910,7 @@ _stage_application_expectation :: proc "contextless" (
 @(require_results)
 expect_reply :: proc(
 	route_context: Route_Context,
-	target_handle: tina.Handle,
+	target_handle: tina.Isolate_Handle,
 	$message_tag: tina.Message_Tag,
 	payload_bytes: []u8,
 	timeout_ns: u64,
@@ -942,7 +942,7 @@ expect_reply :: proc(
 expect_notification :: proc(
 	route_context: Route_Context,
 	timeout_ns: u64,
-	source_handle: tina.Handle = tina.HANDLE_NONE,
+	source_handle: tina.Isolate_Handle = tina.ISOLATE_HANDLE_NONE,
 	message_tag: Message_Tag = Message_Tag(0),
 ) -> Route_Step {
 	when tina.TINA_RUNTIME_ASSERTIONS {

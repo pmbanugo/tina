@@ -2,21 +2,21 @@ package tina
 
 import "core:testing"
 
-Handle :: distinct u64
+Isolate_Handle :: distinct u64
 
-HANDLE_NONE :: Handle(0)
+ISOLATE_HANDLE_NONE :: Isolate_Handle(0)
 
 make_handle :: #force_inline proc "contextless" (
 	shard_id: Shard_Id,
 	type_id: u16,
 	slot: u32,
 	generation: u32,
-) -> Handle {
+) -> Isolate_Handle {
 	// shard_id: 8 bits (63-56)
 	// type_id: 8 bits (55-48)
 	// slot_index: 20 bits (47-28)
 	// generation: 28 bits (27-0)
-	return Handle(
+	return Isolate_Handle(
 		(u64(shard_id) << 56) |
 		(u64(type_id & 0xFF) << 48) |
 		(u64(slot & 0xFFFFF) << 28) |
@@ -24,19 +24,19 @@ make_handle :: #force_inline proc "contextless" (
 	)
 }
 
-extract_shard_id :: #force_inline proc "contextless" (h: Handle) -> Shard_Id {
+extract_shard_id :: #force_inline proc "contextless" (h: Isolate_Handle) -> Shard_Id {
 	return Shard_Id((u64(h) >> 56) & 0xFF)
 }
 
-extract_type_id :: #force_inline proc "contextless" (h: Handle) -> u16 {
+extract_type_id :: #force_inline proc "contextless" (h: Isolate_Handle) -> u16 {
 	return u16((u64(h) >> 48) & 0xFF)
 }
 
-extract_slot :: #force_inline proc "contextless" (h: Handle) -> u32 {
+extract_slot :: #force_inline proc "contextless" (h: Isolate_Handle) -> u32 {
 	return u32((u64(h) >> 28) & 0xFFFFF)
 }
 
-extract_generation :: #force_inline proc "contextless" (h: Handle) -> u32 {
+extract_generation :: #force_inline proc "contextless" (h: Isolate_Handle) -> u32 {
 	return u32(u64(h) & 0x0FFFFFFF)
 }
 

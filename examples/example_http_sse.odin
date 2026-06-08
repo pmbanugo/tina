@@ -24,7 +24,7 @@ TAG_UNSUBSCRIBE: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 3
 TAG_FEED_EVENT: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 4
 
 // Isolate handle of the singleton publisher. HANDLE_NONE before init completes.
-publisher_handle: tina.Handle = tina.HANDLE_NONE
+publisher_handle: tina.Isolate_Handle = tina.ISOLATE_HANDLE_NONE
 
 // ─── Wire payloads ──────────────────────────────────────────────────────────
 
@@ -40,7 +40,7 @@ Feed_Msg :: struct {
 // ─── Publisher isolate ──────────────────────────────────────────────────────
 
 Subscriber :: struct {
-	handle:        tina.Handle,
+	handle:        tina.Isolate_Handle,
 	request_token: http.Request_Token,
 }
 
@@ -181,7 +181,7 @@ events_stream :: proc(
 	switch ev in event {
 	case http.Request_Start:
 		// Bail early if the publisher hasn't booted — EventSource auto-reconnects.
-		if publisher_handle == tina.HANDLE_NONE {
+		if publisher_handle == tina.ISOLATE_HANDLE_NONE {
 			return http.respond_text(
 				response,
 				http.HTTP_STATUS_SERVICE_UNAVAILABLE,
@@ -198,7 +198,7 @@ events_stream :: proc(
 		// Register with the publisher on first arrival; re-park on subsequent.
 		if !sse_state.subscribed {
 			publisher := publisher_handle
-			if publisher == tina.HANDLE_NONE {
+			if publisher == tina.ISOLATE_HANDLE_NONE {
 				return http.close()
 			}
 			sub := Sub_Msg {
@@ -252,7 +252,7 @@ events_stream :: proc(
 
 _unsubscribe_and_close :: proc(route_context: http.Route_Context) -> http.Route_Step {
 	publisher := publisher_handle
-	if publisher != tina.HANDLE_NONE {
+	if publisher != tina.ISOLATE_HANDLE_NONE {
 		empty: [0]u8
 		_ = http.route_send(route_context, publisher, TAG_UNSUBSCRIBE, empty[:])
 	}

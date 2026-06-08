@@ -30,12 +30,12 @@ TAG_DISPATCH_TICK: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 4
 // Passed to Worker during spawn, so it knows who its boss is.
 WorkerInitArgs :: struct {
 	id:         u32,
-	dispatcher: tina.Handle,
+	dispatcher: tina.Isolate_Handle,
 }
 
 WorkerReadyMsg :: struct {
 	id:     u32,
-	handle: tina.Handle,
+	handle: tina.Isolate_Handle,
 }
 
 JobMsg :: struct {
@@ -53,7 +53,7 @@ JobDoneMsg :: struct {
 
 WorkerIsolate :: struct {
 	id:         u32,
-	dispatcher: tina.Handle,
+	dispatcher: tina.Isolate_Handle,
 }
 
 worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
@@ -143,7 +143,7 @@ worker_handler :: proc(
 NUM_WORKERS :: 3
 
 DispatcherIsolate :: struct {
-	workers:     [NUM_WORKERS]tina.Handle,
+	workers:     [NUM_WORKERS]tina.Isolate_Handle,
 	job_counter: u32,
 }
 
@@ -159,7 +159,7 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 
 	// 1. Spawn the workers
 	for i in 0 ..< NUM_WORKERS {
-		self.workers[i] = tina.HANDLE_NONE // We don't know their handles yet!
+		self.workers[i] = tina.ISOLATE_HANDLE_NONE // We don't know their handles yet!
 
 		init_args := WorkerInitArgs {
 			id         = u32(i),
@@ -199,7 +199,7 @@ dispatcher_handler :: proc(
 		old_handle := workers[msg.id]
 		workers[msg.id] = msg.handle
 
-		if old_handle != tina.HANDLE_NONE && old_handle != msg.handle {
+		if old_handle != tina.ISOLATE_HANDLE_NONE && old_handle != msg.handle {
 			str := fmt.bprintf(
 				log_buf[:],
 				"[RECOVER] Worker %d reborn. old=%X new=%X",
@@ -240,7 +240,7 @@ dispatcher_handler :: proc(
 		for target_id in 0 ..< len(workers) {
 			job_counter += 1
 			target_handle := workers[target_id]
-			if target_handle != tina.HANDLE_NONE {
+			if target_handle != tina.ISOLATE_HANDLE_NONE {
 				// Try to send the job
 				job := JobMsg {
 					job_id = job_counter,
@@ -258,7 +258,7 @@ dispatcher_handler :: proc(
 					tina.ctx_log(ctx, .WARN, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 					// Clear the stale handle so we don't try again until it checks in
-					workers[target_id] = tina.HANDLE_NONE
+					workers[target_id] = tina.ISOLATE_HANDLE_NONE
 				} else {
 					str := fmt.bprintf(
 						log_buf[:],

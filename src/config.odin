@@ -759,7 +759,7 @@ _compute_group_capacity :: proc(group: ^Group_Spec) -> int {
 	mem_size := 0
 	cap := len(group.children) + int(group.child_count_dynamic_max)
 
-	mem_size += cap * size_of(Handle) // children_handles array
+	mem_size += cap * size_of(Isolate_Handle) // children_handles array
 	if group.child_count_dynamic_max > 0 {
 		mem_size += int(group.child_count_dynamic_max) * size_of(Dynamic_Child_Spec)
 	}
@@ -798,7 +798,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.transfer_slot_count * size_of(u16)
 	total += spec.fd_handoff_entry_count * size_of(FD_Handoff_Entry)
 	total += spec.timer_entry_count * size_of(u64)            // deadlines
-	total += spec.timer_entry_count * size_of(Handle)          // targets
+	total += spec.timer_entry_count * size_of(Isolate_Handle)          // targets
 	total += spec.timer_entry_count * size_of(Message_Tag)     // tags
 	total += spec.timer_entry_count * size_of(Correlation_Id)  // correlations
 	total += bitmap_word_count_from_bit_count(spec.timer_entry_count) * size_of(u64) // armed_words

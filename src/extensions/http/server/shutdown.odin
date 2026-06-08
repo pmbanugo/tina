@@ -88,7 +88,7 @@ _connection_begin_keep_alive_wait :: proc(connection: ^HTTP_Connection, ctx: tin
 	state.ingress_parsed_offset = 0
 	state.state = .Keep_Alive_Idle
 	state.application_expectation_kind = .Reply
-	state.application_expected_source = tina.HANDLE_NONE
+	state.application_expected_source = tina.ISOLATE_HANDLE_NONE
 	state.application_expected_tag = Message_Tag(0)
 	state.application_correlation_id = tina.CORRELATION_ID_NONE
 	state.application_timeout_ns = 0
@@ -188,7 +188,7 @@ _runtime_evict_idle_connection :: proc(runtime: ^HTTP_Shard_Runtime, ctx: tina.T
 	if runtime == nil || u16(runtime.idle_count) == 0 do return false
 
 	victim_handle := runtime.idle_slot_handles[u16(runtime.idle_count)-1]
-	if victim_handle == tina.HANDLE_NONE do return false
+	if victim_handle == tina.ISOLATE_HANDLE_NONE do return false
 
 	empty_payload: []u8
 	return tina.ctx_send_raw(ctx, victim_handle, TAG_EVICT, empty_payload) == tina.Send_Result.ok
@@ -275,7 +275,7 @@ _runtime_active_slot_remove_by_slot :: proc(runtime: ^HTTP_Shard_Runtime, slot_i
 @(test)
 test_idle_slot_swap_and_pop :: proc(t: ^testing.T) {
 	indices: [4]u16
-	handles: [4]tina.Handle
+	handles: [4]tina.Isolate_Handle
 	positions: [4]u16
 	for index in 0 ..< len(positions) {
 		positions[index] = u16(IDLE_ARRAY_INDEX_NONE)

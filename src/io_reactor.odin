@@ -117,7 +117,7 @@ _reactor_socket_error_from_backend_error :: #force_inline proc "contextless" (
 // Create a socket, register it in the FD table, and establish ownership.
 reactor_control_socket :: proc(
 	reactor: ^Reactor,
-	owner: Handle,
+	owner: Isolate_Handle,
 	domain: Socket_Domain,
 	socket_type: Socket_Type,
 	protocol: Socket_Protocol,
@@ -142,7 +142,7 @@ reactor_control_socket :: proc(
 reactor_control_bind :: proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
-	owner: Handle,
+	owner: Isolate_Handle,
 	address: Socket_Address,
 ) -> Backend_Error {
 	os_fd, err := _resolve_os_fd(reactor, fd, owner, .Any)
@@ -153,7 +153,7 @@ reactor_control_bind :: proc(
 reactor_control_listen :: proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
-	owner: Handle,
+	owner: Isolate_Handle,
 	backlog: u32,
 ) -> Backend_Error {
 	os_fd, err := _resolve_os_fd(reactor, fd, owner, .Any)
@@ -164,7 +164,7 @@ reactor_control_listen :: proc(
 reactor_control_setsockopt :: proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
-	owner: Handle,
+	owner: Isolate_Handle,
 	level: Socket_Level,
 	option: Socket_Option,
 	value: Socket_Option_Value,
@@ -192,7 +192,7 @@ reactor_control_getsockopt :: proc(
 reactor_control_shutdown :: proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
-	owner: Handle,
+	owner: Isolate_Handle,
 	how: Shutdown_How,
 ) -> Backend_Error {
 	dir: Direction_Affinity
@@ -214,7 +214,7 @@ reactor_control_shutdown :: proc(
 reactor_control_close :: proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
-	owner: Handle,
+	owner: Isolate_Handle,
 ) -> Backend_Error {
 	os_fd, err := _resolve_os_fd(reactor, fd, owner, .Any)
 	if err != IO_ERR_NONE do return .Not_Found
@@ -238,7 +238,7 @@ reactor_internal_close_fd :: proc "contextless" (reactor: ^Reactor, fd: FD_Handl
 reactor_export_fd_handoff :: proc "contextless" (
 	reactor: ^Reactor,
 	fd: FD_Handle,
-	owner: Handle,
+	owner: Isolate_Handle,
 ) -> (
 	OS_FD,
 	Peer_Address,
@@ -267,7 +267,7 @@ reactor_export_fd_handoff :: proc "contextless" (
 @(private = "package")
 reactor_adopt_fd_handoff :: proc "contextless" (
 	reactor: ^Reactor,
-	owner: Handle,
+	owner: Isolate_Handle,
 	os_fd: OS_FD,
 	peer_address: Peer_Address,
 ) -> (
@@ -671,7 +671,7 @@ _reactor_resubmit_recv_after_no_buffer :: proc(
 reactor_submit_io :: proc(
 	reactor: ^Reactor,
 	shard: ^Shard,
-	owner: Handle,
+	owner: Isolate_Handle,
 	io_op: IoOp,
 	data_source: IO_Data_Source = .None,
 	payload_offset: u16 = 0,
@@ -996,7 +996,7 @@ _io_op_to_operation_kind :: #force_inline proc(op: IoOp) -> IO_Operation_Kind {
 _resolve_os_fd :: #force_inline proc(
 	reactor: ^Reactor,
 	fd: FD_Handle,
-	owner: Handle,
+	owner: Isolate_Handle,
 	dir: Direction_Affinity,
 ) -> (
 	OS_FD,

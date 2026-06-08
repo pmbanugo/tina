@@ -59,7 +59,7 @@ when TINA_SIMULATION_MODE {
 
 		timer_deadlines := make([]u64, 8)
 		defer delete(timer_deadlines)
-		timer_targets := make([]Handle, 8)
+		timer_targets := make([]Isolate_Handle, 8)
 		defer delete(timer_targets)
 		timer_tags := make([]Message_Tag, 8)
 		defer delete(timer_tags)

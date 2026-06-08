@@ -6,8 +6,8 @@ import "core:mem"
 Test_Context_Proc :: #type proc(user_data: rawptr, ctx: TinaContext)
 
 Test_Context_Config :: struct {
-	self_handle:         Handle,
-	message_source:      Handle,
+	self_handle:         Isolate_Handle,
+	message_source:      Isolate_Handle,
 	correlation_id:      Correlation_Id,
 	flags:               Context_Flags,
 	monotonic_time_ns:   Monotonic_Time_NS,
@@ -17,8 +17,8 @@ Test_Context_Config :: struct {
 }
 
 Test_Local_Context_Config :: struct {
-	self_handle:             Handle,
-	target_handle:           Handle,
+	self_handle:             Isolate_Handle,
+	target_handle:           Isolate_Handle,
 	monotonic_time_ns:       Monotonic_Time_NS,
 	current_tick:            u64,
 	flags:                   Context_Flags,
@@ -53,7 +53,7 @@ test_with_context :: proc(
 
 	timer_deadlines := make([]u64, 16)
 	defer delete(timer_deadlines)
-	timer_targets := make([]Handle, 16)
+	timer_targets := make([]Isolate_Handle, 16)
 	defer delete(timer_targets)
 	timer_tags := make([]Message_Tag, 16)
 	defer delete(timer_tags)
@@ -160,7 +160,7 @@ test_with_local_context :: proc(
 
 	timer_deadlines := make([]u64, 16)
 	defer delete(timer_deadlines)
-	timer_targets := make([]Handle, 16)
+	timer_targets := make([]Isolate_Handle, 16)
 	defer delete(timer_targets)
 	timer_tags := make([]Message_Tag, 16)
 	defer delete(timer_tags)
@@ -224,7 +224,7 @@ test_with_local_context :: proc(
 		shard                  = shard,
 		context_token          = make_tina_context_token(shard),
 		self_handle            = config.self_handle,
-		current_message_source = HANDLE_NONE,
+		current_message_source = ISOLATE_HANDLE_NONE,
 		current_correlation    = CORRELATION_ID_NONE,
 		flags                  = config.flags,
 		timer_resolution_ns    = shard.timer_resolution_ns,

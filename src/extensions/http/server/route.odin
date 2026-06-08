@@ -20,14 +20,14 @@ Peer_Closed :: struct {}
 Server_Drain :: struct {}
 
 Application_Reply :: struct {
-	source_handle: tina.Handle,
+	source_handle: tina.Isolate_Handle,
 	message_tag:   Message_Tag,
 	payload_bytes: []u8,
 	reply_result:  Reply_Result,
 }
 
 Application_Notification :: struct {
-	source_handle: tina.Handle,
+	source_handle: tina.Isolate_Handle,
 	message_tag:   Message_Tag,
 	payload_bytes: []u8,
 }
@@ -98,7 +98,7 @@ Route_Context :: struct {
 @(require_results)
 route_send :: #force_inline proc(
 	route_context: Route_Context,
-	to: tina.Handle,
+	to: tina.Isolate_Handle,
 	$tag: tina.Message_Tag,
 	payload: []u8,
 ) -> tina.Send_Result {
@@ -110,7 +110,7 @@ route_spawn :: proc(route_context: Route_Context, spec: tina.Spawn_Spec) -> tina
 	return tina.ctx_spawn(route_context.tina_context, spec)
 }
 
-route_self_handle :: proc(route_context: Route_Context) -> tina.Handle {
+route_self_handle :: proc(route_context: Route_Context) -> tina.Isolate_Handle {
 	return tina.ctx_self_handle(route_context.tina_context)
 }
 

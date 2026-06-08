@@ -29,7 +29,7 @@ fd_handoff_table_init :: proc(table: ^FD_Handoff_Table, backing: []FD_Handoff_En
 @(private = "package")
 fd_handoff_table_alloc :: proc "contextless" (
 	table: ^FD_Handoff_Table,
-	target_handle: Handle,
+	target_handle: Isolate_Handle,
 	cleanup_fd: OS_FD,
 	peer_address: Peer_Address,
 	deadline_tick: u64,

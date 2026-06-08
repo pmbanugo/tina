@@ -133,7 +133,7 @@ Dynamic_Child_Spec :: struct {
 }
 
 Supervision_Group :: struct {
-	children_handles:      []Handle,
+	children_handles:      []Isolate_Handle,
 	dynamic_specs:         []Dynamic_Child_Spec,
 	boot_spec:             ^Group_Spec,
 	window_start_tick:     u64,
@@ -696,8 +696,8 @@ _dispatch_type_batch :: proc(
 		previous               = g_current_isolate_invocation,
 		shard                  = shard,
 		context_token          = 0, // Assigned per invocation
-		self_handle            = HANDLE_NONE, // Assigned per invocation
-		current_message_source = HANDLE_NONE, // Assigned per invocation
+		self_handle            = ISOLATE_HANDLE_NONE, // Assigned per invocation
+		current_message_source = ISOLATE_HANDLE_NONE, // Assigned per invocation
 		current_correlation    = CORRELATION_ID_NONE, // Assigned per invocation
 		flags                  = {}, // Assigned per invocation
 		timer_resolution_ns    = shard.timer_resolution_ns,
@@ -804,7 +804,7 @@ _dispatch_type_batch :: proc(
 		case .Shutdown:
 			message.tag = TAG_SHUTDOWN
 			message.correlation = CORRELATION_ID_NONE
-			message.user.source = HANDLE_NONE
+			message.user.source = ISOLATE_HANDLE_NONE
 			message.user.payload_size = 0
 
 			message_pointer = &message
@@ -832,7 +832,7 @@ _dispatch_type_batch :: proc(
 			slot_index,
 			generations[slot_index],
 		)
-		invocation.current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : HANDLE_NONE
+		invocation.current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : ISOLATE_HANDLE_NONE
 		invocation.current_correlation = correlation
 		invocation.flags = ctx_flags
 		invocation.slot_index = slot_index
@@ -1143,7 +1143,7 @@ _commit_staged_call :: proc(
 	route_result := _route_envelope_user(shard, envelope.destination, &envelope)
 	if route_result != .ok {
 		timeout_env: Message_Envelope
-		timeout_env.source = HANDLE_NONE
+		timeout_env.source = ISOLATE_HANDLE_NONE
 		timeout_env.destination = invocation.self_handle
 		timeout_env.tag = TAG_CALL_TIMEOUT
 		timeout_env.correlation = correlation_id
@@ -1331,7 +1331,7 @@ _interpret_transition :: proc(
 @(private = "package")
 _route_envelope_user :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	to: Handle,
+	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
 	return _route_envelope_internal(shard, to, envelope, true)
@@ -1340,7 +1340,7 @@ _route_envelope_user :: #force_inline proc "contextless" (
 @(private = "package")
 _route_envelope_system :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	to: Handle,
+	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
 	return _route_envelope_internal(shard, to, envelope, false)
@@ -1349,7 +1349,7 @@ _route_envelope_system :: #force_inline proc "contextless" (
 @(private = "file")
 _route_envelope_internal :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	to: Handle,
+	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 	is_user: bool,
 ) -> Send_Result {
@@ -1365,7 +1365,7 @@ _route_envelope_internal :: #force_inline proc "contextless" (
 @(private = "package")
 _enqueue_user_msg :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	to: Handle,
+	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
 	return _enqueue_internal(shard, to, envelope, true)
@@ -1374,7 +1374,7 @@ _enqueue_user_msg :: #force_inline proc "contextless" (
 @(private = "package")
 _enqueue_system_msg :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	to: Handle,
+	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
 	return _enqueue_internal(shard, to, envelope, false)
@@ -1385,7 +1385,7 @@ _enqueue_system_msg :: #force_inline proc "contextless" (
 @(private = "file")
 _enqueue_internal :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	to: Handle,
+	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 	is_user: bool,
 ) -> Send_Result {
@@ -1637,12 +1637,12 @@ _fd_handoff_send_or_defer :: proc "contextless" (
 @(private = "file")
 _fd_handoff_send_abort :: proc "contextless" (
 	shard: ^Shard,
-	destination: Handle,
+	destination: Isolate_Handle,
 	ref: FD_Handoff_Ref,
 	os_fd: OS_FD,
 ) -> FD_Handoff_Control_Send {
 	env: Message_Envelope
-	env.source = HANDLE_NONE
+	env.source = ISOLATE_HANDLE_NONE
 	env.destination = destination
 	env.tag = TAG_FD_HANDOFF_ABORT
 	env.payload_size = u16(size_of(FD_Handoff_Abort))
@@ -1662,7 +1662,7 @@ Target_Slot :: struct {
 @(private = "file")
 _resolve_target_slot :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	target: Handle,
+	target: Isolate_Handle,
 ) -> (
 	Target_Slot,
 	bool,
@@ -1741,8 +1741,8 @@ _fd_handoff_close_all_entries :: proc "contextless" (shard: ^Shard, send_abort: 
 @(private = "file")
 _fd_handoff_send_ack :: proc "contextless" (
 	shard: ^Shard,
-	destination: Handle,
-	source: Handle,
+	destination: Isolate_Handle,
+	source: Isolate_Handle,
 	ref: FD_Handoff_Ref,
 ) -> FD_Handoff_Control_Send {
 	env: Message_Envelope
@@ -1759,8 +1759,8 @@ _fd_handoff_send_ack :: proc "contextless" (
 @(private = "file")
 _fd_handoff_send_reject :: proc "contextless" (
 	shard: ^Shard,
-	destination: Handle,
-	source: Handle,
+	destination: Isolate_Handle,
+	source: Isolate_Handle,
 	ref: FD_Handoff_Ref,
 	reason: FD_Handoff_Reject_Reason,
 ) -> FD_Handoff_Control_Send {
@@ -1779,7 +1779,7 @@ _fd_handoff_send_reject :: proc "contextless" (
 @(private = "file")
 _inject_fd_handoff_accept :: proc "contextless" (
 	shard: ^Shard,
-	target: Handle,
+	target: Isolate_Handle,
 	fd: FD_Handle,
 	peer_address: Peer_Address,
 ) -> FD_Handoff_Reject_Reason {
@@ -1809,7 +1809,7 @@ _inject_fd_handoff_accept :: proc "contextless" (
 @(private = "file")
 _clear_fd_handoff_accept :: proc "contextless" (
 	shard: ^Shard,
-	target: Handle,
+	target: Isolate_Handle,
 	fd: FD_Handle,
 ) {
 	target_slot, ok := _resolve_target_slot(shard, target)
@@ -1994,7 +1994,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]
 
-		if entry.reader_isolate != HANDLE_NONE || entry.writer_isolate != HANDLE_NONE {
+		if entry.reader_isolate != ISOLATE_HANDLE_NONE || entry.writer_isolate != ISOLATE_HANDLE_NONE {
 			backend_control_close(&shard.reactor.backend, entry.os_fd)
 			fd_handle := fd_handle_make(u16(i), entry.generation)
 			fd_table_free(&shard.reactor.fd_table, fd_handle)
@@ -2080,8 +2080,8 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
 	// Step 6: Notify peers via SHARD_RESTARTED
 	env: Message_Envelope
-	env.source = HANDLE_NONE
-	env.destination = HANDLE_NONE
+	env.source = ISOLATE_HANDLE_NONE
+	env.destination = ISOLATE_HANDLE_NONE
 	env.tag = TAG_SHARD_RESTARTED
 	transport_broadcast_envelope(shard, &env)
 }
@@ -2107,7 +2107,7 @@ _process_inbound_envelope :: #force_inline proc "contextless" (
 	envelope: ^Message_Envelope,
 ) {
 	// System Broadcast Intercept
-	if envelope.destination == HANDLE_NONE {
+	if envelope.destination == ISOLATE_HANDLE_NONE {
 		if envelope.tag == TAG_SHARD_RESTARTED {
 			// Peer recovered, un-quarantine it
 			shard_mask_include(&shard.peer_alive_mask, source_shard)
@@ -2168,7 +2168,7 @@ _init_handoff_test_shard :: proc(
 _alloc_handoff_test_entry :: proc(
 	t: ^testing.T,
 	shard: ^Shard,
-	target_handle: Handle,
+	target_handle: Isolate_Handle,
 	deadline_tick: u64,
 ) -> FD_Handoff_Ref {
 	cleanup_fd, sock_err := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
@@ -2403,7 +2403,7 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 		shard.sim_state.network = &network
 		shard.sim_state.fault_config = &fault_config
 
-		prefill_envelope := Message_Envelope {source = make_handle(1, 1, 0, 1), destination = HANDLE_NONE}
+		prefill_envelope := Message_Envelope {source = make_handle(1, 1, 0, 1), destination = ISOLATE_HANDLE_NONE}
 		prefill_result := sim_network_enqueue(
 			&network,
 			shard,
@@ -2536,8 +2536,8 @@ test_fd_handoff_peer_quarantine_closes_entries_targeting_that_shard :: proc(t: ^
 	ref_target_2 := _alloc_handoff_test_entry(t, shard, make_handle(2, 1, 0, 1), 100)
 
 	quarantine_envelope := Message_Envelope {
-		source = HANDLE_NONE,
-		destination = HANDLE_NONE,
+		source = ISOLATE_HANDLE_NONE,
+		destination = ISOLATE_HANDLE_NONE,
 		tag = TAG_SHARD_QUARANTINED,
 	}
 	_process_inbound_envelope(shard, 1, &quarantine_envelope)

@@ -34,7 +34,7 @@ _group_total_child_count :: #force_inline proc(group: ^Supervision_Group) -> u16
 }
 
 @(private = "package")
-_find_child_index :: proc(group: ^Supervision_Group, handle: Handle) -> (u16, bool) {
+_find_child_index :: proc(group: ^Supervision_Group, handle: Isolate_Handle) -> (u16, bool) {
 	for i in 0 ..< _group_total_child_count(group) {
 		if group.children_handles[i] == handle do return i, true
 	}
@@ -45,7 +45,7 @@ _find_child_index :: proc(group: ^Supervision_Group, handle: Handle) -> (u16, bo
 _remove_child_at :: proc(group: ^Supervision_Group, child_index: u16) {
 	_assert_group_layout(group)
 	if child_index < group.child_count_static {
-		group.children_handles[child_index] = HANDLE_NONE
+		group.children_handles[child_index] = ISOLATE_HANDLE_NONE
 		return
 	}
 
@@ -60,7 +60,7 @@ _remove_child_at :: proc(group: ^Supervision_Group, child_index: u16) {
 	}
 
 	last_slot := group.child_count_static + child_index_dynamic_last
-	group.children_handles[last_slot] = HANDLE_NONE
+	group.children_handles[last_slot] = ISOLATE_HANDLE_NONE
 	group.child_count_dynamic -= 1
 }
 
@@ -97,7 +97,7 @@ _check_and_record_restart :: proc(shard: ^Shard, group: ^Supervision_Group) -> b
 _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 	for i := _group_total_child_count(group); i > 0; i -= 1 {
 		handle := group.children_handles[i - 1]
-		if handle != HANDLE_NONE {
+		if handle != ISOLATE_HANDLE_NONE {
 			if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
 				_teardown_isolate(shard, extract_type_id(handle), extract_slot(handle), .Shutdown)
 			} else {
@@ -124,7 +124,7 @@ _escalate :: proc(shard: ^Shard, group: ^Supervision_Group) {
 _teardown_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
 	for i := _group_total_child_count(group); i > 0; i -= 1 {
 		handle := group.children_handles[i - 1]
-		if handle != HANDLE_NONE {
+		if handle != ISOLATE_HANDLE_NONE {
 			if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
 				_teardown_isolate(shard, extract_type_id(handle), extract_slot(handle), .Shutdown)
 			} else {
@@ -134,7 +134,7 @@ _teardown_subgroup :: proc(shard: ^Shard, group: ^Supervision_Group) {
 	}
 
 	for i in group.child_count_static ..< _group_total_child_count(group) {
-		group.children_handles[i] = HANDLE_NONE
+		group.children_handles[i] = ISOLATE_HANDLE_NONE
 	}
 	group.child_count_dynamic = 0
 	group.restart_count = 0
@@ -160,8 +160,8 @@ _spawn_static_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, child_i
 		return false
 	}
 
-	res := _make_isolate(shard, spec, HANDLE_NONE)
-	if handle, ok := res.(Handle); ok {
+	res := _make_isolate(shard, spec, ISOLATE_HANDLE_NONE)
+	if handle, ok := res.(Isolate_Handle); ok {
 		group.children_handles[child_index] = handle
 		return true
 	}
@@ -197,8 +197,8 @@ _respawn_child_at :: proc(shard: ^Shard, group: ^Supervision_Group, child_index:
 			args_payload = dyn.args_payload,
 		}
 
-		res := _make_isolate(shard, spec, HANDLE_NONE)
-		if handle, ok := res.(Handle); ok {
+		res := _make_isolate(shard, spec, ISOLATE_HANDLE_NONE)
+		if handle, ok := res.(Isolate_Handle); ok {
 			group.children_handles[child_index] = handle
 			return .Ok
 		}
@@ -220,7 +220,7 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, child_index_cr
 			if child_index_target == child_index_crashed do continue
 
 			handle := group.children_handles[child_index_target]
-			if handle != HANDLE_NONE {
+			if handle != ISOLATE_HANDLE_NONE {
 				if extract_type_id(handle) != u16(SUPERVISION_SUBGROUP_TYPE_ID) {
 					_teardown_isolate(
 						shard,
@@ -228,7 +228,7 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, child_index_cr
 						extract_slot(handle),
 						.Shutdown,
 					)
-					group.children_handles[child_index_target] = HANDLE_NONE
+					group.children_handles[child_index_target] = ISOLATE_HANDLE_NONE
 				} else {
 					_teardown_subgroup(shard, &shard.supervision_groups[extract_slot(handle)])
 				}
@@ -261,7 +261,7 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, child_index_cr
 _on_child_exit :: proc(
 	shard: ^Shard,
 	group_id: Supervision_Group_Id,
-	child_handle: Handle,
+	child_handle: Isolate_Handle,
 	exit_kind: Exit_Kind,
 ) {
 	group := &shard.supervision_groups[u16(group_id)]
@@ -346,7 +346,7 @@ _build_group :: proc(
 	child_capacity_count := len(group_spec.children) + int(group_spec.child_count_dynamic_max)
 	if len(group.children_handles) == 0 && child_capacity_count > 0 {
 		if arena_alloc_data != nil do arena_alloc_data.current_name = fmt.tprintf("Group_%d_Handles", group_index)
-		group.children_handles = make([]Handle, child_capacity_count, alloc)
+		group.children_handles = make([]Isolate_Handle, child_capacity_count, alloc)
 	}
 
 	if group_spec.child_count_dynamic_max > 0 && len(group.dynamic_specs) == 0 {
@@ -357,7 +357,7 @@ _build_group :: proc(
 	_assert_group_layout(group)
 
 	for i in 0 ..< len(group.children_handles) {
-		group.children_handles[i] = HANDLE_NONE
+		group.children_handles[i] = ISOLATE_HANDLE_NONE
 	}
 
 	for i in 0 ..< len(group_spec.children) {
@@ -440,12 +440,12 @@ test_on_child_exit_does_not_restart_during_process_shutdown :: proc(t: ^testing.
 	group.boot_spec = &group_spec
 	group.strategy = .One_For_One
 	group.child_count_static = 1
-	group.children_handles = make([]Handle, 1)
+	group.children_handles = make([]Isolate_Handle, 1)
 	defer delete(group.children_handles)
 	group.children_handles[0] = child_handle
 
 	_on_child_exit(shard, 0, child_handle, .Normal)
 
-	testing.expect_value(t, group.children_handles[0], HANDLE_NONE)
+	testing.expect_value(t, group.children_handles[0], ISOLATE_HANDLE_NONE)
 	testing.expect_value(t, group.child_count_dynamic, u16(0))
 }

@@ -45,8 +45,8 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 		entry^ = FD_Entry{}
 		entry.os_fd = _fd_table_encode_next(table.free_head)
 		entry.generation = 1
-		entry.reader_isolate = HANDLE_NONE
-		entry.writer_isolate = HANDLE_NONE
+		entry.reader_isolate = ISOLATE_HANDLE_NONE
+		entry.writer_isolate = ISOLATE_HANDLE_NONE
 		entry.peer_address = {}
 		entry.flags = {}
 		table.free_head = u16(i)
@@ -58,7 +58,7 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 fd_table_alloc :: proc "contextless" (
 	table: ^FD_Table,
 	os_fd: OS_FD,
-	owner: Handle,
+	owner: Isolate_Handle,
 ) -> (
 	FD_Handle,
 	FD_Table_Error,
@@ -128,7 +128,7 @@ fd_table_resolve :: #force_inline proc "contextless" (
 // recv/recvfrom/read/accept check reader_isolate; send/sendto/write/connect/close check writer_isolate.
 fd_table_validate_read_affinity :: #force_inline proc "contextless" (
 	entry: ^FD_Entry,
-	owner: Handle,
+	owner: Isolate_Handle,
 ) -> FD_Table_Error {
 	if entry.reader_isolate != owner {
 		return .Affinity_Violation
@@ -138,7 +138,7 @@ fd_table_validate_read_affinity :: #force_inline proc "contextless" (
 
 fd_table_validate_write_affinity :: #force_inline proc "contextless" (
 	entry: ^FD_Entry,
-	owner: Handle,
+	owner: Isolate_Handle,
 ) -> FD_Table_Error {
 	if entry.writer_isolate != owner {
 		return .Affinity_Violation
@@ -150,7 +150,7 @@ fd_table_validate_write_affinity :: #force_inline proc "contextless" (
 fd_table_handoff :: proc "contextless" (
 	table: ^FD_Table,
 	handle: FD_Handle,
-	new_owner: Handle,
+	new_owner: Isolate_Handle,
 	mode: Handoff_Mode,
 ) -> FD_Table_Error {
 	index := fd_table_lookup_index(table, handle) or_return
@@ -189,8 +189,8 @@ fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_
 	// Bump generation to invalidate all outstanding FD_Handles
 	entry.generation += 1
 	entry.os_fd = _fd_table_encode_next(table.free_head)
-	entry.reader_isolate = HANDLE_NONE
-	entry.writer_isolate = HANDLE_NONE
+	entry.reader_isolate = ISOLATE_HANDLE_NONE
+	entry.writer_isolate = ISOLATE_HANDLE_NONE
 	entry.peer_address = {}
 	entry.flags = {}
 
@@ -247,7 +247,7 @@ fd_table_is_fresh_accept :: #force_inline proc "contextless" (entry: ^FD_Entry) 
 // Calls visitor for each matching FD. Visitor returns true to continue, false to stop.
 fd_table_for_each_owned :: proc(
 	table: ^FD_Table,
-	owner: Handle,
+	owner: Isolate_Handle,
 	visitor: proc(handle: FD_Handle, entry: ^FD_Entry) -> bool,
 ) {
 	for i in 0 ..< table.slot_count {

@@ -154,7 +154,7 @@ when TINA_SIMULATION_MODE {
 			shard.metadata[EXITER_TYPE_ID].generation[0],
 		)
 		envelope := Message_Envelope {
-			source       = HANDLE_NONE,
+			source       = ISOLATE_HANDLE_NONE,
 			destination  = exiter_handle,
 			tag          = APP_TAG_PING,
 			payload_size = size_of(PingMsg),
@@ -301,7 +301,7 @@ when TINA_SIMULATION_MODE {
 			shard.metadata[EXITER_TYPE_ID].generation[0],
 		)
 		envelope := Message_Envelope {
-			source       = HANDLE_NONE,
+			source       = ISOLATE_HANDLE_NONE,
 			destination  = exiter_handle,
 			tag          = APP_TAG_PING,
 			payload_size = size_of(PingMsg),

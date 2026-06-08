@@ -31,7 +31,7 @@ Envelope_Flags :: bit_set[Envelope_Flag;u16]
 Message :: struct {
 	using body: struct #raw_union {
 		user: struct {
-			source:       Handle,
+			source:       Isolate_Handle,
 			payload_size: u16,
 			payload:      [MAX_PAYLOAD_SIZE]u8,
 		},
@@ -49,10 +49,10 @@ Message :: struct {
 // 128 bytes exactly. Fields ordered largest-to-smallest to eliminate implicit padding.
 Message_Envelope :: struct #align (128) {
 	using _lifecycle: struct #raw_union {
-		source:         Handle, // ALIVE STATE: Sender's Handle
+		source:         Isolate_Handle, // ALIVE STATE: Sender's Handle
 		next_free_slot: u32, // DEAD STATE: Intrusive pool free-list linkage
 	},
-	destination:      Handle,
+	destination:      Isolate_Handle,
 	correlation:      Correlation_Id,
 	next_in_mailbox:  u32, // (The queue linkage, overwrites index)
 	tag:              Message_Tag,

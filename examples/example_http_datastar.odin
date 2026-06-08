@@ -137,7 +137,7 @@ hello_world :: proc(
 		return http.expect_notification(
 			route_context,
 			u64(hello_state.store.Interval) * 1_000_000,
-			tina.HANDLE_NONE,
+			tina.ISOLATE_HANDLE_NONE,
 			STREAM_TIMEOUT_TAG,
 		)
 

@@ -10,7 +10,7 @@ when TINA_SIMULATION_MODE {
 
 	FDHandoffListener :: struct {
 		listen_fd:      FD_Handle,
-		target_handle:  Handle,
+		target_handle:  Isolate_Handle,
 		handoff_result: FD_Handoff_Result,
 		hand_offered:   bool,
 	}
@@ -33,7 +33,7 @@ when TINA_SIMULATION_MODE {
 		}
 
 		iso.listen_fd = fd
-		iso.target_handle = (cast(^Handle)&args[0])^
+		iso.target_handle = (cast(^Isolate_Handle)&args[0])^
 
 		bind_err := ctx_bind(ctx, fd, Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 8080})
 		if bind_err != .None {

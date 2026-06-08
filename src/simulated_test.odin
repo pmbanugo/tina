@@ -13,9 +13,9 @@ when TINA_SIMULATION_MODE {
 		res: Spawn_Result,
 		name: string,
 		loc := #caller_location,
-	) -> Handle {
+	) -> Isolate_Handle {
 		switch v in res {
-		case Handle:
+		case Isolate_Handle:
 			return v
 		case Spawn_Error:
 			// panic() diverges (never returns), so no return statement is needed after it
@@ -42,12 +42,12 @@ when TINA_SIMULATION_MODE {
 	}
 
 	PingInitArgs :: struct {
-		pong_handle: Handle,
+		pong_handle: Isolate_Handle,
 	}
 
 	Coordinator :: struct {}
 	PingIsolate :: struct {
-		pong_handle: Handle,
+		pong_handle: Isolate_Handle,
 		count:       u32,
 	}
 	PongIsolate :: struct {}

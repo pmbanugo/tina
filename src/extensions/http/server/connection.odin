@@ -965,7 +965,7 @@ _connection_handle_application_mailbox_message :: proc(
 
 	case .Notification:
 		if !is_timeout {
-			if state.application_expected_source != tina.HANDLE_NONE &&
+			if state.application_expected_source != tina.ISOLATE_HANDLE_NONE &&
 			   state.application_expected_source != message.user.source {
 				return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 			}
@@ -1478,7 +1478,7 @@ test_idle_peer_close_unlinks_idle_before_fd_close :: proc(t: ^testing.T) {
 	active_connections: [1]^HTTP_Connection
 	active_slot_positions: [1]u16
 	idle_slot_indices: [1]u16
-	idle_slot_handles: [1]tina.Handle
+	idle_slot_handles: [1]tina.Isolate_Handle
 	idle_slot_positions: [1]u16
 	active_slot_positions[0] = u16(IDLE_ARRAY_INDEX_NONE)
 	idle_slot_positions[0] = u16(IDLE_ARRAY_INDEX_NONE)
@@ -1612,7 +1612,7 @@ _notification_route_event_handler :: proc(
 		return expect_notification(
 			route_context,
 			1_000_000,
-			tina.HANDLE_NONE,
+			tina.ISOLATE_HANDLE_NONE,
 			TEST_NOTIFICATION_MESSAGE_TAG,
 		)
 
@@ -1623,7 +1623,7 @@ _notification_route_event_handler :: proc(
 			return expect_notification(
 				route_context,
 				1_000_000,
-				tina.HANDLE_NONE,
+				tina.ISOLATE_HANDLE_NONE,
 				TEST_NOTIFICATION_MESSAGE_TAG,
 			)
 		}
@@ -1854,7 +1854,7 @@ test_pending_application_message_is_preserved_until_expectation :: proc(t: ^test
 			)
 
 			connection.connection_state.application_expectation_kind = .Notification
-			connection.connection_state.application_expected_source = tina.HANDLE_NONE
+			connection.connection_state.application_expected_source = tina.ISOLATE_HANDLE_NONE
 			connection.connection_state.application_expected_tag = TEST_NOTIFICATION_MESSAGE_TAG
 			connection.connection_state.application_correlation_id = tina.Correlation_Id(33)
 			connection.connection_state.application_timeout_ns = 1_000_000
@@ -1957,7 +1957,7 @@ test_pending_application_message_first_wins_when_multiple_arrive :: proc(t: ^tes
 			)
 
 			connection.connection_state.application_expectation_kind = .Notification
-			connection.connection_state.application_expected_source = tina.HANDLE_NONE
+			connection.connection_state.application_expected_source = tina.ISOLATE_HANDLE_NONE
 			connection.connection_state.application_expected_tag = TEST_NOTIFICATION_MESSAGE_TAG
 			connection.connection_state.application_correlation_id = tina.Correlation_Id(44)
 			connection.connection_state.application_timeout_ns = 1_000_000
@@ -2059,7 +2059,7 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 @(test)
 test_shutdown_while_reading_headers_closes_immediately :: proc(t: ^testing.T) {
 	idle_slot_indices: [1]u16
-	idle_slot_handles: [1]tina.Handle
+	idle_slot_handles: [1]tina.Isolate_Handle
 	idle_slot_positions: [1]u16
 	idle_slot_positions[0] = u16(IDLE_ARRAY_INDEX_NONE)
 
@@ -2699,7 +2699,7 @@ test_process_header_bytes_closes_when_core_shutdown_started_before_http_runtime_
 @(test)
 test_finalize_flushed_response_processes_pipeline_tail_before_recv :: proc(t: ^testing.T) {
 	idle_slot_indices: [4]u16
-	idle_slot_handles: [4]tina.Handle
+	idle_slot_handles: [4]tina.Isolate_Handle
 	idle_slot_positions: [4]u16
 	for position_index in 0 ..< len(idle_slot_positions) {
 		idle_slot_positions[position_index] = u16(IDLE_ARRAY_INDEX_NONE)

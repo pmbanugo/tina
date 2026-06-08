@@ -145,7 +145,7 @@ Application_Expectation_Kind :: enum u8 {
 
 @(private = "package")
 Application_Pending_Message :: struct {
-	source_handle: tina.Handle,
+	source_handle: tina.Isolate_Handle,
 	message_tag:   Message_Tag,
 	correlation_id: tina.Correlation_Id,
 	payload_size:  u16,
@@ -174,7 +174,7 @@ HTTP_Shard_Runtime :: struct {
 	active_slot_positions: []u16,
 	active_count:          Active_Array_Count,
 	idle_slot_indices:    []u16, // dense swap-and-pop tracker
-	idle_slot_handles:    []tina.Handle,
+	idle_slot_handles:    []tina.Isolate_Handle,
 	idle_slot_positions:  []u16,
 	idle_count:           Idle_Array_Count,
 	free_count:           u16, // free connection slots (dropped on spawn, restored on close)
@@ -193,7 +193,7 @@ HTTP_Shard_Runtime :: struct {
 HTTP_Listener :: struct {
 	listen_fd:                  tina.FD_Handle,
 	shard_runtime:              ^HTTP_Shard_Runtime,
-	dispatcher_handles:         []tina.Handle,
+	dispatcher_handles:         []tina.Isolate_Handle,
 	next_dispatcher_shard_index: u8,
 	accept_backoff_ns:          u64,
 }
@@ -219,12 +219,12 @@ HTTP_Connection_State :: struct {
 	fd:                         tina.FD_Handle,
 	request_token:              Request_Token,
 	application_expectation_kind: Application_Expectation_Kind,
-	application_expected_source: tina.Handle,
+	application_expected_source: tina.Isolate_Handle,
 	application_expected_tag:    Message_Tag,
 	application_correlation_id:  tina.Correlation_Id,
 	application_timeout_ns:      u64,
 	application_pending_message:  Application_Pending_Message,
-	self_handle:                 tina.Handle,
+	self_handle:                 tina.Isolate_Handle,
 	request_body_size_received:   u64,
 	sendfile_offset:             u64,
 	sendfile_size_remaining:     u64,
@@ -912,7 +912,7 @@ _listener_working_memory_size :: #force_inline proc "contextless" (
 		_align_up(connection_slot_count * size_of(^HTTP_Connection)) +
 		_align_up(connection_slot_count * size_of(u16)) +
 		_align_up(connection_slot_count * size_of(u16)) +
-		_align_up(connection_slot_count * size_of(tina.Handle)) +
+		_align_up(connection_slot_count * size_of(tina.Isolate_Handle)) +
 		_align_up(connection_slot_count * size_of(u16))
 }
 
@@ -929,7 +929,7 @@ _make_shard_runtime :: proc(
 	active_connections := make([]^HTTP_Connection, int(connection_slot_count), allocator)
 	active_slot_positions := make([]u16, int(connection_slot_count), allocator)
 	idle_slot_indices := make([]u16, int(connection_slot_count), allocator)
-	idle_slot_handles := make([]tina.Handle, int(connection_slot_count), allocator)
+	idle_slot_handles := make([]tina.Isolate_Handle, int(connection_slot_count), allocator)
 	idle_slot_positions := make([]u16, int(connection_slot_count), allocator)
 	for index in 0 ..< len(active_slot_positions) {
 		active_slot_positions[index] = u16(IDLE_ARRAY_INDEX_NONE)

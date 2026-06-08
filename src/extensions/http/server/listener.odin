@@ -63,7 +63,7 @@ _http_listener_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 	}
 
 	if topology.coordinator_mode_enabled {
-		dispatcher_handles := make([]tina.Handle, int(init_args.dispatcher_shard_count), runtime_allocator)
+		dispatcher_handles := make([]tina.Isolate_Handle, int(init_args.dispatcher_shard_count), runtime_allocator)
 		for shard_index in 0 ..< len(dispatcher_handles) {
 			dispatcher_handles[shard_index] = tina.make_handle(
 				tina.Shard_Id(u8(shard_index)),
@@ -189,7 +189,7 @@ _spawn_connection_local :: proc(runtime: ^HTTP_Shard_Runtime, ctx: tina.TinaCont
 	}
 
 	spawn_result := tina.ctx_spawn(ctx, spawn_spec)
-	if _, ok := spawn_result.(tina.Handle); ok {
+	if _, ok := spawn_result.(tina.Isolate_Handle); ok {
 		if runtime.free_count > 0 {
 			runtime.free_count -= 1
 		}

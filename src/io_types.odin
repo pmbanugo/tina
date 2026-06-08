@@ -274,8 +274,8 @@ FD_Flag :: enum {
 FD_Flags :: bit_set[FD_Flag;u8]
 
 FD_Entry :: struct {
-	reader_isolate: Handle,
-	writer_isolate: Handle,
+	reader_isolate: Isolate_Handle,
+	writer_isolate: Isolate_Handle,
 	peer_address:   Peer_Address,
 	os_fd:          OS_FD,
 	generation:     u16,
@@ -350,7 +350,7 @@ FD_Handoff_Abort :: struct {
 
 @(private = "package")
 FD_Handoff_Entry :: struct {
-	target_handle:   Handle,
+	target_handle:   Isolate_Handle,
 	peer_address:    Peer_Address,
 	deadline_tick:   u64,
 	cleanup_fd:      OS_FD,

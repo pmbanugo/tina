@@ -14,8 +14,8 @@ Isolate_Invocation :: struct {
 	previous:               ^Isolate_Invocation,
 	shard:                  ^Shard,
 	context_token:          TinaContext,
-	self_handle:            Handle,
-	current_message_source: Handle,
+	self_handle:            Isolate_Handle,
+	current_message_source: Isolate_Handle,
 	current_correlation:    Correlation_Id,
 	staged_call:            Staged_Call,
 	staged_io_operation:    IoOp,
@@ -92,7 +92,7 @@ ctx_invocation_require_self_handle :: #force_inline proc(ctx: TinaContext) -> ^I
 	invocation := ctx_invocation(ctx)
 	when TINA_RUNTIME_ASSERTIONS {
 		assert(
-			invocation.self_handle != HANDLE_NONE,
+			invocation.self_handle != ISOLATE_HANDLE_NONE,
 			"ctx_invocation_require_self_handle API requires a live Isolate handle.",
 		)
 	}
@@ -102,7 +102,7 @@ ctx_invocation_require_self_handle :: #force_inline proc(ctx: TinaContext) -> ^I
 @(require_results)
 ctx_send_raw :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	$tag: Message_Tag,
 	payload: []u8,
 ) -> Send_Result {
@@ -194,7 +194,7 @@ ctx_reserve_correlation_id :: #force_inline proc(ctx: TinaContext) -> Correlatio
 @(require_results)
 ctx_send_with_correlation :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	$tag: Message_Tag,
 	payload: []u8,
 	correlation_id: Correlation_Id,
@@ -229,7 +229,7 @@ ctx_send_with_correlation :: #force_inline proc(
 @(require_results)
 ctx_transfer_send_with_correlation :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	handle: Transfer_Handle,
 	correlation_id: Correlation_Id,
 ) -> Send_Result {
@@ -252,7 +252,7 @@ ctx_transfer_send_with_correlation :: #force_inline proc(
 @(require_results)
 ctx_call_raw :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	$tag: Message_Tag,
 	payload: []u8,
 	timeout_ns: u64,
@@ -314,7 +314,7 @@ ctx_call_raw :: #force_inline proc(
 @(require_results)
 ctx_call_typed :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	$tag: Message_Tag,
 	message: ^$T,
 	timeout_ns: u64,
@@ -331,7 +331,7 @@ ctx_call :: proc {
 
 ctx_transfer_send :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	handle: Transfer_Handle,
 ) -> Send_Result {
 	invocation := ctx_invocation_require_self_handle(ctx)
@@ -366,7 +366,7 @@ ctx_spawn :: #force_inline proc(ctx: TinaContext, spec: Spawn_Spec) -> Spawn_Res
 	// 2. Delegate to internal allocation and init
 	res := _make_isolate(shard, spec, invocation.self_handle)
 
-	child_handle, ok := res.(Handle)
+	child_handle, ok := res.(Isolate_Handle)
 	if !ok {
 		return res
 	}
@@ -391,13 +391,13 @@ ctx_spawn :: #force_inline proc(ctx: TinaContext, spec: Spawn_Spec) -> Spawn_Res
 @(require_results)
 ctx_fd_handoff :: #force_inline proc(
 	ctx: TinaContext,
-	to: Handle,
+	to: Isolate_Handle,
 	fd: FD_Handle,
 ) -> FD_Handoff_Result {
 	invocation := ctx_invocation_require_self_handle(ctx)
 	shard := invocation.shard
 
-	if to == HANDLE_NONE || extract_shard_id(to) == shard.id {
+	if to == ISOLATE_HANDLE_NONE || extract_shard_id(to) == shard.id {
 		return .not_remote_target
 	}
 
@@ -460,7 +460,7 @@ ctx_fd_handoff :: #force_inline proc(
 	return .ok
 }
 
-ctx_self_handle :: #force_inline proc(ctx: TinaContext) -> Handle {
+ctx_self_handle :: #force_inline proc(ctx: TinaContext) -> Isolate_Handle {
 	return ctx_invocation(ctx).self_handle
 }
 

@@ -280,7 +280,7 @@ hydrate_shard :: proc(
 	timer_deadlines := make([]u64, spec.timer_entry_count, alloc)
 
 	alloc_data.current_name = "Timer_Wheel_Targets"
-	timer_targets := make([]Handle, spec.timer_entry_count, alloc)
+	timer_targets := make([]Isolate_Handle, spec.timer_entry_count, alloc)
 
 	alloc_data.current_name = "Timer_Wheel_Tags"
 	timer_tags := make([]Message_Tag, spec.timer_entry_count, alloc)

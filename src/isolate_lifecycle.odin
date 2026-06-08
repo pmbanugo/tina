@@ -3,7 +3,7 @@ package tina
 import "core:mem"
 
 @(private = "package")
-_make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Handle) -> Spawn_Result {
+_make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_Handle) -> Spawn_Result {
 	type_id := u16(spec.type_id)
 
 	// 1. Slot Allocation (Popping the LIFO free list)
@@ -256,7 +256,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 
 		for i in 0 ..< shard.reactor.fd_table.slot_count {
 			entry := &shard.reactor.fd_table.entries[i]
-			if entry.reader_isolate == HANDLE_NONE && entry.writer_isolate == HANDLE_NONE {
+			if entry.reader_isolate == ISOLATE_HANDLE_NONE && entry.writer_isolate == ISOLATE_HANDLE_NONE {
 				continue
 			}
 			if entry.reader_isolate == handle_to_match || entry.writer_isolate == handle_to_match {

@@ -169,8 +169,8 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 					// Single Writer Principle: Shard broadcasts its own quarantine state
 					env: Message_Envelope
-					env.source = HANDLE_NONE
-					env.destination = HANDLE_NONE
+					env.source = ISOLATE_HANDLE_NONE
+					env.destination = ISOLATE_HANDLE_NONE
 					env.tag = TAG_SHARD_QUARANTINED
 					transport_broadcast_envelope(shard, &env)
 					transport_flush_outbound(shard)
