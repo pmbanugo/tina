@@ -98,15 +98,14 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 	child_invocation := Isolate_Invocation {
 		previous            = g_current_isolate_invocation,
 		shard               = shard,
-		context_token       = make_tina_context_token(shard),
+		context_epoch       = make_tina_context_epoch(shard),
 		self_handle         = child_handle,
 		type_id             = type_id,
 		slot_index          = slot,
-		shard_id            = shard.id,
 		timer_resolution_ns = shard.timer_resolution_ns,
 		current_tick        = shard.current_tick,
 	}
-	child_ctx := child_invocation.context_token
+	child_ctx := child_invocation.context_epoch
 
 	mem.arena_init(&child_invocation.scratch_arena, shard.scratch_memory)
 

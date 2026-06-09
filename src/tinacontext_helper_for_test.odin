@@ -106,7 +106,7 @@ test_with_context :: proc(
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
 		shard                  = shard,
-		context_token          = make_tina_context_token(shard),
+		context_epoch          = make_tina_context_epoch(shard),
 		self_handle            = config.self_handle,
 		current_message_source = config.message_source,
 		current_correlation    = config.correlation_id,
@@ -115,7 +115,6 @@ test_with_context :: proc(
 		current_tick           = u64(config.monotonic_time_ns) / shard.timer_resolution_ns,
 		type_id                = self_type_id,
 		slot_index             = self_slot_index,
-		shard_id               = shard.id,
 	}
 	mem.arena_init(&invocation.scratch_arena, scratch_bytes)
 	mem.arena_init(&invocation.working_arena, working_bytes)
@@ -126,7 +125,7 @@ test_with_context :: proc(
 	context.allocator = mem.arena_allocator(&invocation.working_arena)
 	context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
-	callback(user_data, invocation.context_token)
+	callback(user_data, invocation.context_epoch)
 
 	context.allocator = previous_allocator
 	context.temp_allocator = previous_temp_allocator
@@ -222,7 +221,7 @@ test_with_local_context :: proc(
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
 		shard                  = shard,
-		context_token          = make_tina_context_token(shard),
+		context_epoch          = make_tina_context_epoch(shard),
 		self_handle            = config.self_handle,
 		current_message_source = ISOLATE_HANDLE_NONE,
 		current_correlation    = CORRELATION_ID_NONE,
@@ -231,7 +230,6 @@ test_with_local_context :: proc(
 		current_tick           = config.current_tick,
 		type_id                = extract_type_id(config.self_handle),
 		slot_index             = extract_slot(config.self_handle),
-		shard_id               = shard.id,
 	}
 	mem.arena_init(&invocation.scratch_arena, scratch_bytes)
 	mem.arena_init(&invocation.working_arena, working_bytes)
@@ -242,7 +240,7 @@ test_with_local_context :: proc(
 	context.allocator = mem.arena_allocator(&invocation.working_arena)
 	context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
 
-	callback(user_data, invocation.context_token)
+	callback(user_data, invocation.context_epoch)
 
 	context.allocator = previous_allocator
 	context.temp_allocator = previous_temp_allocator

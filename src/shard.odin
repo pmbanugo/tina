@@ -192,7 +192,7 @@ Shard :: struct {
 	current_tick:           u64, // The current time quantized to the resolution
 	timer_resolution_ns:    u64, // E.g., 1_000_000 for 1ms ticks
 	heartbeat_tick:         u64,
-	next_context_token:     u64,
+	next_context_epoch:     u64,
 	next_correlation_id:    Correlation_Id,
 	handoff_retry_head:     u32,
 	handoff_retry_tail:     u32,
@@ -695,7 +695,7 @@ _dispatch_type_batch :: proc(
 	invocation := Isolate_Invocation {
 		previous               = g_current_isolate_invocation,
 		shard                  = shard,
-		context_token          = 0, // Assigned per invocation
+		context_epoch          = 0, // Assigned per invocation
 		self_handle            = ISOLATE_HANDLE_NONE, // Assigned per invocation
 		current_message_source = ISOLATE_HANDLE_NONE, // Assigned per invocation
 		current_correlation    = CORRELATION_ID_NONE, // Assigned per invocation
@@ -704,7 +704,6 @@ _dispatch_type_batch :: proc(
 		current_tick           = shard.current_tick,
 		type_id                = u16(type_id),
 		slot_index             = 0, // Assigned per invocation
-		shard_id               = shard.id,
 	}
 
 	// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop.
@@ -825,7 +824,7 @@ _dispatch_type_batch :: proc(
 		ctx_flags: Context_Flags
 		if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
 
-		invocation.context_token = make_tina_context_token(shard)
+		invocation.context_epoch = make_tina_context_epoch(shard)
 		invocation.self_handle = make_handle(
 			shard.id,
 			u16(type_id),
@@ -838,8 +837,7 @@ _dispatch_type_batch :: proc(
 		invocation.slot_index = slot_index
 		invocation.staged_call = {}
 		invocation.staged_io_operation = {}
-		invocation.staged_call_active = false
-		invocation.staged_io_active = false
+		invocation.staging = .None
 		invocation.reply_sent = false
 		invocation.staged_io_data_source = .None
 		invocation.staged_io_payload_offset = 0
@@ -857,7 +855,7 @@ _dispatch_type_batch :: proc(
 				)
 			}
 		}
-		ctx := invocation.context_token
+		ctx := invocation.context_epoch
 
 		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
 
@@ -1126,7 +1124,7 @@ _commit_staged_call :: proc(
 ) {
 	staged_call := invocation.staged_call
 	correlation_id := staged_call.envelope.correlation
-	invocation.staged_call_active = false
+	invocation.staging = .None
 
 	_slot_set_waiting_for_reply(shard, type_id, slot, correlation_id)
 	_register_system_timer(
@@ -1162,7 +1160,7 @@ _commit_staged_io :: proc(
 	invocation: ^Isolate_Invocation,
 ) {
 	operation := invocation.staged_io_operation
-	invocation.staged_io_active = false
+	invocation.staging = .None
 
 	err := reactor_submit_io(
 		&shard.reactor,
@@ -1205,20 +1203,9 @@ _interpret_transition :: proc(
 	transition: Isolate_Transition,
 	invocation: ^Isolate_Invocation,
 ) {
-	if invocation.staged_call_active && invocation.staged_io_active {
-		_transition_contract_violation(
-			shard,
-			type_id,
-			slot,
-			invocation,
-			"Handler staged both call and io in one invocation",
-		)
-		return
-	}
-
 	switch transition.kind {
 	case .Done:
-		if invocation.staged_call_active || invocation.staged_io_active {
+		if invocation.staging != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
@@ -1230,7 +1217,7 @@ _interpret_transition :: proc(
 		}
 		_teardown_isolate(shard, type_id, slot, .Normal)
 	case .Yield:
-		if invocation.staged_call_active || invocation.staged_io_active {
+		if invocation.staging != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
@@ -1242,7 +1229,7 @@ _interpret_transition :: proc(
 		}
 		_slot_set_state(shard, type_id, slot, .Runnable)
 	case .Wait_Message:
-		if invocation.staged_call_active || invocation.staged_io_active {
+		if invocation.staging != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
@@ -1254,7 +1241,7 @@ _interpret_transition :: proc(
 		}
 		_slot_set_state(shard, type_id, slot, .Wait_Message)
 	case .Crash:
-		if invocation.staged_call_active || invocation.staged_io_active {
+		if invocation.staging != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
@@ -1274,7 +1261,7 @@ _interpret_transition :: proc(
 		)
 		_teardown_isolate(shard, type_id, slot, .Crashed)
 	case .Wait_Reply:
-		if !invocation.staged_call_active || invocation.staged_io_active {
+		if invocation.staging != .Call {
 			_transition_contract_violation(
 				shard,
 				type_id,
@@ -1286,7 +1273,7 @@ _interpret_transition :: proc(
 		}
 		_commit_staged_call(shard, type_id, slot, invocation)
 	case .Wait_Io:
-		if !invocation.staged_io_active || invocation.staged_call_active {
+		if invocation.staging != .Io {
 			_transition_contract_violation(
 				shard,
 				type_id,

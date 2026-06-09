@@ -186,8 +186,12 @@ fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_
 		return .Stale_Generation
 	}
 
-	// Bump generation to invalidate all outstanding FD_Handles
+	// Bump generation to invalidate all outstanding FD_Handles.
+	// Skip 0 on wrap: fd_handle_make(0, 0) == 0 == FD_HANDLE_NONE, so a
+	// generation of 0 on slot 0 would mint a live handle indistinguishable
+	// from the none sentinel.
 	entry.generation += 1
+	if entry.generation == 0 do entry.generation = 1
 	entry.os_fd = _fd_table_encode_next(table.free_head)
 	entry.reader_isolate = ISOLATE_HANDLE_NONE
 	entry.writer_isolate = ISOLATE_HANDLE_NONE
