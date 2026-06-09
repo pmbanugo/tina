@@ -30,9 +30,8 @@ IO_Uring_Buffer_Ring_Register :: struct {
 
 // Tracks the state of a provided buffer ring for receive operations.
 Provided_Buffer_Ring_State :: struct {
-	ring_address:   [^]u8, // page-aligned mmap'd ring memory
+	ring_address:   uintptr, // page-aligned mmap'd ring memory address
 	ring_byte_size: uint, // total byte size of the mmap'd region
-	backing_memory_base: [^]u8,
 	slot_size:      u32, // bytes per buffer slot
 	slot_count:     u16, // number of entries in the ring (must be power of 2)
 	group_id:       u16, // buffer group ID for this shard
@@ -41,6 +40,7 @@ Provided_Buffer_Ring_State :: struct {
 }
 
 IORING_CQE_BUFFER_SHIFT :: u32(16)
+PROVIDED_BUFFER_RING_TAIL_OFFSET :: uintptr(14)
 
 // ---------------------------------------------------------------------------
 // Inline helpers — all contextless so they can be called from hot paths
@@ -50,16 +50,9 @@ IORING_CQE_BUFFER_SHIFT :: u32(16)
 // The kernel stores the ring tail in the `reserved` field of entry[0],
 // which sits at byte offset 14 within the ring memory.
 @(require_results)
-_provided_buffer_ring_tail_pointer :: #force_inline proc "contextless" (state: ^Provided_Buffer_Ring_State) -> ^u16 {
-	return cast(^u16)(rawptr(uintptr(state.ring_address) + 14))
-}
-
-@(require_results)
-_provided_buffer_ring_entry_pointer :: #force_inline proc "contextless" (
-	state: ^Provided_Buffer_Ring_State,
-	index: u16,
-) -> ^IO_Uring_Buffer_Entry {
-	return cast(^IO_Uring_Buffer_Entry)(rawptr(uintptr(state.ring_address) + uintptr(index) * size_of(IO_Uring_Buffer_Entry)))
+_provided_buffer_ring_tail :: #force_inline proc "contextless" (state: ^Provided_Buffer_Ring_State) -> u16 {
+	tail := cast(^u16)(rawptr(state.ring_address + PROVIDED_BUFFER_RING_TAIL_OFFSET))
+	return tail^
 }
 
 // Writes a single buffer entry into the ring without advancing the tail.
@@ -67,15 +60,15 @@ _provided_buffer_ring_entry_pointer :: #force_inline proc "contextless" (
 // _provided_buffer_ring_advance — this mirrors io_uring_buf_ring_add from liburing.
 _provided_buffer_ring_add :: #force_inline proc "contextless" (
 	state: ^Provided_Buffer_Ring_State,
-	buffer_address: u64,
+	buffer_address: uintptr,
 	buffer_length: u32,
 	buffer_id: u16,
-	offset: u16,
+	tail_relative_index: u16,
 ) {
-	tail := _provided_buffer_ring_tail_pointer(state)^
-	index := (tail + offset) & state.mask
-	entry := _provided_buffer_ring_entry_pointer(state, index)
-	entry.address = buffer_address
+	tail := _provided_buffer_ring_tail(state)
+	index := (tail + tail_relative_index) & state.mask
+	entry := cast(^IO_Uring_Buffer_Entry)(rawptr(state.ring_address + uintptr(index) * size_of(IO_Uring_Buffer_Entry)))
+	entry.address = u64(buffer_address)
 	entry.length = buffer_length
 	entry.buffer_id = buffer_id
 }
@@ -87,7 +80,7 @@ _provided_buffer_ring_advance :: #force_inline proc "contextless" (
 	state: ^Provided_Buffer_Ring_State,
 	count: u16,
 ) {
-	tail := _provided_buffer_ring_tail_pointer(state)
+	tail := cast(^u16)(rawptr(state.ring_address + PROVIDED_BUFFER_RING_TAIL_OFFSET))
 	new_tail := tail^ + count
 	intrinsics.atomic_store_explicit(tail, new_tail, .Release)
 }
@@ -99,7 +92,7 @@ _provided_buffer_ring_advance :: #force_inline proc "contextless" (
 _provided_buffer_ring_init :: proc(
 	state: ^Provided_Buffer_Ring_State,
 	ring_fd: linux.Fd,
-	backing_memory_base: [^]u8,
+	backing_memory_base: uintptr,
 	slot_size: u32,
 	slot_count: u16,
 	group_id: u16,
@@ -130,11 +123,11 @@ _provided_buffer_ring_init :: proc(
 		return false
 	}
 
-	ring_address := cast([^]u8)mapped
+	ring_address := uintptr(mapped)
 	mem.zero(mapped, int(ring_byte_size))
 
 	register_arg := IO_Uring_Buffer_Ring_Register {
-		ring_address     = u64(uintptr(mapped)),
+		ring_address     = u64(ring_address),
 		ring_entry_count = u32(slot_count),
 		group_id         = group_id,
 		flags            = 0,
@@ -148,7 +141,6 @@ _provided_buffer_ring_init :: proc(
 
 	state.ring_address = ring_address
 	state.ring_byte_size = ring_byte_size
-	state.backing_memory_base = backing_memory_base
 	state.slot_size = slot_size
 	state.slot_count = slot_count
 	state.group_id = group_id
@@ -157,7 +149,7 @@ _provided_buffer_ring_init :: proc(
 
 	// Pre-fill every slot so the kernel can immediately consume buffers.
 	for i in u16(0) ..< slot_count {
-		slot_address := u64(uintptr(backing_memory_base) + uintptr(i) * uintptr(slot_size))
+		slot_address := backing_memory_base + uintptr(i) * uintptr(slot_size)
 		_provided_buffer_ring_add(state, slot_address, slot_size, i, i)
 	}
 	_provided_buffer_ring_advance(state, slot_count)

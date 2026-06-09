@@ -210,7 +210,7 @@ when !TINA_SIMULATION_MODE {
 			ring_ok := _provided_buffer_ring_init(
 				&backend.provided_receive_ring,
 				backend.ring.fd,
-				config.backing_memory_base,
+				uintptr(config.backing_memory_base),
 				config.backing_memory_slot_size,
 				config.backing_memory_slot_count,
 				0, // group_id 0 — one ring per shard, no collision
@@ -247,21 +247,6 @@ when !TINA_SIMULATION_MODE {
 		backend.unqueued_count = 0
 		backend.addr_entry_count_active = 0
 		backend.sendfile_entry_count_active = 0
-	}
-
-	@(private = "file")
-	_linux_submission_needs_addr_entry :: #force_inline proc "contextless" (submission: ^Submission) -> bool {
-		if _, ok := submission.operation.(Submission_Op_Accept); ok do return true
-		if _, ok := submission.operation.(Submission_Op_Connect); ok do return true
-		if _, ok := submission.operation.(Submission_Op_Sendto); ok do return true
-		if _, ok := submission.operation.(Submission_Op_Recvfrom); ok do return true
-		return false
-	}
-
-	@(private = "file")
-	_linux_submission_needs_sendfile_entry :: #force_inline proc "contextless" (submission: ^Submission) -> bool {
-		_, is_sendfile := submission.operation.(Submission_Op_Sendfile)
-		return is_sendfile
 	}
 
 	@(private = "file")
@@ -302,11 +287,19 @@ when !TINA_SIMULATION_MODE {
 		required_addr_entry_count := 0
 		required_sendfile_entry_count := 0
 		for &submission in submissions {
-			if _linux_submission_needs_addr_entry(&submission) {
+			switch _ in submission.operation {
+			case Submission_Op_Accept,
+			     Submission_Op_Connect,
+			     Submission_Op_Sendto,
+			     Submission_Op_Recvfrom:
 				required_addr_entry_count += 1
-			}
-			if _linux_submission_needs_sendfile_entry(&submission) {
+			case Submission_Op_Sendfile:
 				required_sendfile_entry_count += 1
+			case Submission_Op_Read,
+			     Submission_Op_Write,
+			     Submission_Op_Close,
+			     Submission_Op_Send,
+			     Submission_Op_Recv:
 			}
 		}
 		if int(backend.addr_entry_count_active) + required_addr_entry_count > MAX_LINUX_PENDING_ADDRS {
@@ -396,6 +389,7 @@ when !TINA_SIMULATION_MODE {
 			}
 
 			token := Submission_Token(cqe.user_data)
+			has_provided_buffer := .BUFFER in cqe.flags
 			raw_cqe_flags := transmute(u32)cqe.flags
 
 			// When the kernel picked a buffer from the provided ring, the CQE's
@@ -403,7 +397,7 @@ when !TINA_SIMULATION_MODE {
 			// the token's 12-bit buffer_index field so the reactor's existing
 			// completion path (submission_token_buffer_index) returns the correct
 			// slot without any changes to the reactor.
-			if backend.provided_receive_ring.active && (raw_cqe_flags & 1) != 0 {
+			if backend.provided_receive_ring.active && has_provided_buffer {
 				buffer_id := u16(raw_cqe_flags >> IORING_CQE_BUFFER_SHIFT)
 				raw_token := u64(token)
 				raw_token &= ~(u64(0x0FFF) << 44) // clear old buffer_index bits
@@ -574,7 +568,6 @@ when !TINA_SIMULATION_MODE {
 		address: Socket_Address,
 	) -> Backend_Error {
 		sockaddr := _linux_socket_address_to_sockaddr(address)
-		addr_len := _linux_sockaddr_len(address)
 
 		err := linux.bind(linux.Fd(fd), &sockaddr)
 		if err != nil {
@@ -1749,7 +1742,7 @@ when !TINA_SIMULATION_MODE {
 		buffer_index: IO_Slot_Index,
 	) {
 		state := &backend.provided_receive_ring
-		buffer_address := u64(uintptr(state.backing_memory_base) + uintptr(u32(buffer_index) * state.slot_size))
+		buffer_address := uintptr(backend.backing_memory_base) + uintptr(buffer_index) * uintptr(state.slot_size)
 		_provided_buffer_ring_add(state, buffer_address, state.slot_size, u16(buffer_index), 0)
 		_provided_buffer_ring_advance(state, 1)
 	}
