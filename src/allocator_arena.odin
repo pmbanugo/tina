@@ -5,9 +5,10 @@ import "core:mem"
 import "core:testing"
 
 SubRegion :: struct {
-	name:   string,
-	offset: int,
-	size:   int,
+	name:      string,
+	qualifier: int,
+	offset:    int,
+	size:      int,
 }
 
 Grand_Arena :: struct {
@@ -39,6 +40,7 @@ grand_arena_alloc_named :: proc "contextless" (
 	name: string,
 	size: int,
 	alignment: int = CACHE_LINE_SIZE,
+	qualifier: int = -1,
 ) -> (
 	rawptr,
 	mem.Allocator_Error,
@@ -62,9 +64,10 @@ grand_arena_alloc_named :: proc "contextless" (
 	// Only record if the tracking array has been allocated
 	if arena.regions != nil && arena.region_count < len(arena.regions) {
 		arena.regions[arena.region_count] = SubRegion {
-			name   = name,
-			offset = actual_offset,
-			size   = size,
+			name      = name,
+			qualifier = qualifier,
+			offset    = actual_offset,
+			size      = size,
 		}
 		arena.region_count += 1
 	}
@@ -76,18 +79,29 @@ grand_arena_alloc_slice :: #force_inline proc "contextless" (
 	arena: ^Grand_Arena,
 	name: string,
 	size: int,
+	qualifier: int = -1,
 ) -> (
 	result: []u8,
 	err: mem.Allocator_Error,
 ) {
-	ptr := grand_arena_alloc_named(arena, name, size) or_return
+	ptr := grand_arena_alloc_named(arena, name, size, qualifier = qualifier) or_return
 	return (cast([^]u8)ptr)[:size], .None
 }
 
 // Custom Allocator Wrapper for Grand_Arena
 Grand_Arena_Allocator_Data :: struct {
-	arena:        ^Grand_Arena,
-	current_name: string,
+	arena:             ^Grand_Arena,
+	current_name:      string,
+	current_qualifier: int,
+}
+
+grand_arena_allocator_set_name :: #force_inline proc "contextless" (
+	data: ^Grand_Arena_Allocator_Data,
+	name: string,
+	qualifier: int = -1,
+) {
+	data.current_name = name
+	data.current_qualifier = qualifier
 }
 
 grand_arena_allocator_proc :: proc(
@@ -119,7 +133,13 @@ grand_arena_allocator_proc :: proc(
 		// But tiny metadata slices (Slice Headers, dispatch_cursors, dispatch_credit_counts, isolate_free_heads)
 		// should be tightly packed.
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
-		ptr, err := grand_arena_alloc_named(data.arena, data.current_name, size, actual_alignment)
+		ptr, err := grand_arena_alloc_named(
+			data.arena,
+			data.current_name,
+			size,
+			actual_alignment,
+			data.current_qualifier,
+		)
 		if err != .None do return nil, err
 		return (cast([^]byte)ptr)[:size], .None
 	case .Resize:
@@ -130,7 +150,13 @@ grand_arena_allocator_proc :: proc(
 	case .Alloc_Non_Zeroed:
 		// Arena bumps a pointer; non-zeroed is identical to zeroed allocation
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
-		ptr, err := grand_arena_alloc_named(data.arena, data.current_name, size, actual_alignment)
+		ptr, err := grand_arena_alloc_named(
+			data.arena,
+			data.current_name,
+			size,
+			actual_alignment,
+			data.current_qualifier,
+		)
 		if err != .None do return nil, err
 		return (cast([^]byte)ptr)[:size], .None
 	case .Query_Features, .Query_Info, .Resize_Non_Zeroed:
@@ -160,7 +186,12 @@ hydrate_shard :: proc(
 	) or_return
 
 	arena.regions = (cast([^]SubRegion)tracker_pointer)[:regions_max]
-	arena.regions[0] = SubRegion{"Arena_Regions_Tracker", 0, tracker_size}
+	arena.regions[0] = SubRegion {
+		name      = "Arena_Regions_Tracker",
+		qualifier = -1,
+		offset    = 0,
+		size      = tracker_size,
+	}
 	arena.region_count = 1
 
 	// Setup the custom allocator
@@ -178,7 +209,7 @@ hydrate_shard :: proc(
 	shard.peer_alive_mask = {~u64(0), ~u64(0), ~u64(0), ~u64(0)} // All peers alive by default
 
 	// 2. Allocate the Slice Headers
-	alloc_data.current_name = "Slice_Headers"
+	grand_arena_allocator_set_name(&alloc_data, "Slice_Headers")
 	shard.type_descriptors = make([]IsolateTypeDescriptor, types_count, alloc)
 	shard.isolate_memory = make([][]u8, types_count, alloc)
 	shard.working_memory = make([][]u8, types_count, alloc)
@@ -189,10 +220,10 @@ hydrate_shard :: proc(
 	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
 	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
 
-	alloc_data.current_name = "Dispatch_Cursors"
+	grand_arena_allocator_set_name(&alloc_data, "Dispatch_Cursors")
 	shard.dispatch_cursors = make([]u32, types_count, alloc)
 
-	alloc_data.current_name = "Dispatch_Credit_Counts"
+	grand_arena_allocator_set_name(&alloc_data, "Dispatch_Credit_Counts")
 	shard.dispatch_credit_counts = make([]Scheduler_Credit_Count, types_count, alloc)
 
 	// 3. Allocate Type-Specific Data (Inner slices)
@@ -208,11 +239,11 @@ hydrate_shard :: proc(
 		shard.isolate_free_heads[type_index] = POOL_NONE_INDEX // Initialize
 
 		if desc.slot_count > 0 && desc.stride > 0 {
-			alloc_data.current_name = fmt.tprintf("Typed_Arena_%d", desc.id)
+			grand_arena_allocator_set_name(&alloc_data, "Typed_Arena", type_index)
 			shard.isolate_memory[type_index] = make([]u8, desc.slot_count * desc.stride, alloc)
 		}
 		if desc.slot_count > 0 {
-			alloc_data.current_name = fmt.tprintf("Dispatchable_Slots_%d", desc.id)
+			grand_arena_allocator_set_name(&alloc_data, "Dispatchable_Slots", type_index)
 			shard.dispatchable_slot_words[type_index] = make(
 				[]u64,
 				_dispatch_word_count(desc.slot_count),
@@ -222,7 +253,7 @@ hydrate_shard :: proc(
 
 		aligned_count := _aligned_capacity(desc.slot_count)
 		if aligned_count > 0 {
-			alloc_data.current_name = fmt.tprintf("SOA_Metadata_%d", desc.id)
+			grand_arena_allocator_set_name(&alloc_data, "SOA_Metadata", type_index)
 			shard.metadata[type_index] = make(#soa[]Isolate_Metadata, aligned_count, alloc)
 
 			// Build the intrusive free list for this Type Arena
@@ -237,8 +268,9 @@ hydrate_shard :: proc(
 		if desc.working_memory_size > 0 {
 			shard.working_memory[type_index] = grand_arena_alloc_slice(
 				arena,
-				fmt.tprintf("Working_Memory_%d", desc.id),
+				"Working_Memory",
 				desc.slot_count * desc.working_memory_size,
+				type_index,
 			) or_return
 		}
 	}
@@ -266,29 +298,29 @@ hydrate_shard :: proc(
 		u16(spec.transfer_slot_count),
 	)
 
-	alloc_data.current_name = "Transfer_Generations"
+	grand_arena_allocator_set_name(&alloc_data, "Transfer_Generations")
 	shard.transfer_generations = make([]u16, spec.transfer_slot_count, alloc)
 	for i in 0 ..< spec.transfer_slot_count {
 		shard.transfer_generations[i] = 1
 	}
 
-	alloc_data.current_name = "FD_Handoff_Table"
+	grand_arena_allocator_set_name(&alloc_data, "FD_Handoff_Table")
 	handoff_buffer := make([]FD_Handoff_Entry, spec.fd_handoff_entry_count, alloc)
 	fd_handoff_table_init(&shard.handoff_table, handoff_buffer)
 
-	alloc_data.current_name = "Timer_Wheel_Deadlines"
+	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Deadlines")
 	timer_deadlines := make([]u64, spec.timer_entry_count, alloc)
 
-	alloc_data.current_name = "Timer_Wheel_Targets"
+	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Targets")
 	timer_targets := make([]Isolate_Handle, spec.timer_entry_count, alloc)
 
-	alloc_data.current_name = "Timer_Wheel_Tags"
+	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Tags")
 	timer_tags := make([]Message_Tag, spec.timer_entry_count, alloc)
 
-	alloc_data.current_name = "Timer_Wheel_Correlations"
+	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Correlations")
 	timer_correlations := make([]Correlation_Id, spec.timer_entry_count, alloc)
 
-	alloc_data.current_name = "Timer_Wheel_Armed_Words"
+	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Armed_Words")
 	timer_armed_word_count := bitmap_word_count_from_bit_count(spec.timer_entry_count)
 	timer_armed_words := make([]u64, timer_armed_word_count, alloc)
 
@@ -301,11 +333,11 @@ hydrate_shard :: proc(
 		timer_armed_words,
 	)
 
-	alloc_data.current_name = "Log_Ring_Buffer"
+	grand_arena_allocator_set_name(&alloc_data, "Log_Ring_Buffer")
 	log_buf := make([]u8, spec.log_ring_size, alloc)
 	log_init(&shard.log_ring, log_buf)
 
-	alloc_data.current_name = "Supervision_Group_Table"
+	grand_arena_allocator_set_name(&alloc_data, "Supervision_Group_Table")
 	shard.supervision_groups = make([]Supervision_Group, spec.supervision_groups_max, alloc)
 
 	shard.scratch_memory = grand_arena_alloc_slice(
@@ -315,7 +347,7 @@ hydrate_shard :: proc(
 	) or_return
 
 	// 5. Reactor
-	alloc_data.current_name = "FD_Table"
+	grand_arena_allocator_set_name(&alloc_data, "FD_Table")
 	fd_buf := make([]FD_Entry, spec.fd_table_slot_count, alloc)
 
 	rx_buf := grand_arena_alloc_slice(
@@ -382,13 +414,24 @@ arena_print_layout :: proc(arena: ^Grand_Arena) {
 	fmt.eprintf("Grand Arena Memory Map (Total: %v bytes):\n", arena.total_size)
 	for i in 0 ..< arena.region_count {
 		r := arena.regions[i]
-		fmt.eprintf(
-			"  [0x%08X - 0x%08X] %-30s (%v bytes)\n",
-			r.offset,
-			r.offset + r.size,
-			r.name,
-			r.size,
-		)
+		if r.qualifier >= 0 {
+			fmt.eprintf(
+				"  [0x%08X - 0x%08X] %s_%d (%v bytes)\n",
+				r.offset,
+				r.offset + r.size,
+				r.name,
+				r.qualifier,
+				r.size,
+			)
+		} else {
+			fmt.eprintf(
+				"  [0x%08X - 0x%08X] %s (%v bytes)\n",
+				r.offset,
+				r.offset + r.size,
+				r.name,
+				r.size,
+			)
+		}
 	}
 }
 

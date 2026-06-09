@@ -1,6 +1,5 @@
 package tina
 
-import "core:fmt"
 import "core:mem"
 import "core:testing"
 
@@ -345,12 +344,20 @@ _build_group :: proc(
 
 	child_capacity_count := len(group_spec.children) + int(group_spec.child_count_dynamic_max)
 	if len(group.children_handles) == 0 && child_capacity_count > 0 {
-		if arena_alloc_data != nil do arena_alloc_data.current_name = fmt.tprintf("Group_%d_Handles", group_index)
+		if arena_alloc_data != nil do grand_arena_allocator_set_name(
+			arena_alloc_data,
+			"Group_Handles",
+			int(group_index),
+		)
 		group.children_handles = make([]Isolate_Handle, child_capacity_count, alloc)
 	}
 
 	if group_spec.child_count_dynamic_max > 0 && len(group.dynamic_specs) == 0 {
-		if arena_alloc_data != nil do arena_alloc_data.current_name = fmt.tprintf("Group_%d_Dynamic_Specs", group_index)
+		if arena_alloc_data != nil do grand_arena_allocator_set_name(
+			arena_alloc_data,
+			"Group_Dynamic_Specs",
+			int(group_index),
+		)
 		group.dynamic_specs = make([]Dynamic_Child_Spec, group_spec.child_count_dynamic_max, alloc)
 	}
 

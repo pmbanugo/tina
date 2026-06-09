@@ -190,6 +190,12 @@ main :: proc() {
 
 ## Step 4: Build and Run
 
+Repository `odin test` simulation runs should enable Odin memory enforcement:
+
+```sh
+odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+```
+
 ```sh
 # Build with simulation mode enabled
 odin build my_sim_test.odin -file -out:sim_test -define:TINA_SIM=true

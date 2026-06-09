@@ -121,6 +121,12 @@ prng_tree_init :: proc(tree: ^Prng_Tree, seed: u64, shard_count: int, allocator:
 	}
 }
 
+prng_tree_deinit :: proc(tree: ^Prng_Tree, allocator: mem.Allocator) {
+	delete(tree.shard_io, allocator)
+	delete(tree.shard_crash, allocator)
+	tree^ = {}
+}
+
 // ======
 // Tests
 // ======

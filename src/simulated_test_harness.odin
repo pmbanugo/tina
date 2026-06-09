@@ -22,6 +22,39 @@ when TINA_SIMULATION_MODE {
 	}
 
 	@(test)
+	test_simulator_deinit_balances_allocator :: proc(t: ^testing.T) {
+		types := [1]IsolateTypeDescriptor {
+			{
+				id = HARNESS_NOOP_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(HarnessNoopIsolate),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = harness_noop_init,
+				handler_fn = harness_noop_handler,
+			},
+		}
+
+		children := [1]Child_Spec {
+			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
+		}
+		root_group := sim_test_make_root_group(children[:])
+		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+		sim_config := SimulationConfig {
+			seed                   = t.seed,
+			ticks_max              = 1,
+			terminate_on_quiescent = true,
+		}
+
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
+
+		sim: Simulator
+		err := simulator_init(&sim, &spec, context.allocator)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		simulator_deinit(&sim)
+	}
+
+	@(test)
 	test_termination_reason_quiescent :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 

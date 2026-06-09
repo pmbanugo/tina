@@ -68,6 +68,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 				fmt.eprintfln("[FATAL] Simulator init failed: %v", init_err)
 				os.exit(1)
 			}
+			defer simulator_deinit(simulator)
 
 			store_process_phase(.Running)
 			simulator_run(simulator)

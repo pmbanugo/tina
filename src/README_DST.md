@@ -8,13 +8,13 @@ Simulation mode is a compile-time flag. It strips all OS threading, signal handl
 
 ```sh
 # Run all simulation tests
-odin test . -define:TINA_SIM=true
+odin test . -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
 # With debug assertions (structural invariant checks in non-simulation code paths)
-odin test . -define:TINA_SIM=true -define:TINA_ASSERTS=true
+odin test . -define:TINA_SIM=true -define:TINA_ASSERTS=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
 # Run a specific test
-odin test . -define:TINA_SIM=true -define:ODIN_TEST_NAMES=tina.test_ping_pong_simulation
+odin test . -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_NAMES=tina.test_ping_pong_simulation
 
 # Type-check only (no link)
 odin check . -define:TINA_SIM=true
@@ -230,7 +230,8 @@ The random seed sent to every test is: 12345. Set with -define:ODIN_TEST_RANDOM_
 To reproduce a test that uses `t.seed`:
 
 ```sh
-odin test . -define:TINA_SIM=true -define:ODIN_TEST_RANDOM_SEED=12345 \
+odin test . -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true \
+    -define:ODIN_TEST_RANDOM_SEED=12345 \
     -define:ODIN_TEST_NAMES=tina.test_my_failing_test
 ```
 

@@ -29,6 +29,13 @@ when TINA_SIMULATION_MODE {
 		q.count = 0
 	}
 
+	delay_queue_deinit :: proc(q: ^DelayQueue, allocator: mem.Allocator) {
+		if len(q.buffer) > 0 {
+			delete(q.buffer, allocator)
+		}
+		q^ = {}
+	}
+
 	delay_queue_push :: #force_inline proc "contextless" (
 		q: ^DelayQueue,
 		item: DelayedEnvelope,
@@ -98,6 +105,19 @@ when TINA_SIMULATION_MODE {
 				}
 			}
 		}
+	}
+
+	sim_network_deinit :: proc(net: ^SimulatedNetwork, allocator: mem.Allocator) {
+		for source_index in 0 ..< net.shard_count {
+			for target_index in 0 ..< net.shard_count {
+				if source_index == target_index do continue
+				delay_queue_deinit(&net.channels[source_index][target_index].delay_queue, allocator)
+			}
+			delete(net.channels[source_index], allocator)
+		}
+		delete(net.channels, allocator)
+		delete(net.partition_matrix, allocator)
+		net^ = {}
 	}
 
 	// Enqueue: Called by Source Shard

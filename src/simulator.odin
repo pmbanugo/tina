@@ -12,20 +12,24 @@ when TINA_SIMULATION_MODE {
 	}
 
 	Simulator :: struct {
-		spec:               ^SystemSpec,
-		shards:             []Shard, // Allocated as a flat array
-		watchdog_states:    []u8, // Backing for Shard.watchdog_state_pointer (bypasses watchdog)
-		network:            SimulatedNetwork,
-		prng_tree:          Prng_Tree,
-		fault_engine:       FaultEngine,
-		sim_io_world:       ^Sim_IO_World, // shared IO world — set before shard hydration
+		spec:                    ^SystemSpec,
+		allocator:               mem.Allocator,
+		shards:                  []Shard, // Allocated as a flat array
+		watchdog_states:         []u8, // Backing for Shard.watchdog_state_pointer (bypasses watchdog)
+		shard_arena_bytes:       [][]u8,
+		shard_index_order:       []u8,
+		shard_count_initialized: int,
+		network:                 SimulatedNetwork,
+		prng_tree:               Prng_Tree,
+		fault_engine:            FaultEngine,
+		sim_io_world:            ^Sim_IO_World, // shared IO world — set before shard hydration
 
 		// For fast-forward and clock management
-		tick_resolution_ns: u64,
+		tick_resolution_ns:      u64,
 
 		// Post-run observable state
-		final_round:        u64,
-		termination_reason: Termination_Reason,
+		final_round:             u64,
+		termination_reason:      Termination_Reason,
 	}
 
 	// Simulation is a structural overlay over the production runtime, not a
@@ -42,14 +46,21 @@ when TINA_SIMULATION_MODE {
 		allocator: mem.Allocator,
 	) -> mem.Allocator_Error {
 		sim.spec = spec
+		sim.allocator = allocator
 		sim.shards = make([]Shard, spec.shard_count, allocator)
 		sim.watchdog_states = make([]u8, spec.shard_count, allocator)
+		sim.shard_arena_bytes = make([][]u8, spec.shard_count, allocator)
+		sim.shard_index_order = make([]u8, spec.shard_count, allocator)
 
 		// Use the validated timer resolution from the spec (uniform across all shards)
 		sim.tick_resolution_ns = spec.timer_resolution_ns
 
 		// Create a shared IO world for all shard backends — owned by the simulator
-		io_world := new(Sim_IO_World) or_return
+		io_world, io_world_err := new(Sim_IO_World, allocator)
+		if io_world_err != .None {
+			simulator_deinit(sim)
+			return io_world_err
+		}
 		_sim_world_init(io_world)
 		sim.sim_io_world = io_world
 		spec.simulation.sim_io_world = cast(rawptr)io_world
@@ -66,6 +77,10 @@ when TINA_SIMULATION_MODE {
 			spec.ring_overrides,
 			allocator,
 		)
+		defer {
+			for row in ring_counts do delete(row, allocator)
+			delete(ring_counts, allocator)
+		}
 		sim_network_init(
 			&sim.network,
 			spec.shard_count,
@@ -96,6 +111,7 @@ when TINA_SIMULATION_MODE {
 			// Use standard memory allocation for the Grand Arena in simulation
 			// (we bypass mmap/guard pages because we are single-threaded and testing logic)
 			arena_mem := make([]u8, shard_memory_size, allocator)
+			sim.shard_arena_bytes[i] = arena_mem
 
 			arena := Grand_Arena{}
 			grand_arena_init(&arena, shard_memory_size)
@@ -104,6 +120,7 @@ when TINA_SIMULATION_MODE {
 			// Hydrate the Shard
 			if err := hydrate_shard(&arena, spec, shard); err != .None {
 				fmt.eprintfln("[SIM FATAL] Failed to hydrate Shard %d: %v", i, err)
+				simulator_deinit(sim)
 				return err
 			}
 
@@ -125,11 +142,9 @@ when TINA_SIMULATION_MODE {
 					&alloc_data,
 				)
 			}
-		}
 
-		// Clean up temporary ring sizing array
-		for row in ring_counts do delete(row, allocator)
-		delete(ring_counts, allocator)
+			sim.shard_count_initialized += 1
+		}
 
 		return .None
 	}
@@ -147,8 +162,9 @@ when TINA_SIMULATION_MODE {
 		ticks_max := sim.spec.simulation.ticks_max
 		reason := Termination_Reason.Ticks_Max
 
-		// Pre-allocate array for shuffled shard execution order
-		order := make([]u8, sim.spec.shard_count, context.temp_allocator)
+		// Reuse the simulator-owned shard order buffer. The simulation loop is not
+		// allowed to allocate; only the contents change from round to round.
+		order := sim.shard_index_order
 		for i in 0 ..< sim.spec.shard_count do order[i] = u8(i)
 
 		loop: for round < ticks_max {
@@ -232,14 +248,36 @@ when TINA_SIMULATION_MODE {
 	// Simulation Teardown
 	// ============================================================================
 	simulator_deinit :: proc(sim: ^Simulator) {
-		for i in 0 ..< sim.spec.shard_count {
-			reactor_deinit(&sim.shards[i].reactor)
+		if sim == nil || sim.allocator.procedure == nil {
+			return
 		}
+
+		for shard_index in 0 ..< sim.shard_count_initialized {
+			reactor_deinit(&sim.shards[shard_index].reactor)
+		}
+
+		sim_network_deinit(&sim.network, sim.allocator)
+		prng_tree_deinit(&sim.prng_tree, sim.allocator)
+
+		for shard_arena_bytes in sim.shard_arena_bytes {
+			if len(shard_arena_bytes) > 0 {
+				delete(shard_arena_bytes, sim.allocator)
+			}
+		}
+		delete(sim.shard_arena_bytes, sim.allocator)
+		delete(sim.shard_index_order, sim.allocator)
+		delete(sim.watchdog_states, sim.allocator)
+		delete(sim.shards, sim.allocator)
+
 		if sim.sim_io_world != nil {
-			free(sim.sim_io_world)
-			sim.sim_io_world = nil
+			free(sim.sim_io_world, sim.allocator)
+		}
+
+		if sim.spec != nil && sim.spec.simulation != nil {
 			sim.spec.simulation.sim_io_world = nil
 		}
+
+		sim^ = {}
 	}
 
 	// ============================================================================
