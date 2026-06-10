@@ -45,49 +45,60 @@ when TINA_SIMULATION_MODE {
 		spec: ^SystemSpec,
 		allocator: mem.Allocator,
 	) -> mem.Allocator_Error {
+		err: mem.Allocator_Error
+		defer if err != .None {
+			simulator_deinit(sim)
+		}
+
 		sim.spec = spec
 		sim.allocator = allocator
-		sim.shards = make([]Shard, spec.shard_count, allocator)
-		sim.watchdog_states = make([]u8, spec.shard_count, allocator)
-		sim.shard_arena_bytes = make([][]u8, spec.shard_count, allocator)
-		sim.shard_index_order = make([]u8, spec.shard_count, allocator)
+		sim.shards, err = make([]Shard, spec.shard_count, allocator)
+		if err != .None do return err
+		sim.watchdog_states, err = make([]u8, spec.shard_count, allocator)
+		if err != .None do return err
+		sim.shard_arena_bytes, err = make([][]u8, spec.shard_count, allocator)
+		if err != .None do return err
+		sim.shard_index_order, err = make([]u8, spec.shard_count, allocator)
+		if err != .None do return err
 
 		// Use the validated timer resolution from the spec (uniform across all shards)
 		sim.tick_resolution_ns = spec.timer_resolution_ns
 
 		// Create a shared IO world for all shard backends — owned by the simulator
-		io_world, io_world_err := new(Sim_IO_World, allocator)
-		if io_world_err != .None {
-			simulator_deinit(sim)
-			return io_world_err
-		}
+		io_world: ^Sim_IO_World
+		io_world, err = new(Sim_IO_World, allocator)
+		if err != .None do return err
 		_sim_world_init(io_world)
 		sim.sim_io_world = io_world
 		spec.simulation.sim_io_world = cast(rawptr)io_world
 
 		// SI-1: Initialize PRNG Tree
 		seed := spec.simulation.seed
-		prng_tree_init(&sim.prng_tree, seed, int(spec.shard_count), allocator)
+		err = prng_tree_init(&sim.prng_tree, seed, int(spec.shard_count), allocator)
+		if err != .None do return err
 
 		// SI-3: Initialize Simulated Network
 		// Calculate ring sizes using painter's algorithm
-		ring_counts := compute_ring_sizes(
+		ring_counts: [][]u32
+		ring_counts, err = compute_ring_sizes(
 			spec.shard_count,
 			spec.default_ring_size,
 			spec.ring_overrides,
 			allocator,
 		)
+		if err != .None do return err
 		defer {
 			for row in ring_counts do delete(row, allocator)
 			delete(ring_counts, allocator)
 		}
-		sim_network_init(
+		err = sim_network_init(
 			&sim.network,
 			spec.shard_count,
 			ring_counts,
 			&sim.prng_tree.network_drop,
 			allocator,
 		)
+		if err != .None do return err
 
 		// SI-5: Initialize Fault Engine
 		sim.fault_engine = FaultEngine {
@@ -110,19 +121,22 @@ when TINA_SIMULATION_MODE {
 
 			// Use standard memory allocation for the Grand Arena in simulation
 			// (we bypass mmap/guard pages because we are single-threaded and testing logic)
-			arena_mem := make([]u8, shard_memory_size, allocator)
+			arena_mem: []u8
+			arena_mem, err = make([]u8, shard_memory_size, allocator)
+			if err != .None do return err
 			sim.shard_arena_bytes[i] = arena_mem
 
 			arena := Grand_Arena{}
-			grand_arena_init(&arena, shard_memory_size)
-			arena.base = arena_mem // Override with our slice
+			err = grand_arena_init_from_memory(&arena, arena_mem, shard_memory_size)
+			if err != .None do return err
 
 			// Hydrate the Shard
-			if err := hydrate_shard(&arena, spec, shard); err != .None {
+			err = hydrate_shard(&arena, spec, shard)
+			if err != .None {
 				fmt.eprintfln("[SIM FATAL] Failed to hydrate Shard %d: %v", i, err)
-				simulator_deinit(sim)
 				return err
 			}
+			sim.shard_count_initialized += 1
 
 			// Wire up watchdog_state_pointer before tree building (ctx_spawn reads it)
 			sim.watchdog_states[i] = u8(Shard_State.Running)
@@ -135,15 +149,23 @@ when TINA_SIMULATION_MODE {
 			arena_alloc := grand_arena_allocator(&alloc_data)
 
 			if int(i) < len(spec.shard_specs) {
-				shard_build_supervision_tree(
+				build_result, build_error := shard_build_supervision_tree(
 					shard,
 					&spec.shard_specs[i].root_group,
 					arena_alloc,
 					&alloc_data,
 				)
+				if build_error != .None {
+					fmt.eprintfln("[SIM FATAL] Failed to build supervision tree for Shard %d: %v", i, build_error)
+					err = build_error
+					return err
+				}
+				if build_result != .Ok {
+					fmt.eprintfln("[SIM FATAL] Supervision tree build escalated for Shard %d", i)
+					err = .Out_Of_Memory
+					return err
+				}
 			}
-
-			sim.shard_count_initialized += 1
 		}
 
 		return .None

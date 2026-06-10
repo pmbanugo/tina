@@ -2384,7 +2384,8 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 		prng_init(&drop_prng, 0xD10D)
 
 		network: SimulatedNetwork
-		sim_network_init(&network, 2, ring_sizes, &drop_prng, context.temp_allocator)
+		network_err := sim_network_init(&network, 2, ring_sizes, &drop_prng, context.temp_allocator)
+		testing.expect_value(t, network_err, mem.Allocator_Error.None)
 
 		fault_config := FaultConfig{}
 		shard.sim_state.network = &network

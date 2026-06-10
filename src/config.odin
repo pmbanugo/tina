@@ -1103,14 +1103,26 @@ compute_ring_sizes :: proc(
 	default_size: u32,
 	overrides: []Ring_Override,
 	allocator: mem.Allocator,
-) -> [][]u32 {
-	sizes := make([][]u32, shard_count, allocator)
+	) -> (
+	sizes: [][]u32,
+	err: mem.Allocator_Error,
+) {
+	sizes, err = make([][]u32, shard_count, allocator)
+	if err != .None do return nil, err
 
-	for i in 0 ..< shard_count {
-		sizes[i] = make([]u32, shard_count, allocator)
-		for j in 0 ..< shard_count {
-			if i != j {
-				sizes[i][j] = default_size
+	defer if err != .None {
+		for row in sizes {
+			delete(row, allocator)
+		}
+		delete(sizes, allocator)
+	}
+
+	for source_index in 0 ..< shard_count {
+		sizes[source_index], err = make([]u32, shard_count, allocator)
+		if err != .None do return nil, err
+		for target_index in 0 ..< shard_count {
+			if source_index != target_index {
+				sizes[source_index][target_index] = default_size
 			}
 		}
 	}
@@ -1126,17 +1138,17 @@ compute_ring_sizes :: proc(
 			}
 		case .All_Inbound_To:
 			if o.destination < Shard_Id(shard_count) {
-				for i in 0 ..< shard_count {
-					if Shard_Id(i) != o.destination {sizes[i][o.destination] = o.size}
+				for source_index in 0 ..< shard_count {
+					if Shard_Id(source_index) != o.destination {sizes[source_index][o.destination] = o.size}
 				}
 			}
 		case .All_Outbound_From:
 			if o.source < Shard_Id(shard_count) {
-				for j in 0 ..< shard_count {
-					if o.source != Shard_Id(j) {sizes[o.source][j] = o.size}
+				for target_index in 0 ..< shard_count {
+					if o.source != Shard_Id(target_index) {sizes[o.source][target_index] = o.size}
 				}
 			}
 		}
 	}
-	return sizes
+	return sizes, .None
 }

@@ -17,16 +17,18 @@ when TINA_SIMULATION_MODE {
 		capacity: u32,
 	}
 
-	delay_queue_init :: proc(q: ^DelayQueue, capacity: u32, allocator: mem.Allocator) {
+	delay_queue_init :: proc(q: ^DelayQueue, capacity: u32, allocator: mem.Allocator) -> mem.Allocator_Error {
 		assert(
 			(capacity != 0) && ((capacity & (capacity - 1)) == 0),
 			"DelayQueue capacity must be a power of 2",
 		)
-		q.buffer = make([]DelayedEnvelope, capacity, allocator)
+		q^ = {}
+		q.buffer = make([]DelayedEnvelope, capacity, allocator) or_return
 		q.capacity = capacity
 		q.head = 0
 		q.tail = 0
 		q.count = 0
+		return .None
 	}
 
 	delay_queue_deinit :: proc(q: ^DelayQueue, allocator: mem.Allocator) {
@@ -90,30 +92,50 @@ when TINA_SIMULATION_MODE {
 		ring_sizes: [][]u32,
 		drop_prng: ^Prng,
 		allocator: mem.Allocator,
-	) {
+	) -> mem.Allocator_Error {
+		net^ = {}
+
+		err: mem.Allocator_Error
+		defer if err != .None {
+			sim_network_deinit(net, allocator)
+		}
+
 		net.shard_count = shard_count
 		net.drop_prng = drop_prng
 
-		net.channels = make([][]Channel, shard_count, allocator)
-		net.partition_matrix = make([]Shard_Mask, shard_count, allocator)
+		net.channels, err = make([][]Channel, shard_count, allocator)
+		if err != .None do return err
+		net.partition_matrix, err = make([]Shard_Mask, shard_count, allocator)
+		if err != .None do return err
 
-		for i in 0 ..< shard_count {
-			net.channels[i] = make([]Channel, shard_count, allocator)
-			for j in 0 ..< shard_count {
-				if i != j {
-					delay_queue_init(&net.channels[i][j].delay_queue, ring_sizes[i][j], allocator)
+		for source_index in 0 ..< shard_count {
+			net.channels[source_index], err = make([]Channel, shard_count, allocator)
+			if err != .None do return err
+			for target_index in 0 ..< shard_count {
+				if source_index != target_index {
+					err = delay_queue_init(
+						&net.channels[source_index][target_index].delay_queue,
+						ring_sizes[source_index][target_index],
+						allocator,
+					)
+					if err != .None do return err
 				}
 			}
 		}
+
+		return .None
 	}
 
 	sim_network_deinit :: proc(net: ^SimulatedNetwork, allocator: mem.Allocator) {
-		for source_index in 0 ..< net.shard_count {
-			for target_index in 0 ..< net.shard_count {
+		if net == nil do return
+
+		for source_index in 0 ..< len(net.channels) {
+			channel_row := net.channels[source_index]
+			for target_index in 0 ..< len(channel_row) {
 				if source_index == target_index do continue
-				delay_queue_deinit(&net.channels[source_index][target_index].delay_queue, allocator)
+				delay_queue_deinit(&channel_row[target_index].delay_queue, allocator)
 			}
-			delete(net.channels[source_index], allocator)
+			delete(channel_row, allocator)
 		}
 		delete(net.channels, allocator)
 		delete(net.partition_matrix, allocator)

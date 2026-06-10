@@ -21,6 +21,41 @@ when TINA_SIMULATION_MODE {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
+	Simulator_Test_Fault_Allocator_Data :: struct {
+		backing:          mem.Allocator,
+		allocation_count: int,
+		fail_after_count: int,
+	}
+
+	simulator_test_fault_allocator_proc :: proc(
+		allocator_data: rawptr,
+		mode: mem.Allocator_Mode,
+		size, alignment: int,
+		old_memory: rawptr,
+		old_size: int,
+		loc := #caller_location,
+	) -> ([]byte, mem.Allocator_Error) {
+		data := cast(^Simulator_Test_Fault_Allocator_Data)allocator_data
+		#partial switch mode {
+		case .Alloc, .Alloc_Non_Zeroed:
+			if data.allocation_count >= data.fail_after_count do return nil, .Out_Of_Memory
+			data.allocation_count += 1
+		}
+		return data.backing.procedure(
+			data.backing.data,
+			mode,
+			size,
+			alignment,
+			old_memory,
+			old_size,
+			loc,
+		)
+	}
+
+	simulator_test_fault_allocator :: proc(data: ^Simulator_Test_Fault_Allocator_Data) -> mem.Allocator {
+		return mem.Allocator{procedure = simulator_test_fault_allocator_proc, data = data}
+	}
+
 	@(test)
 	test_simulator_deinit_balances_allocator :: proc(t: ^testing.T) {
 		types := [1]IsolateTypeDescriptor {
@@ -52,6 +87,50 @@ when TINA_SIMULATION_MODE {
 		err := simulator_init(&sim, &spec, context.allocator)
 		testing.expect_value(t, err, mem.Allocator_Error.None)
 		simulator_deinit(&sim)
+	}
+
+	@(test)
+	test_simulator_init_allocator_failure_cleans_partial_state :: proc(t: ^testing.T) {
+		types := [1]IsolateTypeDescriptor {
+			{
+				id = HARNESS_NOOP_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(HarnessNoopIsolate),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = harness_noop_init,
+				handler_fn = harness_noop_handler,
+			},
+		}
+
+		children := [1]Child_Spec {
+			Static_Child_Spec{type_id = HARNESS_NOOP_TYPE_ID, restart_type = .temporary},
+		}
+		root_group := sim_test_make_root_group(children[:])
+		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+		sim_config := SimulationConfig {
+			seed                   = t.seed,
+			ticks_max              = 1,
+			terminate_on_quiescent = true,
+		}
+
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
+
+		tracking_allocator: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&tracking_allocator, context.allocator)
+		defer mem.tracking_allocator_destroy(&tracking_allocator)
+
+		fault_allocator_data := Simulator_Test_Fault_Allocator_Data {
+			backing          = mem.tracking_allocator(&tracking_allocator),
+			fail_after_count = 2,
+		}
+		fault_allocator := simulator_test_fault_allocator(&fault_allocator_data)
+
+		sim: Simulator
+		err := simulator_init(&sim, &spec, fault_allocator)
+		testing.expect_value(t, err, mem.Allocator_Error.Out_Of_Memory)
+		testing.expect_value(t, tracking_allocator.current_memory_allocated, i64(0))
+		testing.expect(t, sim.allocator.procedure == nil, "Failed simulator init must reset partial state")
 	}
 
 	@(test)

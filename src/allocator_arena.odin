@@ -19,6 +19,24 @@ Grand_Arena :: struct {
 	region_count: int,
 }
 
+grand_arena_init_from_memory :: proc "contextless" (
+	arena: ^Grand_Arena,
+	backing_memory: []u8,
+	total_size: int,
+) -> mem.Allocator_Error {
+	if total_size > len(backing_memory) {
+		arena^ = {}
+		return .Out_Of_Memory
+	}
+
+	arena.base = backing_memory
+	arena.offset = 0
+	arena.total_size = total_size
+	arena.region_count = 0
+	arena.regions = nil // Remains nil until carve_shard_memory explicitly allocates it
+	return .None
+}
+
 grand_arena_init :: proc "contextless" (
 	arena: ^Grand_Arena,
 	total_size: int,
@@ -27,11 +45,11 @@ grand_arena_init :: proc "contextless" (
 	if err != .None {
 		return err
 	}
-	arena.base = data
-	arena.offset = 0
-	arena.total_size = total_size
-	arena.region_count = 0
-	arena.regions = nil // Remains nil until carve_shard_memory explicitly allocates it
+	init_err := grand_arena_init_from_memory(arena, data, total_size)
+	if init_err != .None {
+		os_release_arena_with_guard(data)
+		return init_err
+	}
 	return .None
 }
 
@@ -210,21 +228,21 @@ hydrate_shard :: proc(
 
 	// 2. Allocate the Slice Headers
 	grand_arena_allocator_set_name(&alloc_data, "Slice_Headers")
-	shard.type_descriptors = make([]IsolateTypeDescriptor, types_count, alloc)
-	shard.isolate_memory = make([][]u8, types_count, alloc)
-	shard.working_memory = make([][]u8, types_count, alloc)
-	shard.metadata = make([]#soa[]Isolate_Metadata, types_count, alloc)
-	shard.isolate_free_heads = make([]u32, types_count, alloc)
-	shard.dispatchable_slot_words = make([][]u64, types_count, alloc)
-	shard.dispatchable_slot_counts = make([]u32, types_count, alloc)
-	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
-	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(types_count), alloc)
+	shard.type_descriptors = make([]IsolateTypeDescriptor, types_count, alloc) or_return
+	shard.isolate_memory = make([][]u8, types_count, alloc) or_return
+	shard.working_memory = make([][]u8, types_count, alloc) or_return
+	shard.metadata = make([]#soa[]Isolate_Metadata, types_count, alloc) or_return
+	shard.isolate_free_heads = make([]u32, types_count, alloc) or_return
+	shard.dispatchable_slot_words = make([][]u64, types_count, alloc) or_return
+	shard.dispatchable_slot_counts = make([]u32, types_count, alloc) or_return
+	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(types_count), alloc) or_return
+	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(types_count), alloc) or_return
 
 	grand_arena_allocator_set_name(&alloc_data, "Dispatch_Cursors")
-	shard.dispatch_cursors = make([]u32, types_count, alloc)
+	shard.dispatch_cursors = make([]u32, types_count, alloc) or_return
 
 	grand_arena_allocator_set_name(&alloc_data, "Dispatch_Credit_Counts")
-	shard.dispatch_credit_counts = make([]Scheduler_Credit_Count, types_count, alloc)
+	shard.dispatch_credit_counts = make([]Scheduler_Credit_Count, types_count, alloc) or_return
 
 	// 3. Allocate Type-Specific Data (Inner slices)
 	for t, i in spec.types {
@@ -240,7 +258,7 @@ hydrate_shard :: proc(
 
 		if desc.slot_count > 0 && desc.stride > 0 {
 			grand_arena_allocator_set_name(&alloc_data, "Typed_Arena", type_index)
-			shard.isolate_memory[type_index] = make([]u8, desc.slot_count * desc.stride, alloc)
+			shard.isolate_memory[type_index] = make([]u8, desc.slot_count * desc.stride, alloc) or_return
 		}
 		if desc.slot_count > 0 {
 			grand_arena_allocator_set_name(&alloc_data, "Dispatchable_Slots", type_index)
@@ -248,13 +266,13 @@ hydrate_shard :: proc(
 				[]u64,
 				_dispatch_word_count(desc.slot_count),
 				alloc,
-			)
+			) or_return
 		}
 
 		aligned_count := _aligned_capacity(desc.slot_count)
 		if aligned_count > 0 {
 			grand_arena_allocator_set_name(&alloc_data, "SOA_Metadata", type_index)
-			shard.metadata[type_index] = make(#soa[]Isolate_Metadata, aligned_count, alloc)
+			shard.metadata[type_index] = make(#soa[]Isolate_Metadata, aligned_count, alloc) or_return
 
 			// Build the intrusive free list for this Type Arena
 			// We iterate backwards so slot 0 is at the head of the free list
@@ -299,30 +317,30 @@ hydrate_shard :: proc(
 	)
 
 	grand_arena_allocator_set_name(&alloc_data, "Transfer_Generations")
-	shard.transfer_generations = make([]u16, spec.transfer_slot_count, alloc)
+	shard.transfer_generations = make([]u16, spec.transfer_slot_count, alloc) or_return
 	for i in 0 ..< spec.transfer_slot_count {
 		shard.transfer_generations[i] = 1
 	}
 
 	grand_arena_allocator_set_name(&alloc_data, "FD_Handoff_Table")
-	handoff_buffer := make([]FD_Handoff_Entry, spec.fd_handoff_entry_count, alloc)
+	handoff_buffer := make([]FD_Handoff_Entry, spec.fd_handoff_entry_count, alloc) or_return
 	fd_handoff_table_init(&shard.handoff_table, handoff_buffer)
 
 	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Deadlines")
-	timer_deadlines := make([]u64, spec.timer_entry_count, alloc)
+	timer_deadlines := make([]u64, spec.timer_entry_count, alloc) or_return
 
 	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Targets")
-	timer_targets := make([]Isolate_Handle, spec.timer_entry_count, alloc)
+	timer_targets := make([]Isolate_Handle, spec.timer_entry_count, alloc) or_return
 
 	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Tags")
-	timer_tags := make([]Message_Tag, spec.timer_entry_count, alloc)
+	timer_tags := make([]Message_Tag, spec.timer_entry_count, alloc) or_return
 
 	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Correlations")
-	timer_correlations := make([]Correlation_Id, spec.timer_entry_count, alloc)
+	timer_correlations := make([]Correlation_Id, spec.timer_entry_count, alloc) or_return
 
 	grand_arena_allocator_set_name(&alloc_data, "Timer_Wheel_Armed_Words")
 	timer_armed_word_count := bitmap_word_count_from_bit_count(spec.timer_entry_count)
-	timer_armed_words := make([]u64, timer_armed_word_count, alloc)
+	timer_armed_words := make([]u64, timer_armed_word_count, alloc) or_return
 
 	timer_wheel_init(
 		&shard.timer_wheel,
@@ -334,11 +352,11 @@ hydrate_shard :: proc(
 	)
 
 	grand_arena_allocator_set_name(&alloc_data, "Log_Ring_Buffer")
-	log_buf := make([]u8, spec.log_ring_size, alloc)
+	log_buf := make([]u8, spec.log_ring_size, alloc) or_return
 	log_init(&shard.log_ring, log_buf)
 
 	grand_arena_allocator_set_name(&alloc_data, "Supervision_Group_Table")
-	shard.supervision_groups = make([]Supervision_Group, spec.supervision_groups_max, alloc)
+	shard.supervision_groups = make([]Supervision_Group, spec.supervision_groups_max, alloc) or_return
 
 	shard.scratch_memory = grand_arena_alloc_slice(
 		arena,
@@ -348,7 +366,7 @@ hydrate_shard :: proc(
 
 	// 5. Reactor
 	grand_arena_allocator_set_name(&alloc_data, "FD_Table")
-	fd_buf := make([]FD_Entry, spec.fd_table_slot_count, alloc)
+	fd_buf := make([]FD_Entry, spec.fd_table_slot_count, alloc) or_return
 
 	rx_buf := grand_arena_alloc_slice(
 		arena,
@@ -495,4 +513,58 @@ test_grand_arena :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, shard.type_descriptors != nil, "Shard type descriptors should be mapped")
 	testing.expect(t, shard.metadata[0] != nil, "Shard SOA arrays should be mapped")
+}
+
+@(test)
+test_hydrate_shard_reports_undersized_arena_make_failure :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	types := [1]IsolateTypeDescriptor {
+		{
+			id = 0,
+			slot_count = 10,
+			stride = 64,
+			soa_metadata_size = size_of(Isolate_Metadata),
+			working_memory_size = 0,
+			scratch_requirement_max = 0,
+		},
+	}
+	REACTOR_SLOTS :: 4
+	REACTOR_SIZE :: 4096
+	TRANSFER_SLOTS :: 4
+	TRANSFER_SIZE :: 4096
+
+	spec := SystemSpec {
+		types                     = types[:],
+		pool_slot_count           = 10,
+		scratch_arena_size        = 1024,
+
+		// Provide valid sizes to satisfy the subsystem initializers
+		reactor_buffer_slot_count = REACTOR_SLOTS,
+		reactor_buffer_slot_size  = REACTOR_SIZE,
+		transfer_slot_count       = TRANSFER_SLOTS,
+		transfer_slot_size        = TRANSFER_SIZE,
+		staging_slot_count        = 2,
+		staging_slot_size         = 1024,
+		timer_entry_count         = 64,
+		supervision_groups_max    = 4,
+		fd_table_slot_count       = 16,
+		fd_entry_size             = size_of(FD_Entry),
+		log_ring_size             = 1024,
+	}
+
+	// The tracker fits, but the first allocator-backed make in hydrate_shard must fail.
+	undersized_memory_size := compute_max_sub_regions(&spec) * size_of(SubRegion)
+	undersized_memory, memory_error := make([]u8, undersized_memory_size, context.temp_allocator)
+	testing.expect_value(t, memory_error, mem.Allocator_Error.None)
+
+	arena := Grand_Arena{}
+	init_err := grand_arena_init_from_memory(&arena, undersized_memory, undersized_memory_size)
+	testing.expect_value(t, init_err, mem.Allocator_Error.None)
+
+	shard := new(Shard)
+	defer free(shard)
+
+	carve_err := hydrate_shard(&arena, &spec, shard)
+	testing.expect_value(t, carve_err, mem.Allocator_Error.Out_Of_Memory)
 }

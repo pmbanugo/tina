@@ -100,7 +100,17 @@ Prng_Tree :: struct {
 
 // Initializes the entire tree from a single master seed.
 // Note: Derivation order is STRICT and APPEND-ONLY to maintain determinism guarantees.
-prng_tree_init :: proc(tree: ^Prng_Tree, seed: u64, shard_count: int, allocator: mem.Allocator) {
+prng_tree_init :: proc(
+	tree: ^Prng_Tree,
+	seed: u64,
+	shard_count: int,
+	allocator: mem.Allocator,
+) -> mem.Allocator_Error {
+	err: mem.Allocator_Error
+	defer if err != .None {
+		prng_tree_deinit(tree, allocator)
+	}
+
 	// Initialize the master generator
 	prng_init(&tree.master, seed)
 
@@ -111,14 +121,18 @@ prng_tree_init :: proc(tree: ^Prng_Tree, seed: u64, shard_count: int, allocator:
 	prng_init(&tree.partition, prng_step(&tree.master))
 
 	// Pre-allocate the arrays first
-	tree.shard_io = make([]Prng, shard_count, allocator)
-	tree.shard_crash = make([]Prng, shard_count, allocator)
+	tree.shard_io, err = make([]Prng, shard_count, allocator)
+	if err != .None do return err
+	tree.shard_crash, err = make([]Prng, shard_count, allocator)
+	if err != .None do return err
 
 	// Derive per-shard PRNGs sequentially with no internal branching
 	for i in 0 ..< shard_count {
 		prng_init(&tree.shard_io[i], prng_step(&tree.master))
 		prng_init(&tree.shard_crash[i], prng_step(&tree.master))
 	}
+
+	return .None
 }
 
 prng_tree_deinit :: proc(tree: ^Prng_Tree, allocator: mem.Allocator) {
@@ -149,7 +163,9 @@ test_prng_tree_isolation :: proc(t: ^testing.T) {
 
 	// We use t.seed here so the test harness can fuzz it,
 	// but the user can lock it via ODIN_TEST_RANDOM_SEED
-	prng_tree_init(&tree, t.seed, 4, context.temp_allocator)
+	err := prng_tree_init(&tree, t.seed, 4, context.temp_allocator)
+	testing.expect_value(t, err, mem.Allocator_Error.None)
+	defer prng_tree_deinit(&tree, context.temp_allocator)
 
 	v1 := prng_step(&tree.shard_io[0])
 	v2 := prng_step(&tree.shard_io[1])

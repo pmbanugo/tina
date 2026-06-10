@@ -61,7 +61,11 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 	when TINA_SIMULATION_MODE {
 		if spec.simulation != nil {
-			simulator := new(Simulator)
+			simulator, simulator_err := new(Simulator)
+			if simulator_err != .None {
+				fmt.eprintfln("[FATAL] Failed to allocate simulator: %v", simulator_err)
+				os.exit(1)
+			}
 			defer free(simulator)
 
 			if init_err := simulator_init(simulator, spec, context.allocator); init_err != .None {
@@ -78,12 +82,16 @@ tina_start :: proc(spec: ^SystemSpec) {
 	}
 
 	// Evaluate SPSC ring matrix via painter's algorithm. Returns counts (items), not sizes (bytes).
-	ring_counts := compute_ring_sizes(
+	ring_counts, ring_counts_err := compute_ring_sizes(
 		spec.shard_count,
 		spec.default_ring_size,
 		spec.ring_overrides,
 		context.allocator,
 	)
+	if ring_counts_err != .None {
+		fmt.eprintfln("[FATAL] Failed to compute SPSC ring sizes: %v", ring_counts_err)
+		os.exit(1)
+	}
 	defer {
 		for row in ring_counts do delete(row)
 		delete(ring_counts)

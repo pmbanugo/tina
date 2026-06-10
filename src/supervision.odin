@@ -306,9 +306,12 @@ shard_build_supervision_tree :: proc(
 	root_spec: ^Group_Spec,
 	alloc: mem.Allocator,
 	arena_alloc_data: ^Grand_Arena_Allocator_Data = nil,
+) -> (
+	Build_Result,
+	mem.Allocator_Error,
 ) {
 	group_index_next: u16 = 0
-	_ = _build_group(
+	return _build_group(
 		shard,
 		root_spec,
 		SUPERVISION_GROUP_ID_NONE,
@@ -326,7 +329,10 @@ _build_group :: proc(
 	group_index_next: ^u16,
 	alloc: mem.Allocator,
 	arena_alloc_data: ^Grand_Arena_Allocator_Data,
-) -> Build_Result {
+) -> (
+	Build_Result,
+	mem.Allocator_Error,
+) {
 	group_index := group_index_next^
 	group_index_next^ += 1
 
@@ -342,6 +348,7 @@ _build_group :: proc(
 	group.child_count_static = u16(len(group_spec.children))
 	group.child_count_dynamic = 0
 
+	allocation_error: mem.Allocator_Error
 	child_capacity_count := len(group_spec.children) + int(group_spec.child_count_dynamic_max)
 	if len(group.children_handles) == 0 && child_capacity_count > 0 {
 		if arena_alloc_data != nil do grand_arena_allocator_set_name(
@@ -349,7 +356,8 @@ _build_group :: proc(
 			"Group_Handles",
 			int(group_index),
 		)
-		group.children_handles = make([]Isolate_Handle, child_capacity_count, alloc)
+		group.children_handles, allocation_error = make([]Isolate_Handle, child_capacity_count, alloc)
+		if allocation_error != .None do return .Ok, allocation_error
 	}
 
 	if group_spec.child_count_dynamic_max > 0 && len(group.dynamic_specs) == 0 {
@@ -358,7 +366,12 @@ _build_group :: proc(
 			"Group_Dynamic_Specs",
 			int(group_index),
 		)
-		group.dynamic_specs = make([]Dynamic_Child_Spec, group_spec.child_count_dynamic_max, alloc)
+		group.dynamic_specs, allocation_error = make(
+			[]Dynamic_Child_Spec,
+			group_spec.child_count_dynamic_max,
+			alloc,
+		)
+		if allocation_error != .None do return .Ok, allocation_error
 	}
 
 	_assert_group_layout(group)
@@ -376,7 +389,7 @@ _build_group :: proc(
 			// static child spawn in a tight loop without any state change is pure churn.
 			if !_spawn_static_child_at(shard, group, u16(i)) {
 				_escalate(shard, group)
-				return .Escalated
+				return .Escalated, .None
 			}
 
 		case Group_Spec:
@@ -388,20 +401,24 @@ _build_group :: proc(
 				0,
 			)
 
-			if _build_group(
+			build_result, build_error := _build_group(
 				shard,
 				&s,
 				Supervision_Group_Id(group_index),
 				group_index_next,
 				alloc,
 				arena_alloc_data,
-			) == .Escalated {
-				return .Escalated
+			)
+			if build_error != .None {
+				return .Ok, build_error
+			}
+			if build_result == .Escalated {
+				return .Escalated, .None
 			}
 		}
 	}
 
-	return .Ok
+	return .Ok, .None
 }
 
 @(private = "package")

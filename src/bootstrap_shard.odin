@@ -112,11 +112,19 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	// S7-S10: Hydrate ONCE. Do not put this in a recovery loop.
 	// ==========================================================
 	arena := Grand_Arena{}
-	grand_arena_init(&arena, config.total_memory_size)
-	arena.base = config.grand_arena_base
+	if err := grand_arena_init_from_memory(
+		&arena,
+		config.grand_arena_base,
+		config.total_memory_size,
+	); err != .None {
+		fmt.eprintfln("[FATAL] Shard %d Grand Arena backing is too small: %v", config.shard_id, err)
+		store_watchdog_state(runtime_state, .Terminated)
+		return
+	}
 
 	if err := hydrate_shard(&arena, config.system_spec, shard); err != .None {
 		fmt.eprintfln("[FATAL] Shard %d failed to hydrate memory: %v", config.shard_id, err)
+		store_watchdog_state(runtime_state, .Terminated)
 		return
 	}
 
@@ -217,12 +225,26 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			arena = &arena,
 		}
 		arena_alloc := grand_arena_allocator(&arena_alloc_data)
-		shard_build_supervision_tree(
+		build_result, build_error := shard_build_supervision_tree(
 			shard,
 			&config.shard_spec.root_group,
 			arena_alloc,
 			&arena_alloc_data,
 		)
+		if build_error != .None {
+			fmt.eprintfln(
+				"[FATAL] Shard %d failed to build supervision tree: %v",
+				config.shard_id,
+				build_error,
+			)
+			store_watchdog_state(runtime_state, .Terminated)
+			return
+		}
+		if build_result != .Ok {
+			fmt.eprintfln("[FATAL] Shard %d supervision tree build escalated", config.shard_id)
+			store_watchdog_state(runtime_state, .Terminated)
+			return
+		}
 
 		if recovery_reason == 0 {
 			if config.shard_id == 0 do arena_print_layout(&arena)

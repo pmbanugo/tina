@@ -25,7 +25,8 @@ when TINA_SIMULATION_MODE {
 		prng_init(&drop_prng, 0xDEAD)
 
 		net: SimulatedNetwork
-		sim_network_init(&net, 2, ring_sizes, &drop_prng, allocator)
+		err := sim_network_init(&net, 2, ring_sizes, &drop_prng, allocator)
+		assert(err == .None)
 
 		for row in ring_sizes do delete(row, allocator)
 		delete(ring_sizes, allocator)
