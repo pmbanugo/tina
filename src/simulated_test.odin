@@ -217,8 +217,8 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)

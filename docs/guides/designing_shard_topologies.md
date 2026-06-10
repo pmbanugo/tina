@@ -56,8 +56,8 @@ symmetric_listener_init :: proc(
 ) -> tina.Isolate_Transition {
     self := tina.self_as(SymmetricListener, self_raw, ctx)
 
-    fd, err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-    if err != .None {
+    fd, error := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+    if error != .None {
         return tina.transition_to_crash(.Init_Failed)
     }
     self.listen_fd = fd

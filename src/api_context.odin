@@ -429,7 +429,7 @@ ctx_fd_handoff :: #force_inline proc(
 	}
 
 	deadline_tick := shard.current_tick + FD_HANDOFF_TIMEOUT_TICKS
-	handoff_ref, handoff_alloc_err := fd_handoff_table_alloc(
+	handoff_ref, handoff_alloc_error := fd_handoff_table_alloc(
 		&shard.handoff_table,
 		to,
 		cleanup_fd,
@@ -437,7 +437,7 @@ ctx_fd_handoff :: #force_inline proc(
 		deadline_tick,
 		shard.id,
 	)
-	if handoff_alloc_err != .None {
+	if handoff_alloc_error != .None {
 		_ = backend_control_close(&shard.reactor.backend, cleanup_fd)
 		shard.counters.handoff_exhaustions += 1
 		return .handoff_table_full
@@ -549,8 +549,8 @@ ctx_working_arena_bytes :: #force_inline proc(ctx: TinaContext) -> []u8 {
 @(require_results)
 ctx_transfer_alloc :: #force_inline proc(ctx: TinaContext) -> Transfer_Alloc_Result {
 	shard := ctx_invocation(ctx).shard
-	index, err := io_slot_pool_alloc(&shard.transfer_pool)
-	if err != .None {
+	index, error := io_slot_pool_alloc(&shard.transfer_pool)
+	if error != .None {
 		shard.counters.transfer_exhaustions += 1
 		return Transfer_Alloc_Error.Pool_Exhausted
 	}
@@ -776,8 +776,8 @@ ctx_claim_send_slot :: #force_inline proc(ctx: TinaContext) -> []u8 {
 		return nil // Already claimed
 	}
 	shard := invocation.shard
-	index, err := io_slot_pool_alloc(&shard.reactor.staging_pool)
-	if err != .None {
+	index, error := io_slot_pool_alloc(&shard.reactor.staging_pool)
+	if error != .None {
 		shard.counters.io_staging_exhaustions += 1
 		return nil
 	}

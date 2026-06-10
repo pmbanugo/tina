@@ -53,23 +53,23 @@ tina_start :: proc(spec: ^SystemSpec) {
 	os_set_current_thread_name("tina-watchdog")
 
 	// 1. Parse boot spec and validate
-	err := validate_system_spec(spec)
-	if err != .None {
-		fmt.eprintfln("[FATAL] Boot spec validation failed: %v", err)
+	error := validate_system_spec(spec)
+	if error != .None {
+		fmt.eprintfln("[FATAL] Boot spec validation failed: %v", error)
 		os.exit(1)
 	}
 
 	when TINA_SIMULATION_MODE {
 		if spec.simulation != nil {
-			simulator, simulator_err := new(Simulator)
-			if simulator_err != .None {
-				fmt.eprintfln("[FATAL] Failed to allocate simulator: %v", simulator_err)
+			simulator, simulator_error := new(Simulator)
+			if simulator_error != .None {
+				fmt.eprintfln("[FATAL] Failed to allocate simulator: %v", simulator_error)
 				os.exit(1)
 			}
 			defer free(simulator)
 
-			if init_err := simulator_init(simulator, spec, context.allocator); init_err != .None {
-				fmt.eprintfln("[FATAL] Simulator init failed: %v", init_err)
+			if init_error := simulator_init(simulator, spec, context.allocator); init_error != .None {
+				fmt.eprintfln("[FATAL] Simulator init failed: %v", init_error)
 				os.exit(1)
 			}
 			defer simulator_deinit(simulator)
@@ -82,14 +82,14 @@ tina_start :: proc(spec: ^SystemSpec) {
 	}
 
 	// Evaluate SPSC ring matrix via painter's algorithm. Returns counts (items), not sizes (bytes).
-	ring_counts, ring_counts_err := compute_ring_sizes(
+	ring_counts, ring_counts_error := compute_ring_sizes(
 		spec.shard_count,
 		spec.default_ring_size,
 		spec.ring_overrides,
 		context.allocator,
 	)
-	if ring_counts_err != .None {
-		fmt.eprintfln("[FATAL] Failed to compute SPSC ring sizes: %v", ring_counts_err)
+	if ring_counts_error != .None {
+		fmt.eprintfln("[FATAL] Failed to compute SPSC ring sizes: %v", ring_counts_error)
 		os.exit(1)
 	}
 	defer {
@@ -110,8 +110,8 @@ tina_start :: proc(spec: ^SystemSpec) {
 	total_system_memory_size := int(spec.shard_count) * shard_memory_size
 
 	for i in 0 ..< spec.shard_count {
-		arena_mem, mem_err := os_reserve_arena_with_guard(uint(shard_memory_size))
-		if mem_err != .None {
+		arena_mem, mem_error := os_reserve_arena_with_guard(uint(shard_memory_size))
+		if mem_error != .None {
 			fmt.eprintfln("[FATAL] Failed to reserve Grand Arena for Shard %v", i)
 			os.exit(1)
 		}
@@ -144,8 +144,8 @@ tina_start :: proc(spec: ^SystemSpec) {
 			spsc_memory_size += ring_memory_size
 
 			// TODO: (Production) mbind to the writer's (source) NUMA node here.
-			raw_mem, alloc_err := os_reserve_arena_with_guard(uint(ring_memory_size))
-			if alloc_err != .None {
+			raw_mem, alloc_error := os_reserve_arena_with_guard(uint(ring_memory_size))
+			if alloc_error != .None {
 				fmt.eprintfln("[FATAL] Failed to allocate SPSC ring %v->%v", source, target)
 				os.exit(1)
 			}

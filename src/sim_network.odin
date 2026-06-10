@@ -95,30 +95,30 @@ when TINA_SIMULATION_MODE {
 	) -> mem.Allocator_Error {
 		net^ = {}
 
-		err: mem.Allocator_Error
-		defer if err != .None {
+		error: mem.Allocator_Error
+		defer if error != .None {
 			sim_network_deinit(net, allocator)
 		}
 
 		net.shard_count = shard_count
 		net.drop_prng = drop_prng
 
-		net.channels, err = make([][]Channel, shard_count, allocator)
-		if err != .None do return err
-		net.partition_matrix, err = make([]Shard_Mask, shard_count, allocator)
-		if err != .None do return err
+		net.channels, error = make([][]Channel, shard_count, allocator)
+		if error != .None do return error
+		net.partition_matrix, error = make([]Shard_Mask, shard_count, allocator)
+		if error != .None do return error
 
 		for source_index in 0 ..< shard_count {
-			net.channels[source_index], err = make([]Channel, shard_count, allocator)
-			if err != .None do return err
+			net.channels[source_index], error = make([]Channel, shard_count, allocator)
+			if error != .None do return error
 			for target_index in 0 ..< shard_count {
 				if source_index != target_index {
-					err = delay_queue_init(
+					error = delay_queue_init(
 						&net.channels[source_index][target_index].delay_queue,
 						ring_sizes[source_index][target_index],
 						allocator,
 					)
-					if err != .None do return err
+					if error != .None do return error
 				}
 			}
 		}

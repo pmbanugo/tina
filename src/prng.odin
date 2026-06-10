@@ -106,8 +106,8 @@ prng_tree_init :: proc(
 	shard_count: int,
 	allocator: mem.Allocator,
 ) -> mem.Allocator_Error {
-	err: mem.Allocator_Error
-	defer if err != .None {
+	error: mem.Allocator_Error
+	defer if error != .None {
 		prng_tree_deinit(tree, allocator)
 	}
 
@@ -121,10 +121,10 @@ prng_tree_init :: proc(
 	prng_init(&tree.partition, prng_step(&tree.master))
 
 	// Pre-allocate the arrays first
-	tree.shard_io, err = make([]Prng, shard_count, allocator)
-	if err != .None do return err
-	tree.shard_crash, err = make([]Prng, shard_count, allocator)
-	if err != .None do return err
+	tree.shard_io, error = make([]Prng, shard_count, allocator)
+	if error != .None do return error
+	tree.shard_crash, error = make([]Prng, shard_count, allocator)
+	if error != .None do return error
 
 	// Derive per-shard PRNGs sequentially with no internal branching
 	for i in 0 ..< shard_count {
@@ -163,8 +163,8 @@ test_prng_tree_isolation :: proc(t: ^testing.T) {
 
 	// We use t.seed here so the test harness can fuzz it,
 	// but the user can lock it via ODIN_TEST_RANDOM_SEED
-	err := prng_tree_init(&tree, t.seed, 4, context.temp_allocator)
-	testing.expect_value(t, err, mem.Allocator_Error.None)
+	error := prng_tree_init(&tree, t.seed, 4, context.temp_allocator)
+	testing.expect_value(t, error, mem.Allocator_Error.None)
 	defer prng_tree_deinit(&tree, context.temp_allocator)
 
 	v1 := prng_step(&tree.shard_io[0])

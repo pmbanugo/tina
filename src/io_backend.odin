@@ -105,7 +105,7 @@ backend_deinit :: proc(backend: ^Platform_Backend) {
 	_backend_deinit(backend)
 }
 
-backend_error_label :: #force_inline proc "contextless" (err: Backend_Error) -> string {
+backend_error_label :: #force_inline proc "contextless" (error: Backend_Error) -> string {
 	@(static, rodata)
 	labels := [Backend_Error]string {
 		.None                 = "none",
@@ -120,7 +120,7 @@ backend_error_label :: #force_inline proc "contextless" (err: Backend_Error) -> 
 		.Too_Late             = "too late",
 		.Unsupported          = "unsupported",
 	}
-	return labels[err]
+	return labels[error]
 }
 
 // Submit a batch of I/O operations. All-or-error semantics.

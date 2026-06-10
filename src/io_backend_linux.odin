@@ -29,8 +29,8 @@ when !TINA_SIMULATION_MODE {
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_LINUX_UNQUEUED)
 
 	@(private = "file")
-	_linux_map_socket_startup_error :: #force_inline proc "contextless" (err: linux.Errno) -> Backend_Error {
-		#partial switch err {
+	_linux_map_socket_startup_error :: #force_inline proc "contextless" (error: linux.Errno) -> Backend_Error {
+		#partial switch error {
 		case .EACCES, .EPERM:
 			return .Permission_Denied
 		case .EINVAL:
@@ -130,8 +130,8 @@ when !TINA_SIMULATION_MODE {
 			return .System_Error
 		}
 
-		wakefd, wakefd_err := linux.eventfd(0, {.CLOEXEC, .NONBLOCK})
-		if wakefd_err != nil {
+		wakefd, wakefd_error := linux.eventfd(0, {.CLOEXEC, .NONBLOCK})
+		if wakefd_error != nil {
 			uring.destroy(&backend.ring)
 			return .System_Error
 		}
@@ -153,8 +153,8 @@ when !TINA_SIMULATION_MODE {
 		for i in 0 ..< MAX_LINUX_SENDFILE_ENTRIES {
 			backend.sendfile_entries[i].active = false
 			pipes: [2]linux.Fd
-			pipe_err := linux.pipe2(&pipes, {.CLOEXEC, .NONBLOCK})
-			if pipe_err != nil {
+			pipe_error := linux.pipe2(&pipes, {.CLOEXEC, .NONBLOCK})
+			if pipe_error != nil {
 				// Clean up already-created pipes and fail init
 				for j in 0 ..< i {
 					linux.close(backend.sendfile_entries[j].pipe_read_fd)
@@ -317,8 +317,8 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		// Flush SQEs to kernel
-		_, err := uring.submit(&backend.ring, 0, nil)
-		if err != nil && err != .NONE {
+		_, error := uring.submit(&backend.ring, 0, nil)
+		if error != nil && error != .NONE {
 			return .System_Error
 		}
 
@@ -355,11 +355,11 @@ when !TINA_SIMULATION_MODE {
 
 		needs_submit := backend.unqueued_count > 0 || timeout_ns != 0
 		if needs_submit {
-			_, submit_err := uring.submit(&backend.ring, wait_number, time_spec_pointer)
-			if submit_err != nil &&
-			   submit_err != .NONE &&
-			   submit_err != .ETIME &&
-			   submit_err != .EINTR {
+			_, submit_error := uring.submit(&backend.ring, wait_number, time_spec_pointer)
+			if submit_error != nil &&
+			   submit_error != .NONE &&
+			   submit_error != .ETIME &&
+			   submit_error != .EINTR {
 				return 0, .System_Error
 			}
 		}
@@ -367,8 +367,8 @@ when !TINA_SIMULATION_MODE {
 		// Harvest CQEs. Keep the temporary harvest buffer aligned with the reactor
 		// completion batch configuration so higher batch counts do not silently clamp.
 		cqes: [REACTOR_COMPLETION_BATCH_COUNT]linux.IO_Uring_CQE = ---
-		completed, cqe_err := uring.copy_cqes(&backend.ring, cqes[:], 0)
-		if cqe_err != nil && cqe_err != .NONE && cqe_err != .EINTR {
+		completed, cqe_error := uring.copy_cqes(&backend.ring, cqes[:], 0)
+		if cqe_error != nil && cqe_error != .NONE && cqe_error != .EINTR {
 			return 0, .System_Error
 		}
 
@@ -497,8 +497,8 @@ when !TINA_SIMULATION_MODE {
 			return .Queue_Full
 		}
 
-		_, err := uring.submit(&backend.ring, 0, nil)
-		if err != nil && err != .NONE {
+		_, error := uring.submit(&backend.ring, 0, nil)
+		if error != nil && error != .NONE {
 			return .System_Error
 		}
 
@@ -554,9 +554,9 @@ when !TINA_SIMULATION_MODE {
 			proto = .UDP
 		}
 
-		fd, err := linux.socket(af, st, sf, proto)
-		if err != nil {
-			return OS_FD_INVALID, _linux_map_socket_startup_error(err)
+		fd, error := linux.socket(af, st, sf, proto)
+		if error != nil {
+			return OS_FD_INVALID, _linux_map_socket_startup_error(error)
 		}
 		return OS_FD(fd), .None
 	}
@@ -569,9 +569,9 @@ when !TINA_SIMULATION_MODE {
 	) -> Backend_Error {
 		sockaddr := _linux_socket_address_to_sockaddr(address)
 
-		err := linux.bind(linux.Fd(fd), &sockaddr)
-		if err != nil {
-			return _linux_map_socket_startup_error(err)
+		error := linux.bind(linux.Fd(fd), &sockaddr)
+		if error != nil {
+			return _linux_map_socket_startup_error(error)
 		}
 		return .None
 	}
@@ -582,9 +582,9 @@ when !TINA_SIMULATION_MODE {
 		fd: OS_FD,
 		backlog: u32,
 	) -> Backend_Error {
-		err := linux.listen(linux.Fd(fd), i32(backlog))
-		if err != nil {
-			return _linux_map_socket_startup_error(err)
+		error := linux.listen(linux.Fd(fd), i32(backlog))
+		if error != nil {
+			return _linux_map_socket_startup_error(error)
 		}
 		return .None
 	}
@@ -650,16 +650,16 @@ when !TINA_SIMULATION_MODE {
 		switch v in value {
 		case bool:
 			int_val: i32 = 1 if v else 0
-			err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
-			if err != nil do return .System_Error
+			error := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
+			if error != nil do return .System_Error
 		case i32:
 			int_val := v
-			err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
-			if err != nil do return .System_Error
+			error := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &int_val)
+			if error != nil do return .System_Error
 		case Socket_Linger:
 			lin := v
-			err := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &lin)
-			if err != nil do return .System_Error
+			error := linux.setsockopt_base(linux.Fd(fd), int(sol), int(opt), &lin)
+			if error != nil do return .System_Error
 		case:
 			return .Unsupported
 		}
@@ -729,14 +729,14 @@ when !TINA_SIMULATION_MODE {
 		// SO_LINGER requires an 8-byte struct; route it separately to avoid stack overflow
 		if option == .SO_LINGER {
 			lin: Socket_Linger
-			_, err := linux.getsockopt_base(linux.Fd(fd), int(sol), linux.Socket_Option(opt), &lin)
-			if err != nil do return nil, .System_Error
+			_, error := linux.getsockopt_base(linux.Fd(fd), int(sol), linux.Socket_Option(opt), &lin)
+			if error != nil do return nil, .System_Error
 			return lin, .None
 		}
 
 		val: i32
-		_, err := linux.getsockopt_base(linux.Fd(fd), int(sol), linux.Socket_Option(opt), &val)
-		if err != nil {
+		_, error := linux.getsockopt_base(linux.Fd(fd), int(sol), linux.Socket_Option(opt), &val)
+		if error != nil {
 			return nil, .System_Error
 		}
 
@@ -764,8 +764,8 @@ when !TINA_SIMULATION_MODE {
 			shutdown_how = .RDWR
 		}
 
-		err := linux.shutdown(linux.Fd(fd), shutdown_how)
-		if err != nil {
+		error := linux.shutdown(linux.Fd(fd), shutdown_how)
+		if error != nil {
 			return .System_Error
 		}
 		return .None
@@ -776,8 +776,8 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		fd: OS_FD,
 	) -> Backend_Error {
-		err := linux.close(linux.Fd(fd))
-		if err != nil {
+		error := linux.close(linux.Fd(fd))
+		if error != nil {
 			return .System_Error
 		}
 		return .None
@@ -791,8 +791,8 @@ when !TINA_SIMULATION_MODE {
 		OS_FD,
 		Backend_Error,
 	) {
-		dup_fd, err := linux.fcntl_dupfd_cloexec(linux.Fd(fd), .DUPFD_CLOEXEC, 0)
-		if err != nil {
+		dup_fd, error := linux.fcntl_dupfd_cloexec(linux.Fd(fd), .DUPFD_CLOEXEC, 0)
+		if error != nil {
 			return OS_FD_INVALID, .System_Error
 		}
 		return OS_FD(dup_fd), .None
@@ -1319,13 +1319,13 @@ when !TINA_SIMULATION_MODE {
 				len  = uint(backing_memory_slot_size),
 			}
 		}
-		err := linux.io_uring_register(
+		error := linux.io_uring_register(
 			backend.ring.fd,
 			.REGISTER_BUFFERS,
 			&iovecs[0],
 			u32(backing_memory_slot_count),
 		)
-		return err == .NONE
+		return error == .NONE
 	}
 
 	// Register a sparse fixed-file table with io_uring (§6.6.2 §8).
@@ -1337,13 +1337,13 @@ when !TINA_SIMULATION_MODE {
 		for i in 0 ..< int(fd_slot_count) {
 			fds[i] = linux.Fd(-1)
 		}
-		err := linux.io_uring_register(
+		error := linux.io_uring_register(
 			backend.ring.fd,
 			.REGISTER_FILES,
 			&fds[0],
 			u32(fd_slot_count),
 		)
-		return err == .NONE
+		return error == .NONE
 	}
 
 	// Internal struct matching kernel's io_uring_rsrc_update for FILES_UPDATE.
@@ -1603,8 +1603,8 @@ when !TINA_SIMULATION_MODE {
 		testing.expect_value(t, dup_error, Backend_Error.None)
 		testing.expect(t, dup_fd != fd, "dup must return a distinct descriptor")
 
-		flags, flags_err := linux.fcntl_getfd(linux.Fd(dup_fd), .GETFD)
-		testing.expect_value(t, flags_err, linux.Errno(0))
+		flags, flags_error := linux.fcntl_getfd(linux.Fd(dup_fd), .GETFD)
+		testing.expect_value(t, flags_error, linux.Errno(0))
 		testing.expect(t, flags != 0, "dup fd must have close-on-exec set")
 
 		close_error := backend_control_close(&backend, fd)
@@ -1621,8 +1621,8 @@ when !TINA_SIMULATION_MODE {
 			fd_slot_count = 8,
 		}
 
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		testing.expect(t, backend.files_registered, "fixed files should be registered")
 		testing.expect_value(t, backend.fixed_fd_count, 8)
 
@@ -1638,8 +1638,8 @@ when !TINA_SIMULATION_MODE {
 			fd_slot_count = 0,
 		}
 
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		testing.expect(t, !backend.files_registered, "should not register with 0 slots")
 
 		backend_deinit(&backend)
@@ -1660,8 +1660,8 @@ when !TINA_SIMULATION_MODE {
 		defer backend_deinit(&backend)
 
 		// Create a real socket
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
 		// Register it in slot 0
 		_backend_register_fixed_fd(&backend, 0, fd)
@@ -1676,8 +1676,8 @@ when !TINA_SIMULATION_MODE {
 				operation = Submission_Op_Recv{fd_socket = fd},
 			},
 		}
-		sub_err := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_err, Backend_Error.None)
+		sub_error := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_error, Backend_Error.None)
 		// If IOSQE_FIXED_FILE was applied incorrectly, the kernel would return EBADF
 		// on the CQE. The submit succeeding means the SQE was accepted.
 
@@ -1715,8 +1715,8 @@ when !TINA_SIMULATION_MODE {
 				operation = Submission_Op_Close{fd = fd},
 			},
 		}
-		sub_err := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_err, Backend_Error.None)
+		sub_error := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_error, Backend_Error.None)
 
 		// Collect the close completion — should succeed (not EBADF)
 		completions: [4]Raw_Completion

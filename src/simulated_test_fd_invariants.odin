@@ -44,8 +44,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		return sim
 	}
 
@@ -58,14 +58,14 @@ when TINA_SIMULATION_MODE {
 		shard := &sim.shards[0]
 		owner := make_handle(0, u16(HARNESS_NOOP_TYPE_ID), 0, 1)
 
-		os_fd, sock_err := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		os_fd, sock_error := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
-		fd_handle, fd_err := fd_table_alloc(&shard.reactor.fd_table, os_fd, owner)
-		testing.expect_value(t, fd_err, FD_Table_Error.None)
+		fd_handle, fd_error := fd_table_alloc(&shard.reactor.fd_table, os_fd, owner)
+		testing.expect_value(t, fd_error, FD_Table_Error.None)
 
-		entry_index, lookup_err := fd_table_lookup_index(&shard.reactor.fd_table, fd_handle)
-		testing.expect_value(t, lookup_err, FD_Table_Error.None)
+		entry_index, lookup_error := fd_table_lookup_index(&shard.reactor.fd_table, fd_handle)
+		testing.expect_value(t, lookup_error, FD_Table_Error.None)
 		entry := &shard.reactor.fd_table.entries[entry_index]
 		entry.os_fd = OS_FD_INVALID
 
@@ -85,15 +85,15 @@ when TINA_SIMULATION_MODE {
 		shard := &sim.shards[0]
 		target_handle := make_handle(0, u16(HARNESS_NOOP_TYPE_ID), 0, 1)
 
-		cleanup_fd, sock_err := backend_control_socket(
+		cleanup_fd, sock_error := backend_control_socket(
 			&shard.reactor.backend,
 			.AF_INET,
 			.STREAM,
 			.TCP,
 		)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
-		ref, alloc_err := fd_handoff_table_alloc(
+		ref, alloc_error := fd_handoff_table_alloc(
 			&shard.handoff_table,
 			target_handle,
 			cleanup_fd,
@@ -101,10 +101,10 @@ when TINA_SIMULATION_MODE {
 			8,
 			shard.id,
 		)
-		testing.expect_value(t, alloc_err, FD_Handoff_Table_Error.None)
+		testing.expect_value(t, alloc_error, FD_Handoff_Table_Error.None)
 
-		entry_index, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
-		testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.None)
+		entry_index, lookup_error := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+		testing.expect_value(t, lookup_error, FD_Handoff_Table_Error.None)
 		entry := &shard.handoff_table.entries[entry_index]
 		entry.cleanup_fd = OS_FD_INVALID
 
@@ -123,8 +123,8 @@ when TINA_SIMULATION_MODE {
 		defer simulator_deinit(&sim)
 		backend := &sim.shards[0].reactor.backend
 
-		fd, sock_err := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
 		desc, ok := _sim_lookup_descriptor(backend, fd)
 		testing.expect(t, ok, "simulated descriptor should resolve")

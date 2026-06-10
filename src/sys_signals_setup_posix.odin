@@ -40,9 +40,9 @@ os_signals_init_process :: #force_inline proc() {
 	posix.sigaddset(&blocked, .SIGUSR2)
 	posix.sigaddset(&blocked, .SIGHUP)
 
-	sig_err := posix.pthread_sigmask(.BLOCK, &blocked, nil)
-	if sig_err != .NONE {
-		fmt.eprintfln("[FATAL] Failed to set pthread_sigmask: %v", posix.strerror(sig_err))
+	sig_error := posix.pthread_sigmask(.BLOCK, &blocked, nil)
+	if sig_error != .NONE {
+		fmt.eprintfln("[FATAL] Failed to set pthread_sigmask: %v", posix.strerror(sig_error))
 		os.exit(1)
 	}
 }

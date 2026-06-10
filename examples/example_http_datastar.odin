@@ -100,7 +100,7 @@ hello_world :: proc(
 	switch ev in event {
 	case http.Request_Start:
 		hello_state^ = Hello_State{}
-		if err := datastar.read_signals(request, &hello_state.store); err != .None {
+		if error := datastar.read_signals(request, &hello_state.store); error != .None {
 			return http.respond_text(response, http.HTTP_STATUS_BAD_REQUEST, "invalid datastar signals")
 		}
 

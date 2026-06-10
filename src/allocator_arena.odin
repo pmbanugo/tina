@@ -41,14 +41,14 @@ grand_arena_init :: proc "contextless" (
 	arena: ^Grand_Arena,
 	total_size: int,
 ) -> mem.Allocator_Error {
-	data, err := os_reserve_arena_with_guard(uint(total_size))
-	if err != .None {
-		return err
+	data, error := os_reserve_arena_with_guard(uint(total_size))
+	if error != .None {
+		return error
 	}
-	init_err := grand_arena_init_from_memory(arena, data, total_size)
-	if init_err != .None {
+	init_error := grand_arena_init_from_memory(arena, data, total_size)
+	if init_error != .None {
 		os_release_arena_with_guard(data)
-		return init_err
+		return init_error
 	}
 	return .None
 }
@@ -100,7 +100,7 @@ grand_arena_alloc_slice :: #force_inline proc "contextless" (
 	qualifier: int = -1,
 ) -> (
 	result: []u8,
-	err: mem.Allocator_Error,
+	error: mem.Allocator_Error,
 ) {
 	ptr := grand_arena_alloc_named(arena, name, size, qualifier = qualifier) or_return
 	return (cast([^]u8)ptr)[:size], .None
@@ -151,14 +151,14 @@ grand_arena_allocator_proc :: proc(
 		// But tiny metadata slices (Slice Headers, dispatch_cursors, dispatch_credit_counts, isolate_free_heads)
 		// should be tightly packed.
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
-		ptr, err := grand_arena_alloc_named(
+		ptr, error := grand_arena_alloc_named(
 			data.arena,
 			data.current_name,
 			size,
 			actual_alignment,
 			data.current_qualifier,
 		)
-		if err != .None do return nil, err
+		if error != .None do return nil, error
 		return (cast([^]byte)ptr)[:size], .None
 	case .Resize:
 		if old_size >= size do return (cast([^]byte)old_memory)[:size], .None
@@ -168,14 +168,14 @@ grand_arena_allocator_proc :: proc(
 	case .Alloc_Non_Zeroed:
 		// Arena bumps a pointer; non-zeroed is identical to zeroed allocation
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
-		ptr, err := grand_arena_alloc_named(
+		ptr, error := grand_arena_alloc_named(
 			data.arena,
 			data.current_name,
 			size,
 			actual_alignment,
 			data.current_qualifier,
 		)
-		if err != .None do return nil, err
+		if error != .None do return nil, error
 		return (cast([^]byte)ptr)[:size], .None
 	case .Query_Features, .Query_Info, .Resize_Non_Zeroed:
 		return nil, .Mode_Not_Implemented
@@ -399,14 +399,14 @@ hydrate_shard :: proc(
 		}
 	}
 
-	reactor_err := reactor_init(
+	reactor_error := reactor_init(
 		&shard.reactor,
 		backend_config,
 		fd_buf,
 		IO_Slot_Pool_Config{backing_memory = rx_buf, slot_size = u32(spec.reactor_buffer_slot_size), slot_count = u16(spec.reactor_buffer_slot_count)},
 		IO_Slot_Pool_Config{backing_memory = staging_buf, slot_size = u32(spec.staging_slot_size), slot_count = u16(spec.staging_slot_count)},
 	)
-	if reactor_err != .None {
+	if reactor_error != .None {
 		return .Out_Of_Memory // Standardizing to allocator error to bubble up cleanly
 	}
 
@@ -493,17 +493,17 @@ test_grand_arena :: proc(t: ^testing.T) {
 	total_mem := compute_shard_memory_total(&spec)
 
 	arena := Grand_Arena{}
-	err := grand_arena_init(&arena, total_mem)
-	testing.expect_value(t, err, mem.Allocator_Error.None)
+	error := grand_arena_init(&arena, total_mem)
+	testing.expect_value(t, error, mem.Allocator_Error.None)
 
 	defer os_release_arena_with_guard(arena.base)
 
 	shard := new(Shard)
 	defer free(shard)
 
-	carve_err := hydrate_shard(&arena, &spec, shard)
+	carve_error := hydrate_shard(&arena, &spec, shard)
 	defer reactor_deinit(&shard.reactor)
-	testing.expect_value(t, carve_err, mem.Allocator_Error.None)
+	testing.expect_value(t, carve_error, mem.Allocator_Error.None)
 
 	testing.expect(t, arena.region_count > 1, "Arena should have carved regions")
 	testing.expect(
@@ -559,12 +559,12 @@ test_hydrate_shard_reports_undersized_arena_make_failure :: proc(t: ^testing.T) 
 	testing.expect_value(t, memory_error, mem.Allocator_Error.None)
 
 	arena := Grand_Arena{}
-	init_err := grand_arena_init_from_memory(&arena, undersized_memory, undersized_memory_size)
-	testing.expect_value(t, init_err, mem.Allocator_Error.None)
+	init_error := grand_arena_init_from_memory(&arena, undersized_memory, undersized_memory_size)
+	testing.expect_value(t, init_error, mem.Allocator_Error.None)
 
 	shard := new(Shard)
 	defer free(shard)
 
-	carve_err := hydrate_shard(&arena, &spec, shard)
-	testing.expect_value(t, carve_err, mem.Allocator_Error.Out_Of_Memory)
+	carve_error := hydrate_shard(&arena, &spec, shard)
+	testing.expect_value(t, carve_error, mem.Allocator_Error.Out_Of_Memory)
 }

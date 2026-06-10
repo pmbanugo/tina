@@ -116,7 +116,7 @@ test_fd_handoff_table_alloc_free :: proc(t: ^testing.T) {
 	table: FD_Handoff_Table
 	fd_handoff_table_init(&table, backing[:])
 
-	ref, alloc_err := fd_handoff_table_alloc(
+	ref, alloc_error := fd_handoff_table_alloc(
 		&table,
 		make_handle(1, 2, 3, 4),
 		OS_FD(10),
@@ -124,18 +124,18 @@ test_fd_handoff_table_alloc_free :: proc(t: ^testing.T) {
 		42,
 		0,
 	)
-	testing.expect_value(t, alloc_err, FD_Handoff_Table_Error.None)
+	testing.expect_value(t, alloc_error, FD_Handoff_Table_Error.None)
 	testing.expect_value(t, table.free_count, u16(1))
 
-	entry_index, lookup_err := fd_handoff_table_lookup_index(&table, ref)
-	testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.None)
+	entry_index, lookup_error := fd_handoff_table_lookup_index(&table, ref)
+	testing.expect_value(t, lookup_error, FD_Handoff_Table_Error.None)
 	entry := &table.entries[entry_index]
 	testing.expect_value(t, entry.cleanup_fd, OS_FD(10))
 
-	free_err := fd_handoff_table_free(&table, ref)
-	testing.expect_value(t, free_err, FD_Handoff_Table_Error.None)
+	free_error := fd_handoff_table_free(&table, ref)
+	testing.expect_value(t, free_error, FD_Handoff_Table_Error.None)
 	testing.expect_value(t, table.free_count, u16(2))
 
-	_, lookup_err = fd_handoff_table_lookup_index(&table, ref)
-	testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.Stale_Generation)
+	_, lookup_error = fd_handoff_table_lookup_index(&table, ref)
+	testing.expect_value(t, lookup_error, FD_Handoff_Table_Error.Stale_Generation)
 }

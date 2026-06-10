@@ -199,15 +199,15 @@ compile_router :: proc(
 		// literal_buffer.
 		canonical := make([]u8, len(route.pattern), context.temp_allocator)
 		copy(canonical, transmute([]u8)route.pattern)
-		canonical_size, canon_err, _ := path_canonicalize_selective_in_place(canonical)
-		if canon_err != .None {
+		canonical_size, canon_error, _ := path_canonicalize_selective_in_place(canonical)
+		if canon_error != .None {
 			return {}, .Pattern_Bad_Encoding, route_input_index
 		}
 		canonical = canonical[:canonical_size]
 
-		kind, parts, classify_err := classify_pattern(canonical, context.temp_allocator)
-		if classify_err != .None {
-			return {}, classify_err, route_input_index
+		kind, parts, classify_error := classify_pattern(canonical, context.temp_allocator)
+		if classify_error != .None {
+			return {}, classify_error, route_input_index
 		}
 
 		// Expand each method bit into its own IR entry — one descriptor and
@@ -933,8 +933,8 @@ test_route_index_sentinel :: proc(t: ^testing.T) {
 
 @(test)
 test_compile_empty :: proc(t: ^testing.T) {
-	router, err, _ := compile_router({})
-	testing.expect_value(t, err, Compile_Error.None)
+	router, error, _ := compile_router({})
+	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 0)
 	testing.expect_value(t, router.options_asterisk_route_index, ROUTE_INDEX_NONE)
 	defer compiled_router_destroy(&router)
@@ -947,9 +947,9 @@ test_compile_static_routes_packed :: proc(t: ^testing.T) {
 		{pattern = "/users", methods_mask = {.GET, .POST}},
 		{pattern = "/users/me", methods_mask = {.GET}},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 3)
 	testing.expect_value(t, router.static_count, 3)
 	testing.expect_value(t, router.parametric_count, 0)
@@ -965,9 +965,9 @@ test_compile_aggregates_methods_into_one_entry :: proc(t: ^testing.T) {
 		{pattern = "/users", methods_mask = {.GET}},
 		{pattern = "/users", methods_mask = {.POST}},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 1)
 
 	entry := router.entries[0]
@@ -989,9 +989,9 @@ test_compile_explicit_head_overrides_get_fallback :: proc(t: ^testing.T) {
 		{pattern = "/x", methods_mask = {.GET}, handler = rawptr(uintptr(0xAAAA))},
 		{pattern = "/x", methods_mask = {.HEAD}, handler = rawptr(uintptr(0xBBBB))},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	entry := router.entries[0]
 	get_index := entry.route_index_by_method[Method.GET]
@@ -1007,8 +1007,8 @@ test_compile_duplicate_route_rejected :: proc(t: ^testing.T) {
 		{pattern = "/dup", methods_mask = {.GET}},
 		{pattern = "/dup", methods_mask = {.GET}},
 	}
-	_, err, _ := compile_router(routes)
-	testing.expect_value(t, err, Compile_Error.Duplicate_Route)
+	_, error, _ := compile_router(routes)
+	testing.expect_value(t, error, Compile_Error.Duplicate_Route)
 }
 
 @(test)
@@ -1018,16 +1018,16 @@ test_compile_canonicalization_collision :: proc(t: ^testing.T) {
 		{pattern = "/admin", methods_mask = {.GET}},
 		{pattern = "/%61dmin", methods_mask = {.GET}},
 	}
-	_, err, _ := compile_router(routes)
-	testing.expect_value(t, err, Compile_Error.Duplicate_Route)
+	_, error, _ := compile_router(routes)
+	testing.expect_value(t, error, Compile_Error.Duplicate_Route)
 }
 
 @(test)
 test_compile_parametric_classified :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users/:id", methods_mask = {.GET}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, router.parametric_count, 1)
 	testing.expect_value(t, router.entries[0].kind, Route_Kind.Parametric)
 	testing.expect_value(t, router.entries[0].segment_count, 2)
@@ -1036,9 +1036,9 @@ test_compile_parametric_classified :: proc(t: ^testing.T) {
 @(test)
 test_compile_wildcard_classified :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/static/*", methods_mask = {.GET}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, router.wildcard_count, 1)
 	testing.expect_value(t, router.entries[0].kind, Route_Kind.Wildcard)
 }
@@ -1046,15 +1046,15 @@ test_compile_wildcard_classified :: proc(t: ^testing.T) {
 @(test)
 test_compile_wildcard_must_be_terminal :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/*/foo", methods_mask = {.GET}}}
-	_, err, _ := compile_router(routes)
-	testing.expect_value(t, err, Compile_Error.Wildcard_Not_Terminal)
+	_, error, _ := compile_router(routes)
+	testing.expect_value(t, error, Compile_Error.Wildcard_Not_Terminal)
 }
 
 @(test)
 test_compile_empty_param_name_rejected :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users/:", methods_mask = {.GET}}}
-	_, err, _ := compile_router(routes)
-	testing.expect_value(t, err, Compile_Error.Empty_Param_Name)
+	_, error, _ := compile_router(routes)
+	testing.expect_value(t, error, Compile_Error.Empty_Param_Name)
 }
 
 @(test)
@@ -1062,9 +1062,9 @@ test_compile_options_asterisk_split_out :: proc(t: ^testing.T) {
 	routes := []Route {
 		{pattern = "*", methods_mask = {.OPTIONS}, handler = rawptr(uintptr(0xCAFE))},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 0)
 	testing.expect(t, router.options_asterisk_route_index != ROUTE_INDEX_NONE, "should be set")
 	testing.expect_value(
@@ -1077,9 +1077,9 @@ test_compile_options_asterisk_split_out :: proc(t: ^testing.T) {
 @(test)
 test_compile_options_asterisk_canned_response_built :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/health", methods_mask = {.GET}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, router.options_asterisk_route_index, ROUTE_INDEX_NONE)
 	testing.expect(t, len(router.options_asterisk_response) > 0, "canned response should be built")
 	canned := string(router.options_asterisk_response)
@@ -1091,8 +1091,8 @@ test_compile_options_asterisk_canned_response_built :: proc(t: ^testing.T) {
 @(test)
 test_compile_asterisk_for_non_options_rejected :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "*", methods_mask = {.GET}}}
-	_, err, _ := compile_router(routes)
-	testing.expect_value(t, err, Compile_Error.Asterisk_Wrong_Method)
+	_, error, _ := compile_router(routes)
+	testing.expect_value(t, error, Compile_Error.Asterisk_Wrong_Method)
 }
 
 @(test)
@@ -1103,8 +1103,8 @@ test_compile_param_name_conflict_rejected :: proc(t: ^testing.T) {
 		{pattern = "/users/:id", methods_mask = {.GET}},
 		{pattern = "/users/:name", methods_mask = {.POST}},
 	}
-	_, err, _ := compile_router(routes)
-	testing.expect_value(t, err, Compile_Error.Param_Name_Conflict)
+	_, error, _ := compile_router(routes)
+	testing.expect_value(t, error, Compile_Error.Param_Name_Conflict)
 }
 
 @(test)
@@ -1114,9 +1114,9 @@ test_match_static_hit :: proc(t: ^testing.T) {
 		{pattern = "/users", methods_mask = {.GET}},
 		{pattern = "/users/me", methods_mask = {.GET}},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1133,9 +1133,9 @@ test_match_static_hit :: proc(t: ^testing.T) {
 @(test)
 test_match_static_miss_falls_through_to_not_found :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users", methods_mask = {.GET}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1148,9 +1148,9 @@ test_match_static_miss_falls_through_to_not_found :: proc(t: ^testing.T) {
 @(test)
 test_match_method_not_allowed_emits_correct_mask :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1167,9 +1167,9 @@ test_match_method_not_allowed_emits_correct_mask :: proc(t: ^testing.T) {
 @(test)
 test_match_unknown_method_known_path_still_reports_method_not_allowed :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1186,9 +1186,9 @@ test_match_unknown_method_known_path_still_reports_method_not_allowed :: proc(t:
 @(test)
 test_match_unknown_method_missing_path_stays_not_found :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1202,9 +1202,9 @@ test_match_unknown_method_missing_path_stays_not_found :: proc(t: ^testing.T) {
 @(test)
 test_match_head_resolves_to_get_handler :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET}, handler = rawptr(uintptr(0x1111))}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1226,9 +1226,9 @@ test_match_static_beats_parametric :: proc(t: ^testing.T) {
 		{pattern = "/users/:id", methods_mask = {.GET}, handler = rawptr(uintptr(0xAA))},
 		{pattern = "/users/me", methods_mask = {.GET}, handler = rawptr(uintptr(0xBB))},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1244,9 +1244,9 @@ test_match_parametric_route :: proc(t: ^testing.T) {
 	routes := []Route {
 		{pattern = "/users/:id", methods_mask = {.GET}, handler = rawptr(uintptr(0xAA))},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1260,9 +1260,9 @@ test_match_parametric_route :: proc(t: ^testing.T) {
 @(test)
 test_match_parametric_segment_count_mismatch :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users/:id", methods_mask = {.GET}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1275,9 +1275,9 @@ test_match_parametric_segment_count_mismatch :: proc(t: ^testing.T) {
 @(test)
 test_match_wildcard_consumes_suffix :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/static/*", methods_mask = {.GET}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1293,9 +1293,9 @@ test_match_parametric_beats_wildcard :: proc(t: ^testing.T) {
 		{pattern = "/files/*", methods_mask = {.GET}, handler = rawptr(uintptr(0xAAA1))},
 		{pattern = "/files/:name", methods_mask = {.GET}, handler = rawptr(uintptr(0xBBB2))},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1316,9 +1316,9 @@ test_match_parametric_beats_wildcard :: proc(t: ^testing.T) {
 test_match_2F_does_not_split_segments_at_runtime :: proc(t: ^testing.T) {
 	// Path `/a%2Fb` must match parametric `/:p` (one segment), not `/:a/:b`.
 	routes := []Route{{pattern = "/:p", methods_mask = {.GET}}}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	request: Request_State
 	request_state_reset(&request)
@@ -1394,9 +1394,9 @@ test_dozens_of_paths_resolve_correctly :: proc(t: ^testing.T) {
 			handler = rawptr(uintptr(9)),
 		},
 	}
-	router, err, _ := compile_router(routes)
+	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
-	testing.expect_value(t, err, Compile_Error.None)
+	testing.expect_value(t, error, Compile_Error.None)
 
 	Case :: struct {
 		method:           Method,

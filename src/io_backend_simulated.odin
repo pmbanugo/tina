@@ -916,8 +916,8 @@ when TINA_SIMULATION_MODE {
 			sim_config = Simulation_IO_Config{delay_range_ticks = {1, 3}, seed = t.seed, world = cast(rawptr)world},
 		}
 
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		testing.expect_value(t, backend.pending_count, 0)
 		testing.expect(t, world.next_sim_fd >= 100, "sim FD should start at 100+")
 
@@ -939,8 +939,8 @@ when TINA_SIMULATION_MODE {
 		backend_init(&backend, config)
 		defer backend_deinit(&backend)
 
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
 		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, IO_Operation_Kind(3))
 		submissions := [1]Submission {
@@ -952,13 +952,13 @@ when TINA_SIMULATION_MODE {
 				},
 			},
 		}
-		sub_err := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_err, Backend_Error.None)
+		sub_error := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_error, Backend_Error.None)
 		testing.expect_value(t, backend.pending_count, 1)
 
 		completions: [8]Raw_Completion
-		count, collect_err := backend_collect(&backend, completions[:], 0)
-		testing.expect_value(t, collect_err, Backend_Error.None)
+		count, collect_error := backend_collect(&backend, completions[:], 0)
+		testing.expect_value(t, collect_error, Backend_Error.None)
 		testing.expect(t, count >= 1, "should have at least 1 completion")
 		testing.expect_value(t, completions[0].token, token)
 		testing.expect_value(t, completions[0].result, 0)
@@ -980,8 +980,8 @@ when TINA_SIMULATION_MODE {
 		backend_init(&backend, config)
 		defer backend_deinit(&backend)
 
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
 		token := submission_token_pack(1, 5, 0, 0, IO_SLOT_INDEX_NONE, IO_Operation_Kind(1))
 		submissions := [1]Submission {
@@ -990,8 +990,8 @@ when TINA_SIMULATION_MODE {
 		backend_submit(&backend, submissions[:])
 		testing.expect_value(t, backend.pending_count, 1)
 
-		cancel_err := backend_cancel(&backend, token)
-		testing.expect_value(t, cancel_err, Backend_Error.None)
+		cancel_error := backend_cancel(&backend, token)
+		testing.expect_value(t, cancel_error, Backend_Error.None)
 		testing.expect_value(t, backend.pending_count, 0)
 
 		// Cancel again should return Not_Found
@@ -1038,8 +1038,8 @@ when TINA_SIMULATION_MODE {
 
 			fds: [4]OS_FD
 			for i in 0 ..< 4 {
-				fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-				if sock_err != .None {
+				fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+				if sock_error != .None {
 					return [4]Raw_Completion{}
 				}
 				fds[i] = fd
@@ -1096,8 +1096,8 @@ when TINA_SIMULATION_MODE {
 		backend_init(&backend, config)
 		defer backend_deinit(&backend)
 
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
 		backend_set_current_tick(&backend, 7)
 
@@ -1111,8 +1111,8 @@ when TINA_SIMULATION_MODE {
 				},
 			},
 		}
-		sub_err := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_err, Backend_Error.None)
+		sub_error := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_error, Backend_Error.None)
 
 		completions: [1]Raw_Completion
 		count_first, collect_err_first := backend_collect(&backend, completions[:], 0)
@@ -1154,8 +1154,8 @@ when TINA_SIMULATION_MODE {
 		backend_init(&backend, config)
 		defer backend_deinit(&backend)
 
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
 		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Recv_Complete)
 		submissions := [1]Submission {
@@ -1185,15 +1185,15 @@ when TINA_SIMULATION_MODE {
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer backend_deinit(&backend)
 
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
-		dup_fd, dup_err := backend_control_dup(&backend, fd)
-		testing.expect_value(t, dup_err, Backend_Error.None)
+		dup_fd, dup_error := backend_control_dup(&backend, fd)
+		testing.expect_value(t, dup_error, Backend_Error.None)
 		testing.expect(t, dup_fd != fd, "simulated dup must return a distinct descriptor")
 
 		desc, ok := _sim_lookup_descriptor(&backend, dup_fd)
@@ -1209,25 +1209,25 @@ when TINA_SIMULATION_MODE {
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer backend_deinit(&backend)
 
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
-		dup_fd, dup_err := backend_control_dup(&backend, fd)
-		testing.expect_value(t, dup_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
+		dup_fd, dup_error := backend_control_dup(&backend, fd)
+		testing.expect_value(t, dup_error, Backend_Error.None)
 
-		close_err := backend_control_close(&backend, fd)
-		testing.expect_value(t, close_err, Backend_Error.None)
+		close_error := backend_control_close(&backend, fd)
+		testing.expect_value(t, close_error, Backend_Error.None)
 
 		_, original_ok := _sim_lookup_descriptor(&backend, fd)
 		testing.expect(t, !original_ok, "closed descriptor should be invalidated")
 		_, dup_ok := _sim_lookup_descriptor(&backend, dup_fd)
 		testing.expect(t, dup_ok, "duplicate descriptor should remain active")
 
-		shutdown_err := backend_control_shutdown(&backend, dup_fd, .SHUT_BOTH)
-		testing.expect_value(t, shutdown_err, Backend_Error.None)
+		shutdown_error := backend_control_shutdown(&backend, dup_fd, .SHUT_BOTH)
+		testing.expect_value(t, shutdown_error, Backend_Error.None)
 	}
 
 	@(test)
@@ -1242,32 +1242,32 @@ when TINA_SIMULATION_MODE {
 				world = cast(rawptr)world,
 			},
 		}
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer backend_deinit(&backend)
 
-		fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
-		dup_fd, dup_err := backend_control_dup(&backend, fd)
-		testing.expect_value(t, dup_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
+		dup_fd, dup_error := backend_control_dup(&backend, fd)
+		testing.expect_value(t, dup_error, Backend_Error.None)
 
 		token := submission_token_pack(2, 0, 0, 0, IO_SLOT_INDEX_NONE, .Recv_Complete)
 		submissions := [1]Submission {
 			{token = token, data_size = 256, operation = Submission_Op_Recv{fd_socket = fd}},
 		}
-		sub_err := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_err, Backend_Error.None)
+		sub_error := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_error, Backend_Error.None)
 
-		close_err := backend_control_close(&backend, dup_fd)
-		testing.expect_value(t, close_err, Backend_Error.None)
+		close_error := backend_control_close(&backend, dup_fd)
+		testing.expect_value(t, close_error, Backend_Error.None)
 
 		completions: [2]Raw_Completion
-		count, collect_err := backend_collect(&backend, completions[:], 0)
-		testing.expect_value(t, collect_err, Backend_Error.None)
+		count, collect_error := backend_collect(&backend, completions[:], 0)
+		testing.expect_value(t, collect_error, Backend_Error.None)
 		testing.expect_value(t, count, u32(0))
 
-		count, collect_err = backend_collect(&backend, completions[:], 0)
-		testing.expect_value(t, collect_err, Backend_Error.None)
+		count, collect_error = backend_collect(&backend, completions[:], 0)
+		testing.expect_value(t, collect_error, Backend_Error.None)
 		testing.expect_value(t, count, u32(1))
 		testing.expect_value(t, completions[0].token, token)
 		testing.expect(t, completions[0].result >= 0, "pending op should still complete after duplicate close")
@@ -1285,23 +1285,23 @@ when TINA_SIMULATION_MODE {
 				world = cast(rawptr)world,
 			},
 		}
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer backend_deinit(&backend)
 
-		listen_fd, sock_err := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		listen_fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 
 		token := submission_token_pack(0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Accept_Complete)
 		submissions := [1]Submission {
 			{token = token, operation = Submission_Op_Accept{listen_fd = listen_fd}},
 		}
-		sub_err := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_err, Backend_Error.None)
+		sub_error := backend_submit(&backend, submissions[:])
+		testing.expect_value(t, sub_error, Backend_Error.None)
 
 		completions: [2]Raw_Completion
-		count, collect_err := backend_collect(&backend, completions[:], 0)
-		testing.expect_value(t, collect_err, Backend_Error.None)
+		count, collect_error := backend_collect(&backend, completions[:], 0)
+		testing.expect_value(t, collect_error, Backend_Error.None)
 		testing.expect_value(t, count, u32(1))
 
 		accept_extra, ok := completions[0].extra.(Completion_Extra_Accept)
@@ -1318,8 +1318,8 @@ when TINA_SIMULATION_MODE {
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer backend_deinit(&backend)
 
 		address := Socket_Address_Inet4 {address = {127, 0, 0, 1}, port = 8080}
@@ -1343,8 +1343,8 @@ when TINA_SIMULATION_MODE {
 		config := Backend_Config {
 			sim_config = Simulation_IO_Config {seed = t.seed, world = cast(rawptr)world},
 		}
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer backend_deinit(&backend)
 
 		address := Socket_Address_Inet4 {address = {127, 0, 0, 1}, port = 8080}

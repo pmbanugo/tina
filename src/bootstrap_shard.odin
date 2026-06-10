@@ -101,8 +101,8 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 		os_signals_init_thread()
 	}
 
-	sigstack_mem, sigstack_err := os_reserve_arena_with_guard(TINA_SIGALTSTACK_SIZE)
-	if sigstack_err == .None {
+	sigstack_mem, sigstack_error := os_reserve_arena_with_guard(TINA_SIGALTSTACK_SIZE)
+	if sigstack_error == .None {
 		os_install_sigaltstack(sigstack_mem)
 	}
 
@@ -112,18 +112,18 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	// S7-S10: Hydrate ONCE. Do not put this in a recovery loop.
 	// ==========================================================
 	arena := Grand_Arena{}
-	if err := grand_arena_init_from_memory(
+	if error := grand_arena_init_from_memory(
 		&arena,
 		config.grand_arena_base,
 		config.total_memory_size,
-	); err != .None {
-		fmt.eprintfln("[FATAL] Shard %d Grand Arena backing is too small: %v", config.shard_id, err)
+	); error != .None {
+		fmt.eprintfln("[FATAL] Shard %d Grand Arena backing is too small: %v", config.shard_id, error)
 		store_watchdog_state(runtime_state, .Terminated)
 		return
 	}
 
-	if err := hydrate_shard(&arena, config.system_spec, shard); err != .None {
-		fmt.eprintfln("[FATAL] Shard %d failed to hydrate memory: %v", config.shard_id, err)
+	if error := hydrate_shard(&arena, config.system_spec, shard); error != .None {
+		fmt.eprintfln("[FATAL] Shard %d failed to hydrate memory: %v", config.shard_id, error)
 		store_watchdog_state(runtime_state, .Terminated)
 		return
 	}

@@ -84,8 +84,8 @@ when TINA_SIMULATION_MODE {
 		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		simulator_deinit(&sim)
 	}
 
@@ -127,8 +127,8 @@ when TINA_SIMULATION_MODE {
 		fault_allocator := simulator_test_fault_allocator(&fault_allocator_data)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, fault_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.Out_Of_Memory)
+		error := simulator_init(&sim, &spec, fault_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.Out_Of_Memory)
 		testing.expect_value(t, tracking_allocator.current_memory_allocated, i64(0))
 		testing.expect(t, sim.allocator.procedure == nil, "Failed simulator init must reset partial state")
 	}
@@ -165,8 +165,8 @@ when TINA_SIMULATION_MODE {
 		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
@@ -205,8 +205,8 @@ when TINA_SIMULATION_MODE {
 		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
@@ -258,8 +258,8 @@ when TINA_SIMULATION_MODE {
 		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
@@ -312,8 +312,8 @@ when TINA_SIMULATION_MODE {
 		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
@@ -362,8 +362,8 @@ when TINA_SIMULATION_MODE {
 		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		// Corrupt message pool to trigger Pool_Integrity if it were enabled

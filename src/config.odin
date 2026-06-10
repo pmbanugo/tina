@@ -286,21 +286,21 @@ Child_Spec :: union {
 @(private = "package")
 validate_system_spec :: proc(spec: ^SystemSpec) -> SystemSpecError {
 	// Global & Type Constraints (What you've mostly done)
-	if err := _validate_globals_and_types(spec); err != .None do return err
+	if error := _validate_globals_and_types(spec); error != .None do return error
 
 	// SPSC Ring Topology (Checks 8, 9, 16)
-	if err := _validate_ring_topology(spec); err != .None do return err
+	if error := _validate_ring_topology(spec); error != .None do return error
 
 	// Shard & Supervision Tree Rules (Checks 12, 13, 14, 15)
-	if err := _validate_shard_specs(spec); err != .None do return err
+	if error := _validate_shard_specs(spec); error != .None do return error
 
 	// DIO is currently out of scope, but added to SystemSpec (with bootstrap assertion).
 	// This validation is to keep the spec validation complete for when it gets implemented
-	if err := _validate_dio_config(spec); err != .None do return err
+	if error := _validate_dio_config(spec); error != .None do return error
 
 	// Simulation Constraints (Check 20)
 	when TINA_SIMULATION_MODE {
-		if err := _validate_simulation(spec); err != .None do return err
+		if error := _validate_simulation(spec); error != .None do return error
 	}
 
 	// Advisory Warnings (A1 - A6)
@@ -529,8 +529,8 @@ _validate_shard_specs :: proc(spec: ^SystemSpec) -> SystemSpecError {
 	}
 
 	for &shard_spec in spec.shard_specs {
-		if err := _validate_supervision_group(&shard_spec.root_group, &valid_types); err != .None {
-			return err
+		if error := _validate_supervision_group(&shard_spec.root_group, &valid_types); error != .None {
+			return error
 		}
 	}
 	return .None
@@ -563,8 +563,8 @@ _validate_supervision_group :: proc(
 				return .InvalidTypeId
 			}
 		case Group_Spec:
-			if err := _validate_supervision_group(&c, valid_types); err != .None {
-				return err
+			if error := _validate_supervision_group(&c, valid_types); error != .None {
+				return error
 			}
 		}
 	}
@@ -864,21 +864,21 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 		staging_slot_size   = 1024,
 	}
 
-	err := validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+	error := validate_system_spec(&spec)
+	testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 
 	spec.scratch_arena_size = 4096 // Exactly enough
-	err = validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.None)
+	error = validate_system_spec(&spec)
+	testing.expect_value(t, error, SystemSpecError.None)
 
 	// Test reactor_buffer_slot_count exceeds 12-bit token capacity
 	spec.reactor_buffer_slot_count = 4095
-	err = validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+	error = validate_system_spec(&spec)
+	testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 
 	spec.reactor_buffer_slot_count = 4094 // Exactly at limit
-	err = validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.None)
+	error = validate_system_spec(&spec)
+	testing.expect_value(t, error, SystemSpecError.None)
 
 	spec.reactor_buffer_slot_count = 0 // Restore
 
@@ -891,8 +891,8 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 			}
 			spec.shard_specs = win_shards[:]
 			spec.fd_handoff_entry_count = 4
-			err = validate_system_spec(&spec)
-			testing.expect_value(t, err, SystemSpecError.UnsupportedPlatform)
+			error = validate_system_spec(&spec)
+			testing.expect_value(t, error, SystemSpecError.UnsupportedPlatform)
 		}
 	}
 }
@@ -926,8 +926,8 @@ test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
 		staging_slot_size   = 1024,
 	}
 
-	err := validate_system_spec(&spec)
-	testing.expect_value(t, err, SystemSpecError.InvalidTypeId)
+	error := validate_system_spec(&spec)
+	testing.expect_value(t, error, SystemSpecError.InvalidTypeId)
 }
 
 when TINA_SIMULATION_MODE {
@@ -966,49 +966,49 @@ when TINA_SIMULATION_MODE {
 		}
 
 		// Valid config should pass
-		err := validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.None)
+		error := validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.None)
 
 		// ticks_max = 0 should fail
 		sim_config.ticks_max = 0
-		err = validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		error = validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 		sim_config.ticks_max = 1000
 
 		// Bad ratio: numerator > 0 with denominator = 0
 		sim_config.faults.io_error_rate = Ratio{1, 0}
-		err = validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		error = validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 		sim_config.faults.io_error_rate = Ratio{0, 0} // disabled, OK
 
 		// Bad ratio: numerator > denominator
 		sim_config.faults.network_drop_rate = Ratio{10, 5}
-		err = validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		error = validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 		sim_config.faults.network_drop_rate = Ratio{0, 1}
 
 		// Bad delay range: min > max (with max > 0)
 		sim_config.faults.io_delay_range_ticks = {10, 5}
-		err = validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		error = validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 		sim_config.faults.io_delay_range_ticks = {0, 0}
 
 		// Bad network delay range: min > max
 		sim_config.faults.network_delay_range_ticks = {100, 50}
-		err = validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.ValueOutOfBounds)
+		error = validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 		sim_config.faults.network_delay_range_ticks = {0, 0}
 
 		// Valid delay range: min == max is OK
 		sim_config.faults.io_delay_range_ticks = {5, 5}
-		err = validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.None)
+		error = validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.None)
 		sim_config.faults.io_delay_range_ticks = {0, 0}
 
 		// Valid ratio: numerator == denominator (100%)
 		sim_config.faults.io_error_rate = Ratio{100, 100}
-		err = validate_system_spec(&spec)
-		testing.expect_value(t, err, SystemSpecError.None)
+		error = validate_system_spec(&spec)
+		testing.expect_value(t, error, SystemSpecError.None)
 		sim_config.faults.io_error_rate = Ratio{0, 0}
 	}
 }
@@ -1105,12 +1105,12 @@ compute_ring_sizes :: proc(
 	allocator: mem.Allocator,
 	) -> (
 	sizes: [][]u32,
-	err: mem.Allocator_Error,
+	error: mem.Allocator_Error,
 ) {
-	sizes, err = make([][]u32, shard_count, allocator)
-	if err != .None do return nil, err
+	sizes, error = make([][]u32, shard_count, allocator)
+	if error != .None do return nil, error
 
-	defer if err != .None {
+	defer if error != .None {
 		for row in sizes {
 			delete(row, allocator)
 		}
@@ -1118,8 +1118,8 @@ compute_ring_sizes :: proc(
 	}
 
 	for source_index in 0 ..< shard_count {
-		sizes[source_index], err = make([]u32, shard_count, allocator)
-		if err != .None do return nil, err
+		sizes[source_index], error = make([]u32, shard_count, allocator)
+		if error != .None do return nil, error
 		for target_index in 0 ..< shard_count {
 			if source_index != target_index {
 				sizes[source_index][target_index] = default_size

@@ -27,16 +27,16 @@ when TINA_SIMULATION_MODE {
 
 	fd_handoff_listener_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		iso := cast(^FDHandoffListener)self
-		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-		if err != .None {
+		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		if error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
 
 		iso.listen_fd = fd
 		iso.target_handle = (cast(^Isolate_Handle)&args[0])^
 
-		bind_err := ctx_bind(ctx, fd, Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 8080})
-		if bind_err != .None {
+		bind_error := ctx_bind(ctx, fd, Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 8080})
+		if bind_error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
 		if ctx_listen(ctx, fd, 16) != .None {
@@ -84,8 +84,8 @@ when TINA_SIMULATION_MODE {
 		ctx: TinaContext,
 	) -> Isolate_Transition {
 		iso := cast(^FDHandoffBusyDispatcher)self
-		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-		if err != .None {
+		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		if error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
 		iso.fd = fd
@@ -171,8 +171,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}
@@ -284,8 +284,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}
@@ -383,8 +383,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}
@@ -507,8 +507,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {0, 0}

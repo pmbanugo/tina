@@ -21,8 +21,8 @@ os_poll_watchdog_events :: proc(timeout_ms: u32) -> Watchdog_Event {
 }
 
 os_wait_for_signal :: proc(timeout_ms: u32) -> (sig: posix.Signal, ok: bool) {
-    kq, err := kqueue.kqueue()
-    if err != nil do return nil, false
+    kq, error := kqueue.kqueue()
+    if error != nil do return nil, false
     defer posix.close(posix.FD(kq))
 
     // Watch for blocked signals

@@ -32,8 +32,8 @@ when TINA_SIMULATION_MODE {
 	io_timeout_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		iso := cast(^IoTimeoutIsolate)self
 
-		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-		if err != .None {
+		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		if error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
 		iso.fd = fd
@@ -168,8 +168,8 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {50, 100}
@@ -223,8 +223,8 @@ when TINA_SIMULATION_MODE {
 	write_writer_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		w := cast(^WriteWriterIsolate)self
 
-		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-		if err != .None do return transition_to_crash(.Init_Failed)
+		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		if error != .None do return transition_to_crash(.Init_Failed)
 		w.fd = fd
 		w.send_buf[0] = 0x42
 
@@ -308,8 +308,8 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {1, 2}
@@ -409,8 +409,8 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		shard := &sim.shards[0]

@@ -97,8 +97,8 @@ test_path_canon_no_percent_fast_path :: proc(t: ^testing.T) {
 	copy(original, buffer)
 	defer mem.delete(original)
 
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	testing.expect_value(t, size, 10)
 	for i in 0 ..< size {
 		testing.expect_value(t, buffer[i], original[i])
@@ -109,8 +109,8 @@ test_path_canon_no_percent_fast_path :: proc(t: ^testing.T) {
 test_path_canon_decode_unreserved :: proc(t: ^testing.T) {
 	// `%61` → `a`
 	buffer := []u8{'/', '%', '6', '1', 'd', 'm', 'i', 'n'}
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	testing.expect_value(t, size, 6)
 	testing.expect_value(t, string(buffer[:size]), "/admin")
 }
@@ -118,8 +118,8 @@ test_path_canon_decode_unreserved :: proc(t: ^testing.T) {
 @(test)
 test_path_canon_preserves_uppercase_2F :: proc(t: ^testing.T) {
 	buffer := []u8{'/', 'a', '%', '2', 'F', 'b'}
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	testing.expect_value(t, size, 6)
 	testing.expect_value(t, string(buffer[:size]), "/a%2Fb")
 }
@@ -127,8 +127,8 @@ test_path_canon_preserves_uppercase_2F :: proc(t: ^testing.T) {
 @(test)
 test_path_canon_canonicalizes_lowercase_2f_to_uppercase :: proc(t: ^testing.T) {
 	buffer := []u8{'/', 'a', '%', '2', 'f', 'b'}
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	testing.expect_value(t, size, 6)
 	testing.expect_value(t, string(buffer[:size]), "/a%2Fb")
 }
@@ -136,44 +136,44 @@ test_path_canon_canonicalizes_lowercase_2f_to_uppercase :: proc(t: ^testing.T) {
 @(test)
 test_path_canon_rejects_decoded_null :: proc(t: ^testing.T) {
 	buffer := []u8{'/', '%', '0', '0'}
-	_, err, offset := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.Decoded_CTL)
+	_, error, offset := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.Decoded_CTL)
 	testing.expect_value(t, offset, 1)
 }
 
 @(test)
 test_path_canon_rejects_decoded_low_ctl :: proc(t: ^testing.T) {
 	buffer := []u8{'/', '%', '1', 'F'}
-	_, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.Decoded_CTL)
+	_, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.Decoded_CTL)
 }
 
 @(test)
 test_path_canon_rejects_decoded_del :: proc(t: ^testing.T) {
 	buffer := []u8{'/', '%', '7', 'F'}
-	_, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.Decoded_CTL)
+	_, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.Decoded_CTL)
 }
 
 @(test)
 test_path_canon_rejects_truncated_percent :: proc(t: ^testing.T) {
 	buffer := []u8{'/', 'a', '%'}
-	_, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.Malformed_Percent)
+	_, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.Malformed_Percent)
 }
 
 @(test)
 test_path_canon_rejects_short_trailing_percent :: proc(t: ^testing.T) {
 	buffer := []u8{'/', 'a', '%', '4'}
-	_, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.Malformed_Percent)
+	_, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.Malformed_Percent)
 }
 
 @(test)
 test_path_canon_rejects_non_hex_digits :: proc(t: ^testing.T) {
 	buffer := []u8{'/', '%', 'G', '0'}
-	_, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.Malformed_Percent)
+	_, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.Malformed_Percent)
 
 	buffer2 := []u8{'/', '%', '0', 'G'}
 	_, err2, _ := path_canonicalize_selective_in_place(buffer2)
@@ -184,8 +184,8 @@ test_path_canon_rejects_non_hex_digits :: proc(t: ^testing.T) {
 test_path_canon_decodes_utf8_bytes :: proc(t: ^testing.T) {
 	// `/caf%C3%A9` → `/café` (UTF-8 0xC3 0xA9)
 	buffer := []u8{'/', 'c', 'a', 'f', '%', 'C', '3', '%', 'A', '9'}
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	testing.expect_value(t, size, 6)
 	testing.expect_value(t, buffer[0], u8('/'))
 	testing.expect_value(t, buffer[1], u8('c'))
@@ -199,8 +199,8 @@ test_path_canon_decodes_utf8_bytes :: proc(t: ^testing.T) {
 test_path_canon_2F_does_not_split_segments :: proc(t: ^testing.T) {
 	// `/a%2Fb` must survive as one structural segment for the router.
 	buffer := []u8{'/', 'a', '%', '2', 'F', 'b'}
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	canonical := string(buffer[:size])
 	// The canonical form must still contain `%2F`, NOT a literal `/`.
 	testing.expect(t, bytes.contains(buffer[:size], []u8{'%', '2', 'F'}), "must preserve %2F")
@@ -211,15 +211,15 @@ test_path_canon_2F_does_not_split_segments :: proc(t: ^testing.T) {
 test_path_canon_mixed_decode_and_preserve :: proc(t: ^testing.T) {
 	// `/u%73ers/%2Fid` → `/users/%2Fid` (decode `%73`→`s`, preserve `%2F`)
 	buffer := []u8{'/', 'u', '%', '7', '3', 'e', 'r', 's', '/', '%', '2', 'F', 'i', 'd'}
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	testing.expect_value(t, string(buffer[:size]), "/users/%2Fid")
 }
 
 @(test)
 test_path_canon_empty_input :: proc(t: ^testing.T) {
 	buffer: []u8 = {}
-	size, err, _ := path_canonicalize_selective_in_place(buffer)
-	testing.expect_value(t, err, Path_Canon_Error.None)
+	size, error, _ := path_canonicalize_selective_in_place(buffer)
+	testing.expect_value(t, error, Path_Canon_Error.None)
 	testing.expect_value(t, size, 0)
 }

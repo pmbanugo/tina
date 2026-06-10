@@ -46,8 +46,8 @@ when !TINA_SIMULATION_MODE {
 	POSIX_EDGE_EVENT_UDATA_FLAG :: uintptr(1) << 63
 
 	@(private = "file")
-	_posix_map_socket_startup_error :: #force_inline proc "contextless" (err: posix.Errno) -> Backend_Error {
-		#partial switch err {
+	_posix_map_socket_startup_error :: #force_inline proc "contextless" (error: posix.Errno) -> Backend_Error {
+		#partial switch error {
 		case .EACCES, .EPERM:
 			return .Permission_Denied
 		case .EINVAL:
@@ -144,8 +144,8 @@ when !TINA_SIMULATION_MODE {
 
 	@(private = "package")
 	_backend_init :: proc(backend: ^Platform_Backend, config: Backend_Config) -> Backend_Error {
-		kq_fd, err := kq.kqueue()
-		if err != nil {
+		kq_fd, error := kq.kqueue()
+		if error != nil {
 			return .System_Error
 		}
 
@@ -225,8 +225,8 @@ when !TINA_SIMULATION_MODE {
 				}
 				backend.pending_count += 1
 
-				reg_err := _register_kqueue(backend, &backend.pending[backend.pending_count - 1])
-				if reg_err != .None {
+				reg_error := _register_kqueue(backend, &backend.pending[backend.pending_count - 1])
+				if reg_error != .None {
 					// Registration failed — remove from pending and complete as error.
 					// Cannot fail the batch: earlier submissions may have already
 					// executed real syscalls (optimistic try) that cannot be rolled back.
@@ -1482,8 +1482,8 @@ when !TINA_SIMULATION_MODE {
 		backend.pending[0].kqueue_filter = .Read
 		backend.pending_count = 1
 
-		cancel_err := backend_cancel(backend, test_token)
-		testing.expect_value(t, cancel_err, Backend_Error.None)
+		cancel_error := backend_cancel(backend, test_token)
+		testing.expect_value(t, cancel_error, Backend_Error.None)
 
 		// The pending entry must be removed.
 		testing.expect_value(t, backend.pending_count, 0)

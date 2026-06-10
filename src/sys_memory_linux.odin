@@ -10,7 +10,7 @@ os_page_size :: #force_inline proc "contextless" () -> uint {
 
 // Reserves VA space and appends an inaccessible guard page at the tail.
 // Returns the usable slice of memory (excluding the guard page).
-os_reserve_arena_with_guard :: proc "contextless" (size: uint) -> (data:[]u8, err: mem.Allocator_Error) {
+os_reserve_arena_with_guard :: proc "contextless" (size: uint) -> (data:[]u8, error: mem.Allocator_Error) {
 	page_sz := os_page_size()
 	aligned_size := align_forward_page(size, page_sz)
 	total_size := aligned_size + page_sz

@@ -83,8 +83,8 @@ when TINA_SIMULATION_MODE {
 		}
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		if err != .None {
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		if error != .None {
 			panic("simulator_init failed in run_ping_pong_simulation_once")
 		}
 		defer simulator_deinit(&sim)
@@ -203,8 +203,8 @@ when TINA_SIMULATION_MODE {
 			}
 
 			sim: Simulator
-			err := simulator_init(&sim, &spec, context.temp_allocator)
-			if err != .None {
+			error := simulator_init(&sim, &spec, context.temp_allocator)
+			if error != .None {
 				panic("simulator_init failed in run_with_faults")
 			}
 			defer simulator_deinit(&sim)

@@ -169,15 +169,15 @@ test_io_slot_pool_alloc_free :: proc(t: ^testing.T) {
 
 	indices: [8]IO_Slot_Index
 	for i in 0 ..< 8 {
-		index, err := io_slot_pool_alloc(&pool)
-		testing.expect_value(t, err, IO_Slot_Pool_Error.None)
+		index, error := io_slot_pool_alloc(&pool)
+		testing.expect_value(t, error, IO_Slot_Pool_Error.None)
 		testing.expect(t, index != IO_SLOT_INDEX_NONE, "should get valid index")
 		indices[i] = index
 	}
 	testing.expect_value(t, pool.free_count, 0)
 
-	_, empty_err := io_slot_pool_alloc(&pool)
-	testing.expect_value(t, empty_err, IO_Slot_Pool_Error.Empty)
+	_, empty_error := io_slot_pool_alloc(&pool)
+	testing.expect_value(t, empty_error, IO_Slot_Pool_Error.Empty)
 
 	for i in 0 ..< 8 {
 		io_slot_pool_free(&pool, indices[i])

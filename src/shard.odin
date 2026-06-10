@@ -1162,7 +1162,7 @@ _commit_staged_io :: proc(
 	operation := invocation.staged_io_operation
 	invocation.staging = .None
 
-	err := reactor_submit_io(
+	error := reactor_submit_io(
 		&shard.reactor,
 		shard,
 		invocation.self_handle,
@@ -1172,13 +1172,13 @@ _commit_staged_io :: proc(
 		invocation.staged_io_payload_size,
 		shard.metadata[type_id][slot].staging_slot_index,
 	)
-	if err != IO_ERR_NONE {
+	if error != IO_ERR_NONE {
 		_slot_set_io_submit_failure(
 			shard,
 			type_id,
 			slot,
 			_io_op_to_operation_kind(operation),
-			i32(err),
+			i32(error),
 		)
 		// If staging slot was claimed but IO failed, free it
 		staging_slot := shard.metadata[type_id][slot].staging_slot_index
@@ -1406,16 +1406,16 @@ _enqueue_internal :: #force_inline proc "contextless" (
 
 	// Pool Allocation
 	pool_index: u32
-	err: Pool_Error
+	error: Pool_Error
 	// Because `is_user` is passed as a constant from the wrapper,
 	// I expect the compiler will dead-code-eliminate this IF statement.
 	if is_user {
-		pool_index, err = pool_alloc_user(&shard.message_pool)
+		pool_index, error = pool_alloc_user(&shard.message_pool)
 	} else {
-		pool_index, err = pool_alloc_system(&shard.message_pool)
+		pool_index, error = pool_alloc_system(&shard.message_pool)
 	}
 
-	if err != .None {
+	if error != .None {
 		shard.counters.pool_exhaustion_drops += 1
 		return .pool_exhausted
 	}
@@ -1496,15 +1496,15 @@ _dequeue :: proc "contextless" (
 
 @(private = "package")
 _fd_handoff_close_entry :: proc "contextless" (shard: ^Shard, ref: FD_Handoff_Ref) -> bool {
-	entry_index, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
-	if lookup_err != .None {
+	entry_index, lookup_error := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+	if lookup_error != .None {
 		return false
 	}
 	entry := &shard.handoff_table.entries[entry_index]
 
 	cleanup_fd := entry.cleanup_fd
-	free_err := fd_handoff_table_free(&shard.handoff_table, ref)
-	if free_err != .None {
+	free_error := fd_handoff_table_free(&shard.handoff_table, ref)
+	if free_error != .None {
 		return false
 	}
 
@@ -2147,8 +2147,8 @@ _init_handoff_test_shard :: proc(
 			world = world,
 		}
 	}
-	err := backend_init(&shard.reactor.backend, backend_config)
-	testing.expect_value(t, err, Backend_Error.None)
+	error := backend_init(&shard.reactor.backend, backend_config)
+	testing.expect_value(t, error, Backend_Error.None)
 }
 
 @(private = "file")
@@ -2158,10 +2158,10 @@ _alloc_handoff_test_entry :: proc(
 	target_handle: Isolate_Handle,
 	deadline_tick: u64,
 ) -> FD_Handoff_Ref {
-	cleanup_fd, sock_err := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
-	testing.expect_value(t, sock_err, Backend_Error.None)
+	cleanup_fd, sock_error := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
+	testing.expect_value(t, sock_error, Backend_Error.None)
 
-	ref, alloc_err := fd_handoff_table_alloc(
+	ref, alloc_error := fd_handoff_table_alloc(
 		&shard.handoff_table,
 		target_handle,
 		cleanup_fd,
@@ -2169,7 +2169,7 @@ _alloc_handoff_test_entry :: proc(
 		deadline_tick,
 		shard.id,
 	)
-	testing.expect_value(t, alloc_err, FD_Handoff_Table_Error.None)
+	testing.expect_value(t, alloc_error, FD_Handoff_Table_Error.None)
 	return ref
 }
 
@@ -2220,8 +2220,8 @@ _make_teardown_test_shard_with_slots :: proc(t: ^testing.T, isolate_slot_count: 
 
 	total_memory_size := compute_shard_memory_total(&spec)
 	arena := new(Grand_Arena)
-	err := grand_arena_init(arena, total_memory_size)
-	testing.expect_value(t, err, mem.Allocator_Error.None)
+	error := grand_arena_init(arena, total_memory_size)
+	testing.expect_value(t, error, mem.Allocator_Error.None)
 
 	shard := new(Shard)
 	when TINA_SIMULATION_MODE {
@@ -2233,8 +2233,8 @@ _make_teardown_test_shard_with_slots :: proc(t: ^testing.T, isolate_slot_count: 
 		}
 		spec.simulation = _mt_sim_config
 	}
-	carve_err := hydrate_shard(arena, &spec, shard)
-	testing.expect_value(t, carve_err, mem.Allocator_Error.None)
+	carve_error := hydrate_shard(arena, &spec, shard)
+	testing.expect_value(t, carve_error, mem.Allocator_Error.None)
 	return shard, arena
 }
 
@@ -2384,8 +2384,8 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 		prng_init(&drop_prng, 0xD10D)
 
 		network: SimulatedNetwork
-		network_err := sim_network_init(&network, 2, ring_sizes, &drop_prng, context.temp_allocator)
-		testing.expect_value(t, network_err, mem.Allocator_Error.None)
+		network_error := sim_network_init(&network, 2, ring_sizes, &drop_prng, context.temp_allocator)
+		testing.expect_value(t, network_error, mem.Allocator_Error.None)
 
 		fault_config := FaultConfig{}
 		shard.sim_state.network = &network
@@ -2583,8 +2583,8 @@ test_fd_handoff_timeout_scan_counts_but_keeps_entry :: proc(t: ^testing.T) {
 
 	_fd_handoff_timeout_scan(shard, 6)
 
-	entry_index, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
-	testing.expect_value(t, lookup_err, FD_Handoff_Table_Error.None)
+	entry_index, lookup_error := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+	testing.expect_value(t, lookup_error, FD_Handoff_Table_Error.None)
 	entry := &shard.handoff_table.entries[entry_index]
 	testing.expect_value(t, entry.deadline_tick, u64(0))
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(1))
@@ -2628,8 +2628,8 @@ test_shard_mass_teardown_reclaims_in_flight_handoff_entries :: proc(t: ^testing.
 
 	shard_mass_teardown(shard)
 
-	_, lookup_err := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
-	testing.expect(t, lookup_err != .None, "mass teardown should reclaim in-flight handoff entries")
+	_, lookup_error := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
+	testing.expect(t, lookup_error != .None, "mass teardown should reclaim in-flight handoff entries")
 	testing.expect_value(t, shard.handoff_table.free_count, shard.handoff_table.entry_count)
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(0))
 }

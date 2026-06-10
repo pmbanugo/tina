@@ -52,8 +52,8 @@ when TINA_SIMULATION_MODE {
 	staging_stager_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
 		s := cast(^StagingStager)self
 
-		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-		if err != .None do return transition_to_crash(.Init_Failed)
+		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		if error != .None do return transition_to_crash(.Init_Failed)
 		s.fd = fd
 
 		stage := ctx_claim_send_slot(ctx)
@@ -127,8 +127,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		sim.shards[0].reactor.backend.config.delay_range_ticks = {1, 2}
@@ -213,8 +213,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
@@ -308,8 +308,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
@@ -348,8 +348,8 @@ when TINA_SIMULATION_MODE {
 		s := cast(^StagingAlreadyStaged)self
 
 		// Open a socket so ctx_io_send has a valid FD to stage against.
-		fd, err := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-		if err != .None do return transition_to_crash(.Init_Failed)
+		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		if error != .None do return transition_to_crash(.Init_Failed)
 		s.fd = fd
 
 		// Claim a staging slot (writes to both invocation and metadata).
@@ -421,8 +421,8 @@ when TINA_SIMULATION_MODE {
 		)
 
 		sim: Simulator
-		err := simulator_init(&sim, &spec, context.temp_allocator)
-		testing.expect_value(t, err, mem.Allocator_Error.None)
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
 		defer simulator_deinit(&sim)
 
 		simulator_run(&sim)
@@ -471,11 +471,11 @@ when TINA_SIMULATION_MODE {
 		// Use the same type/slot as the helper provides. Reserve a fresh
 		// receive pool slot for the in-flight case and another for the
 		// completed case so we can check both behaviors.
-		in_flight_index, in_flight_err := io_slot_pool_alloc(&shard.reactor.receive_pool)
-		testing.expect_value(t, in_flight_err, IO_Slot_Pool_Error.None)
+		in_flight_index, in_flight_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
+		testing.expect_value(t, in_flight_error, IO_Slot_Pool_Error.None)
 
-		completed_index, completed_err := io_slot_pool_alloc(&shard.reactor.receive_pool)
-		testing.expect_value(t, completed_err, IO_Slot_Pool_Error.None)
+		completed_index, completed_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
+		testing.expect_value(t, completed_error, IO_Slot_Pool_Error.None)
 
 		receive_pool := &shard.reactor.receive_pool
 		// 2 slots consumed above out of pool.slot_count
@@ -630,8 +630,8 @@ when TINA_SIMULATION_MODE {
 		shard.isolate_free_heads[type_id] = POOL_NONE_INDEX
 
 		// Allocate a receive pool slot to simulate in-flight recv.
-		recv_slot, recv_err := io_slot_pool_alloc(&shard.reactor.receive_pool)
-		testing.expect_value(t, recv_err, IO_Slot_Pool_Error.None)
+		recv_slot, recv_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
+		testing.expect_value(t, recv_error, IO_Slot_Pool_Error.None)
 
 		generation: u32 = 1
 		io_sequence: u8 = 1

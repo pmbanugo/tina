@@ -35,8 +35,8 @@ when !TINA_SIMULATION_MODE {
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_WIN_COMPLETED)
 
 	@(private = "file")
-	_win_map_socket_startup_error :: #force_inline proc "contextless" (err: i32) -> Backend_Error {
-		switch err {
+	_win_map_socket_startup_error :: #force_inline proc "contextless" (error: i32) -> Backend_Error {
+		switch error {
 		case win.WSAEACCES:
 			return .Permission_Denied
 		case win.WSAEINVAL:
@@ -198,11 +198,11 @@ when !TINA_SIMULATION_MODE {
 					&entry.overlapped,
 				)
 				if ok == win.FALSE {
-					err := win.GetLastError()
-					if err == win.ERROR_IO_PENDING {
+					error := win.GetLastError()
+					if error == win.ERROR_IO_PENDING {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -220,11 +220,11 @@ when !TINA_SIMULATION_MODE {
 					&entry.overlapped,
 				)
 				if ok == win.FALSE {
-					err := win.GetLastError()
-					if err == win.ERROR_IO_PENDING {
+					error := win.GetLastError()
+					if error == win.ERROR_IO_PENDING {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -269,13 +269,13 @@ when !TINA_SIMULATION_MODE {
 				}
 
 				if ok == win.FALSE {
-					err := win.GetLastError()
-					if err == win.ERROR_IO_PENDING {
+					error := win.GetLastError()
+					if error == win.ERROR_IO_PENDING {
 						continue
 					}
 					win.closesocket(client_sock)
 					entry.op_data.accept.client_fd = OS_FD_INVALID
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -303,11 +303,11 @@ when !TINA_SIMULATION_MODE {
 				}
 
 				if ok == win.FALSE {
-					err := win.GetLastError()
-					if err == win.ERROR_IO_PENDING {
+					error := win.GetLastError()
+					if error == win.ERROR_IO_PENDING {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -339,11 +339,11 @@ when !TINA_SIMULATION_MODE {
 					nil,
 				)
 				if rc == win.SOCKET_ERROR {
-					err := win.WSAGetLastError()
-					if _win_is_pending(err) {
+					error := win.WSAGetLastError()
+					if _win_is_pending(error) {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -365,11 +365,11 @@ when !TINA_SIMULATION_MODE {
 					nil,
 				)
 				if rc == win.SOCKET_ERROR {
-					err := win.WSAGetLastError()
-					if _win_is_pending(err) {
+					error := win.WSAGetLastError()
+					if _win_is_pending(error) {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -393,11 +393,11 @@ when !TINA_SIMULATION_MODE {
 					nil,
 				)
 				if rc == win.SOCKET_ERROR {
-					err := win.WSAGetLastError()
-					if _win_is_pending(err) {
+					error := win.WSAGetLastError()
+					if _win_is_pending(error) {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -423,11 +423,11 @@ when !TINA_SIMULATION_MODE {
 					nil,
 				)
 				if rc == win.SOCKET_ERROR {
-					err := win.WSAGetLastError()
-					if _win_is_pending(err) {
+					error := win.WSAGetLastError()
+					if _win_is_pending(error) {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -474,11 +474,11 @@ when !TINA_SIMULATION_MODE {
 					0,
 				)
 				if ok == win.FALSE {
-					err := win.GetLastError()
-					if err == win.ERROR_IO_PENDING {
+					error := win.GetLastError()
+					if error == win.ERROR_IO_PENDING {
 						continue
 					}
-					_win_push_error_completion(backend, sub.token, i32(err))
+					_win_push_error_completion(backend, sub.token, i32(error))
 					entry.active = false
 					continue
 				}
@@ -540,8 +540,8 @@ when !TINA_SIMULATION_MODE {
 			timeout_ms,
 			false,
 		) {
-			err := win.GetLastError()
-			if err == win.WAIT_TIMEOUT || err == win.WAIT_IO_COMPLETION {
+			error := win.GetLastError()
+			if error == win.WAIT_TIMEOUT || error == win.WAIT_IO_COMPLETION {
 				return count, .None
 			}
 			return count, .System_Error
@@ -940,13 +940,13 @@ when !TINA_SIMULATION_MODE {
 	test_windows_backend_control_dup_unsupported :: proc(t: ^testing.T) {
 		backend: Platform_Backend
 		config := Backend_Config {queue_size = DEFAULT_BACKEND_QUEUE_SIZE}
-		err := backend_init(&backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(&backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer backend_deinit(&backend)
 
-		dup_fd, dup_err := backend_control_dup(&backend, OS_FD(42))
+		dup_fd, dup_error := backend_control_dup(&backend, OS_FD(42))
 		testing.expect_value(t, dup_fd, OS_FD_INVALID)
-		testing.expect_value(t, dup_err, Backend_Error.Unsupported)
+		testing.expect_value(t, dup_error, Backend_Error.Unsupported)
 	}
 
 	// ============================================================================
@@ -1025,9 +1025,9 @@ when !TINA_SIMULATION_MODE {
 	_win_push_error_completion :: proc(
 		backend: ^Platform_Backend,
 		token: Submission_Token,
-		err: i32,
+		error: i32,
 	) {
-		_win_push_completion(backend, token, -err, nil)
+		_win_push_completion(backend, token, -error, nil)
 	}
 
 	@(private = "file")
@@ -1048,10 +1048,10 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_win_is_pending :: proc(err: win.INT) -> bool {
+	_win_is_pending :: proc(error: win.INT) -> bool {
 		return(
-			err == i32(win.System_Error.IO_PENDING) ||
-			err == i32(win.System_Error.WSAEWOULDBLOCK) \
+			error == i32(win.System_Error.IO_PENDING) ||
+			error == i32(win.System_Error.WSAEWOULDBLOCK) \
 		)
 	}
 
@@ -1215,13 +1215,13 @@ when !TINA_SIMULATION_MODE {
 	test_windows_socket_creation_and_close :: proc(t: ^testing.T) {
 		backend := new(Platform_Backend)
 		config := Backend_Config{queue_size = DEFAULT_BACKEND_QUEUE_SIZE}
-		err := backend_init(backend, config)
-		testing.expect_value(t, err, Backend_Error.None)
+		error := backend_init(backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
 		defer { backend_deinit(backend); free(backend) }
 
 		// Create a socket — IOCP association happens here
-		fd, sock_err := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
-		testing.expect_value(t, sock_err, Backend_Error.None)
+		fd, sock_error := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
+		testing.expect_value(t, sock_error, Backend_Error.None)
 		testing.expect(t, fd != OS_FD_INVALID, "should get a valid socket")
 
 		// Submit close — exercises the IOCP path (close is synchronous but goes through submit)
@@ -1229,13 +1229,13 @@ when !TINA_SIMULATION_MODE {
 		submissions := [1]Submission {
 			{token = token, operation = Submission_Op_Close{fd = fd}},
 		}
-		sub_err := backend_submit(backend, submissions[:])
-		testing.expect_value(t, sub_err, Backend_Error.None)
+		sub_error := backend_submit(backend, submissions[:])
+		testing.expect_value(t, sub_error, Backend_Error.None)
 
 		// Collect the close completion
 		completions: [4]Raw_Completion
-		count, collect_err := backend_collect(backend, completions[:], 0)
-		testing.expect_value(t, collect_err, Backend_Error.None)
+		count, collect_error := backend_collect(backend, completions[:], 0)
+		testing.expect_value(t, collect_error, Backend_Error.None)
 		testing.expect(t, count >= 1, "close should produce a completion")
 		testing.expect_value(t, completions[0].token, token)
 		testing.expect(t, completions[0].result >= 0, "close of valid socket should succeed")

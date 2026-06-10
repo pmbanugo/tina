@@ -84,14 +84,14 @@ read_signals :: proc(request: ^http.Request, signals: ^$T) -> Read_Signals_Error
 		if !ok do return .Invalid_Percent_Encoding
 		if len(decoded) == 0 do return .Missing_Datastar_Query
 
-		if err := json.unmarshal(decoded, signals, allocator = allocator); err != nil {
+		if error := json.unmarshal(decoded, signals, allocator = allocator); error != nil {
 			return .Invalid_JSON
 		}
 		return .None
 
 	case .POST, .PUT, .PATCH:
 		body := http.body_buffered(request)
-		if err := json.unmarshal(body, signals, allocator = http.request_scratch(request)); err != nil {
+		if error := json.unmarshal(body, signals, allocator = http.request_scratch(request)); error != nil {
 			return .Invalid_JSON
 		}
 		return .None

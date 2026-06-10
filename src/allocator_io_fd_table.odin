@@ -117,9 +117,9 @@ fd_table_resolve :: #force_inline proc "contextless" (
 	OS_FD,
 	FD_Table_Error,
 ) {
-	index, err := fd_table_lookup_index(table, handle)
-	if err != .None {
-		return OS_FD_INVALID, err
+	index, error := fd_table_lookup_index(table, handle)
+	if error != .None {
+		return OS_FD_INVALID, error
 	}
 	return table.entries[index].os_fd, .None
 }
@@ -299,13 +299,13 @@ test_fd_table_alloc_and_lookup :: proc(t: ^testing.T) {
 	table: FD_Table
 	fd_table_init(&table, backing[:])
 
-	handle, err := fd_table_alloc(&table, OS_FD(42), make_handle(0, 1, 0, 0))
-	testing.expect_value(t, err, FD_Table_Error.None)
+	handle, error := fd_table_alloc(&table, OS_FD(42), make_handle(0, 1, 0, 0))
+	testing.expect_value(t, error, FD_Table_Error.None)
 	testing.expect(t, handle != FD_HANDLE_NONE, "should get a valid handle")
 	testing.expect_value(t, table.free_count, 3)
 
-	entry_index, lookup_err := fd_table_lookup_index(&table, handle)
-	testing.expect_value(t, lookup_err, FD_Table_Error.None)
+	entry_index, lookup_error := fd_table_lookup_index(&table, handle)
+	testing.expect_value(t, lookup_error, FD_Table_Error.None)
 	entry := &table.entries[entry_index]
 	testing.expect_value(t, entry.os_fd, OS_FD(42))
 }
@@ -320,12 +320,12 @@ test_fd_table_generation_check :: proc(t: ^testing.T) {
 	handle, _ := fd_table_alloc(&table, OS_FD(10), owner)
 
 	// Free the slot — generation bumps
-	free_err := fd_table_free(&table, handle)
-	testing.expect_value(t, free_err, FD_Table_Error.None)
+	free_error := fd_table_free(&table, handle)
+	testing.expect_value(t, free_error, FD_Table_Error.None)
 
 	// Old handle is now stale
-	_, stale_err := fd_table_lookup_index(&table, handle)
-	testing.expect_value(t, stale_err, FD_Table_Error.Stale_Generation)
+	_, stale_error := fd_table_lookup_index(&table, handle)
+	testing.expect_value(t, stale_error, FD_Table_Error.Stale_Generation)
 }
 
 @(test)
@@ -338,8 +338,8 @@ test_fd_table_full :: proc(t: ^testing.T) {
 	fd_table_alloc(&table, OS_FD(1), owner)
 	fd_table_alloc(&table, OS_FD(2), owner)
 
-	_, err := fd_table_alloc(&table, OS_FD(3), owner)
-	testing.expect_value(t, err, FD_Table_Error.Table_Full)
+	_, error := fd_table_alloc(&table, OS_FD(3), owner)
+	testing.expect_value(t, error, FD_Table_Error.Table_Full)
 }
 
 @(test)
@@ -412,8 +412,8 @@ test_fd_table_reuse_after_free :: proc(t: ^testing.T) {
 	testing.expect_value(t, table.free_count, 1)
 
 	// Re-allocate — should reuse h1's slot (LIFO) with bumped generation
-	h3, err := fd_table_alloc(&table, OS_FD(30), owner)
-	testing.expect_value(t, err, FD_Table_Error.None)
+	h3, error := fd_table_alloc(&table, OS_FD(30), owner)
+	testing.expect_value(t, error, FD_Table_Error.None)
 	testing.expect_value(t, fd_handle_index(h3), fd_handle_index(h1))
 	testing.expect(
 		t,

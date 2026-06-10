@@ -133,14 +133,14 @@ test_message_pool :: proc(t: ^testing.T) {
 	// Allocate all slots
 	indices: [10]u32
 	for i in 0 ..< 10 {
-		index, err := pool_alloc_user(&pool)
-		testing.expect_value(t, err, Pool_Error.None)
+		index, error := pool_alloc_user(&pool)
+		testing.expect_value(t, error, Pool_Error.None)
 		indices[i] = index
 	}
 
 	// Pool should now be empty
-	_, empty_err := pool_alloc_user(&pool)
-	testing.expect_value(t, empty_err, Pool_Error.Empty)
+	_, empty_error := pool_alloc_user(&pool)
+	testing.expect_value(t, empty_error, Pool_Error.Empty)
 
 	stats_full := pool_stats(&pool)
 	testing.expect_value(t, stats_full.used_count, 10)

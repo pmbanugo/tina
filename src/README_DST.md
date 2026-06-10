@@ -78,8 +78,8 @@ test_my_scenario :: proc(t: ^testing.T) {
 
     // 5. Init and run
     sim: Simulator
-    err := simulator_init(&sim, &spec, context.temp_allocator)
-    testing.expect_value(t, err, mem.Allocator_Error.None)
+    error := simulator_init(&sim, &spec, context.temp_allocator)
+    testing.expect_value(t, error, mem.Allocator_Error.None)
     simulator_run(&sim)
 
     // 6. Assert on post-run state

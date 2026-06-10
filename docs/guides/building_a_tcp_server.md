@@ -41,8 +41,8 @@ listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> t
     self := tina.self_as(ServerListener, self_raw, ctx)
 
     // 1. Create a TCP socket.
-    fd, err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
-    if err != .None {
+    fd, error := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+    if error != .None {
         // Can't open a socket — crash. The supervisor will restart us.
         return tina.transition_to_crash(.Init_Failed)
     }
