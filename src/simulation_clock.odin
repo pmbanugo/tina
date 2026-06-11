@@ -12,7 +12,7 @@ when TINA_SIMULATION_MODE {
 
 			// Check if any Isolate has pending work in its mailbox or is waiting for I/O
 			for type_desc in shard.type_descriptors {
-				type_id := u16(type_desc.id)
+				type_id := type_desc.id
 				slot_count := type_desc.slot_count
 
 				for slot in 0 ..< slot_count {

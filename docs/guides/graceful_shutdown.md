@@ -54,14 +54,14 @@ Dispatch priority during shutdown:
 
 ## Proactive Check: ctx_is_shutting_down
 
-You don't have to wait for `TAG_SHUTDOWN`. Call `tina.ctx_is_shutting_down(ctx)` in any handler to check if the Shard is shutting down. Returns `true` once the Shard enters shutdown mode.
+You don't have to wait for `TAG_SHUTDOWN`. Call `tina.ctx_is_shutting_down()` in any handler to check if the Shard is shutting down. Returns `true` once the Shard enters shutdown mode.
 
 Use this to stop accepting new work before `TAG_SHUTDOWN` arrives:
 
 ```odin
 case TAG_JOB:
     // Don't start new work if we're shutting down.
-    if tina.ctx_is_shutting_down(ctx) {
+    if tina.ctx_is_shutting_down() {
         return tina.ISOLATE_TRANSITION_DONE
     }
     // ... process the job normally ...
@@ -77,9 +77,8 @@ For Isolates with no drain work — timers, simple workers, dispatchers.
 worker_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(WorkerIsolate, self_raw, ctx)
+    self := tina.self_as(WorkerIsolate, self_raw)
 
     switch message.tag {
 
@@ -123,9 +122,8 @@ DrainConnection :: struct {
 drain_conn_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(DrainConnection, self_raw, ctx)
+    self := tina.self_as(DrainConnection, self_raw)
 
     switch self.state {
 
@@ -136,20 +134,20 @@ drain_conn_handler :: proc(
         // ---- Shutdown requested while actively serving ----
         case tina.TAG_SHUTDOWN:
             // Send TCP FIN to the peer. This tells them "no more data from us."
-            tina.ctx_shutdown(ctx, self.fd, .SHUT_WRITER)
+            tina.ctx_shutdown(self.fd, .SHUT_WRITER)
 
             // Transition to Draining. We need to read until EOF
             // so the peer knows we received their last bytes.
             self.state = .Draining
-            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
 
         case tina.IO_TAG_RECV_COMPLETE:
             if message.io.result <= 0 {
                 self.state = .Closing
-                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
+                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Close{fd = self.fd}))
             }
             // ... process data, echo back, etc ...
-            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
 
         case:
             return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -163,11 +161,11 @@ drain_conn_handler :: proc(
                 // EOF (result == 0) or error (result < 0).
                 // Either way, the peer is done. Close the socket.
                 self.state = .Closing
-                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
+                return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Close{fd = self.fd}))
             }
             // Peer is still sending data. Keep reading until they stop.
             // We already sent FIN, so they know we're closing.
-            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Recv{fd = self.fd, buffer_size_max = u32(len(self.buffer))}))
         case:
             return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
         }
@@ -219,9 +217,8 @@ A Listener can receive `TAG_SHUTDOWN` while an accept is in flight. Handle both 
 listener_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(ServerListener, self_raw, ctx)
+    self := tina.self_as(ServerListener, self_raw)
 
     switch message.tag {
 
@@ -235,21 +232,21 @@ listener_handler :: proc(
             payload, size := tina.init_args_of(&conn_args)
             spec := tina.Spawn_Spec{
                 type_id      = CONN_TYPE,
-                group_id     = tina.ctx_supervision_group_id(ctx),
+                group_id     = tina.ctx_supervision_group_id(),
                 restart_type = .temporary,
                 args_payload = payload,
                 args_size    = size,
                 handoff_fd   = message.io.fd,
                 handoff_mode = .Full,
             }
-            _ = tina.ctx_spawn(ctx, spec)
+            _ = tina.ctx_spawn(spec)
         }
 
         // If shutting down, stop accepting. Otherwise, accept the next connection.
-        if tina.ctx_is_shutting_down(ctx) {
+        if tina.ctx_is_shutting_down() {
             return tina.ISOLATE_TRANSITION_DONE
         }
-        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_fd}))
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = self.listen_fd}))
 
     // ---- Shutdown signal (if we were parked waiting for accept, the I/O was cancelled) ----
     case tina.TAG_SHUTDOWN:
@@ -299,6 +296,6 @@ If your Isolates do not finish within this window, Phase 3 bypasses user-space c
 | API | Purpose |
 |---|---|
 | `tina.TAG_SHUTDOWN` | System message tag (`0x0003`). Delivered to all live Isolates on shutdown. |
-| `tina.ctx_is_shutting_down(ctx)` | Returns `true` once the Shard enters shutdown mode. Check proactively. |
-| `tina.ctx_shutdown(ctx, fd, how)` | Half-close a socket (`.SHUT_WRITER` sends TCP FIN). |
+| `tina.ctx_is_shutting_down()` | Returns `true` once the Shard enters shutdown mode. Check proactively. |
+| `tina.ctx_shutdown(fd, how)` | Half-close a socket (`.SHUT_WRITER` sends TCP FIN). |
 | `shutdown_timeout_ms` on `SystemSpec` | Maximum time for Phase 2 graceful drain. |

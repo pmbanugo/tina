@@ -65,7 +65,7 @@ when TINA_SIMULATION_MODE {
 			// (zero is reserved for HANDLE_NONE / stale sentinel)
 			if .Generation_Monotonic in flags {
 				for type_desc in shard.type_descriptors {
-					type_id := u16(type_desc.id)
+					type_id := type_desc.id
 					for slot in 0 ..< type_desc.slot_count {
 						gen := shard.metadata[type_id].generation[slot]
 						if gen == 0 {

@@ -37,11 +37,11 @@ ServerListener :: struct {
 All socket setup happens here — in one shot, no multi-step init.
 
 ```odin
-listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
-    self := tina.self_as(ServerListener, self_raw, ctx)
+listener_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+    self := tina.self_as(ServerListener, self_raw)
 
     // 1. Create a TCP socket.
-    fd, error := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+    fd, error := tina.ctx_socket(.AF_INET, .STREAM, .TCP)
     if error != .None {
         // Can't open a socket — crash. The supervisor will restart us.
         return tina.transition_to_crash(.Init_Failed)
@@ -49,22 +49,22 @@ listener_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> t
     self.listen_fd = fd
 
     // 2. Set SO_REUSEADDR so we can restart quickly without TIME_WAIT issues.
-    tina.ctx_setsockopt(ctx, self.listen_fd, .SOL_SOCKET, .SO_REUSEADDR, true)
+    tina.ctx_setsockopt(self.listen_fd, .SOL_SOCKET, .SO_REUSEADDR, true)
 
     // 3. Bind to 127.0.0.1:9090.
-    tina.ctx_bind(ctx, self.listen_fd, tina.ipv4(127, 0, 0, 1, 9090))
+    tina.ctx_bind(self.listen_fd, tina.ipv4(127, 0, 0, 1, 9090))
 
     // 4. Start listening with a backlog of 128.
-    tina.ctx_listen(ctx, self.listen_fd, 128)
+    tina.ctx_listen(self.listen_fd, 128)
 
     // 5. Log that we're ready.
-    str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "TCP Server listening on 127.0.0.1:9090")
-    tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+    str := fmt.bprintf(tina.ctx_scratch_arena_bytes(), "TCP Server listening on 127.0.0.1:9090")
+    tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
     // 6. Park waiting for the first connection.
     //    This is our initial parking transition — the scheduler won't call us again
     //    until a client connects.
-    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_fd}))
+    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = self.listen_fd}))
 }
 ```
 
@@ -76,9 +76,8 @@ Each time a connection is accepted, spawn a Connection Isolate and loop back to 
 listener_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(ServerListener, self_raw, ctx)
+    self := tina.self_as(ServerListener, self_raw)
 
     switch message.tag {
 
@@ -94,18 +93,18 @@ listener_handler :: proc(
             // Spawn the Connection Isolate.
             spec := tina.Spawn_Spec{
                 type_id      = CONN_TYPE,                              // which IsolateTypeDescriptor to use
-                group_id     = tina.ctx_supervision_group_id(ctx),     // same supervision group as us
+                group_id     = tina.ctx_supervision_group_id(),     // same supervision group as us
                 restart_type = .temporary,                             // don't restart on clean exit
                 args_payload = payload,                                // serialized ConnectionArgs
                 args_size    = size,                                   // byte count
                 handoff_fd   = message.io.fd,                          // transfer FD ownership
                 handoff_mode = .Full,                                  // child owns both read and write
             }
-            _ = tina.ctx_spawn(ctx, spec)
+            _ = tina.ctx_spawn(spec)
         }
 
         // Always loop back to accepting the next connection.
-        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_fd}))
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = self.listen_fd}))
 
     case:
         return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -149,20 +148,20 @@ ServerConnection :: struct {
 Called once when the Isolate is spawned. Sets up the socket and parks waiting for data.
 
 ```odin
-conn_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
+conn_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
     // Cast the raw pointer to our typed struct. Debug builds verify the stride matches.
-    self := tina.self_as(ServerConnection, self_raw, ctx)
+    self := tina.self_as(ServerConnection, self_raw)
 
     // Deserialize the init args the Listener passed during ctx_spawn.
     conn_args := tina.payload_as(ConnectionArgs, args)
     self.fd = conn_args.client_fd
 
     // Disable Nagle's algorithm — we want low-latency echo.
-    tina.ctx_setsockopt(ctx, self.fd, .IPPROTO_TCP, .TCP_NODELAY, true)
+    tina.ctx_setsockopt(self.fd, .IPPROTO_TCP, .TCP_NODELAY, true)
 
     // Park this Isolate waiting for incoming data.
     // The scheduler wakes us when the kernel has bytes ready.
-    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{
+    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Recv{
         fd              = self.fd,
         buffer_size_max = u32(len(self.buffer)),  // max bytes to read
     }))
@@ -177,9 +176,8 @@ Called every time a message (I/O completion, user message, or system signal) arr
 conn_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(ServerConnection, self_raw, ctx)
+    self := tina.self_as(ServerConnection, self_raw)
 
     switch message.tag {
 
@@ -188,12 +186,12 @@ conn_handler :: proc(
         // message.io.result: bytes read (>0), 0 = EOF, <0 = error
         if message.io.result <= 0 {
             // EOF or error — close the socket and exit.
-            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Close{fd = self.fd}))
         }
 
         // Read the received data from the reactor's buffer pool.
         recv_len := u32(message.io.result)
-        data := tina.ctx_read_buffer(ctx, message.io.buffer_index, recv_len)
+        data := tina.ctx_read_buffer(message.io.buffer_index, recv_len)
 
         // Copy into our own stable buffer (the reactor buffer is freed after this handler returns).
         self.buffer = {}
@@ -203,16 +201,16 @@ conn_handler :: proc(
         // Echo it back. Tina does not allocate staging buffers for outbound I/O.
         // ctx_io_send computes the byte offset of self.buffer within the arena slot,
         // allowing the kernel to read directly from the Isolate's memory.
-        return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(ctx, self, self.fd, self.buffer[:copy_len]))
+        return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(self, self.fd, self.buffer[:copy_len]))
 
     // ---- Kernel finished sending our echo response ----
     case tina.IO_TAG_SEND_COMPLETE:
         if message.io.result < 0 {
             // Send failed — close and exit.
-            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Close{fd = self.fd}))
         }
         // Send succeeded — go back to reading.
-        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Recv{
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Recv{
             fd              = self.fd,
             buffer_size_max = u32(len(self.buffer)),
         }))

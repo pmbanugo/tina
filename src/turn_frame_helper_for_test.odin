@@ -2,36 +2,35 @@ package tina
 
 import "core:mem"
 
+Test_Turn_Frame_Proc :: #type proc(user_data: rawptr)
 
-Test_Context_Proc :: #type proc(user_data: rawptr, ctx: TinaContext)
-
-Test_Context_Config :: struct {
+Test_Turn_Frame_Config :: struct {
 	self_handle:         Isolate_Handle,
 	message_source:      Isolate_Handle,
 	correlation_id:      Correlation_Id,
-	flags:               Context_Flags,
+	flags:               Isolate_Turn_Flags,
 	monotonic_time_ns:   Monotonic_Time_NS,
 	timer_resolution_ns: u64,
 	shutting_down:       bool,
 	working_memory_size: int,
 }
 
-Test_Local_Context_Config :: struct {
+Test_Local_Turn_Frame_Config :: struct {
 	self_handle:             Isolate_Handle,
 	target_handle:           Isolate_Handle,
 	monotonic_time_ns:       Monotonic_Time_NS,
 	current_tick:            u64,
-	flags:                   Context_Flags,
+	flags:                   Isolate_Turn_Flags,
 	timer_resolution_ns:     u64,
 	target_mailbox_capacity: u32,
 	target_state:            Isolate_State,
 	working_memory_size:     int,
 }
 
-test_with_context :: proc(
-	config: Test_Context_Config,
+test_with_turn_frame :: proc(
+	config: Test_Turn_Frame_Config,
 	user_data: rawptr,
-	callback: Test_Context_Proc,
+	callback: Test_Turn_Frame_Proc,
 ) {
 	watchdog_state := u8(Shard_State.Running)
 	if config.shutting_down {
@@ -66,14 +65,6 @@ test_with_context :: proc(
 	scratch_bytes := make([]u8, 4096)
 	defer delete(scratch_bytes)
 
-	// Allocate the metadata slot for self_handle. The ADR's staging_slot_index
-	// refactor moved the staging-claim source of truth from Isolate_Invocation
-	// into Isolate_Metadata, so any ctx helper that consults the claim (e.g.
-	// _staging_claim_read inside ctx_io_send) reads through
-	// shard.metadata[type_id][slot_index]. Tests that drive a struct-source
-	// IoOp_Send reach that read; without this allocation, the nil-slice bounds
-	// check trips before any testing.expect* call. Mirrors the metadata setup
-	// already performed by test_with_local_context.
 	self_type_id := extract_type_id(config.self_handle)
 	self_slot_index := extract_slot(config.self_handle)
 	self_slot_count := int(self_slot_index) + 1
@@ -86,16 +77,12 @@ test_with_context :: proc(
 	shard.metadata[self_type_id] = make(#soa[]Isolate_Metadata, self_slot_count)
 	defer delete(shard.metadata[self_type_id])
 
-	// Initialize the slot so incidental reads see sane zero values, not
-	// garbage. The dispatchable bitmap is not touched here — the tests in
-	// this helper do not run the dispatch cycle.
 	shard.metadata[self_type_id][self_slot_index] = Isolate_Metadata {
-		generation                       = extract_generation(config.self_handle),
-		staging_slot_index               = IO_SLOT_INDEX_NONE,
-		io_slot_index                    = IO_SLOT_INDEX_NONE,
+		generation     = extract_generation(config.self_handle),
+		io_slot_index  = IO_SLOT_INDEX_NONE,
 		io_operation_kind = .None,
-		flags                            = {},
-		state                            = .Runnable,
+		flags          = {},
+		state          = .Runnable,
 	}
 
 	working_size := config.working_memory_size
@@ -103,39 +90,43 @@ test_with_context :: proc(
 	working_bytes := make([]u8, working_size)
 	defer delete(working_bytes)
 
-	invocation := Isolate_Invocation {
-		previous               = g_current_isolate_invocation,
-		shard                  = shard,
-		context_epoch          = make_tina_context_epoch(shard),
-		self_handle            = config.self_handle,
-		current_message_source = config.message_source,
-		current_correlation    = config.correlation_id,
-		flags                  = config.flags,
-		timer_resolution_ns    = shard.timer_resolution_ns,
-		current_tick           = u64(config.monotonic_time_ns) / shard.timer_resolution_ns,
-		type_id                = self_type_id,
-		slot_index             = self_slot_index,
+	frame := Isolate_Turn_Frame {
+		previous_isolate_turn_frame = shard.current_isolate_turn_frame,
+		isolate_handle              = config.self_handle,
+		message_source_handle       = config.message_source,
+		message_correlation_id      = config.correlation_id,
+		turn_flags                  = config.flags,
+		timer_resolution_ns         = shard.timer_resolution_ns,
+		current_tick                = u64(config.monotonic_time_ns) / shard.timer_resolution_ns,
+		isolate_type_id             = self_type_id,
+		isolate_slot_index          = self_slot_index,
+		staging_slot_index          = IO_SLOT_INDEX_NONE,
+		transfer_read_handle        = TRANSFER_HANDLE_NONE,
+		message_pool_index          = POOL_NONE_INDEX,
 	}
-	mem.arena_init(&invocation.scratch_arena, scratch_bytes)
-	mem.arena_init(&invocation.working_arena, working_bytes)
+	mem.arena_init(&frame.scratch_arena, scratch_bytes)
+	mem.arena_init(&frame.working_arena, working_bytes)
 
+	previous_shard := g_current_shard_pointer
 	previous_allocator := context.allocator
 	previous_temp_allocator := context.temp_allocator
-	g_current_isolate_invocation = &invocation
-	context.allocator = mem.arena_allocator(&invocation.working_arena)
-	context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
+	g_current_shard_pointer = shard
+	shard.current_isolate_turn_frame = &frame
+	context.allocator = mem.arena_allocator(&frame.working_arena)
+	context.temp_allocator = mem.arena_allocator(&frame.scratch_arena)
 
-	callback(user_data, invocation.context_epoch)
+	callback(user_data)
 
 	context.allocator = previous_allocator
 	context.temp_allocator = previous_temp_allocator
-	g_current_isolate_invocation = invocation.previous
+	shard.current_isolate_turn_frame = frame.previous_isolate_turn_frame
+	g_current_shard_pointer = previous_shard
 }
 
-test_with_local_context :: proc(
-	config: Test_Local_Context_Config,
+test_with_local_turn_frame :: proc(
+	config: Test_Local_Turn_Frame_Config,
 	user_data: rawptr,
-	callback: Test_Context_Proc,
+	callback: Test_Turn_Frame_Proc,
 ) -> (
 	message_count: u16,
 	message: Message,
@@ -218,33 +209,37 @@ test_with_local_context :: proc(
 	working_bytes := make([]u8, working_size)
 	defer delete(working_bytes)
 
-	invocation := Isolate_Invocation {
-		previous               = g_current_isolate_invocation,
-		shard                  = shard,
-		context_epoch          = make_tina_context_epoch(shard),
-		self_handle            = config.self_handle,
-		current_message_source = ISOLATE_HANDLE_NONE,
-		current_correlation    = CORRELATION_ID_NONE,
-		flags                  = config.flags,
-		timer_resolution_ns    = shard.timer_resolution_ns,
-		current_tick           = config.current_tick,
-		type_id                = extract_type_id(config.self_handle),
-		slot_index             = extract_slot(config.self_handle),
+	frame := Isolate_Turn_Frame {
+		previous_isolate_turn_frame = shard.current_isolate_turn_frame,
+		isolate_handle              = config.self_handle,
+		message_source_handle       = ISOLATE_HANDLE_NONE,
+		message_correlation_id      = CORRELATION_ID_NONE,
+		turn_flags                  = config.flags,
+		timer_resolution_ns         = shard.timer_resolution_ns,
+		current_tick                = config.current_tick,
+		isolate_type_id             = extract_type_id(config.self_handle),
+		isolate_slot_index          = extract_slot(config.self_handle),
+		staging_slot_index          = IO_SLOT_INDEX_NONE,
+		transfer_read_handle        = TRANSFER_HANDLE_NONE,
+		message_pool_index          = POOL_NONE_INDEX,
 	}
-	mem.arena_init(&invocation.scratch_arena, scratch_bytes)
-	mem.arena_init(&invocation.working_arena, working_bytes)
+	mem.arena_init(&frame.scratch_arena, scratch_bytes)
+	mem.arena_init(&frame.working_arena, working_bytes)
 
+	previous_shard := g_current_shard_pointer
 	previous_allocator := context.allocator
 	previous_temp_allocator := context.temp_allocator
-	g_current_isolate_invocation = &invocation
-	context.allocator = mem.arena_allocator(&invocation.working_arena)
-	context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
+	g_current_shard_pointer = shard
+	shard.current_isolate_turn_frame = &frame
+	context.allocator = mem.arena_allocator(&frame.working_arena)
+	context.temp_allocator = mem.arena_allocator(&frame.scratch_arena)
 
-	callback(user_data, invocation.context_epoch)
+	callback(user_data)
 
 	context.allocator = previous_allocator
 	context.temp_allocator = previous_temp_allocator
-	g_current_isolate_invocation = invocation.previous
+	shard.current_isolate_turn_frame = frame.previous_isolate_turn_frame
+	g_current_shard_pointer = previous_shard
 
 	soa_meta := shard.metadata[target_type_id]
 	message_count = soa_meta[target_slot_index].inbox_count

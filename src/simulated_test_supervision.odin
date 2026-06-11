@@ -8,41 +8,41 @@ when TINA_SIMULATION_MODE {
 	Exiter :: struct {}
 	Bystander :: struct {}
 
-	supervisor_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	supervisor_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		bystander_spec := Spawn_Spec {
 			type_id      = BYSTANDER_TYPE_ID,
-			group_id     = ctx_supervision_group_id(ctx),
+			group_id     = ctx_supervision_group_id(),
 			restart_type = .temporary,
 		}
-		_ = assert_spawn_success(ctx_spawn(ctx, bystander_spec), "Bystander")
+		_ = assert_spawn_success(ctx_spawn(bystander_spec), "Bystander")
 
 		exiter_spec := Spawn_Spec {
 			type_id      = EXITER_TYPE_ID,
-			group_id     = ctx_supervision_group_id(ctx),
+			group_id     = ctx_supervision_group_id(),
 			restart_type = .temporary,
 		}
-		_ = assert_spawn_success(ctx_spawn(ctx, exiter_spec), "Exiter")
+		_ = assert_spawn_success(ctx_spawn(exiter_spec), "Exiter")
 
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	supervisor_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	supervisor_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	exiter_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	exiter_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	exiter_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	exiter_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_DONE
 	}
 
-	bystander_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	bystander_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	bystander_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	bystander_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
@@ -149,7 +149,7 @@ when TINA_SIMULATION_MODE {
 		// Send a message to Exiter to trigger its handler (which returns DONE)
 		exiter_handle := make_handle(
 			0,
-			u16(EXITER_TYPE_ID),
+			EXITER_TYPE_ID,
 			0,
 			shard.metadata[EXITER_TYPE_ID].generation[0],
 		)
@@ -290,13 +290,13 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(
 			t,
 			extract_type_id(root.children_handles[0]),
-			u16(SUPERVISION_SUBGROUP_TYPE_ID),
+			SUPERVISION_SUBGROUP_TYPE_ID,
 		)
-		testing.expect_value(t, extract_slot(root.children_handles[0]), u32(1))
+		testing.expect_value(t, extract_slot(root.children_handles[0]), Isolate_Slot_Index(1))
 
 		exiter_handle := make_handle(
 			0,
-			u16(EXITER_TYPE_ID),
+			EXITER_TYPE_ID,
 			0,
 			shard.metadata[EXITER_TYPE_ID].generation[0],
 		)
@@ -316,9 +316,9 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(
 			t,
 			extract_type_id(root.children_handles[0]),
-			u16(SUPERVISION_SUBGROUP_TYPE_ID),
+			SUPERVISION_SUBGROUP_TYPE_ID,
 		)
-		testing.expect_value(t, extract_slot(root.children_handles[0]), u32(1))
+		testing.expect_value(t, extract_slot(root.children_handles[0]), Isolate_Slot_Index(1))
 
 		subgroup_bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[0]
 		dynamic_bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[1]

@@ -31,14 +31,14 @@ MyWorker :: struct {
     boss:   tina.Handle,
 }
 
-worker_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
-    self := tina.self_as(MyWorker, self_raw, ctx)
+worker_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+    self := tina.self_as(MyWorker, self_raw)
     // ... initialize from args ...
     return tina.ISOLATE_TRANSITION_WAIT_MESSAGE  // park, wait for messages
 }
 
-worker_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
-    self := tina.self_as(MyWorker, self_raw, ctx)
+worker_handler :: proc(self_raw: rawptr, message: ^tina.Message) -> tina.Isolate_Transition {
+    self := tina.self_as(MyWorker, self_raw)
     switch message.tag {
     case MY_TAG:
         // ... handle the message ...
@@ -49,7 +49,7 @@ worker_handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.Tina
 }
 ```
 
-Both functions receive `rawptr` because the scheduler operates on heterogeneous typed arenas. Use `tina.self_as(T, self_raw, ctx)` for a debug-checked cast that validates the stride at runtime.
+Both functions receive `rawptr` because the scheduler operates on heterogeneous typed arenas. Use `tina.self_as(T, self_raw)` for a debug-checked cast that validates the stride at runtime.
 
 ## The Transition System
 
@@ -69,7 +69,7 @@ Seven possible states:
 
 **Every transition is a state notification**, not an action. Actions (sending messages, spawning Isolates, logging, submitting I/O) are done via `ctx_*()` calls during the handler. The transition is returned at the end.
 
-This split — actions via `ctx` calls, state transition via the return value — is what makes the API non-colored. You can send 100 messages, submit I/O, and park on completion in a single handler invocation. No async/await, no callbacks, no colored functions.
+This split — actions via `ctx_*` calls during the handler, state transition via the return value — is what makes the API non-colored. You can send 100 messages, submit I/O, and park on completion in a single handler invocation. No async/await, no callbacks, no colored functions.
 
 ## Handles: Safe Identity Without Pointers
 
@@ -113,7 +113,7 @@ For payloads larger than 96 bytes, use the **Transfer Buffer Pool** — allocate
 ### Sending a Message
 
 ```odin
-result := tina.ctx_send(ctx, target_handle, MY_TAG, &my_payload)
+result := tina.ctx_send(target_handle, MY_TAG, &my_payload)
 ```
 
 `ctx_send()` returns `Send_Result` immediately:
@@ -139,7 +139,7 @@ There is one channel per Shard-pair. For N Shards: N×(N-1) channels. Each is si
 The handler receives messages one at a time:
 
 ```odin
-handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
+handler :: proc(self_raw: rawptr, message: ^tina.Message) -> tina.Isolate_Transition {
     switch message.tag {
     case MY_TAG:
         msg := tina.payload_as(MyPayload, message.user.payload[:])
@@ -159,12 +159,12 @@ There is no selective receive (no Erlang-style pattern matching on the mailbox).
 ```odin
 spec := tina.Spawn_Spec{
     type_id      = WORKER_TYPE,
-    group_id     = tina.ctx_supervision_group_id(ctx),
+    group_id     = tina.ctx_supervision_group_id(),
     restart_type = .permanent,
     args_payload = payload,
     args_size    = size,
 }
-result := tina.ctx_spawn(ctx, spec)
+result := tina.ctx_spawn(spec)
 ```
 
 `ctx_spawn()` returns synchronously: either a `Handle` (the new Isolate's identity) or a `Spawn_Error` (arena full, group full, init failed). The child's `init_handler` runs immediately — the spawn is not deferred.

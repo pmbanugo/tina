@@ -79,7 +79,6 @@ log_init :: proc(ring: ^Log_Ring_Buffer, backing: []u8) {
 // Writes a diagnostic log to the Shard's environment.
 // The message is raw-byte
 ctx_log_raw :: #force_inline proc(
-	ctx: TinaContext,
 	level: Log_Level,
 	$tag: Log_Tag,
 	payload: []u8,
@@ -88,14 +87,13 @@ ctx_log_raw :: #force_inline proc(
 		tag >= USER_LOG_TAG_BASE,
 		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
 	)
-	invocation := ctx_invocation(ctx)
-	_shard_log(invocation.shard, invocation.self_handle, level, tag, payload)
+	shard, frame := _current_isolate_turn_frame_require_handle()
+	_shard_log(shard, frame.isolate_handle, level, tag, payload)
 }
 
 // Writes a diagnostic log to the Shard's environment.
 // The message is typed
 ctx_log_typed :: #force_inline proc(
-	ctx: TinaContext,
 	level: Log_Level,
 	$tag: Log_Tag,
 	message: ^$T,
@@ -105,10 +103,10 @@ ctx_log_typed :: #force_inline proc(
 		tag >= USER_LOG_TAG_BASE,
 		"[Tina] User code cannot log with system tags. Tag must be >= 0x40.",
 	)
-	invocation := ctx_invocation(ctx)
+	shard, frame := _current_isolate_turn_frame_require_handle()
 	_shard_log(
-		invocation.shard,
-		invocation.self_handle,
+		shard,
+		frame.isolate_handle,
 		level,
 		tag,
 		mem.byte_slice(message, size_of(T)),

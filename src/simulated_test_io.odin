@@ -29,26 +29,26 @@ when TINA_SIMULATION_MODE {
 		},
 	}
 
-	io_timeout_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	io_timeout_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		iso := cast(^IoTimeoutIsolate)self
 
-		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
 		if error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
 		iso.fd = fd
 
+		_, frame := _current_isolate_turn_frame()
 		ctx_register_timer(
-			ctx,
-			2 * ctx_invocation(ctx).timer_resolution_ns,
+			2 * frame.timer_resolution_ns,
 			APP_TAG_IO_TIMEOUT,
 		)
 
 		iso.state = .Wait_Io
-		return transition_to_wait_io_or_crash(ctx_submit_io(ctx, IoOp_Recv{fd = iso.fd, buffer_size_max = 512}))
+		return transition_to_wait_io_or_crash(ctx_submit_io(IoOp_Recv{fd = iso.fd, buffer_size_max = 512}))
 	}
 
-	io_timeout_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	io_timeout_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		iso := cast(^IoTimeoutIsolate)self
 
 		if message.tag == APP_TAG_IO_TIMEOUT {
@@ -211,29 +211,30 @@ when TINA_SIMULATION_MODE {
 		send_buf: [32]u8,
 	}
 
-	write_crasher_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	write_crasher_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_YIELD
 	}
 
-	write_crasher_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
-		if ctx_invocation(ctx).shard.current_tick == 1 do return transition_to_crash(.None)
+	write_crasher_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
+		shard, _ := _current_isolate_turn_frame()
+		if shard.current_tick == 1 do return transition_to_crash(.None)
 		return ISOLATE_TRANSITION_DONE
 	}
 
-	write_writer_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	write_writer_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		w := cast(^WriteWriterIsolate)self
 
-		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
 		if error != .None do return transition_to_crash(.Init_Failed)
 		w.fd = fd
 		w.send_buf[0] = 0x42
 
 		return transition_to_wait_io_or_crash(
-			ctx_io_send(ctx, w, w.fd, w.send_buf[:]),
+			ctx_io_send(w, w.fd, w.send_buf[:]),
 		)
 	}
 
-	write_writer_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	write_writer_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_DONE
 	}
 
@@ -338,11 +339,11 @@ when TINA_SIMULATION_MODE {
 		received_count: u8,
 	}
 
-	priority_test_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	priority_test_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	priority_test_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	priority_test_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		iso := cast(^PriorityTestIsolate)self
 		if iso.received_count < 4 {
 			iso.received_tags[iso.received_count] = message.tag
@@ -423,7 +424,7 @@ when TINA_SIMULATION_MODE {
 		soa[0].flags += {.Shutdown_Pending}
 		_slot_set_io_completion_ready(
 			shard,
-			u16(PRIORITY_TYPE_ID),
+			PRIORITY_TYPE_ID,
 			0,
 			.Recv_Complete,
 			128,
@@ -432,7 +433,7 @@ when TINA_SIMULATION_MODE {
 
 		simulator_run(&sim)
 
-		received := cast(^PriorityTestIsolate)_get_isolate_ptr(shard, u16(PRIORITY_TYPE_ID), 0)
+		received := cast(^PriorityTestIsolate)_get_isolate_ptr(shard, PRIORITY_TYPE_ID, 0)
 		testing.expect_value(t, received.received_count, u8(2))
 		testing.expect_value(t, received.received_tags[0], IO_TAG_RECV_COMPLETE)
 		testing.expect_value(t, received.received_tags[1], TAG_SHUTDOWN)

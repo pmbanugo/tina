@@ -77,7 +77,6 @@ Route_Handler_Kind :: enum u8 {
 // request lifetime and backing storage remain under library control.
 Request :: struct {
 	connection_state: ^HTTP_Connection_State,
-	tina_context:     tina.TinaContext,
 	frame:            []u8,
 }
 
@@ -85,14 +84,12 @@ Request :: struct {
 // slice and the connection-local egress buffer view.
 Response :: struct {
 	connection:   ^HTTP_Connection,
-	tina_context: tina.TinaContext,
 }
 
 // Connection-execution context. Passed by value to event handlers and helper
 // functions that need Tina messaging or the connection state.
 Route_Context :: struct {
 	connection_state: ^HTTP_Connection_State,
-	tina_context:     tina.TinaContext,
 }
 
 @(require_results)
@@ -102,16 +99,16 @@ route_send :: #force_inline proc(
 	$tag: tina.Message_Tag,
 	payload: []u8,
 ) -> tina.Send_Result {
-	return tina.ctx_send_raw(route_context.tina_context, to, tag, payload)
+	return tina.ctx_send_raw(to, tag, payload)
 }
 
 @(require_results)
 route_spawn :: proc(route_context: Route_Context, spec: tina.Spawn_Spec) -> tina.Spawn_Result {
-	return tina.ctx_spawn(route_context.tina_context, spec)
+	return tina.ctx_spawn(spec)
 }
 
 route_self_handle :: proc(route_context: Route_Context) -> tina.Isolate_Handle {
-	return tina.ctx_self_handle(route_context.tina_context)
+	return tina.ctx_self_handle()
 }
 
 route_request_token :: proc(route_context: Route_Context) -> Request_Token {

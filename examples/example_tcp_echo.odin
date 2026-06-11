@@ -45,33 +45,32 @@ ServerListenerIsolate :: struct {
 	listen_file_descriptor: tina.FD_Handle,
 }
 
-server_listener_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
-	self := tina.self_as(ServerListenerIsolate, self_raw, ctx)
+server_listener_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+	self := tina.self_as(ServerListenerIsolate, self_raw)
 
-	file_descriptor, socket_err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+	file_descriptor, socket_err := tina.ctx_socket(.AF_INET, .STREAM, .TCP)
 	if socket_err != .None {
 		return tina.transition_to_crash(.Init_Failed)
 	}
 	self.listen_file_descriptor = file_descriptor
 
-	tina.ctx_setsockopt(ctx, self.listen_file_descriptor, .SOL_SOCKET, .SO_REUSEADDR, true)
-	tina.ctx_bind(ctx, self.listen_file_descriptor, tina.ipv4(127, 0, 0, 1, 9090))
-	tina.ctx_listen(ctx, self.listen_file_descriptor, 128)
+	tina.ctx_setsockopt(self.listen_file_descriptor, .SOL_SOCKET, .SO_REUSEADDR, true)
+	tina.ctx_bind(self.listen_file_descriptor, tina.ipv4(127, 0, 0, 1, 9090))
+	tina.ctx_listen(self.listen_file_descriptor, 128)
 
-	str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "TCP Server listening on 127.0.0.1:9090")
-	tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+	str := fmt.bprintf(tina.ctx_scratch_arena_bytes(), "TCP Server listening on 127.0.0.1:9090")
+	tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 	return tina.transition_to_wait_io_or_crash(
-		tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_file_descriptor}),
+		tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = self.listen_file_descriptor}),
 	)
 }
 
 server_listener_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
-	self := tina.self_as(ServerListenerIsolate, self_raw, ctx)
+	self := tina.self_as(ServerListenerIsolate, self_raw)
 
 	switch message.tag {
 	case tina.IO_TAG_ACCEPT_COMPLETE:
@@ -83,17 +82,17 @@ server_listener_handler :: proc(
 
 			spec := tina.Spawn_Spec {
 				type_id      = SERVER_CONN_ISOLATE_TYPE,
-				group_id     = tina.ctx_supervision_group_id(ctx),
+				group_id     = tina.ctx_supervision_group_id(),
 				restart_type = .temporary,
 				args_payload = payload_buffer,
 				args_size    = payload_size,
 				handoff_fd   = message.io.fd,
 				handoff_mode = .Full,
 			}
-			_ = tina.ctx_spawn(ctx, spec)
+			_ = tina.ctx_spawn(spec)
 		}
 		return tina.transition_to_wait_io_or_crash(
-			tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_file_descriptor}),
+			tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = self.listen_file_descriptor}),
 		)
 
 	case:
@@ -115,16 +114,15 @@ ServerConnIsolate :: struct {
 	buffer:                 [128]u8,
 }
 
-server_conn_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
-	self := tina.self_as(ServerConnIsolate, self_raw, ctx)
+server_conn_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+	self := tina.self_as(ServerConnIsolate, self_raw)
 	connection_args := tina.payload_as(ConnectionArgs, args)
 	self.client_file_descriptor = connection_args.client_file_descriptor
 
-	tina.ctx_setsockopt(ctx, self.client_file_descriptor, .IPPROTO_TCP, .TCP_NODELAY, true)
+	tina.ctx_setsockopt(self.client_file_descriptor, .IPPROTO_TCP, .TCP_NODELAY, true)
 
 	return tina.transition_to_wait_io_or_crash(
 		tina.ctx_submit_io(
-			ctx,
 			tina.IoOp_Recv {
 				fd = self.client_file_descriptor,
 				buffer_size_max = u32(len(self.buffer)),
@@ -136,38 +134,36 @@ server_conn_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) ->
 server_conn_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
-	self := tina.self_as(ServerConnIsolate, self_raw, ctx)
+	self := tina.self_as(ServerConnIsolate, self_raw)
 
 	switch message.tag {
 	case tina.IO_TAG_RECV_COMPLETE:
 		if message.io.result <= 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 
 		recv_len := u32(message.io.result)
-		data := tina.ctx_read_buffer(ctx, message.io.buffer_index, recv_len)
+		data := tina.ctx_read_io_slot(message.io.buffer_index, recv_len)
 
 		self.buffer = {}
 		copy_len := min(recv_len, u32(len(self.buffer)))
 		mem.copy(&self.buffer[0], raw_data(data), int(copy_len))
 
 		return tina.transition_to_wait_io_or_crash(
-			tina.ctx_io_send(ctx, self, self.client_file_descriptor, self.buffer[:copy_len]),
+			tina.ctx_io_send(self, self.client_file_descriptor, self.buffer[:copy_len]),
 		)
 
 	case tina.IO_TAG_SEND_COMPLETE:
 		if message.io.result < 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 		return tina.transition_to_wait_io_or_crash(
 			tina.ctx_submit_io(
-				ctx,
 				tina.IoOp_Recv {
 					fd = self.client_file_descriptor,
 					buffer_size_max = u32(len(self.buffer)),
@@ -193,10 +189,10 @@ ClientIsolate :: struct {
 	buffer:                 [128]u8,
 }
 
-client_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
-	self := tina.self_as(ClientIsolate, self_raw, ctx)
+client_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+	self := tina.self_as(ClientIsolate, self_raw)
 
-	file_descriptor, socket_err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+	file_descriptor, socket_err := tina.ctx_socket(.AF_INET, .STREAM, .TCP)
 	if socket_err != .None {
 		return tina.transition_to_crash(.Init_Failed)
 	}
@@ -204,7 +200,6 @@ client_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina
 
 	return tina.transition_to_wait_io_or_crash(
 		tina.ctx_submit_io(
-			ctx,
 			tina.IoOp_Connect {
 				fd = self.client_file_descriptor,
 				address = tina.ipv4(127, 0, 0, 1, 9090),
@@ -216,15 +211,14 @@ client_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina
 client_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
-	self := tina.self_as(ClientIsolate, self_raw, ctx)
+	self := tina.self_as(ClientIsolate, self_raw)
 
 	switch message.tag {
 	case tina.IO_TAG_CONNECT_COMPLETE:
 		if message.io.result < 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 
@@ -238,18 +232,17 @@ client_handler :: proc(
 		packet.payload[3] = 'G'
 
 		return tina.transition_to_wait_io_or_crash(
-			tina.ctx_io_send(ctx, self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
+			tina.ctx_io_send(self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
 		)
 
 	case tina.IO_TAG_SEND_COMPLETE:
 		if message.io.result < 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 		return tina.transition_to_wait_io_or_crash(
 			tina.ctx_submit_io(
-				ctx,
 				tina.IoOp_Recv {
 					fd = self.client_file_descriptor,
 					buffer_size_max = u32(size_of(Packet)),
@@ -260,24 +253,24 @@ client_handler :: proc(
 	case tina.IO_TAG_RECV_COMPLETE:
 		if message.io.result <= 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 
-		data := tina.ctx_read_buffer(ctx, message.io.buffer_index, u32(message.io.result))
+		data := tina.ctx_read_io_slot(message.io.buffer_index, u32(message.io.result))
 		if len(data) >= size_of(Packet) {
 			packet := tina.payload_as(Packet, data)
 
 			str := fmt.bprintf(
-				tina.ctx_scratch_arena_bytes(ctx),
+				tina.ctx_scratch_arena_bytes(),
 				"Client on Shard %d: PONG #%d received ✓",
-				tina.ctx_shard_id(ctx),
+				tina.ctx_shard_id(),
 				packet.sequence_number,
 			)
-			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+			tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 		}
 
-		tina.ctx_register_timer(ctx, 1_000_000_000, TAG_CLIENT_TIMER) // Re-fire in 1 second
+		tina.ctx_register_timer(1_000_000_000, TAG_CLIENT_TIMER) // Re-fire in 1 second
 		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case TAG_CLIENT_TIMER:
@@ -291,7 +284,7 @@ client_handler :: proc(
 		packet.payload[3] = 'G'
 
 		return tina.transition_to_wait_io_or_crash(
-			tina.ctx_io_send(ctx, self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
+			tina.ctx_io_send(self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
 		)
 
 	case tina.IO_TAG_CLOSE_COMPLETE:
@@ -316,10 +309,10 @@ ChaosIsolate :: struct {
 	buffer:                 [128]u8,
 }
 
-chaos_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
-	self := tina.self_as(ChaosIsolate, self_raw, ctx)
+chaos_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+	self := tina.self_as(ChaosIsolate, self_raw)
 
-	file_descriptor, socket_err := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+	file_descriptor, socket_err := tina.ctx_socket(.AF_INET, .STREAM, .TCP)
 	if socket_err != .None {
 		return tina.transition_to_crash(.Init_Failed)
 	}
@@ -327,7 +320,6 @@ chaos_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.
 
 	return tina.transition_to_wait_io_or_crash(
 		tina.ctx_submit_io(
-			ctx,
 			tina.IoOp_Connect {
 				fd = self.client_file_descriptor,
 				address = tina.ipv4(127, 0, 0, 1, 9090),
@@ -339,15 +331,14 @@ chaos_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.
 chaos_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
-	self := tina.self_as(ChaosIsolate, self_raw, ctx)
+	self := tina.self_as(ChaosIsolate, self_raw)
 
 	switch message.tag {
 	case tina.IO_TAG_CONNECT_COMPLETE:
 		if message.io.result < 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 
@@ -361,18 +352,17 @@ chaos_handler :: proc(
 		packet.payload[3] = 'G'
 
 		return tina.transition_to_wait_io_or_crash(
-			tina.ctx_io_send(ctx, self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
+			tina.ctx_io_send(self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
 		)
 
 	case tina.IO_TAG_SEND_COMPLETE:
 		if message.io.result < 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 		return tina.transition_to_wait_io_or_crash(
 			tina.ctx_submit_io(
-				ctx,
 				tina.IoOp_Recv {
 					fd = self.client_file_descriptor,
 					buffer_size_max = u32(size_of(Packet)),
@@ -383,35 +373,35 @@ chaos_handler :: proc(
 	case tina.IO_TAG_RECV_COMPLETE:
 		if message.io.result <= 0 {
 			return tina.transition_to_wait_io_or_crash(
-				tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.client_file_descriptor}),
+				tina.ctx_submit_io(tina.IoOp_Close{fd = self.client_file_descriptor}),
 			)
 		}
 
-		data := tina.ctx_read_buffer(ctx, message.io.buffer_index, u32(message.io.result))
+		data := tina.ctx_read_io_slot(message.io.buffer_index, u32(message.io.result))
 		if len(data) >= size_of(Packet) {
 			packet := tina.payload_as(Packet, data)
 
 			str := fmt.bprintf(
-				tina.ctx_scratch_arena_bytes(ctx),
+				tina.ctx_scratch_arena_bytes(),
 				"Chaos client on Shard %d: PONG #%d received ✓",
-				tina.ctx_shard_id(ctx),
+				tina.ctx_shard_id(),
 				packet.sequence_number,
 			)
-			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+			tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 		}
 
 		if self.sequence_number >= DEMO_ECHO_CHAOS_CRASH_AFTER {
 			str := fmt.bprintf(
-				tina.ctx_scratch_arena_bytes(ctx),
+				tina.ctx_scratch_arena_bytes(),
 				"[FAIL] Chaos client on Shard %d crashing (after %d pings)",
-				tina.ctx_shard_id(ctx),
+				tina.ctx_shard_id(),
 				self.sequence_number,
 			)
-			tina.ctx_log(ctx, .ERROR, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+			tina.ctx_log(.ERROR, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 			return tina.transition_to_crash(.None)
 		}
 
-		tina.ctx_register_timer(ctx, 1_000_000_000, TAG_CLIENT_TIMER)
+		tina.ctx_register_timer(1_000_000_000, TAG_CLIENT_TIMER)
 		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case TAG_CLIENT_TIMER:
@@ -425,7 +415,7 @@ chaos_handler :: proc(
 		packet.payload[3] = 'G'
 
 		return tina.transition_to_wait_io_or_crash(
-			tina.ctx_io_send(ctx, self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
+			tina.ctx_io_send(self, self.client_file_descriptor, self.buffer[:size_of(Packet)]),
 		)
 
 	case tina.IO_TAG_CLOSE_COMPLETE:

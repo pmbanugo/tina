@@ -38,7 +38,7 @@ There is no secondary buffer. If the outbound channel to Shard 3 is full, the me
 Here is what happens when an Isolate handler calls `ctx_send()`:
 
 ```
-ctx_send(ctx, target_handle, tag, payload)
+ctx_send(target_handle, tag, payload)
     │
     ├── Is target on this Shard?
     │   ├── Yes: local delivery
@@ -88,11 +88,11 @@ Tina offers two message-sending mechanisms, each with different guarantees:
 
 ```odin
 // Fire-and-forget: sender does not wait
-_ = ctx_send(ctx, target, MY_TAG, payload)
+_ = ctx_send(target, MY_TAG, payload)
 return ISOLATE_TRANSITION_WAIT_MESSAGE
 
 // Request-response: sender waits until reply or timeout
-tina.ctx_call(ctx, target, MY_TAG, payload, 5_000_000_000)  // 5 second timeout
+tina.ctx_call(target, MY_TAG, payload, 5_000_000_000)  // 5 second timeout
 return ISOLATE_TRANSITION_WAIT_REPLY
 ```
 

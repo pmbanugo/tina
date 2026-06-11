@@ -15,8 +15,19 @@ Process_Phase :: enum u8 {
 g_process_phase: Process_Phase = .Bootstrap
 
 @(private = "package")
-load_watchdog_state :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
+load_watchdog_state :: proc {
+	_load_watchdog_state_runtime,
+	_load_watchdog_state_shard,
+}
+
+@(private = "package")
+_load_watchdog_state_runtime :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
 	return cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
+}
+
+@(private = "package")
+_load_watchdog_state_shard :: #force_inline proc "contextless" (shard: ^Shard) -> Shard_State {
+	return cast(Shard_State)sync.atomic_load_explicit(shard.watchdog_state_pointer, .Relaxed)
 }
 
 @(private = "package")

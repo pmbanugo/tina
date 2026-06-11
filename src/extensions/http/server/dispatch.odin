@@ -71,7 +71,7 @@ _dispatch_route :: proc(request: ^Request, response: ^Response) -> Route_Step {
 		state.response.flags += {.Close_After_Send}
 		return _normalize_route_step(respond_text(response, HTTP_STATUS_CONTENT_TOO_LARGE, "Content Too Large"))
 	}
-	route_context := _make_route_context(state, request.tina_context)
+	route_context := _make_route_context(state)
 	route_state := _route_state_ptr(state)
 	if descriptor.handler_kind == .Event {
 		if descriptor.body_mode == .Buffered && state.parser.phase != .Complete {
@@ -191,13 +191,12 @@ _route_state_ptr :: proc "contextless" (state: ^HTTP_Connection_State) -> rawptr
 }
 
 @(private = "package")
-_make_route_context :: proc (state: ^HTTP_Connection_State, ctx: tina.TinaContext) -> Route_Context {
+_make_route_context :: proc (state: ^HTTP_Connection_State) -> Route_Context {
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(state != nil, "_make_route_context: state is nil")
 	}
 	return Route_Context {
 		connection_state = state,
-		tina_context     = ctx,
 	}
 }
 
@@ -241,13 +240,13 @@ test_dispatch_unknown_method_missing_path_returns_not_implemented :: proc(t: ^te
 		request_frame = request_frame,
 		t             = t,
 	}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&dispatch_unknown_method_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Dispatch_Unknown_Method_Test_State)user_data
-			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame)
+			response := http_test_fixture_response(test_state.fixture)
 			step := _dispatch_route(&request, &response)
 			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
 		},
@@ -315,13 +314,13 @@ test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^t
 		request_frame = request_frame,
 		t             = t,
 	}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&dispatch_close_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Dispatch_Close_Test_State)user_data
-			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame)
+			response := http_test_fixture_response(test_state.fixture)
 			step := _dispatch_route(&request, &response)
 			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
 		},
@@ -361,13 +360,13 @@ test_dispatch_none_body_route_closes_after_response_when_body_present :: proc(t:
 		request_frame = request_frame,
 		t             = t,
 	}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&dispatch_none_body_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Dispatch_None_Body_Test_State)user_data
-			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame)
+			response := http_test_fixture_response(test_state.fixture)
 			step := _dispatch_route(&request, &response)
 			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
 		},
@@ -416,13 +415,13 @@ test_dispatch_streamed_route_final_response_before_body_closes_after_send :: pro
 		request_frame = request_frame,
 		t             = t,
 	}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&dispatch_streamed_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Dispatch_Streamed_Test_State)user_data
-			request := http_test_fixture_request(test_state.fixture, test_state.request_frame, ctx)
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			request := http_test_fixture_request(test_state.fixture, test_state.request_frame)
+			response := http_test_fixture_response(test_state.fixture)
 			step := _dispatch_route(&request, &response)
 			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
 		},

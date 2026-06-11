@@ -4,19 +4,20 @@ import "core:mem"
 
 @(private = "package")
 _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_Handle) -> Spawn_Result {
-	type_id := u16(spec.type_id)
+	type_id := spec.type_id
 
 	// 1. Slot Allocation (Popping the LIFO free list)
-	slot := shard.isolate_free_heads[type_id]
-	if slot == POOL_NONE_INDEX {
+	slot_index := shard.isolate_free_heads[type_id]
+	if slot_index == POOL_NONE_INDEX {
 		return Spawn_Error.arena_full
 	}
 
 	soa_meta := shard.metadata[type_id]
-	shard.isolate_free_heads[type_id] = soa_meta[slot].inbox_head
+	shard.isolate_free_heads[type_id] = soa_meta[slot_index].inbox_head
 
-	child_generation := soa_meta[slot].generation
-	child_handle := make_handle(shard.id, type_id, slot, child_generation)
+	child_generation := soa_meta[slot_index].generation
+	child_slot_index := Isolate_Slot_Index(slot_index)
+	child_handle := make_handle(shard.id, type_id, child_slot_index, child_generation)
 
 	// 2. Validate FD Handoff Affinity
 	if spec.handoff_fd != FD_HANDLE_NONE {
@@ -37,8 +38,8 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 						LOG_TAG_ISOLATE_CRASHED,
 						transmute([]u8)string("Split-FD handoff requires one_for_all group"),
 					)
-					soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-					shard.isolate_free_heads[type_id] = slot
+					soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
+					shard.isolate_free_heads[type_id] = slot_index
 					return Spawn_Error.init_failed
 				}
 			}
@@ -65,55 +66,59 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 					LOG_TAG_ISOLATE_CRASHED,
 					transmute([]u8)string("FD handoff affinity violation"),
 				)
-				soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-				shard.isolate_free_heads[type_id] = slot
+				soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
+				shard.isolate_free_heads[type_id] = slot_index
 				return Spawn_Error.init_failed
 			}
 		} else {
-			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-			shard.isolate_free_heads[type_id] = slot
+			soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
+			shard.isolate_free_heads[type_id] = slot_index
 			return Spawn_Error.init_failed
 		}
 	}
 
-	// 3. Initialize Isolate Memory & Context
-	soa_meta[slot].state = .Runnable
-	soa_meta[slot].group_id = spec.group_id
-	soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
+	// 3. Initialize Isolate memory and durable slot metadata.
+	soa_meta[slot_index].state = .Runnable
+	soa_meta[slot_index].group_id = spec.group_id
 
-	soa_meta[slot].inbox_head = POOL_NONE_INDEX
-	soa_meta[slot].inbox_tail = POOL_NONE_INDEX
-	soa_meta[slot].inbox_count = 0
-	soa_meta[slot].io_operation_kind = .None
-	soa_meta[slot].io_slot_index = IO_SLOT_INDEX_NONE
-	soa_meta[slot].staging_slot_index = IO_SLOT_INDEX_NONE
-	soa_meta[slot].flags -= ISOLATE_FLAGS_CLEARED_ON_ALLOC
+	soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
+	soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
+	soa_meta[slot_index].inbox_count = 0
+	soa_meta[slot_index].io_operation_kind = .None
+	soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
+	soa_meta[slot_index].flags -= ISOLATE_FLAGS_CLEARED_ON_ALLOC
 
-	isolate_pointer := _get_isolate_ptr(shard, type_id, slot)
+	isolate_pointer := _get_isolate_ptr(shard, type_id, child_slot_index)
 	stride := shard.type_descriptors[type_id].stride
 	if isolate_pointer != nil && stride > 0 {
 		mem.zero(isolate_pointer, stride)
 	}
 
-	child_invocation := Isolate_Invocation {
-		previous            = g_current_isolate_invocation,
-		shard               = shard,
-		context_epoch       = make_tina_context_epoch(shard),
-		self_handle         = child_handle,
-		type_id             = type_id,
-		slot_index          = slot,
-		timer_resolution_ns = shard.timer_resolution_ns,
-		current_tick        = shard.current_tick,
+	child_turn_frame := Isolate_Turn_Frame {
+		previous_isolate_turn_frame = shard.current_isolate_turn_frame,
+		isolate_handle             = child_handle,
+		message_source_handle      = spawner_handle,
+		message_correlation_id     = CORRELATION_ID_NONE,
+		transfer_read_handle       = TRANSFER_HANDLE_NONE,
+		isolate_type_id            = type_id,
+		isolate_slot_index         = child_slot_index,
+		message_pool_index         = POOL_NONE_INDEX,
+		staging_slot_index         = IO_SLOT_INDEX_NONE,
+		timer_resolution_ns        = shard.timer_resolution_ns,
+		current_tick               = shard.current_tick,
+		phase                      = .User_Code,
 	}
-	child_ctx := child_invocation.context_epoch
-
-	mem.arena_init(&child_invocation.scratch_arena, shard.scratch_memory)
+	parent_frame := child_turn_frame.previous_isolate_turn_frame
+	child_turn_frame.scratch_arena = mem.Arena {
+		data   = shard.scratch_memory,
+		offset = parent_frame != nil ? parent_frame.scratch_arena.offset : 0,
+	}
 
 	working_stride := shard.type_descriptors[type_id].working_memory_size
 	if working_stride > 0 {
-		start_index := int(slot) * working_stride
+		start_index := int(slot_index) * working_stride
 		working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
-		mem.arena_init(&child_invocation.working_arena, working_slice)
+		mem.arena_init(&child_turn_frame.working_arena, working_slice)
 	}
 
 	// 4. Execute init_handler
@@ -124,33 +129,70 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 			shard.sim_state.fault_config.init_failure_rate,
 			shard.sim_state.crash_prng,
 		) {
-			soa_meta[slot].state = .Unallocated
-			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
-			shard.isolate_free_heads[type_id] = slot
-			_dispatchable_refresh_slot(shard, type_id, slot)
+			soa_meta[slot_index].state = .Unallocated
+			soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
+			shard.isolate_free_heads[type_id] = slot_index
+			_dispatchable_refresh_slot(shard, type_id, child_slot_index)
 			return Spawn_Error.init_failed
 		}
 	}
 
+	when TINA_SIMULATION_MODE {
+		g_current_shard_pointer = shard
+	}
 	previous_allocator := context.allocator
 	previous_temp_allocator := context.temp_allocator
-	g_current_isolate_invocation = &child_invocation
-	context.allocator = mem.arena_allocator(&child_invocation.working_arena)
-	context.temp_allocator = mem.arena_allocator(&child_invocation.scratch_arena)
+	previous_trap_environment := shard.current_trap_environment
+	child_turn_frame.previous_allocator = previous_allocator
+	child_turn_frame.previous_temp_allocator = previous_temp_allocator
+
+	if os_trap_save(&shard.trap_environment_init) != 0 {
+		when !TINA_SIMULATION_MODE {
+			free_all(context.temp_allocator)
+			os_signals_restore_thread_mask()
+		}
+
+		context.allocator = child_turn_frame.previous_allocator
+		context.temp_allocator = child_turn_frame.previous_temp_allocator
+		if child_turn_frame.phase == .Scheduler_Commit {
+			shard.current_trap_environment = nil
+			shard.current_isolate_turn_frame = nil
+			os_trap_restore(&shard.trap_environment_outer, RECOVERY_ROOT_ESCALATE)
+		}
+
+		shard.current_trap_environment = previous_trap_environment
+		_turn_cleanup_resources(shard, &child_turn_frame)
+		shard.current_isolate_turn_frame = child_turn_frame.previous_isolate_turn_frame
+		if spec.handoff_fd != FD_HANDLE_NONE {
+			fd_table_handoff(
+				&shard.reactor.fd_table,
+				spec.handoff_fd,
+				spawner_handle,
+				spec.handoff_mode,
+			)
+		}
+		_teardown_isolate(shard, type_id, child_slot_index, .Crashed)
+		return Spawn_Error.init_failed
+	}
+
+	shard.current_isolate_turn_frame = &child_turn_frame
+	shard.current_trap_environment = &shard.trap_environment_init
+	context.allocator = mem.arena_allocator(&child_turn_frame.working_arena)
+	context.temp_allocator = mem.arena_allocator(&child_turn_frame.scratch_arena)
 
 	transition := shard.type_descriptors[type_id].init_handler(
 		isolate_pointer,
 		local_spec.args_payload[:local_spec.args_size],
-		child_ctx,
 	)
-	child_shutdown_pending := ctx_is_shutting_down(child_ctx)
+	child_turn_frame.phase = .Scheduler_Commit
+	child_shutdown_pending := load_watchdog_state(shard) == .Shutting_Down
 
-	context.allocator = previous_allocator
-	context.temp_allocator = previous_temp_allocator
-	g_current_isolate_invocation = child_invocation.previous
+	context.allocator = child_turn_frame.previous_allocator
+	context.temp_allocator = child_turn_frame.previous_temp_allocator
+	shard.current_trap_environment = previous_trap_environment
 
 	if working_stride > 0 {
-		soa_meta[slot].working_arena_offset = u32(child_invocation.working_arena.offset)
+		soa_meta[slot_index].working_arena_offset = u32(child_turn_frame.working_arena.offset)
 	}
 
 	is_crash := transition.kind == .Crash
@@ -174,6 +216,8 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 		)
 	}
 	if is_crash || is_done {
+		_turn_cleanup_resources(shard, &child_turn_frame)
+		shard.current_isolate_turn_frame = child_turn_frame.previous_isolate_turn_frame
 		if spec.handoff_fd != FD_HANDLE_NONE {
 			fd_table_handoff(
 				&shard.reactor.fd_table,
@@ -182,22 +226,24 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 				spec.handoff_mode,
 			)
 		}
-		_teardown_isolate(shard, type_id, slot, .Crashed)
+		_teardown_isolate(shard, type_id, child_slot_index, .Crashed)
 		return Spawn_Error.init_failed
 	}
 
 	// §11: Spawns during shutdown
 	if child_shutdown_pending {
-		_slot_add_shutdown_pending(shard, type_id, slot)
+		_slot_add_shutdown_pending(shard, type_id, child_slot_index)
 	}
 
-	_interpret_transition(shard, type_id, slot, transition, &child_invocation)
-	_dispatchable_refresh_slot(shard, type_id, slot)
+	_interpret_transition(shard, type_id, child_slot_index, transition, &child_turn_frame)
+	_turn_cleanup_resources(shard, &child_turn_frame)
+	shard.current_isolate_turn_frame = child_turn_frame.previous_isolate_turn_frame
+	_dispatchable_refresh_slot(shard, type_id, child_slot_index)
 	return child_handle
 }
 
 @(private = "package")
-_teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kind: Exit_Kind) {
+_teardown_isolate :: proc(shard: ^Shard, type_id: Isolate_Type_Id, slot_index: Isolate_Slot_Index, exit_kind: Exit_Kind) {
 	soa_meta := shard.metadata[type_id]
 
 	// Step 1: Bump generation (seal the Isolate) - 28-bit mask
@@ -215,9 +261,6 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	is_io_completion_ready := .IO_Completion_Ready in soa_meta[slot_index].flags
 
 	if has_io_tag {
-		// Completed-but-undispatched slots are owned by the scheduler and can be
-		// reclaimed here. In-flight slots are reclaimed by the eventual stale
-		// completion, because the token still carries the slot index.
 		if is_io_completion_ready && soa_meta[slot_index].io_slot_index != IO_SLOT_INDEX_NONE {
 			_io_slot_return_to_pool(
 				&shard.reactor,
@@ -226,29 +269,11 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 			)
 			soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 		}
-		// Don't clear io_operation_kind yet if in-flight —
-		// needed for deferred reuse check below (§5.3)
 		if is_io_completion_ready {
 			soa_meta[slot_index].io_operation_kind = .None
 			soa_meta[slot_index].flags -= {.IO_Completion_Ready}
 		}
 	}
-	if soa_meta[slot_index].pending_transfer_read != TRANSFER_HANDLE_NONE {
-		transfer_index := transfer_handle_index(soa_meta[slot_index].pending_transfer_read)
-		_transfer_pool_free(shard, transfer_index)
-		soa_meta[slot_index].pending_transfer_read = TRANSFER_HANDLE_NONE
-	}
-
-	// Reclaim a claimed-but-uncommitted staging slot (ADR §5.5.3 — every exit
-	// path through the handler lifecycle must free the slot). If the slot has
-	// already been moved to the in-flight I/O via ctx_io_send_staged, the
-	// commit path cleared this field; io_slot_index carries the slot until
-	// the eventual completion reclaims it.
-	if soa_meta[slot_index].staging_slot_index != IO_SLOT_INDEX_NONE {
-		io_slot_pool_free(&shard.reactor.staging_pool, soa_meta[slot_index].staging_slot_index)
-		soa_meta[slot_index].staging_slot_index = IO_SLOT_INDEX_NONE
-	}
-
 	// Step 2c: FD Table Cleanup
 	handle_to_match := make_handle(shard.id, type_id, slot_index, old_generation)
 	in_flight_fd := soa_meta[slot_index].io_fd
@@ -264,19 +289,12 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 				if has_io_tag && !is_io_completion_ready && fd_h == in_flight_fd {
 					io_token := submission_token_pack(
 						u8(type_id),
-						slot_index,
+						u32(slot_index),
 						u8(old_generation),
 						soa_meta[slot_index].io_sequence,
 						soa_meta[slot_index].io_slot_index,
 						soa_meta[slot_index].io_operation_kind,
 					)
-					// On kqueue, backend_cancel synthesizes a .Synthesized
-					// completion into backend.completed. On Linux/Windows
-					// the kernel delivers an equivalent cancellation
-					// completion (e.g. -ECANCELED CQE). Either way, the
-					// next reactor_collect_completions reclaims the
-					// buffer via the .Synthesized / stale / slot-gone
-					// branches in io_reactor.odin.
 					backend_cancel(&shard.reactor.backend, io_token)
 
 					if io_operation_pool_affinity(soa_meta[slot_index].io_operation_kind) == .Receive {
@@ -295,19 +313,9 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
 
 	// Step 2d: Deferred slot reuse for zero-copy writes (§5.3)
-	// If the Isolate has in-flight write I/O, defer slot reuse until the
-	// stale completion arrives — the kernel may still be reading from struct memory.
 	if has_io_tag && !is_io_completion_ready {
 		existing_op_kind := soa_meta[slot_index].io_operation_kind
 
-		// Struct-source writes are the only in-flight category whose buffer is the
-		// Isolate slot itself — the kernel reads directly from struct memory until
-		// the stale completion arrives, so slot reuse must be deferred (ADR §5.3).
-		// Pool affinity .Staging selects writes (send/write/sendto); io_slot_index
-		// == NONE then distinguishes a struct source (no pool slot) from a
-		// staging-slot write (pool slot present, reactor-owned). Reads write INTO
-		// the receive pool; non-data ops (accept/connect/close/sendfile) move
-		// nothing — neither touches struct memory, so both are safe to reuse now.
 		is_struct_source_write :=
 			io_operation_pool_affinity(existing_op_kind) == .Staging &&
 			soa_meta[slot_index].io_slot_index == IO_SLOT_INDEX_NONE
@@ -317,22 +325,13 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 			soa_meta[slot_index].state = .Pending_IO_Reuse
 			_dispatchable_refresh_slot(shard, type_id, slot_index)
 
-			// Still drain mailbox and invoke supervision, but skip free list push
 			_drain_mailbox(shard, soa_meta, slot_index)
 
 			if group_id != SUPERVISION_GROUP_ID_NONE {
 				_on_child_exit(shard, group_id, old_handle, exit_kind)
 			}
-			return // Skip free list push — slot stays reserved until stale write completion
+			return
 		}
-		// No deferred reuse needed for these in-flight categories:
-		//   1. Reads (recv/read/recvfrom)       — kernel writes INTO the receive
-		//      pool, never the Isolate struct.
-		//   2. Staging-slot writes (claim API)  — kernel reads from reactor-owned
-		//      pool memory, freed via the token on stale completion.
-		//   3. Non-data ops (accept/connect/close/sendfile) — no data movement.
-		// In all three, the Isolate struct is never read by the kernel, so the
-		// slot is safe to reuse immediately.
 		soa_meta[slot_index].io_operation_kind = .None
 		soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 	}
@@ -344,10 +343,10 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 	_slot_track_io_awaiting_transition(shard, soa_meta[slot_index].state, .Unallocated)
 	soa_meta[slot_index].state = .Unallocated
 	soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
-	shard.isolate_free_heads[type_id] = slot_index
+	shard.isolate_free_heads[type_id] = u32(slot_index)
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 
-	// Step 5: Invoke supervision subsystem (can now safely execute inline restarts)
+	// Step 5: Invoke supervision subsystem
 	if group_id != SUPERVISION_GROUP_ID_NONE {
 		_on_child_exit(shard, group_id, old_handle, exit_kind)
 	}
@@ -355,7 +354,7 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: u16, slot_index: u32, exit_kin
 
 // Drain all messages from an Isolate's mailbox, freeing transfer buffers.
 @(private = "file")
-_drain_mailbox :: proc(shard: ^Shard, soa_meta: #soa[]Isolate_Metadata, slot_index: u32) {
+_drain_mailbox :: proc(shard: ^Shard, soa_meta: #soa[]Isolate_Metadata, slot_index: Isolate_Slot_Index) {
 	current := soa_meta[slot_index].inbox_head
 	for current != POOL_NONE_INDEX {
 		envelope := pool_get_ptr_unchecked(&shard.message_pool, current)
@@ -381,12 +380,12 @@ _drain_mailbox :: proc(shard: ^Shard, soa_meta: #soa[]Isolate_Metadata, slot_ind
 }
 
 @(private = "package")
-_get_isolate_ptr :: proc(shard: ^Shard, type_id: u16, slot: u32) -> rawptr {
+_get_isolate_ptr :: proc(shard: ^Shard, type_id: Isolate_Type_Id, slot_index: Isolate_Slot_Index) -> rawptr {
 	stride := shard.type_descriptors[type_id].stride
 	if stride == 0 {return nil}
 
 	assert(int(type_id) < len(shard.isolate_memory), "type_id out of bounds")
-	assert(int(slot) * stride < len(shard.isolate_memory[type_id]), "slot out of bounds")
+	assert(int(slot_index) * stride < len(shard.isolate_memory[type_id]), "slot_index out of bounds")
 
-	return rawptr(&shard.isolate_memory[type_id][int(slot) * stride])
+	return rawptr(&shard.isolate_memory[type_id][int(slot_index) * stride])
 }

@@ -32,7 +32,11 @@ recovery_reason_label :: #force_inline proc "contextless" (reason: i32) -> strin
 g_current_shard_pointer: ^Shard
 
 trigger_tier2_panic :: proc(shard: ^Shard) -> ! {
-	os_trap_restore(&shard.trap_environment_inner, 1)
+	trap_environment := shard.current_trap_environment
+	if trap_environment == nil {
+		trap_environment = &shard.trap_environment_inner
+	}
+	os_trap_restore(trap_environment, 1)
 }
 
 // --- Enums & Constants ---
@@ -84,14 +88,12 @@ Isolate_Metadata :: struct {
 	pending_correlation:   Correlation_Id,
 	io_fd:                 FD_Handle,
 	io_result:             i32,
-	pending_transfer_read: Transfer_Handle,
 	generation:            u32,
 	working_arena_offset:  u32,
 	inbox_count:           u16,
 	group_id:              Supervision_Group_Id,
 	io_operation_kind:     IO_Operation_Kind,
-	io_slot_index:       IO_Slot_Index,
-	staging_slot_index:  IO_Slot_Index,
+	io_slot_index:         IO_Slot_Index,
 	state:                 Isolate_State,
 	flags:                 Isolate_Flags, // Replaces shutdown_pending: u8
 	io_sequence:           u8,
@@ -192,17 +194,15 @@ Shard :: struct {
 	current_tick:           u64, // The current time quantized to the resolution
 	timer_resolution_ns:    u64, // E.g., 1_000_000 for 1ms ticks
 	heartbeat_tick:         u64,
-	next_context_epoch:     u64,
+	current_isolate_turn_frame: ^Isolate_Turn_Frame,
+	current_trap_environment:    ^OS_Trap_Environment,
 	next_correlation_id:    Correlation_Id,
 	handoff_retry_head:     u32,
 	handoff_retry_tail:     u32,
 	handoff_retry_count:    u32,
-	current_msg_slot:       u32,
-	current_slot_index:     u32,
 	dispatch_type_cursor:   u32,
 	id:                     Shard_Id,
 	shard_count:            u8,
-	current_type_id:        u16,
 	peer_alive_mask:        Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
 	control_signal:         Control_Signal, // Atomic, mutually exclusive signals from watchdog
 	_padding:               [4]u8,
@@ -212,6 +212,7 @@ Shard :: struct {
 	timer_wheel:            Timer_Wheel,
 	trap_environment_outer: OS_Trap_Environment,
 	trap_environment_inner: OS_Trap_Environment,
+	trap_environment_init:  OS_Trap_Environment,
 	reactor:                Reactor,
 
 	// Placed at the end to prevent possible cache-line shifting of hot fields.
@@ -228,7 +229,7 @@ Dispatch_Kind :: enum u8 {
 }
 
 @(private = "file")
-_wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot_count: u32) {
+_wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: Isolate_Type_Id, slot_count: u32) {
 	states := shard.metadata[type_id].state[:]
 	flags := shard.metadata[type_id].flags[:]
 	io_sequences := shard.metadata[type_id].io_sequence[:]
@@ -236,13 +237,13 @@ _wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot
 
 	for slot_index in 0 ..< slot_count {
 		if states[slot_index] == .Unallocated do continue
-		_slot_add_shutdown_pending(shard, type_id, slot_index)
+		_slot_add_shutdown_pending(shard, type_id, Isolate_Slot_Index(slot_index))
 	}
 
 	for slot_index in 0 ..< slot_count {
 		state := states[slot_index]
 		if state == .Wait_Message {
-			_slot_set_state(shard, type_id, slot_index, .Runnable)
+			_slot_set_state(shard, type_id, Isolate_Slot_Index(slot_index), .Runnable)
 			continue
 		}
 		if state == .Wait_Io {
@@ -252,13 +253,13 @@ _wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: u16, slot
 			// reactor_collect_completions, and have its buffer freed
 			// by the stale-path reclamation. See §6.6.3 §12 design note.
 			io_sequences[slot_index] += 1
-			_slot_set_state(shard, type_id, slot_index, .Runnable)
+			_slot_set_state(shard, type_id, Isolate_Slot_Index(slot_index), .Runnable)
 			continue
 		}
 		if state == .Wait_Reply {
 			// Discard stale replies.
 			pending_correlations[slot_index] = 0
-			_slot_set_state(shard, type_id, slot_index, .Runnable)
+			_slot_set_state(shard, type_id, Isolate_Slot_Index(slot_index), .Runnable)
 		}
 	}
 }
@@ -273,7 +274,7 @@ _handle_shard_control_signal :: proc(shard: ^Shard) {
 		store_watchdog_state(shard, .Shutting_Down)
 
 		for type_descriptor in shard.type_descriptors {
-			_wake_type_for_shutdown(shard, u16(type_descriptor.id), u32(type_descriptor.slot_count))
+			_wake_type_for_shutdown(shard, type_descriptor.id, u32(type_descriptor.slot_count))
 		}
 
 		_fd_handoff_close_all_entries(shard, true)
@@ -331,7 +332,7 @@ _bitset_clear :: #force_inline proc "contextless" (words: []u64, bit_index: u32)
 }
 
 @(private = "file")
-_dispatchable_type_refresh :: #force_inline proc "contextless" (shard: ^Shard, type_id: u16) {
+_dispatchable_type_refresh :: #force_inline proc "contextless" (shard: ^Shard, type_id: Isolate_Type_Id) {
 	if int(type_id) >= len(shard.dispatchable_slot_counts) {
 		return
 	}
@@ -354,8 +355,8 @@ _dispatchable_type_refresh :: #force_inline proc "contextless" (shard: ^Shard, t
 @(private = "file")
 _dispatchable_slot_set_present :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 ) {
 	if int(type_id) >= len(shard.dispatchable_slot_words) {
 		return
@@ -364,8 +365,9 @@ _dispatchable_slot_set_present :: #force_inline proc "contextless" (
 	if len(words) == 0 {
 		return
 	}
-	word_index := bitmap_word_index_from_bit_index(slot_index)
-	bit_mask := bitmap_mask_from_bit_index(slot_index)
+	slot := u32(slot_index)
+	word_index := bitmap_word_index_from_bit_index(slot)
+	bit_mask := bitmap_mask_from_bit_index(slot)
 	if words[word_index] & bit_mask != 0 {
 		return
 	}
@@ -377,8 +379,8 @@ _dispatchable_slot_set_present :: #force_inline proc "contextless" (
 @(private = "file")
 _dispatchable_slot_set_absent :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 ) {
 	if int(type_id) >= len(shard.dispatchable_slot_words) {
 		return
@@ -387,8 +389,8 @@ _dispatchable_slot_set_absent :: #force_inline proc "contextless" (
 	if len(words) == 0 {
 		return
 	}
-	word_index := bitmap_word_index_from_bit_index(slot_index)
-	bit_mask := bitmap_mask_from_bit_index(slot_index)
+	word_index := bitmap_word_index_from_bit_index(u32(slot_index))
+	bit_mask := bitmap_mask_from_bit_index(u32(slot_index))
 	if words[word_index] & bit_mask == 0 {
 		return
 	}
@@ -400,8 +402,8 @@ _dispatchable_slot_set_absent :: #force_inline proc "contextless" (
 @(private = "package")
 _dispatchable_refresh_slot :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 ) {
 	if int(type_id) >= len(shard.metadata) {
 		return
@@ -494,14 +496,15 @@ _bitset_find_next_set_bit :: proc "contextless" (
 @(private = "file")
 _dispatchable_find_next_slot :: proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	start_slot_index: u32,
+	type_id: Isolate_Type_Id,
+	start_slot_index: Isolate_Slot_Index,
 	slot_count: u32,
 ) -> (
-	u32,
+	Isolate_Slot_Index,
 	bool,
 ) {
-	return _bitset_find_next_set_bit(shard.dispatchable_slot_words[type_id], start_slot_index, slot_count)
+	result, found := _bitset_find_next_set_bit(shard.dispatchable_slot_words[type_id], u32(start_slot_index), slot_count)
+	return Isolate_Slot_Index(result), found
 }
 
 @(private = "package")
@@ -528,8 +531,8 @@ _slot_track_io_awaiting_transition :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_set_state :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 	state: Isolate_State,
 ) {
 	old_state := shard.metadata[type_id][slot_index].state
@@ -541,8 +544,8 @@ _slot_set_state :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_set_waiting_for_reply :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 	correlation_id: Correlation_Id,
 ) {
 	meta := &shard.metadata[type_id][slot_index]
@@ -555,8 +558,8 @@ _slot_set_waiting_for_reply :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_set_io_operation_kind :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 	operation_kind: IO_Operation_Kind,
 ) {
 	shard.metadata[type_id][slot_index].io_operation_kind = operation_kind
@@ -566,8 +569,8 @@ _slot_set_io_operation_kind :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_add_shutdown_pending :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 ) {
 	shard.metadata[type_id][slot_index].flags += {.Shutdown_Pending}
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
@@ -576,8 +579,8 @@ _slot_add_shutdown_pending :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_clear_shutdown_pending :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 ) {
 	shard.metadata[type_id][slot_index].flags -= {.Shutdown_Pending}
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
@@ -586,8 +589,8 @@ _slot_clear_shutdown_pending :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_increment_inbox_count :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 ) {
 	shard.metadata[type_id][slot_index].inbox_count += 1
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
@@ -596,8 +599,8 @@ _slot_increment_inbox_count :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_decrement_inbox_count :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 ) {
 	shard.metadata[type_id][slot_index].inbox_count -= 1
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
@@ -606,8 +609,8 @@ _slot_decrement_inbox_count :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_set_io_completion_ready :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 	operation_kind: IO_Operation_Kind,
 	completion_result: i32,
 	buffer_index: IO_Slot_Index,
@@ -627,8 +630,8 @@ _slot_set_io_completion_ready :: #force_inline proc "contextless" (
 @(private = "package")
 _slot_set_io_submit_failure :: #force_inline proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot_index: u32,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 	operation_kind: IO_Operation_Kind,
 	completion_result: i32,
 ) {
@@ -687,23 +690,23 @@ _dispatch_type_batch :: proc(
 	if work_budget_count == 0 {
 		return 0
 	}
-
-		type_id := u16(type_descriptor.id)
+	type_id := type_descriptor.id
 	slot_count := u32(type_descriptor.slot_count)
 
 	// Hoisted
-	invocation := Isolate_Invocation {
-		previous               = g_current_isolate_invocation,
-		shard                  = shard,
-		context_epoch          = 0, // Assigned per invocation
-		self_handle            = ISOLATE_HANDLE_NONE, // Assigned per invocation
-		current_message_source = ISOLATE_HANDLE_NONE, // Assigned per invocation
-		current_correlation    = CORRELATION_ID_NONE, // Assigned per invocation
-		flags                  = {}, // Assigned per invocation
+	turn_frame := Isolate_Turn_Frame {
+		previous_isolate_turn_frame = shard.current_isolate_turn_frame,
+		isolate_handle             = ISOLATE_HANDLE_NONE, // Assigned per turn
+		message_source_handle      = ISOLATE_HANDLE_NONE, // Assigned per turn
+		message_correlation_id     = CORRELATION_ID_NONE, // Assigned per turn
+		transfer_read_handle       = TRANSFER_HANDLE_NONE,
+		turn_flags             = {}, // Assigned per turn
 		timer_resolution_ns    = shard.timer_resolution_ns,
 		current_tick           = shard.current_tick,
-		type_id                = u16(type_id),
-		slot_index             = 0, // Assigned per invocation
+		isolate_type_id         = type_id,
+		isolate_slot_index      = 0, // Assigned per turn
+		message_pool_index     = POOL_NONE_INDEX,
+		staging_slot_index     = IO_SLOT_INDEX_NONE,
 	}
 
 	// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop.
@@ -717,12 +720,9 @@ _dispatch_type_batch :: proc(
 	io_slot_indices := shard.metadata[type_id].io_slot_index[:]
 	io_peer_addresses := shard.metadata[type_id].io_peer_address[:]
 	working_arena_offsets := shard.metadata[type_id].working_arena_offset[:]
-	pending_transfer_reads := shard.metadata[type_id].pending_transfer_read[:]
 
 	dispatch_budget := u32(work_budget_count)
 	dispatched_count: u32 = 0
-
-	shard.current_type_id = u16(type_id)
 
 	if os_trap_save(&shard.trap_environment_inner) != 0 {
 		when !TINA_SIMULATION_MODE {
@@ -732,16 +732,30 @@ _dispatch_type_batch :: proc(
 			os_signals_restore_thread_mask()
 		}
 
-		if shard.current_msg_slot != POOL_NONE_INDEX {
-			pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
-			shard.current_msg_slot = POOL_NONE_INDEX
+		frame := shard.current_isolate_turn_frame
+		if frame == nil {
+			shard.current_trap_environment = nil
+			os_trap_restore(&shard.trap_environment_outer, RECOVERY_ROOT_ESCALATE)
 		}
-		_teardown_isolate(shard, shard.current_type_id, shard.current_slot_index, .Crashed)
+		if frame.phase == .Scheduler_Commit {
+			context.allocator = frame.previous_allocator
+			context.temp_allocator = frame.previous_temp_allocator
+			shard.current_isolate_turn_frame = nil
+			shard.current_trap_environment = nil
+			os_trap_restore(&shard.trap_environment_outer, RECOVERY_ROOT_ESCALATE)
+		}
+
+		context.allocator = frame.previous_allocator
+		context.temp_allocator = frame.previous_temp_allocator
+		shard.current_trap_environment = nil
+		_turn_cleanup_resources(shard, frame)
+		_teardown_isolate(shard, frame.isolate_type_id, frame.isolate_slot_index, .Crashed)
 
 		// Advance the cursor past the crashed isolate.
-		next_cursor := shard.current_slot_index + 1
+		next_cursor := u32(frame.isolate_slot_index) + 1
 		if next_cursor >= slot_count do next_cursor = 0
 		shard.dispatch_cursors[type_id] = next_cursor
+		shard.current_isolate_turn_frame = frame.previous_isolate_turn_frame
 	}
 
 	cursor := shard.dispatch_cursors[type_id]
@@ -751,13 +765,13 @@ _dispatch_type_batch :: proc(
 	}
 
 	slot_loop: for dispatched_count < dispatch_budget {
-		slot_index, found := _dispatchable_find_next_slot(shard, type_id, cursor, slot_count)
+		slot_index, found := _dispatchable_find_next_slot(shard, type_id, Isolate_Slot_Index(cursor), slot_count)
 		if !found {
 			shard.dispatch_cursors[type_id] = 0
 			break slot_loop
 		}
 
-		next_cursor := slot_index + 1
+		next_cursor := u32(slot_index) + 1
 		if next_cursor >= slot_count do next_cursor = 0
 		shard.dispatch_cursors[type_id] = next_cursor
 
@@ -774,8 +788,7 @@ _dispatch_type_batch :: proc(
 		}
 		dispatched_count += 1
 
-		shard.current_slot_index = slot_index
-		shard.current_msg_slot = POOL_NONE_INDEX
+		turn_frame.message_pool_index = POOL_NONE_INDEX
 
 		message: Message
 		message_pointer: ^Message = nil
@@ -809,9 +822,9 @@ _dispatch_type_batch :: proc(
 			message_pointer = &message
 			_slot_clear_shutdown_pending(shard, type_id, slot_index)
 		case .Inbox:
-			dequeue_result := _dequeue(shard, u16(type_id), slot_index)
-			shard.current_msg_slot = dequeue_result.pool_index
-			if shard.current_msg_slot != POOL_NONE_INDEX {
+			dequeue_result := _dequeue(shard, type_id, slot_index)
+			turn_frame.message_pool_index = dequeue_result.pool_index
+			if turn_frame.message_pool_index != POOL_NONE_INDEX {
 				message = dequeue_result.message
 				message.correlation = dequeue_result.correlation
 				correlation = dequeue_result.correlation
@@ -821,68 +834,53 @@ _dispatch_type_batch :: proc(
 		case .Runnable:
 		}
 
-		ctx_flags: Context_Flags
-		if .Is_Call in envelope_flags do ctx_flags += {.Is_Call}
+		turn_flags: Isolate_Turn_Flags
+		if .Is_Call in envelope_flags do turn_flags += {.Is_Call}
 
-		invocation.context_epoch = make_tina_context_epoch(shard)
-		invocation.self_handle = make_handle(
+		turn_frame.isolate_handle = make_handle(
 			shard.id,
-			u16(type_id),
+			type_id,
 			slot_index,
 			generations[slot_index],
 		)
-		invocation.current_message_source = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : ISOLATE_HANDLE_NONE
-		invocation.current_correlation = correlation
-		invocation.flags = ctx_flags
-		invocation.slot_index = slot_index
-		invocation.staged_call = {}
-		invocation.staged_io_operation = {}
-		invocation.staging = .None
-		invocation.reply_sent = false
-		invocation.staged_io_data_source = .None
-		invocation.staged_io_payload_offset = 0
-		invocation.staged_io_payload_size = 0
-		// Re-dispatch boundary invariant: by the time the handler runs, the
-		// metadata field must be NONE. A non-NONE value here means a previous
-		// exit (auto-free, _commit_staged_io, or teardown) forgot to clear —
-		// a likely slot leak.
-		if shard.metadata[type_id][slot_index].staging_slot_index != IO_SLOT_INDEX_NONE {
-			shard.counters.staging_slot_leaks += 1
-			when TINA_RUNTIME_ASSERTIONS {
-				assert(
-					false,
-					"staging_slot_index must be cleared on re-dispatch (prior exit leaked)",
-				)
-			}
-		}
-		ctx := invocation.context_epoch
+		turn_frame.message_source_handle = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : ISOLATE_HANDLE_NONE
+		turn_frame.message_correlation_id = correlation
+		turn_frame.turn_flags = turn_flags
+		turn_frame.isolate_slot_index = slot_index
+		turn_frame.staged_effect.call = {}
+		turn_frame.staged_effect.io.operation = {}
+		turn_frame.staged_effect.kind = .None
+		turn_frame.reply_sent = false
+		turn_frame.transfer_read_handle = TRANSFER_HANDLE_NONE
+		turn_frame.staging_slot_index = IO_SLOT_INDEX_NONE
+		turn_frame.phase = .User_Code
+		turn_frame.staged_effect.io.data_source = .None
+		turn_frame.staged_effect.io.payload_offset = 0
+		turn_frame.staged_effect.io.payload_size = 0
 
-		mem.arena_init(&invocation.scratch_arena, shard.scratch_memory)
+		mem.arena_init(&turn_frame.scratch_arena, shard.scratch_memory)
 
 		working_stride := type_descriptor.working_memory_size
 		if working_stride > 0 {
 			start_index := int(slot_index) * working_stride
 			working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
-			invocation.working_arena = mem.Arena {
+			turn_frame.working_arena = mem.Arena {
 				data   = working_slice,
 				offset = int(working_arena_offsets[slot_index]),
 			}
 		} else {
-			invocation.working_arena = {}
+			turn_frame.working_arena = {}
 		}
 
-		isolate_pointer := _get_isolate_ptr(shard, u16(type_id), slot_index)
+		isolate_pointer := _get_isolate_ptr(shard, type_id, slot_index)
 
 		when TINA_SIMULATION_MODE {
 			if ratio_chance(
 				shard.sim_state.fault_config.isolate_crash_rate,
 				shard.sim_state.crash_prng,
 			) {
-				if shard.current_msg_slot != POOL_NONE_INDEX {
-					pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
-					shard.current_msg_slot = POOL_NONE_INDEX
-				}
-				_teardown_isolate(shard, u16(type_id), slot_index, .Crashed)
+				_turn_cleanup_resources(shard, &turn_frame)
+				_teardown_isolate(shard, type_id, slot_index, .Crashed)
 				cursor = shard.dispatch_cursors[type_id]
 				continue slot_loop
 			}
@@ -890,18 +888,22 @@ _dispatch_type_batch :: proc(
 
 		previous_allocator := context.allocator
 		previous_temp_allocator := context.temp_allocator
-		g_current_isolate_invocation = &invocation
-		context.allocator = mem.arena_allocator(&invocation.working_arena)
-		context.temp_allocator = mem.arena_allocator(&invocation.scratch_arena)
+		turn_frame.previous_allocator = previous_allocator
+		turn_frame.previous_temp_allocator = previous_temp_allocator
+		shard.current_isolate_turn_frame = &turn_frame
+		shard.current_trap_environment = &shard.trap_environment_inner
+		context.allocator = mem.arena_allocator(&turn_frame.working_arena)
+		context.temp_allocator = mem.arena_allocator(&turn_frame.scratch_arena)
 
-		transition := type_descriptor.handler_fn(isolate_pointer, message_pointer, ctx)
+		transition := type_descriptor.handler_fn(isolate_pointer, message_pointer)
 
-		context.allocator = previous_allocator
-		context.temp_allocator = previous_temp_allocator
-		g_current_isolate_invocation = invocation.previous
+		turn_frame.phase = .Scheduler_Commit
+		context.allocator = turn_frame.previous_allocator
+		context.temp_allocator = turn_frame.previous_temp_allocator
+		shard.current_trap_environment = nil
 
 		if working_stride > 0 {
-			working_arena_offsets[slot_index] = u32(invocation.working_arena.offset)
+			working_arena_offsets[slot_index] = u32(turn_frame.working_arena.offset)
 		}
 
 		if is_io_completion {
@@ -914,18 +916,9 @@ _dispatch_type_batch :: proc(
 			}
 		}
 
-		if pending_transfer_reads[slot_index] != TRANSFER_HANDLE_NONE {
-			t_handle := pending_transfer_reads[slot_index]
-			_transfer_pool_free(shard, transfer_handle_index(t_handle))
-			pending_transfer_reads[slot_index] = TRANSFER_HANDLE_NONE
-		}
-
-		if shard.current_msg_slot != POOL_NONE_INDEX {
-			pool_free_unchecked(&shard.message_pool, shard.current_msg_slot)
-			shard.current_msg_slot = POOL_NONE_INDEX
-		}
-
-		_interpret_transition(shard, u16(type_id), slot_index, transition, &invocation)
+		_interpret_transition(shard, type_id, slot_index, transition, &turn_frame)
+		_turn_cleanup_resources(shard, &turn_frame)
+		shard.current_isolate_turn_frame = turn_frame.previous_isolate_turn_frame
 		cursor = shard.dispatch_cursors[type_id]
 	}
 
@@ -961,7 +954,7 @@ _scheduler_replenish_dispatch_credits :: proc(shard: ^Shard) {
 		credit_count += weight_count * credit_per_weight_count
 		if credit_count > credit_count_max do credit_count = credit_count_max
 		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(credit_count)
-		_dispatchable_type_refresh(shard, u16(type_index))
+		_dispatchable_type_refresh(shard, Isolate_Type_Id(type_index))
 	}
 }
 
@@ -995,7 +988,7 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 
 		credit_count := u32(shard.dispatch_credit_counts[type_index])
 		if credit_count == 0 {
-			_dispatchable_type_refresh(shard, u16(type_index))
+			_dispatchable_type_refresh(shard, Isolate_Type_Id(type_index))
 			continue
 		}
 
@@ -1012,13 +1005,13 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 		))
 
 		if dispatched_count == 0 {
-			_dispatchable_type_refresh(shard, u16(type_index))
+			_dispatchable_type_refresh(shard, Isolate_Type_Id(type_index))
 			continue
 		}
 
 		scanned_type_count = 0
 		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(credit_count - dispatched_count)
-		_dispatchable_type_refresh(shard, u16(type_index))
+		_dispatchable_type_refresh(shard, Isolate_Type_Id(type_index))
 		turn_work_budget_count -= dispatched_count
 		dispatch_since_io_service_count += dispatched_count
 
@@ -1032,6 +1025,9 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 }
 
 scheduler_tick :: proc(shard: ^Shard) {
+	when TINA_SIMULATION_MODE {
+		g_current_shard_pointer = shard
+	}
 	_handle_shard_control_signal(shard)
 
 	when !TINA_SIMULATION_MODE {
@@ -1097,17 +1093,37 @@ ISOLATE_FAULT_REASONS_INTERPRETED := [Isolate_Fault_Reason]string {
 	.Contract_Violation       = "Voluntary isolate fault reason: Contract_Violation",
 }
 
+@(private = "package")
+_turn_cleanup_resources :: proc(shard: ^Shard, frame: ^Isolate_Turn_Frame) {
+	if frame == nil do return
+
+	if frame.message_pool_index != POOL_NONE_INDEX {
+		pool_free_unchecked(&shard.message_pool, frame.message_pool_index)
+		frame.message_pool_index = POOL_NONE_INDEX
+	}
+
+	if frame.transfer_read_handle != TRANSFER_HANDLE_NONE {
+		_transfer_pool_free(shard, transfer_handle_index(frame.transfer_read_handle))
+		frame.transfer_read_handle = TRANSFER_HANDLE_NONE
+	}
+
+	if frame.staging_slot_index != IO_SLOT_INDEX_NONE {
+		io_slot_pool_free(&shard.reactor.staging_pool, frame.staging_slot_index)
+		frame.staging_slot_index = IO_SLOT_INDEX_NONE
+	}
+}
+
 @(private = "file")
 _transition_contract_violation :: proc(
 	shard: ^Shard,
-	type_id: u16,
-	slot: u32,
-	invocation: ^Isolate_Invocation,
+	type_id: Isolate_Type_Id,
+	slot: Isolate_Slot_Index,
+	turn_frame: ^Isolate_Turn_Frame,
 	message: string,
 ) {
 	_shard_log(
 		shard,
-		invocation.self_handle,
+		turn_frame.isolate_handle,
 		.ERROR,
 		LOG_TAG_ISOLATE_CRASHED,
 		transmute([]u8)message,
@@ -1118,35 +1134,35 @@ _transition_contract_violation :: proc(
 @(private = "file")
 _commit_staged_call :: proc(
 	shard: ^Shard,
-	type_id: u16,
-	slot: u32,
-	invocation: ^Isolate_Invocation,
+	type_id: Isolate_Type_Id,
+	slot: Isolate_Slot_Index,
+	turn_frame: ^Isolate_Turn_Frame,
 ) {
-	staged_call := invocation.staged_call
+	staged_call := turn_frame.staged_effect.call
 	correlation_id := staged_call.envelope.correlation
-	invocation.staging = .None
+	turn_frame.staged_effect.kind = .None
 
 	_slot_set_waiting_for_reply(shard, type_id, slot, correlation_id)
 	_register_system_timer(
 		shard,
-		invocation.self_handle,
+		turn_frame.isolate_handle,
 		_duration_ns_to_ticks(staged_call.timeout_ns, shard.timer_resolution_ns),
 		TAG_CALL_TIMEOUT,
 		correlation_id,
 	)
 
 	envelope := staged_call.envelope
-	envelope.source = invocation.self_handle
+	envelope.source = turn_frame.isolate_handle
 	envelope.flags += {.Is_Call}
 	route_result := _route_envelope_user(shard, envelope.destination, &envelope)
 	if route_result != .ok {
 		timeout_env: Message_Envelope
 		timeout_env.source = ISOLATE_HANDLE_NONE
-		timeout_env.destination = invocation.self_handle
+		timeout_env.destination = turn_frame.isolate_handle
 		timeout_env.tag = TAG_CALL_TIMEOUT
 		timeout_env.correlation = correlation_id
-		if _enqueue_system_msg(shard, invocation.self_handle, &timeout_env) != .ok {
-			shard.metadata[type_id][slot].pending_correlation = 0
+		if _enqueue_system_msg(shard, turn_frame.isolate_handle, &timeout_env) != .ok {
+			shard.metadata[type_id][u32(slot)].pending_correlation = 0
 			_slot_set_state(shard, type_id, slot, .Runnable)
 		}
 	}
@@ -1155,22 +1171,22 @@ _commit_staged_call :: proc(
 @(private = "file")
 _commit_staged_io :: proc(
 	shard: ^Shard,
-	type_id: u16,
-	slot: u32,
-	invocation: ^Isolate_Invocation,
+	type_id: Isolate_Type_Id,
+	slot: Isolate_Slot_Index,
+	turn_frame: ^Isolate_Turn_Frame,
 ) {
-	operation := invocation.staged_io_operation
-	invocation.staging = .None
+	operation := turn_frame.staged_effect.io.operation
+	turn_frame.staged_effect.kind = .None
 
 	error := reactor_submit_io(
 		&shard.reactor,
 		shard,
-		invocation.self_handle,
+		turn_frame.isolate_handle,
 		operation,
-		invocation.staged_io_data_source,
-		invocation.staged_io_payload_offset,
-		invocation.staged_io_payload_size,
-		shard.metadata[type_id][slot].staging_slot_index,
+		turn_frame.staged_effect.io.data_source,
+		turn_frame.staged_effect.io.payload_offset,
+		turn_frame.staged_effect.io.payload_size,
+		turn_frame.staging_slot_index,
 	)
 	if error != IO_ERR_NONE {
 		_slot_set_io_submit_failure(
@@ -1181,72 +1197,72 @@ _commit_staged_io :: proc(
 			i32(error),
 		)
 		// If staging slot was claimed but IO failed, free it
-		staging_slot := shard.metadata[type_id][slot].staging_slot_index
+		staging_slot := turn_frame.staging_slot_index
 		if staging_slot != IO_SLOT_INDEX_NONE {
 			io_slot_pool_free(&shard.reactor.staging_pool, staging_slot)
-			shard.metadata[type_id][slot].staging_slot_index = IO_SLOT_INDEX_NONE
+			turn_frame.staging_slot_index = IO_SLOT_INDEX_NONE
 		}
 	} else {
 		// Staging claim is now owned by the in-flight I/O (kernel reads from it).
 		// metadata.io_slot_index carries it until the completion reclaims via
-		// _io_slot_return_to_pool. Clear the metadata mirror so the
+		// _io_slot_return_to_pool. Clear the turn claim so the
 		// post-commit auto-free does not return the slot while the kernel holds it.
-		shard.metadata[type_id][slot].staging_slot_index = IO_SLOT_INDEX_NONE
+		turn_frame.staging_slot_index = IO_SLOT_INDEX_NONE
 		_slot_set_state(shard, type_id, slot, .Wait_Io)
 	}
 }
 
 _interpret_transition :: proc(
 	shard: ^Shard,
-	type_id: u16,
-	slot: u32,
+	type_id: Isolate_Type_Id,
+	slot: Isolate_Slot_Index,
 	transition: Isolate_Transition,
-	invocation: ^Isolate_Invocation,
+	turn_frame: ^Isolate_Turn_Frame,
 ) {
 	switch transition.kind {
 	case .Done:
-		if invocation.staging != .None {
+		if turn_frame.staged_effect.kind != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
 				slot,
-				invocation,
+				turn_frame,
 				"Handler returned .Done with staged control-plane work",
 			)
 			return
 		}
 		_teardown_isolate(shard, type_id, slot, .Normal)
 	case .Yield:
-		if invocation.staging != .None {
+		if turn_frame.staged_effect.kind != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
 				slot,
-				invocation,
+				turn_frame,
 				"Handler returned .Yield with staged control-plane work",
 			)
 			return
 		}
 		_slot_set_state(shard, type_id, slot, .Runnable)
 	case .Wait_Message:
-		if invocation.staging != .None {
+		if turn_frame.staged_effect.kind != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
 				slot,
-				invocation,
+				turn_frame,
 				"Handler returned .Wait_Message with staged control-plane work",
 			)
 			return
 		}
 		_slot_set_state(shard, type_id, slot, .Wait_Message)
 	case .Crash:
-		if invocation.staging != .None {
+		if turn_frame.staged_effect.kind != .None {
 			_transition_contract_violation(
 				shard,
 				type_id,
 				slot,
-				invocation,
+				turn_frame,
 				"Handler returned .Crash with staged control-plane work",
 			)
 			return
@@ -1254,62 +1270,36 @@ _interpret_transition :: proc(
 		reason_str := ISOLATE_FAULT_REASONS_INTERPRETED[transition.fault_reason]
 		_shard_log(
 			shard,
-			invocation.self_handle,
+			turn_frame.isolate_handle,
 			.ERROR,
 			LOG_TAG_ISOLATE_CRASHED,
 			transmute([]u8)reason_str,
 		)
 		_teardown_isolate(shard, type_id, slot, .Crashed)
 	case .Wait_Reply:
-		if invocation.staging != .Call {
+		if turn_frame.staged_effect.kind != .Call {
 			_transition_contract_violation(
 				shard,
 				type_id,
 				slot,
-				invocation,
+				turn_frame,
 				"Handler returned .Wait_Reply without exactly one staged call",
 			)
 			return
 		}
-		_commit_staged_call(shard, type_id, slot, invocation)
+		_commit_staged_call(shard, type_id, slot, turn_frame)
 	case .Wait_Io:
-		if invocation.staging != .Io {
+		if turn_frame.staged_effect.kind != .IO {
 			_transition_contract_violation(
 				shard,
 				type_id,
 				slot,
-				invocation,
+				turn_frame,
 				"Handler returned .Wait_Io without exactly one staged io submission",
 			)
 			return
 		}
-		_commit_staged_io(shard, type_id, slot, invocation)
-	}
-
-	// Auto-free any staging slot that was claimed but never consumed by a
-	// committed I/O. Safe to run unconditionally on every exit path because
-	// _commit_staged_io clears staging_slot_index on both the success path
-	// (ownership transferred to the in-flight I/O via the kernel) and the
-	// submit-failure path (explicit free + clear in the failure arm).
-	// If we reach this block with staging_slot_index != IO_SLOT_INDEX_NONE,
-	// the handler claimed a slot but did not return .Wait_Io, so the claim
-	// was never submitted and must be returned to the staging pool.
-	staging_slot := shard.metadata[type_id][slot].staging_slot_index
-	if staging_slot != IO_SLOT_INDEX_NONE {
-		io_slot_pool_free(&shard.reactor.staging_pool, staging_slot)
-		shard.metadata[type_id][slot].staging_slot_index = IO_SLOT_INDEX_NONE
-	}
-
-	// Post-exit invariant: every path through _interpret_transition must
-	// leave the staging claim cleared. The block above is the only auto-free
-	// site; _commit_staged_io handles the .Wait_Io path internally. If a
-	// new transition kind is added without updating this invariant, the
-	// next re-dispatch will trip the entry assert.
-	when TINA_RUNTIME_ASSERTIONS {
-		assert(
-			shard.metadata[type_id][slot].staging_slot_index == IO_SLOT_INDEX_NONE,
-			"staging_slot_index must be cleared on every exit from _interpret_transition",
-		)
+		_commit_staged_io(shard, type_id, slot, turn_frame)
 	}
 }
 
@@ -1464,8 +1454,8 @@ Dequeue_Result :: struct {
 @(private = "package")
 _dequeue :: proc "contextless" (
 	shard: ^Shard,
-	type_id: u16,
-	slot: u32,
+	type_id: Isolate_Type_Id,
+	slot: Isolate_Slot_Index,
 ) -> Dequeue_Result {
 	result := Dequeue_Result {
 		pool_index = POOL_NONE_INDEX,
@@ -1642,8 +1632,8 @@ _fd_handoff_send_abort :: proc "contextless" (
 
 @(private = "file")
 Target_Slot :: struct {
-	type_id:    u16,
-	slot_index: u32,
+	type_id:    Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 }
 
 @(private = "file")
@@ -1998,7 +1988,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	}
 	fd_handoff_table_init(&shard.handoff_table, shard.handoff_table.entries)
 	for type_desc in shard.type_descriptors {
-		type_id := u16(type_desc.id)
+		type_id := type_desc.id
 		soa_meta := shard.metadata[type_id]
 
 		// Reset the free head for this type
@@ -2028,10 +2018,8 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			soa_meta[slot].inbox_count = 0
 			soa_meta[slot].inbox_tail = POOL_NONE_INDEX
 			soa_meta[slot].pending_correlation = 0
-			soa_meta[slot].pending_transfer_read = TRANSFER_HANDLE_NONE
 			soa_meta[slot].io_operation_kind = .None
 			soa_meta[slot].working_arena_offset = 0
-			soa_meta[slot].staging_slot_index = IO_SLOT_INDEX_NONE
 			soa_meta[slot].flags = {}
 
 			// Re-link the intrusive free list!
@@ -2055,9 +2043,8 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	}
 	shard.counters.io_awaiting_count = 0
 	shard.dispatch_type_cursor = 0
-	shard.current_type_id = 0
-	shard.current_slot_index = 0
-	shard.current_msg_slot = POOL_NONE_INDEX
+	shard.current_isolate_turn_frame = nil
+	shard.current_trap_environment = nil
 
 	timer_wheel_reset(&shard.timer_wheel)
 
@@ -2077,7 +2064,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 @(private)
 shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
 	for type_desc in shard.type_descriptors {
-		states := shard.metadata[u16(type_desc.id)].state[:]
+		states := shard.metadata[type_desc.id].state[:]
 		for i in 0 ..< type_desc.slot_count {
 			if states[i] != .Unallocated {
 				return true
@@ -2347,13 +2334,13 @@ test_dispatchable_find_next_slot_wraps_within_single_word :: proc(t: ^testing.T)
 	defer delete(shard.dispatchable_slot_words[0])
 	shard.dispatchable_slot_words[0][0] = (u64(1) << 5) | (u64(1) << 63)
 
-	slot_index, found := _dispatchable_find_next_slot(shard, 0, 6, 64)
+	slot_index, found := _dispatchable_find_next_slot(shard, 0, Isolate_Slot_Index(6), 64)
 	testing.expect(t, found, "expected to find wrapped dispatchable slot")
-	testing.expect_value(t, slot_index, u32(63))
+	testing.expect_value(t, slot_index, Isolate_Slot_Index(63))
 
-	slot_index, found = _dispatchable_find_next_slot(shard, 0, 6, 63)
+	slot_index, found = _dispatchable_find_next_slot(shard, 0, Isolate_Slot_Index(6), 63)
 	testing.expect(t, found, "expected wrapped search to reach lower bits in same word")
-	testing.expect_value(t, slot_index, u32(5))
+	testing.expect_value(t, slot_index, Isolate_Slot_Index(5))
 }
 
 @(test)
@@ -2458,17 +2445,15 @@ test_shard_mass_teardown_resets_scheduler_state :: proc(t: ^testing.T) {
 
 	shard.dispatch_credit_counts[0] = 7
 	shard.dispatch_type_cursor = 1
-	shard.current_type_id = 1
-	shard.current_slot_index = 1
-	shard.current_msg_slot = 3
+	shard.current_isolate_turn_frame = cast(^Isolate_Turn_Frame)uintptr(1)
+	shard.current_trap_environment = &shard.trap_environment_inner
 
 	shard_mass_teardown(shard)
 
 	testing.expect_value(t, shard.dispatch_credit_counts[0], Scheduler_Credit_Count(0))
 	testing.expect_value(t, shard.dispatch_type_cursor, u32(0))
-	testing.expect_value(t, shard.current_type_id, u16(0))
-	testing.expect_value(t, shard.current_slot_index, u32(0))
-	testing.expect_value(t, shard.current_msg_slot, POOL_NONE_INDEX)
+	testing.expect_value(t, shard.current_isolate_turn_frame, nil)
+	testing.expect_value(t, shard.current_trap_environment, nil)
 }
 
 @(test)

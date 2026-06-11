@@ -268,45 +268,42 @@ timer_cancel_and_release :: proc(
 
 // Registers a one-shot timer that will enqueue a message with the specified tag
 // back to this Isolate. The duration is specified in nanoseconds.
-ctx_register_timer :: proc(ctx: TinaContext, duration_ns: u64, tag: Message_Tag) {
-	invocation := ctx_invocation_require_self_handle(ctx)
-	shard := invocation.shard
+ctx_register_timer :: proc(duration_ns: u64, tag: Message_Tag) {
+	shard, frame := _current_isolate_turn_frame_require_handle()
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
 		_shard_log(
 			shard,
-			invocation.self_handle,
+			frame.isolate_handle,
 			.ERROR,
 			USER_LOG_TAG_BASE,
 			transmute([]u8)string("Timer pool exhausted"),
 		)
 		return
 	}
-	timer_schedule(wheel, shard.current_tick + _duration_ns_to_ticks(duration_ns, shard.timer_resolution_ns), invocation.self_handle, tag, CORRELATION_ID_NONE)
+	timer_schedule(wheel, shard.current_tick + _duration_ns_to_ticks(duration_ns, shard.timer_resolution_ns), frame.isolate_handle, tag, CORRELATION_ID_NONE)
 }
 
 // Registers a one-shot timer with an explicit correlation token so the receiver
 // can reject stale lazy-cancelled expirations in O(1).
 ctx_register_timer_with_correlation :: proc(
-	ctx: TinaContext,
 	duration_ns: u64,
 	tag: Message_Tag,
 	correlation: Correlation_Id,
 ) {
-	invocation := ctx_invocation_require_self_handle(ctx)
-	shard := invocation.shard
+	shard, frame := _current_isolate_turn_frame_require_handle()
 	wheel := &shard.timer_wheel
 	if wheel.free_head == POOL_NONE_INDEX {
 		_shard_log(
 			shard,
-			invocation.self_handle,
+			frame.isolate_handle,
 			.ERROR,
 			USER_LOG_TAG_BASE,
 			transmute([]u8)string("Timer pool exhausted"),
 		)
 		return
 	}
-	timer_schedule(wheel, shard.current_tick + _duration_ns_to_ticks(duration_ns, shard.timer_resolution_ns), invocation.self_handle, tag, correlation)
+	timer_schedule(wheel, shard.current_tick + _duration_ns_to_ticks(duration_ns, shard.timer_resolution_ns), frame.isolate_handle, tag, correlation)
 }
 
 @(private = "package")
@@ -476,8 +473,8 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 		handle = make_handle(0, 1, 0, 1),
 	}
 
-	message_count, message := test_with_local_context(
-		Test_Local_Context_Config {
+	message_count, message := test_with_local_turn_frame(
+		Test_Local_Turn_Frame_Config {
 			self_handle         = test_state.handle,
 			target_handle       = test_state.handle,
 			current_tick        = 5,
@@ -485,12 +482,12 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: TinaContext) {
+		proc(user_data: rawptr) {
 			state := cast(^Arm_And_Expire_Test_State)user_data
-			invocation := ctx_invocation(ctx)
-			wheel := &invocation.shard.timer_wheel
+			shard, frame := _current_isolate_turn_frame()
+			wheel := &shard.timer_wheel
 
-			timer_handle := timer_acquire(wheel, invocation.self_handle)
+			timer_handle := timer_acquire(wheel, frame.isolate_handle)
 			testing.expect(
 				state.t,
 				timer_handle != TIMER_HANDLE_NONE,
@@ -499,22 +496,22 @@ test_renewable_deadline_arms_and_expires :: proc(t: ^testing.T) {
 			timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_tick + 5,
+				frame.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(7),
 				)
 
-				invocation.shard.current_tick = 9
-				_advance_timers(invocation.shard)
-				soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
+				shard.current_tick = 9
+				_advance_timers(shard)
+				soa_meta := shard.metadata[extract_type_id(state.handle)]
 				testing.expect_value(
 				state.t,
 				soa_meta[extract_slot(state.handle)].inbox_count,
 				u16(0),
 				)
 
-				invocation.shard.current_tick = 10
-			_advance_timers(invocation.shard)
+				shard.current_tick = 10
+			_advance_timers(shard)
 
 			timer_release(wheel, timer_handle)
 		},
@@ -537,8 +534,8 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 		handle = make_handle(0, 1, 0, 1),
 	}
 
-	message_count, message := test_with_local_context(
-		Test_Local_Context_Config {
+	message_count, message := test_with_local_turn_frame(
+		Test_Local_Turn_Frame_Config {
 			self_handle         = test_state.handle,
 			target_handle       = test_state.handle,
 			current_tick        = 20,
@@ -546,38 +543,38 @@ test_renewable_deadline_rearm_updates_deadline_and_payload :: proc(t: ^testing.T
 			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: TinaContext) {
+		proc(user_data: rawptr) {
 			state := cast(^Rearm_Test_State)user_data
-			invocation := ctx_invocation(ctx)
-			wheel := &invocation.shard.timer_wheel
+			shard, frame := _current_isolate_turn_frame()
+			wheel := &shard.timer_wheel
 
-			timer_handle := timer_acquire(wheel, invocation.self_handle)
+			timer_handle := timer_acquire(wheel, frame.isolate_handle)
 			timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_tick + 5,
+				frame.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(1),
 				)
 				timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_tick + 10,
+				frame.current_tick + 10,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 1),
 				Correlation_Id(9),
 				)
 
-				invocation.shard.current_tick = 25
-				_advance_timers(invocation.shard)
-				soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
+				shard.current_tick = 25
+				_advance_timers(shard)
+				soa_meta := shard.metadata[extract_type_id(state.handle)]
 				testing.expect_value(
 				state.t,
 				soa_meta[extract_slot(state.handle)].inbox_count,
 				u16(0),
 				)
 
-				invocation.shard.current_tick = 30
-			_advance_timers(invocation.shard)
+				shard.current_tick = 30
+			_advance_timers(shard)
 
 			timer_release(wheel, timer_handle)
 		},
@@ -603,8 +600,8 @@ test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^t
 		timer_handle_second = TIMER_HANDLE_NONE,
 	}
 
-	message_count, _ := test_with_local_context(
-		Test_Local_Context_Config {
+	message_count, _ := test_with_local_turn_frame(
+		Test_Local_Turn_Frame_Config {
 			self_handle         = test_state.handle,
 			target_handle       = test_state.handle,
 			current_tick        = 100,
@@ -612,40 +609,40 @@ test_renewable_deadline_release_frees_slot_and_prevents_expiration :: proc(t: ^t
 			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: TinaContext) {
+		proc(user_data: rawptr) {
 			state := cast(^Release_Test_State)user_data
-			invocation := ctx_invocation(ctx)
-			wheel := &invocation.shard.timer_wheel
+			shard, frame := _current_isolate_turn_frame()
+			wheel := &shard.timer_wheel
 
-			state.timer_handle_first = timer_acquire(wheel, invocation.self_handle)
+			state.timer_handle_first = timer_acquire(wheel, frame.isolate_handle)
 			timer_rearm(
 				wheel,
 				state.timer_handle_first,
-				invocation.current_tick + 5,
+				frame.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(3),
 				)
 				timer_release(wheel, state.timer_handle_first)
-				state.timer_handle_second = timer_acquire(wheel, invocation.self_handle)
+				state.timer_handle_second = timer_acquire(wheel, frame.isolate_handle)
 				timer_rearm(
 				wheel,
 				state.timer_handle_second,
-				invocation.current_tick + 7,
+				frame.current_tick + 7,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 2),
 				Correlation_Id(4),
 				)
 
-				invocation.shard.current_tick = 106
-				_advance_timers(invocation.shard)
-				soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
+				shard.current_tick = 106
+				_advance_timers(shard)
+				soa_meta := shard.metadata[extract_type_id(state.handle)]
 				testing.expect_value(
 				state.t,
 				soa_meta[extract_slot(state.handle)].inbox_count,
 				u16(0),
 				)
 
-				invocation.shard.current_tick = 107
-			_advance_timers(invocation.shard)
+				shard.current_tick = 107
+			_advance_timers(shard)
 
 			timer_release(wheel, state.timer_handle_second)
 		},
@@ -666,8 +663,8 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 		handle = make_handle(0, 1, 0, 1),
 	}
 
-	message_count, _ := test_with_local_context(
-		Test_Local_Context_Config {
+	message_count, _ := test_with_local_turn_frame(
+		Test_Local_Turn_Frame_Config {
 			self_handle         = test_state.handle,
 			target_handle       = test_state.handle,
 			current_tick        = 50,
@@ -675,24 +672,24 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 			target_state        = .Wait_Io,
 		},
 		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: TinaContext) {
+		proc(user_data: rawptr) {
 			state := cast(^Wake_Test_State)user_data
-			invocation := ctx_invocation(ctx)
-			wheel := &invocation.shard.timer_wheel
+			shard, frame := _current_isolate_turn_frame()
+			wheel := &shard.timer_wheel
 
-			timer_handle := timer_acquire(wheel, invocation.self_handle)
+			timer_handle := timer_acquire(wheel, frame.isolate_handle)
 			timer_rearm(
 				wheel,
 				timer_handle,
-				invocation.current_tick + 5,
+				frame.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(11),
 				)
 
-				invocation.shard.current_tick = 55
-			_advance_timers(invocation.shard)
+				shard.current_tick = 55
+			_advance_timers(shard)
 
-			soa_meta := invocation.shard.metadata[extract_type_id(state.handle)]
+			soa_meta := shard.metadata[extract_type_id(state.handle)]
 			state.target_state = soa_meta[extract_slot(state.handle)].state
 			state.target_io_sequence = soa_meta[extract_slot(state.handle)].io_sequence
 
@@ -720,8 +717,8 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 		timer_handle_second = TIMER_HANDLE_NONE,
 	}
 
-	message_count, message := test_with_local_context(
-		Test_Local_Context_Config {
+	message_count, message := test_with_local_turn_frame(
+		Test_Local_Turn_Frame_Config {
 			self_handle         = test_state.handle,
 			target_handle       = test_state.handle,
 			current_tick        = 100,
@@ -729,33 +726,33 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 			target_state        = .Wait_Message,
 		},
 		rawptr(&test_state),
-		proc(user_data: rawptr, ctx: TinaContext) {
+		proc(user_data: rawptr) {
 			state := cast(^Mixed_Expiry_Test_State)user_data
-			invocation := ctx_invocation(ctx)
-			wheel := &invocation.shard.timer_wheel
+			shard, frame := _current_isolate_turn_frame()
+			wheel := &shard.timer_wheel
 
 			// Both handles will map to the same 64-bit word of armed_words bitmap
-			state.timer_handle_first = timer_acquire(wheel, invocation.self_handle)
-			state.timer_handle_second = timer_acquire(wheel, invocation.self_handle)
+			state.timer_handle_first = timer_acquire(wheel, frame.isolate_handle)
+			state.timer_handle_second = timer_acquire(wheel, frame.isolate_handle)
 
 			timer_rearm(
 				wheel,
 				state.timer_handle_first,
-				invocation.current_tick + 5,
+				frame.current_tick + 5,
 				Message_Tag(USER_MESSAGE_TAG_BASE),
 				Correlation_Id(3),
 				)
 				timer_rearm(
 				wheel,
 				state.timer_handle_second,
-				invocation.current_tick + 10,
+				frame.current_tick + 10,
 				Message_Tag(USER_MESSAGE_TAG_BASE + 1),
 				Correlation_Id(4),
 				)
 
 				// Advance past the first deadline but before the second
-				invocation.shard.current_tick = 106
-			_advance_timers(invocation.shard)
+				shard.current_tick = 106
+			_advance_timers(shard)
 
 			// The first deadline should have fired, but the second must still be armed.
 			word := wheel.armed_words[0]
@@ -771,8 +768,8 @@ test_renewable_deadline_same_word_mixed_expiry :: proc(t: ^testing.T) {
 			)
 
 			// Now advance past the second deadline
-			invocation.shard.current_tick = 111
-			_advance_timers(invocation.shard)
+			shard.current_tick = 111
+			_advance_timers(shard)
 
 			// Verify that the second timer has now also fired and count is zero
 			testing.expect_value(

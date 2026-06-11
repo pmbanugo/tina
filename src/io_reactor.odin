@@ -358,8 +358,8 @@ _reactor_completion_apply_accept :: proc (
 
 		owner := make_handle(
 			shard.id,
-			u16(type_index),
-			slot_index,
+			Isolate_Type_Id(type_index),
+			Isolate_Slot_Index(slot_index),
 			soa_meta[slot_index].generation,
 		)
 		fd_handle, fd_error := fd_table_alloc(&reactor.fd_table, e.client_fd, owner)
@@ -476,9 +476,9 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 				soa_meta[slot_index].io_fd = FD_HANDLE_NONE
 				// Route through _slot_set_state so io_awaiting_count is
 				// decremented and dispatchable bits are refreshed.
-				_slot_set_state(shard, u16(type_index), slot_index, .Unallocated)
-				soa_meta[slot_index].inbox_head = shard.isolate_free_heads[u16(type_index)]
-				shard.isolate_free_heads[u16(type_index)] = slot_index
+				_slot_set_state(shard, Isolate_Type_Id(type_index), Isolate_Slot_Index(slot_index), .Unallocated)
+				soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_index]
+				shard.isolate_free_heads[type_index] = slot_index
 			}
 
 			if operation_kind == .Accept_Complete {
@@ -492,8 +492,8 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		// Live: dispatch to handler.
 		_slot_set_io_completion_ready(
 			shard,
-			u16(type_index),
-			slot_index,
+			Isolate_Type_Id(type_index),
+			Isolate_Slot_Index(slot_index),
 			operation_kind,
 			completion.result,
 			buffer_index,
@@ -579,8 +579,8 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 		if u8(soa_meta[slot_index].generation) == submission_token_generation(sub.token) {
 			_slot_set_io_submit_failure(
 				shard,
-				u16(type_index),
-				slot_index,
+				Isolate_Type_Id(type_index),
+				Isolate_Slot_Index(slot_index),
 				flush_operation_kind,
 				i32(io_error),
 			)
@@ -920,8 +920,8 @@ reactor_submit_io :: proc(
 @(private = "file")
 _compute_source_pointer :: #force_inline proc(
 	shard: ^Shard,
-	type_index: u16,
-	slot_index: u32,
+	type_index: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 	payload_offset: u16,
 	payload_size: u32,
 ) -> ([^]u8, IO_Error) {
@@ -937,8 +937,8 @@ _compute_source_pointer :: #force_inline proc(
 _reactor_submission_finalize :: #force_inline proc (
 	reactor: ^Reactor,
 	shard: ^Shard,
-	type_index: u16,
-	slot_index: u32,
+	type_index: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
 	generation: u8,
 	sequence: u8,
 	target_fd: FD_Handle,
@@ -961,7 +961,7 @@ _reactor_submission_finalize :: #force_inline proc (
 
 	submission_value.token = submission_token_pack(
 		u8(type_index),
-		slot_index,
+		u32(slot_index),
 		generation,
 		sequence,
 		buffer_index,

@@ -11,7 +11,7 @@ This abstraction is not just for ergonomics — it's the simulation seam. In pro
 The I/O cycle:
 
 ```
-Handler calls ctx_submit_io(ctx, IoOp_Recv{fd, buffer_size_max})
+Handler calls ctx_submit_io(IoOp_Recv{fd, buffer_size_max})
         │
         ▼
 Scheduler parks Isolate in Wait_Io state
@@ -54,20 +54,20 @@ When an I/O read operation completes, the data lands in a slot from the **reacto
     case tina.IO_TAG_RECV_COMPLETE:
         if message.io.result <= 0 {
             // EOF or error
-            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = self.fd}))
+            return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Close{fd = self.fd}))
         }
 
         // Read the data from the reactor buffer pool.
         // This slice is valid ONLY during this handler invocation.
         recv_len := u32(message.io.result)
-        data := tina.ctx_read_buffer(ctx, message.io.buffer_index, recv_len)
+        data := tina.ctx_read_buffer(message.io.buffer_index, recv_len)
 
         // Copy what you need into your Isolate's own memory.
         // After this handler returns, the reactor buffer slot is freed.
         mem.copy(&self.buffer[0], raw_data(data), int(recv_len))
 
         // Now self.buffer contains your data — it persists across handler calls.
-        return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(ctx, self, self.fd, self.buffer[:recv_len]))
+        return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(self, self.fd, self.buffer[:recv_len]))
 ```
 
 **Why reactor-owned buffers?** If an Isolate crashes while I/O is in flight, the kernel (via io_uring or DMA) is still actively writing to that memory address. If the buffer lived in the Isolate's arena, the kernel would silently corrupt the next Isolate spawned in that slot. Reactor-owned pools structurally prevent this memory corruption.
@@ -82,7 +82,7 @@ copy(self.buffer[:], "hello"[:])
 
 // ctx_io_send computes the byte offset of self.buffer within the Isolate struct.
 // The reactor reads directly from the Isolate's arena slot during the write.
-return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(ctx, self, self.fd, self.buffer[:5]))
+return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(self, self.fd, self.buffer[:5]))
 ```
 
 No allocation. No copy to a staging buffer. The reactor reads directly from your struct. This works because the Isolate is parked during the I/O operation — its memory is stable.
@@ -97,7 +97,7 @@ When you need to send more than 96 bytes to another Isolate, use the **Transfer 
 // ---- Sender ----
 
 // 1. Allocate a transfer buffer slot.
-handle_result := tina.ctx_transfer_alloc(ctx)
+handle_result := tina.ctx_transfer_alloc()
 handle, ok := handle_result.(tina.Transfer_Handle)
 if !ok {
     // Pool exhausted — shed load or retry later.
@@ -105,11 +105,11 @@ if !ok {
 }
 
 // 2. Write your large payload into the transfer slot.
-tina.ctx_transfer_write(ctx, handle, &my_large_struct)
+tina.ctx_transfer_write(handle, &my_large_struct)
 
 // 3. Send a small reference message to the receiver.
 //    The message payload is just the Transfer_Handle (4 bytes).
-_ = tina.ctx_transfer_send(ctx, target, handle)
+_ = tina.ctx_transfer_send(target, handle)
 ```
 
 ```odin
@@ -121,7 +121,7 @@ case tina.TAG_TRANSFER:
 
     // Read the large payload from the transfer buffer.
     // This slice is valid ONLY during this handler invocation.
-    read_result := tina.ctx_transfer_read(ctx, handle)
+    read_result := tina.ctx_transfer_read(handle)
     data, ok := read_result.([]u8)
     if !ok {
         // Stale handle — the transfer slot was already freed.

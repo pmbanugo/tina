@@ -45,18 +45,18 @@ when TINA_SIMULATION_MODE {
 	//
 	// Catches Bug 1: the post-commit auto-free at shard.odin:1281 used to fire
 	// unconditionally. With the fix, the success branch of _commit_staged_io
-	// clears invocation.staging_slot_index so the auto-free is a no-op, and the
+	// clears turn_frame.staging_slot_index so the auto-free is a no-op, and the
 	// slot is freed exactly once on I/O completion.
 	// ----------------------------------------------------------------------------
 
-	staging_stager_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	staging_stager_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		s := cast(^StagingStager)self
 
-		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
 		if error != .None do return transition_to_crash(.Init_Failed)
 		s.fd = fd
 
-		stage := ctx_claim_send_slot(ctx)
+		stage := ctx_claim_send_slot()
 		if stage == nil do return transition_to_crash(.Contract_Violation)
 
 		// Write a few bytes of payload. The simulated backend ignores the bytes
@@ -67,7 +67,7 @@ when TINA_SIMULATION_MODE {
 		stage[2] = 0xBE
 		stage[3] = 0xEF
 
-		submit := ctx_io_send_staged(ctx, s.fd, 4)
+		submit := ctx_io_send_staged(s.fd, 4)
 		if submit != .ok do return transition_to_crash(.Contract_Violation)
 
 		return ISOLATE_TRANSITION_WAIT_IO
@@ -76,7 +76,6 @@ when TINA_SIMULATION_MODE {
 	staging_stager_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		s := cast(^StagingStager)self
 		if message != nil && message.tag == IO_TAG_SEND_COMPLETE {
@@ -135,7 +134,7 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		shard := &sim.shards[0]
-		stager := cast(^StagingStager)_get_isolate_ptr(shard, u16(STAGING_TYPE_ID), 0)
+		stager := cast(^StagingStager)_get_isolate_ptr(shard, STAGING_TYPE_ID, 0)
 		testing.expect(t, stager.fired, "stager should have received SEND_COMPLETE")
 
 		stage_pool := &shard.reactor.staging_pool
@@ -157,8 +156,8 @@ when TINA_SIMULATION_MODE {
 	// the claim on the Wait_Message exit path.
 	// ----------------------------------------------------------------------------
 
-	staging_noop_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
-		stage := ctx_claim_send_slot(ctx)
+	staging_noop_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
+		stage := ctx_claim_send_slot()
 		if stage == nil do return transition_to_crash(.Contract_Violation)
 		stage[0] = 0xAA
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -167,7 +166,6 @@ when TINA_SIMULATION_MODE {
 	staging_noop_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_DONE
 	}
@@ -244,9 +242,9 @@ when TINA_SIMULATION_MODE {
 	// exercise.
 	// ----------------------------------------------------------------------------
 
-	staging_crash_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	staging_crash_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		s := cast(^StagingCrash)self
-		stage := ctx_claim_send_slot(ctx)
+		stage := ctx_claim_send_slot()
 		if stage == nil do return transition_to_crash(.Contract_Violation)
 		stage[0] = 0xCC
 		// Mark the claim so the handler can crash and exercise the teardown path.
@@ -257,9 +255,8 @@ when TINA_SIMULATION_MODE {
 	staging_crash_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
-		// Crash on first message — staging_slot_index in metadata still
+		// Crash on first message — staging_slot_index in the turn frame still
 		// holds the claim from init, so teardown must reclaim it.
 		return transition_to_crash(.Contract_Violation)
 	}
@@ -343,17 +340,16 @@ when TINA_SIMULATION_MODE {
 	staging_already_staged_init :: proc(
 		self: rawptr,
 		args: []u8,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		s := cast(^StagingAlreadyStaged)self
 
 		// Open a socket so ctx_io_send has a valid FD to stage against.
-		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
 		if error != .None do return transition_to_crash(.Init_Failed)
 		s.fd = fd
 
-		// Claim a staging slot (writes to both invocation and metadata).
-		stage := ctx_claim_send_slot(ctx)
+		// Claim a staging slot (writes to the turn frame).
+		stage := ctx_claim_send_slot()
 		if stage == nil do return transition_to_crash(.Contract_Violation)
 		stage[0] = 0x55
 
@@ -363,7 +359,7 @@ when TINA_SIMULATION_MODE {
 		noop := struct {
 			_payload: [1]u8,
 		}{_payload = {0x33}}
-		s.send_result = ctx_io_send(ctx, &noop, fd, noop._payload[:])
+		s.send_result = ctx_io_send(&noop, fd, noop._payload[:])
 		s.result_check = true
 
 		// Returning Wait_Io without a committed I/O is a contract violation —
@@ -375,7 +371,6 @@ when TINA_SIMULATION_MODE {
 	staging_already_staged_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_DONE
 	}
@@ -428,7 +423,7 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		shard := &sim.shards[0]
-		isolate_ptr := _get_isolate_ptr(shard, u16(STAGING_TYPE_ID), 0)
+		isolate_ptr := _get_isolate_ptr(shard, STAGING_TYPE_ID, 0)
 		result_holder := cast(^StagingAlreadyStaged)isolate_ptr
 		testing.expect_value(t, result_holder.result_check, true)
 		testing.expect_value(t, result_holder.send_result, Io_Submit_Result.already_staged)
@@ -539,7 +534,7 @@ when TINA_SIMULATION_MODE {
 		}
 
 		soa_meta := shard.metadata[0]
-		type_id: u16 = 0
+		type_id: Isolate_Type_Id = 0
 		slot_index: u32 = 0
 
 		// --- Setup: simulate a live Isolate with in-flight struct-source write ---
@@ -558,15 +553,13 @@ when TINA_SIMULATION_MODE {
 		soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
 		soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
 		soa_meta[slot_index].inbox_count = 0
-		soa_meta[slot_index].staging_slot_index = IO_SLOT_INDEX_NONE
-		soa_meta[slot_index].pending_transfer_read = TRANSFER_HANDLE_NONE
 		soa_meta[slot_index].group_id = SUPERVISION_GROUP_ID_NONE
 
 		// Counter: one slot is waiting for I/O.
 		shard.counters.io_awaiting_count = 1
 
 		// --- Step 1: Teardown — should enter Pending_IO_Reuse, not Unallocated ---
-		_teardown_isolate(shard, type_id, slot_index, .Normal)
+		_teardown_isolate(shard, type_id, Isolate_Slot_Index(slot_index), .Normal)
 
 		testing.expect_value(t, soa_meta[slot_index].state, Isolate_State.Pending_IO_Reuse)
 		// Counter must still be 1 — the slot is still I/O-blocked.
@@ -623,7 +616,7 @@ when TINA_SIMULATION_MODE {
 		}
 
 		soa_meta := shard.metadata[0]
-		type_id: u16 = 0
+		type_id: Isolate_Type_Id = 0
 		slot_index: u32 = 0
 
 		// Remove slot from free list.
@@ -645,14 +638,12 @@ when TINA_SIMULATION_MODE {
 		soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
 		soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
 		soa_meta[slot_index].inbox_count = 0
-		soa_meta[slot_index].staging_slot_index = IO_SLOT_INDEX_NONE
-		soa_meta[slot_index].pending_transfer_read = TRANSFER_HANDLE_NONE
 		soa_meta[slot_index].group_id = SUPERVISION_GROUP_ID_NONE
 
 		shard.counters.io_awaiting_count = 1
 
 		// Teardown: recv is NOT struct memory — should go directly to Unallocated.
-		_teardown_isolate(shard, type_id, slot_index, .Normal)
+		_teardown_isolate(shard, type_id, Isolate_Slot_Index(slot_index), .Normal)
 
 		testing.expect_value(t, soa_meta[slot_index].state, Isolate_State.Unallocated)
 		testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))

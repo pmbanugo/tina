@@ -50,22 +50,21 @@ PublisherIsolate :: struct {
 	counter:          u32,
 }
 
-publisher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
-	self := tina.self_as(PublisherIsolate, self_raw, ctx)
+publisher_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+	self := tina.self_as(PublisherIsolate, self_raw)
 	self.subscriber_count = 0
 	self.counter = 0
 
-	publisher_handle = tina.ctx_self_handle(ctx)
-	tina.ctx_register_timer(ctx, SSE_TICK_INTERVAL_NS, TAG_PUBLISHER_TICK)
+	publisher_handle = tina.ctx_self_handle()
+	tina.ctx_register_timer(SSE_TICK_INTERVAL_NS, TAG_PUBLISHER_TICK)
 	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
 
 publisher_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
-	self := tina.self_as(PublisherIsolate, self_raw, ctx)
+	self := tina.self_as(PublisherIsolate, self_raw)
 
 	switch message.tag {
 	case TAG_SUBSCRIBE:
@@ -99,7 +98,7 @@ publisher_handler :: proc(
 				request_token = subscriber.request_token,
 				counter       = self.counter,
 			}
-			result := tina.ctx_send(ctx, subscriber.handle, TAG_FEED_EVENT, &feed)
+			result := tina.ctx_send(subscriber.handle, TAG_FEED_EVENT, &feed)
 			if result == .stale_handle {
 				continue
 			}
@@ -109,7 +108,7 @@ publisher_handler :: proc(
 		}
 		self.subscriber_count = write_index
 
-		tina.ctx_register_timer(ctx, SSE_TICK_INTERVAL_NS, TAG_PUBLISHER_TICK)
+		tina.ctx_register_timer(SSE_TICK_INTERVAL_NS, TAG_PUBLISHER_TICK)
 	}
 
 	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE

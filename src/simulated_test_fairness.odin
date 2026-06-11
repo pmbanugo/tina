@@ -17,15 +17,15 @@ when TINA_SIMULATION_MODE {
 		run_count: u32,
 	}
 
-	starvation_coord_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	starvation_coord_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		// Spawn 300 workers to exceed one same-type dispatch batch.
 		for i in 0 ..< 300 {
 			spec := Spawn_Spec {
 				type_id      = STARVATION_WORKER_ID,
-				group_id     = ctx_supervision_group_id(ctx),
+				group_id     = ctx_supervision_group_id(),
 				restart_type = .temporary,
 			}
-			_ = assert_spawn_success(ctx_spawn(ctx, spec), "StarvationWorker")
+			_ = assert_spawn_success(ctx_spawn(spec), "StarvationWorker")
 		}
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -33,19 +33,17 @@ when TINA_SIMULATION_MODE {
 	starvation_coord_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	starvation_worker_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	starvation_worker_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_YIELD
 	}
 
 	starvation_worker_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		w := cast(^StarvationWorker)self
 		w.run_count += 1
@@ -133,7 +131,7 @@ when TINA_SIMULATION_MODE {
 
 		// Verify every single worker got a fair share of the 2,560 total dispatches
 		for i in 0 ..< 300 {
-			worker_pointer := _get_isolate_ptr(shard, u16(STARVATION_WORKER_ID), u32(i))
+			worker_pointer := _get_isolate_ptr(shard, STARVATION_WORKER_ID, Isolate_Slot_Index(i))
 			worker := cast(^StarvationWorker)worker_pointer
 
 			if worker.run_count == 0 {

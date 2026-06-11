@@ -10,14 +10,57 @@ when TINA_SIMULATION_MODE {
 	// ============================================================================
 
 	HARNESS_NOOP_TYPE_ID: Isolate_Type_Id : 0
+	HARNESS_TRAP_PARENT_TYPE_ID: Isolate_Type_Id : 0
+	HARNESS_TRAP_CHILD_TYPE_ID: Isolate_Type_Id : 1
 
 	HarnessNoopIsolate :: struct {}
+	HarnessTrapParent :: struct {
+		spawn_failed:         bool,
+		continued_after_trap: bool,
+		parent_handle:        Isolate_Handle,
+		group_id:             Supervision_Group_Id,
+	}
+	HarnessTrapChild :: struct {}
 
-	harness_noop_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	harness_noop_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	harness_noop_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	harness_noop_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	harness_trap_child_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
+		trigger_tier2_panic(g_current_shard_pointer)
+	}
+
+	harness_trap_child_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	harness_trap_parent_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
+		parent := cast(^HarnessTrapParent)self
+		child_spec := Spawn_Spec {
+			type_id      = HARNESS_TRAP_CHILD_TYPE_ID,
+			group_id     = ctx_supervision_group_id(),
+			restart_type = .temporary,
+		}
+
+		spawn_result := ctx_spawn(child_spec)
+		switch result in spawn_result {
+		case Isolate_Handle:
+			parent.spawn_failed = false
+		case Spawn_Error:
+			parent.spawn_failed = result == .init_failed
+		}
+
+		parent.parent_handle = ctx_self_handle()
+		parent.group_id = ctx_supervision_group_id()
+		parent.continued_after_trap = true
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	harness_trap_parent_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
@@ -54,6 +97,67 @@ when TINA_SIMULATION_MODE {
 
 	simulator_test_fault_allocator :: proc(data: ^Simulator_Test_Fault_Allocator_Data) -> mem.Allocator {
 		return mem.Allocator{procedure = simulator_test_fault_allocator_proc, data = data}
+	}
+
+	@(test)
+	test_child_init_trap_returns_spawn_error_and_restores_parent_turn :: proc(t: ^testing.T) {
+		defer free_all(context.temp_allocator)
+
+		types := [2]IsolateTypeDescriptor {
+			{
+				id = HARNESS_TRAP_PARENT_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(HarnessTrapParent),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = harness_trap_parent_init,
+				handler_fn = harness_trap_parent_handler,
+			},
+			{
+				id = HARNESS_TRAP_CHILD_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(HarnessTrapChild),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = harness_trap_child_init,
+				handler_fn = harness_trap_child_handler,
+			},
+		}
+
+		children := [1]Child_Spec {
+			Static_Child_Spec{type_id = HARNESS_TRAP_PARENT_TYPE_ID, restart_type = .temporary},
+		}
+		root_group := sim_test_make_root_group(children[:], .One_For_One, 1)
+		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+		sim_config := SimulationConfig {
+			seed                   = t.seed,
+			ticks_max              = 1,
+			terminate_on_quiescent = true,
+			builtin_checkers       = CHECKER_FLAGS_ALL,
+			checker_interval_ticks = 1,
+		}
+
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
+
+		sim: Simulator
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
+
+		shard := &sim.shards[0]
+		parent_pointer := cast(^HarnessTrapParent)_get_isolate_ptr(
+			shard,
+			HARNESS_TRAP_PARENT_TYPE_ID,
+			0,
+		)
+
+		testing.expect(t, parent_pointer.spawn_failed, "child init trap must return Spawn_Error.init_failed")
+		testing.expect(t, parent_pointer.continued_after_trap, "parent turn must continue after child init trap")
+		testing.expect_value(t, extract_type_id(parent_pointer.parent_handle), HARNESS_TRAP_PARENT_TYPE_ID)
+		testing.expect_value(t, parent_pointer.group_id, Supervision_Group_Id(0))
+		testing.expect_value(t, shard.metadata[HARNESS_TRAP_PARENT_TYPE_ID].state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[HARNESS_TRAP_CHILD_TYPE_ID].state[0], Isolate_State.Unallocated)
+		testing.expect_value(t, shard.current_isolate_turn_frame, nil)
+		testing.expect_value(t, shard.current_trap_environment, nil)
 	}
 
 	@(test)

@@ -160,14 +160,12 @@ Spawn_Spec :: struct {
 	handoff_fd:   FD_Handle,
 }
 
-Context_Flag :: enum u8 {
-	Is_Call,
-	// Future flags would come here.
-}
-Context_Flags :: distinct bit_set[Context_Flag;u8]
+Isolate_Slot_Index :: distinct u32
 
-// Scalar capability token valid only during the active Isolate handler invocation.
-TinaContext :: distinct u64
+Isolate_Turn_Flag :: enum u8 {
+	Is_Call,
+}
+Isolate_Turn_Flags :: distinct bit_set[Isolate_Turn_Flag;u8]
 
 Enqueue_Result :: enum u8 {
 	Success,
@@ -185,17 +183,19 @@ bytes_of :: #force_inline proc(ptr: ^$T) -> []u8 {
 
 // Retrieves the current deterministic time (in nanoseconds) from the scheduler.
 // This ensures all isolates process events using a consistent, uniform clock per tick.
-ctx_monotonic_time_ns :: #force_inline proc(ctx: TinaContext) -> Monotonic_Time_NS {
-	invocation := ctx_invocation(ctx)
-	return Monotonic_Time_NS(invocation.current_tick * invocation.timer_resolution_ns)
+ctx_monotonic_time_ns :: #force_inline proc() -> Monotonic_Time_NS {
+	_, frame := _current_isolate_turn_frame()
+	return Monotonic_Time_NS(frame.current_tick * frame.timer_resolution_ns)
 }
 
-ctx_timer_resolution_ns :: #force_inline proc(ctx: TinaContext) -> u64 {
-	return ctx_invocation(ctx).timer_resolution_ns
+ctx_timer_resolution_ns :: #force_inline proc() -> u64 {
+	_, frame := _current_isolate_turn_frame()
+	return frame.timer_resolution_ns
 }
 
-ctx_current_tick :: #force_inline proc(ctx: TinaContext) -> u64 {
-	return ctx_invocation(ctx).current_tick
+ctx_current_tick :: #force_inline proc() -> u64 {
+	_, frame := _current_isolate_turn_frame()
+	return frame.current_tick
 }
 
 // Helper to safely cast an incoming message payload byte slice into a typed pointer.
@@ -214,12 +214,10 @@ init_args_of :: #force_inline proc(args: ^$T) -> (payload: [MAX_INIT_ARGS_SIZE]u
 // Debug-checked cast from rawptr to a typed Isolate pointer.
 // Validates at runtime (under TINA_DEBUG_ASSERTS) that the registered stride
 // matches the target type, catching wrong-type casts before they corrupt memory.
-self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext, caller_location := #caller_location) -> ^T {
+self_as :: #force_inline proc($T: typeid, self_raw: rawptr, caller_location := #caller_location) -> ^T {
 	when TINA_RUNTIME_ASSERTIONS {
-		invocation := ctx_invocation(ctx)
-		shard := invocation.shard
-		type_id := invocation.type_id
-		registered_stride := shard.type_descriptors[type_id].stride
+		shard, frame := _current_isolate_turn_frame()
+		registered_stride := shard.type_descriptors[frame.isolate_type_id].stride
 		assert(
 			registered_stride == size_of(T),
 			"self_as: type stride mismatch — registered stride does not match target type size",
@@ -233,14 +231,12 @@ self_as :: #force_inline proc($T: typeid, self_raw: rawptr, ctx: TinaContext, ca
 // Isolate_Transition{kind = .Wait_Io}.
 @(require_results)
 ctx_io_sendfile :: #force_inline proc(
-	ctx: TinaContext,
 	fd_socket: FD_Handle,
 	fd_file: FD_Handle,
 	source_offset: u64,
 	size: u32,
 ) -> Io_Submit_Result {
 	return ctx_submit_io(
-		ctx,
 		IoOp_Sendfile {
 			fd_file = fd_file,
 			fd_socket = fd_socket,
@@ -269,7 +265,6 @@ ipv6 :: #force_inline proc "contextless" (
 // Returns a Send_Result immediately to provide backpressure feedback (e.g., mailbox full, dead handle).
 @(require_results)
 ctx_send_typed :: #force_inline proc(
-	ctx: TinaContext,
 	to: Isolate_Handle,
 	$tag: Message_Tag,
 	message: ^$T,
@@ -279,7 +274,7 @@ ctx_send_typed :: #force_inline proc(
 		tag >= USER_MESSAGE_TAG_BASE,
 		"ctx_send: Cannot forge system messages. Tag must be >= 0x0040.",
 	)
-	return ctx_send_raw(ctx, to, tag, mem.byte_slice(message, size_of(T)))
+	return ctx_send_raw(to, tag, mem.byte_slice(message, size_of(T)))
 }
 
 ctx_send :: proc {

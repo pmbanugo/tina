@@ -92,7 +92,7 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		shard := &sim.shards[0]
-		ping_pointer := _get_isolate_ptr(shard, u16(PING_TYPE_ID), 0)
+		ping_pointer := _get_isolate_ptr(shard, PING_TYPE_ID, 0)
 		ping_memory := cast(^PingIsolate)ping_pointer
 
 		return Ping_Pong_Run_Result {
@@ -212,7 +212,7 @@ when TINA_SIMULATION_MODE {
 			simulator_run(&sim)
 
 			shard := &sim.shards[0]
-			ping_pointer := _get_isolate_ptr(shard, u16(PING_TYPE_ID), 0)
+			ping_pointer := _get_isolate_ptr(shard, PING_TYPE_ID, 0)
 			ping_memory := cast(^PingIsolate)ping_pointer
 
 			return Ping_Pong_Run_Result {

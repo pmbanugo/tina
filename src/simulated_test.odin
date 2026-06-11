@@ -55,14 +55,14 @@ when TINA_SIMULATION_MODE {
 	// ======================================
 	// Coordinator (Spawns Ping and Pong)
 	// ======================================
-	coordinator_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	coordinator_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		// 1. Spawn Pong
 		pong_spec := Spawn_Spec {
 			type_id      = PONG_TYPE_ID,
-			group_id     = ctx_supervision_group_id(ctx), // Inherit the coordinator's group
+			group_id     = ctx_supervision_group_id(), // Inherit the coordinator's group
 			restart_type = .temporary,
 		}
-		pong_res := ctx_spawn(ctx, pong_spec)
+		pong_res := ctx_spawn(pong_spec)
 		pong_handle := assert_spawn_success(pong_res, "Pong")
 
 		// 2. Spawn Ping, passing Pong's Handle via init_args
@@ -73,26 +73,26 @@ when TINA_SIMULATION_MODE {
 
 		ping_spec := Spawn_Spec {
 			type_id      = PING_TYPE_ID,
-			group_id     = ctx_supervision_group_id(ctx), // Inherit the coordinator's group
+			group_id     = ctx_supervision_group_id(), // Inherit the coordinator's group
 			restart_type = .temporary,
 			args_payload = payload,
 			args_size    = payload_len,
 		}
-		ping_res := ctx_spawn(ctx, ping_spec)
+		ping_res := ctx_spawn(ping_spec)
 		_ = assert_spawn_success(ping_res, "Ping")
 
 		// Park forever
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	coordinator_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	coordinator_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	// =================
 	// Ping Isolate
 	// =================
-	ping_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	ping_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		p := cast(^PingIsolate)self
 		init_args := payload_as(PingInitArgs, args)
 		p.pong_handle = init_args.pong_handle
@@ -101,12 +101,12 @@ when TINA_SIMULATION_MODE {
 		msg := PingMsg {
 			seq = 0,
 		}
-		_ = ctx_send(ctx, p.pong_handle, APP_TAG_PING, &msg)
+		_ = ctx_send(p.pong_handle, APP_TAG_PING, &msg)
 
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	ping_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	ping_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		using p := cast(^PingIsolate)self
 		pong := payload_as(PongMsg, message.user.payload[:])
 
@@ -120,24 +120,24 @@ when TINA_SIMULATION_MODE {
 		msg := PingMsg {
 			seq = pong.seq + 1,
 		}
-		_ = ctx_send(ctx, p.pong_handle, APP_TAG_PING, &msg)
+		_ = ctx_send(p.pong_handle, APP_TAG_PING, &msg)
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	// ================
 	// Pong Isolate
 	// ================
-	pong_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	pong_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	pong_handler :: proc(self: rawptr, message: ^Message, ctx: TinaContext) -> Isolate_Transition {
+	pong_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		ping := payload_as(PingMsg, message.user.payload[:])
 
 		msg := PongMsg {
 			seq = ping.seq,
 		}
-		_ = ctx_send(ctx, message.user.source, APP_TAG_PONG, &msg)
+		_ = ctx_send(message.user.source, APP_TAG_PONG, &msg)
 
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -234,7 +234,7 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(t, pong_state, Isolate_State.Wait_Message)
 
 		// Prove Ping hit 100 iterations
-		ping_pointer := _get_isolate_ptr(shard, u16(PING_TYPE_ID), 0)
+		ping_pointer := _get_isolate_ptr(shard, PING_TYPE_ID, 0)
 		ping_memory := cast(^PingIsolate)ping_pointer
 		testing.expect_value(t, ping_memory.count, 100)
 

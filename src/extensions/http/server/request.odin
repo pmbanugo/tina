@@ -368,10 +368,7 @@ is_shutting_down :: #force_inline proc(request: ^Request) -> bool {
 	if state.shard_runtime != nil && state.shard_runtime.draining {
 		return true
 	}
-	if request.tina_context == 0 {
-		return false
-	}
-	return tina.ctx_is_shutting_down(request.tina_context)
+	return tina.ctx_is_shutting_down()
 }
 
 peer_address :: #force_inline proc (request: ^Request) -> tina.Peer_Address {
@@ -394,10 +391,10 @@ request_arena :: proc(request: ^Request) -> mem.Allocator {
 // Returns the allocator for the Connection's (Isolate) scratch memory
 request_scratch :: proc(request: ^Request) -> mem.Allocator {
 	when tina.TINA_RUNTIME_ASSERTIONS {
-		assert(request != nil && request.tina_context != 0, "request_scratch: request context is nil")
+		assert(request != nil, "request_scratch: request is nil")
 	}
-	if request == nil || request.tina_context == 0 do return mem.Allocator{}
-	return tina.ctx_scratch_arena(request.tina_context)
+	if request == nil do return mem.Allocator{}
+	return tina.ctx_scratch_arena()
 }
 
 @(private = "file")

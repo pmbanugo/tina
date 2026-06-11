@@ -23,17 +23,17 @@ The scratch arena is for data that does not outlive the current handler call. Th
 
 ### String formatting for logging
 
-The most common pattern. Use `tina.ctx_scratch_arena_bytes(ctx)` as the destination buffer for `fmt.bprintf`:
+The most common pattern. Use `tina.ctx_scratch_arena_bytes()` as the destination buffer for `fmt.bprintf`:
 
 ```odin
-handler :: proc(self_raw: rawptr, message: ^tina.Message, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
-    self := tina.self_as(MyIsolate, self_raw, ctx)
+handler :: proc(self_raw: rawptr, message: ^tina.Message) -> tina.Isolate_Transition {
+    self := tina.self_as(MyIsolate, self_raw)
 
     // Format a log string into the scratch arena's backing buffer.
     // This buffer is valid until this handler returns.
-    str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "Processed request %d on Shard %d",
-        self.request_count, tina.ctx_shard_id(ctx))
-    tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+    str := fmt.bprintf(tina.ctx_scratch_arena_bytes(), "Processed request %d on Shard %d",
+        self.request_count, tina.ctx_shard_id())
+    tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
     return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
@@ -45,7 +45,7 @@ You can get a standard `mem.Allocator` from the scratch arena for general-purpos
 
 ```odin
     // Get a standard Allocator backed by the scratch arena.
-    scratch := tina.ctx_scratch_arena(ctx)
+    scratch := tina.ctx_scratch_arena()
 
     // Allocate a temporary buffer for parsing.
     temp_buffer := make([]u8, 256, scratch)
@@ -73,11 +73,11 @@ RouterIsolate :: struct {
     subscriber_count: u32,
 }
 
-router_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tina.Isolate_Transition {
-    self := tina.self_as(RouterIsolate, self_raw, ctx)
+router_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+    self := tina.self_as(RouterIsolate, self_raw)
 
     // Get an Allocator backed by this Isolate's private working memory region.
-    working := tina.ctx_working_arena(ctx)
+    working := tina.ctx_working_arena()
 
     // Allocate a subscriber table. This memory survives across handler calls —
     // it persists until the Isolate is torn down (crash, ISOLATE_TRANSITION_DONE, or shutdown).
@@ -89,9 +89,8 @@ router_init :: proc(self_raw: rawptr, args: []u8, ctx: ^tina.TinaContext) -> tin
 router_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(RouterIsolate, self_raw, ctx)
+    self := tina.self_as(RouterIsolate, self_raw)
 
     // self.subscribers is still valid — working arena persists across handler calls.
     switch message.tag {
@@ -113,7 +112,7 @@ If `working_memory_size = 0` (the default), `ctx_working_arena()` returns a zero
 
 ### Resetting
 
-To reclaim all working arena memory without tearing down the Isolate, call `ctx_working_arena_reset(ctx)`. All prior allocations from the working arena become invalid. Use this when your Isolate goes through phases that don't share state — e.g., resetting between protocol sessions.
+To reclaim all working arena memory without tearing down the Isolate, call `ctx_working_arena_reset()`. All prior allocations from the working arena become invalid. Use this when your Isolate goes through phases that don't share state — e.g., resetting between protocol sessions.
 
 ---
 
@@ -127,7 +126,7 @@ For the full lifecycle and I/O buffer details, see [I/O, Buffers & Data Transfer
 
 ```odin
 // 1. Allocate a transfer buffer slot.
-handle_result := tina.ctx_transfer_alloc(ctx)
+handle_result := tina.ctx_transfer_alloc()
 handle, ok := handle_result.(tina.Transfer_Handle)
 if !ok {
     // Pool exhausted — shed load or retry later.
@@ -135,10 +134,10 @@ if !ok {
 }
 
 // 2. Write the large payload into the transfer slot.
-tina.ctx_transfer_write(ctx, handle, &my_large_struct)
+tina.ctx_transfer_write(handle, &my_large_struct)
 
 // 3. Send a small reference message to the receiver.
-_ = tina.ctx_transfer_send(ctx, target, handle)
+_ = tina.ctx_transfer_send(target, handle)
 ```
 
 ### Receiving a large payload
@@ -148,7 +147,7 @@ case tina.TAG_TRANSFER:
     handle := (cast(^tina.Transfer_Handle)&message.user.payload[0])^
 
     // Read the large payload. This slice is valid ONLY during this handler call.
-    read_result := tina.ctx_transfer_read(ctx, handle)
+    read_result := tina.ctx_transfer_read(handle)
     data, ok := read_result.([]u8)
     if !ok {
         // Stale handle — the slot was already freed.

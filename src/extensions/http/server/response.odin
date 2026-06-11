@@ -735,7 +735,7 @@ continue_100 :: proc(response: ^Response) {
 		response.connection.egress_buffer[:],
 		state,
 		response.connection.connection_state.response_header_bytes,
-		_connection_date_value(response.connection, response.tina_context),
+		_connection_date_value(response.connection),
 	)
 	if !ok {
 		_response_stage_internal_server_error(response, state)
@@ -850,7 +850,7 @@ _response_commit_headers :: proc(response: ^Response) -> bool {
 		response.connection.egress_buffer[:],
 		state,
 		response.connection.connection_state.response_header_bytes,
-		_connection_date_value(response.connection, response.tina_context),
+		_connection_date_value(response.connection),
 	)
 	if !ok {
 		_response_stage_internal_server_error(response, state)
@@ -918,9 +918,8 @@ expect_reply :: proc(
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(timeout_ns > 0, "expect_reply: timeout_ns must be > 0")
 	}
-	correlation_id := tina.ctx_reserve_correlation_id(route_context.tina_context)
+	correlation_id := tina.ctx_reserve_correlation_id()
 	send_result := tina.ctx_send_with_correlation(
-		route_context.tina_context,
 		target_handle,
 		tina.Message_Tag(message_tag),
 		payload_bytes,
@@ -948,7 +947,7 @@ expect_notification :: proc(
 	when tina.TINA_RUNTIME_ASSERTIONS {
 		assert(timeout_ns > 0, "expect_notification: timeout_ns must be > 0")
 	}
-	correlation_id := tina.ctx_reserve_correlation_id(route_context.tina_context)
+	correlation_id := tina.ctx_reserve_correlation_id()
 	_stage_application_expectation(
 		route_context,
 		.Notification,
@@ -984,7 +983,7 @@ _respond_bytes :: proc(
 		response.connection.egress_buffer[:],
 		state,
 		response.connection.connection_state.response_header_bytes,
-		_connection_date_value(response.connection, response.tina_context),
+		_connection_date_value(response.connection),
 	)
 	if !ok {
 		_response_stage_internal_server_error(response, state)
@@ -1647,12 +1646,12 @@ test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testi
 	http_test_fixture_init(&fixture)
 	Begin_Stream_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
 	begin_stream_test_state := Begin_Stream_Test_State {fixture = &fixture, t = t}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&begin_stream_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Begin_Stream_Test_State)user_data
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			response := http_test_fixture_response(test_state.fixture)
 			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
 			state := _response_state(&response)
 			testing.expect(test_state.t, .Headers_Committed in state.flags)
@@ -1674,12 +1673,12 @@ test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing
 	http_test_fixture_init(&fixture)
 	Prepare_Flush_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
 	prepare_flush_test_state := Prepare_Flush_Test_State {fixture = &fixture, t = t}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&prepare_flush_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Prepare_Flush_Test_State)user_data
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			response := http_test_fixture_response(test_state.fixture)
 			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
 			_ = write_bytes(&response, transmute([]u8)string("ab"))
 			state := _response_state(&response)
@@ -1703,12 +1702,12 @@ test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) 
 	fixture.connection.connection_state.response.mode = .Head_Suppressed
 	Head_Suppressed_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
 	head_suppressed_test_state := Head_Suppressed_Test_State {fixture = &fixture, t = t}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&head_suppressed_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Head_Suppressed_Test_State)user_data
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			response := http_test_fixture_response(test_state.fixture)
 			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
 			state := _response_state(&response)
 			header_size := int(state.egress_size)
@@ -1726,12 +1725,12 @@ test_respond_file_sets_sendfile_plan_and_returns_flush :: proc(t: ^testing.T) {
 	http_test_fixture_init(&fixture)
 	Respond_File_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
 	respond_file_test_state := Respond_File_Test_State {fixture = &fixture, t = t}
-	tina.test_with_context(
-		tina.Test_Context_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
 		rawptr(&respond_file_test_state),
-		proc(user_data: rawptr, ctx: tina.TinaContext) {
+		proc(user_data: rawptr) {
 			test_state := cast(^Respond_File_Test_State)user_data
-			response := http_test_fixture_response(test_state.fixture, ctx)
+			response := http_test_fixture_response(test_state.fixture)
 			step := respond_file(&response, tina.FD_Handle(42), 8192, "application/octet-stream")
 			testing.expect_value(test_state.t, step, Route_Step.Flush)
 			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_file_fd, tina.FD_Handle(42))

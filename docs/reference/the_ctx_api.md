@@ -1,6 +1,6 @@
 # The `ctx` API Reference
 
-Complete public API surface available to Isolate `init_handler` and `handler_fn` callbacks. All functions operate on a `^TinaContext` passed by the scheduler.
+Complete public API surface available to Isolate `init_handler` and `handler_fn` callbacks. These ambient functions are available during active handler execution.
 
 Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
@@ -10,8 +10,8 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 | Call | Signature | Returns | Errors | Description |
 |------|-----------|---------|--------|-------------|
-| `ctx_send` | Overloaded: `ctx_send_raw(ctx, to, tag, payload)` / `ctx_send_typed(ctx, to, $tag, &msg)` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a message to a target Isolate. `tag` must be `>= USER_MESSAGE_TAG_BASE` (0x0040). Payload max: 96 bytes. |
-| `ctx_transfer_send` | `ctx_transfer_send(ctx, to, handle) -> Send_Result` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a `Transfer_Handle` reference to another Isolate. Uses system tag `TAG_TRANSFER` internally. |
+| `ctx_send` | Overloaded: `ctx_send_raw(to, tag, payload)` / `ctx_send_typed(to, $tag, &msg)` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a message to a target Isolate. `tag` must be `>= USER_MESSAGE_TAG_BASE` (0x0040). Payload max: 96 bytes. |
+| `ctx_transfer_send` | `ctx_transfer_send(to, handle) -> Send_Result` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a `Transfer_Handle` reference to another Isolate. Uses system tag `TAG_TRANSFER` internally. |
 
 **Tag constants:**
 
@@ -46,7 +46,7 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 | Call | Signature | Returns | Errors | Description |
 |------|-----------|---------|--------|-------------|
-| `ctx_spawn` | `ctx_spawn(ctx, spec: Spawn_Spec) -> Spawn_Result` | `Handle` or `Spawn_Error` | `.arena_full`, `.group_full`, `.type_not_allocated`, `.init_failed` | Spawn a new Isolate on the local Shard. Requires `@(require_results)`. |
+| `ctx_spawn` | `ctx_spawn(spec: Spawn_Spec) -> Spawn_Result` | `Handle` or `Spawn_Error` | `.arena_full`, `.group_full`, `.type_not_allocated`, `.init_failed` | Spawn a new Isolate on the local Shard. Requires `@(require_results)`. |
 
 ---
 
@@ -54,7 +54,7 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `ctx_register_timer` | `ctx_register_timer(ctx, duration_ns: u64, tag: Message_Tag)` | void | Register a one-shot timer. Delivers a message with the given `tag` back to this Isolate after `duration_ns` nanoseconds (converted to ticks internally). |
+| `ctx_register_timer` | `ctx_register_timer(duration_ns: u64, tag: Message_Tag)` | void | Register a one-shot timer. Delivers a message with the given `tag` back to this Isolate after `duration_ns` nanoseconds (converted to ticks internally). |
 
 ---
 
@@ -62,7 +62,7 @@ Source files: `api.odin`, `api_context.odin`, `logging.odin`, `timer.odin`.
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `ctx_log` | Overloaded: `ctx_log_raw(ctx, level, $tag, payload)` / `ctx_log_typed(ctx, level, $tag, &msg)` | void | Write a diagnostic log entry. Each Shard buffers log entries in the Logging Subsystem and flushes them to stderr once per scheduler tick. |
+| `ctx_log` | Overloaded: `ctx_log_raw(level, $tag, payload)` / `ctx_log_typed(level, $tag, &msg)` | void | Write a diagnostic log entry. Each Shard buffers log entries in the Logging Subsystem and flushes them to stderr once per scheduler tick. |
 
 **Log levels:**
 
@@ -88,9 +88,9 @@ MY_METRIC_TAG: tina.Log_Tag : tina.USER_LOG_TAG_BASE + 1  // 0x41
 
 ```odin
 // Format into the scratch arena, then log.
-str := fmt.bprintf(tina.ctx_scratch_arena_bytes(ctx), "Connection %d closed after %d bytes",
+str := fmt.bprintf(tina.ctx_scratch_arena_bytes(), "Connection %d closed after %d bytes",
     self.conn_id, self.bytes_sent)
-tina.ctx_log(ctx, .INFO, MY_APP_TAG, transmute([]u8)str)
+tina.ctx_log(.INFO, MY_APP_TAG, transmute([]u8)str)
 ```
 
 **Output format** (written to stderr):
@@ -113,9 +113,9 @@ Example: `[48231] INFO[Tag:40] Handle:10003A2 - Connection 5 closed after 1024 b
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `ctx_working_arena` | `ctx_working_arena(ctx) -> mem.Allocator` | `Allocator` | The Isolate's private working arena. Persists across handler invocations. Freed on teardown. |
-| `ctx_working_arena_reset` | `ctx_working_arena_reset(ctx)` | void | Resets working arena offset to 0. All prior allocations invalidated. |
-| `ctx_scratch_arena` | `ctx_scratch_arena(ctx) -> mem.Allocator` | `Allocator` | Shard-wide scratch arena. Reset before every handler call. For temporaries only. |
+| `ctx_working_arena` | `ctx_working_arena() -> mem.Allocator` | `Allocator` | The Isolate's private working arena. Persists across handler invocations. Freed on teardown. |
+| `ctx_working_arena_reset` | `ctx_working_arena_reset()` | void | Resets working arena offset to 0. All prior allocations invalidated. |
+| `ctx_scratch_arena` | `ctx_scratch_arena() -> mem.Allocator` | `Allocator` | Shard-wide scratch arena. Reset before every handler call. For temporaries only. |
 
 ---
 
@@ -125,10 +125,10 @@ For payloads exceeding the 96-byte inline message limit.
 
 | Call | Signature | Returns | Errors | Description |
 |------|-----------|---------|--------|-------------|
-| `ctx_transfer_alloc` | `ctx_transfer_alloc(ctx) -> Transfer_Alloc_Result` | `Transfer_Handle` or `Transfer_Alloc_Error` | `.Pool_Exhausted` | Allocate a transfer buffer slot. |
-| `ctx_transfer_write` | Overloaded: `ctx_transfer_write_raw(ctx, handle, data)` / `ctx_transfer_write_typed(ctx, handle, &msg)` | `Transfer_Write_Error` | `.Stale_Handle`, `.Bounds_Violation` | Write data into a transfer slot. |
-| `ctx_transfer_read` | `ctx_transfer_read(ctx, handle) -> Transfer_Read_Result` | `[]u8` or `Transfer_Read_Error` | `.Stale_Handle` | Read from a transfer buffer. The scheduler auto-frees the transfer slot when the receiver's handler returns. **Call ONCE per invocation.** |
-| `ctx_transfer_send` | `ctx_transfer_send(ctx, to, handle) -> Send_Result` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a transfer handle reference to another Isolate. |
+| `ctx_transfer_alloc` | `ctx_transfer_alloc() -> Transfer_Alloc_Result` | `Transfer_Handle` or `Transfer_Alloc_Error` | `.Pool_Exhausted` | Allocate a transfer buffer slot. |
+| `ctx_transfer_write` | Overloaded: `ctx_transfer_write_raw(handle, data)` / `ctx_transfer_write_typed(handle, &msg)` | `Transfer_Write_Error` | `.Stale_Handle`, `.Bounds_Violation` | Write data into a transfer slot. |
+| `ctx_transfer_read` | `ctx_transfer_read(handle) -> Transfer_Read_Result` | `[]u8` or `Transfer_Read_Error` | `.Stale_Handle` | Read from a transfer buffer. The scheduler auto-frees the transfer slot when the receiver's handler returns. **Call ONCE per invocation.** |
+| `ctx_transfer_send` | `ctx_transfer_send(to, handle) -> Send_Result` | `Send_Result` | `.mailbox_full`, `.pool_exhausted`, `.stale_handle` | Send a transfer handle reference to another Isolate. |
 
 ---
 
@@ -138,13 +138,13 @@ These are non-batched, non-blocking control-plane operations executed during han
 
 | Call | Signature | Returns | Errors | Description |
 |------|-----------|---------|--------|-------------|
-| `ctx_socket` | `ctx_socket(ctx, domain, socket_type, protocol) -> (FD_Handle, Reactor_Socket_Error)` | FD handle + error | `.Backend_Error`, `.FD_Table_Full` | Create a socket and register it in the FD table. |
-| `ctx_bind` | `ctx_bind(ctx, fd: FD_Handle, address: Socket_Address) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Bind socket to address. |
-| `ctx_listen` | `ctx_listen(ctx, fd: FD_Handle, backlog: u32) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Start listening on a bound socket. |
+| `ctx_socket` | `ctx_socket(domain, socket_type, protocol) -> (FD_Handle, Reactor_Socket_Error)` | FD handle + error | `.Backend_Error`, `.FD_Table_Full` | Create a socket and register it in the FD table. |
+| `ctx_bind` | `ctx_bind(fd: FD_Handle, address: Socket_Address) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Bind socket to address. |
+| `ctx_listen` | `ctx_listen(fd: FD_Handle, backlog: u32) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Start listening on a bound socket. |
 | `ctx_setsockopt` | Overloaded: `ctx_setsockopt_raw`, `_bool`, `_i32`, `_linger` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Set a socket option. |
-| `ctx_getsockopt` | `ctx_getsockopt(ctx, fd, level, option) -> (Socket_Option_Value, Backend_Error)` | value + error | `.Queue_Full`, `.System_Error`, `.Not_Found` | Get a socket option value. |
-| `ctx_shutdown` | `ctx_shutdown(ctx, fd: FD_Handle, how: Shutdown_How) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Shutdown a socket connection direction. |
-| `ctx_read_buffer` | `ctx_read_buffer(ctx, buffer_index: u16, size: u32) -> []u8` | `[]u8` | — | Read I/O completion data from the reactor buffer pool. Valid for one handler call only. |
+| `ctx_getsockopt` | `ctx_getsockopt(fd, level, option) -> (Socket_Option_Value, Backend_Error)` | value + error | `.Queue_Full`, `.System_Error`, `.Not_Found` | Get a socket option value. |
+| `ctx_shutdown` | `ctx_shutdown(fd: FD_Handle, how: Shutdown_How) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Shutdown a socket connection direction. |
+| `ctx_read_buffer` | `ctx_read_buffer(buffer_index: u16, size: u32) -> []u8` | `[]u8` | — | Read I/O completion data from the reactor buffer pool. Valid for one handler call only. |
 
 ---
 
@@ -152,11 +152,11 @@ These are non-batched, non-blocking control-plane operations executed during han
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `ctx_is_shutting_down` | `ctx_is_shutting_down(ctx) -> bool` | `bool` | Is the Shard in shutdown mode? |
-| `ctx_shard_id` | `ctx_shard_id(ctx) -> u8` | `u8` | Current Shard's ID. |
-| `ctx_supervision_group_id` | `ctx_supervision_group_id(ctx) -> Supervision_Group_Id` | `Supervision_Group_Id` | Current Isolate's supervision group. |
-| `ctx_root_supervision_group_id` | `ctx_root_supervision_group_id() -> Supervision_Group_Id` | `Supervision_Group_Id` | Root supervision group ID (constant `0`). No `ctx` parameter. |
-| `ctx_type_config` | `ctx_type_config(ctx) -> ^IsolateTypeDescriptor` | `^IsolateTypeDescriptor` | Type descriptor for current Isolate's registered type. |
+| `ctx_is_shutting_down` | `ctx_is_shutting_down() -> bool` | `bool` | Is the Shard in shutdown mode? |
+| `ctx_shard_id` | `ctx_shard_id() -> u8` | `u8` | Current Shard's ID. |
+| `ctx_supervision_group_id` | `ctx_supervision_group_id() -> Supervision_Group_Id` | `Supervision_Group_Id` | Current Isolate's supervision group. |
+| `ctx_root_supervision_group_id` | `ctx_root_supervision_group_id() -> Supervision_Group_Id` | `Supervision_Group_Id` | Root supervision group ID (constant `0`). |
+| `ctx_type_config` | `ctx_type_config() -> ^IsolateTypeDescriptor` | `^IsolateTypeDescriptor` | Type descriptor for current Isolate's registered type. |
 
 ---
 
@@ -168,7 +168,7 @@ Not `ctx_`-prefixed but part of the public API.
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `self_as` | `self_as($T, self_raw: rawptr, ctx) -> ^T` | `^T` | Debug-checked cast from `rawptr` to typed Isolate pointer. When `TINA_DEBUG_ASSERTS` is true, validates stride matches `size_of(T)`. |
+| `self_as` | `self_as($T, self_raw: rawptr) -> ^T` | `^T` | Debug-checked cast from `rawptr` to typed Isolate pointer. When `TINA_DEBUG_ASSERTS` is true, validates stride matches `size_of(T)`. |
 | `payload_as` | `payload_as($T, payload: []u8) -> ^T` | `^T` | Cast message payload bytes to a typed pointer. Asserts `size_of(T) <= len(payload)`. |
 | `bytes_of` | `bytes_of(ptr: ^$T) -> []u8` | `[]u8` | Cast a typed struct pointer to a byte slice for sending. |
 
@@ -183,11 +183,11 @@ Not `ctx_`-prefixed but part of the public API.
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `ctx_submit_io` | `ctx_submit_io(ctx, operation: IoOp) -> Io_Submit_Result` | `Io_Submit_Result` | Stage an I/O operation for commit. The scheduler commits it only if the handler returns `Isolate_Transition{kind = .Wait_Io}`. |
-| `ctx_io_send` | `ctx_io_send(ctx, self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a socket send from an Isolate-owned buffer. `buffer` must live inside the Isolate struct. |
-| `ctx_io_write` | `ctx_io_write(ctx, self: ^$Isolate, fd: FD_Handle, buffer: []u8, offset: u64) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a write command to a file descriptor at a byte offset. |
-| `ctx_io_sendto` | `ctx_io_sendto(ctx, self: ^$Isolate, fd: FD_Handle, buffer: []u8, address: Socket_Address) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a UDP send. |
-| `ctx_io_sendfile` | `ctx_io_sendfile(ctx, fd_socket: FD_Handle, fd_file: FD_Handle, source_offset: u64, size: u32) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a zero-copy sendfile. No Isolate memory involved — data flows from file page cache to socket. Use `SENDFILE_ALL_BYTES` for `size` to send the entire file from `source_offset`. |
+| `ctx_submit_io` | `ctx_submit_io(operation: IoOp) -> Io_Submit_Result` | `Io_Submit_Result` | Stage an I/O operation for commit. The scheduler commits it only if the handler returns `Isolate_Transition{kind = .Wait_Io}`. |
+| `ctx_io_send` | `ctx_io_send(self: ^$Isolate, fd: FD_Handle, buffer: []u8) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a socket send from an Isolate-owned buffer. `buffer` must live inside the Isolate struct. |
+| `ctx_io_write` | `ctx_io_write(self: ^$Isolate, fd: FD_Handle, buffer: []u8, offset: u64) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a write command to a file descriptor at a byte offset. |
+| `ctx_io_sendto` | `ctx_io_sendto(self: ^$Isolate, fd: FD_Handle, buffer: []u8, address: Socket_Address) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a UDP send. |
+| `ctx_io_sendfile` | `ctx_io_sendfile(fd_socket: FD_Handle, fd_file: FD_Handle, source_offset: u64, size: u32) -> Io_Submit_Result` | `Io_Submit_Result` | Stage a zero-copy sendfile. No Isolate memory involved — data flows from file page cache to socket. Use `SENDFILE_ALL_BYTES` for `size` to send the entire file from `source_offset`. |
 | `payload_offset_of` | `payload_offset_of(self: ^$Isolate, buffer: []u8) -> u16` | `u16` | Compute byte offset of a buffer within an Isolate's stable memory. Debug-validated. |
 
 ### Address Construction
@@ -307,23 +307,6 @@ Spawn_Spec :: struct {
     handoff_fd:   FD_Handle,                // FD to hand off (FD_HANDLE_NONE if none).
 }
 ```
-
-### `TinaContext`
-
-The primary API gateway. Passed to `init_handler` and `handler_fn`.
-
-**User-visible fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `self_handle` | `Handle` | This Isolate's current handle. |
-| `current_message_source` | `Handle` | Source handle of the currently dispatched message. |
-| `working_arena` | `mem.Arena` | Private per-Isolate arena. Persists across handler calls. |
-| `scratch_arena` | `mem.Arena` | Shard-wide scratch. Reset before each handler call. |
-| `current_correlation` | `u32` | Correlation ID for Call/Reply matching. |
-| `flags` | `Context_Flags` | Bit set. Currently: `{Is_Call}`. |
-
-`_shard` is opaque internal state — do not access.
 
 ### `Message`
 
@@ -447,8 +430,8 @@ Handoff_Mode :: enum u8 {
 ### Function Type Signatures
 
 ```odin
-Init_Handler    :: #type proc(self: rawptr, args: []u8, ctx: ^TinaContext) -> Isolate_Transition
-Handler_Fn :: #type proc(self: rawptr, message: ^Message, ctx: ^TinaContext) -> Isolate_Transition
+Init_Handler    :: #type proc(self: rawptr, args: []u8) -> Isolate_Transition
+Handler_Fn :: #type proc(self: rawptr, message: ^Message) -> Isolate_Transition
 ```
 
 ### Boot

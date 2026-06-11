@@ -25,9 +25,9 @@ when TINA_SIMULATION_MODE {
 		fd: FD_Handle,
 	}
 
-	fd_handoff_listener_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	fd_handoff_listener_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		iso := cast(^FDHandoffListener)self
-		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
 		if error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
@@ -35,39 +35,37 @@ when TINA_SIMULATION_MODE {
 		iso.listen_fd = fd
 		iso.target_handle = (cast(^Isolate_Handle)&args[0])^
 
-		bind_error := ctx_bind(ctx, fd, Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 8080})
+		bind_error := ctx_bind(fd, Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 8080})
 		if bind_error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
-		if ctx_listen(ctx, fd, 16) != .None {
+		if ctx_listen(fd, 16) != .None {
 			return transition_to_crash(.Init_Failed)
 		}
 
-		return transition_to_wait_io_or_crash(ctx_submit_io(ctx, IoOp_Accept{listen_fd = fd}))
+		return transition_to_wait_io_or_crash(ctx_submit_io(IoOp_Accept{listen_fd = fd}))
 	}
 
 	fd_handoff_listener_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		iso := cast(^FDHandoffListener)self
 		if message != nil && message.tag == IO_TAG_ACCEPT_COMPLETE {
-			iso.handoff_result = ctx_fd_handoff(ctx, iso.target_handle, message.io.fd)
+			iso.handoff_result = ctx_fd_handoff(iso.target_handle, message.io.fd)
 			iso.hand_offered = iso.handoff_result == .ok
 			return ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
-	fd_handoff_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: TinaContext) -> Isolate_Transition {
+	fd_handoff_dispatcher_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	fd_handoff_dispatcher_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		iso := cast(^FDHandoffDispatcher)self
 		if message != nil && message.tag == IO_TAG_ACCEPT_COMPLETE {
@@ -81,21 +79,19 @@ when TINA_SIMULATION_MODE {
 	fd_handoff_busy_dispatcher_init :: proc(
 		self: rawptr,
 		args: []u8,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		iso := cast(^FDHandoffBusyDispatcher)self
-		fd, error := ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
 		if error != .None {
 			return transition_to_crash(.Init_Failed)
 		}
 		iso.fd = fd
-		return transition_to_wait_io_or_crash(ctx_submit_io(ctx, IoOp_Recv{fd = fd, buffer_size_max = 64}))
+		return transition_to_wait_io_or_crash(ctx_submit_io(IoOp_Recv{fd = fd, buffer_size_max = 64}))
 	}
 
 	fd_handoff_busy_dispatcher_handler :: proc(
 		self: rawptr,
 		message: ^Message,
-		ctx: TinaContext,
 	) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -104,7 +100,7 @@ when TINA_SIMULATION_MODE {
 	test_fd_handoff_accept_completion_reaches_remote_dispatcher :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		target_handle := make_handle(1, u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0, 1)
+		target_handle := make_handle(1, FD_HANDOFF_DISPATCHER_TYPE_ID, 0, 1)
 		listener_args_size, listener_args_payload := sim_test_pack_init_args(
 			bytes_of(&target_handle),
 		)
@@ -181,12 +177,12 @@ when TINA_SIMULATION_MODE {
 
 		listener := cast(^FDHandoffListener)_get_isolate_ptr(
 			&sim.shards[0],
-			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
 		)
 		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
 			&sim.shards[1],
-			u16(FD_HANDOFF_DISPATCHER_TYPE_ID),
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
 			0,
 		)
 
@@ -214,7 +210,7 @@ when TINA_SIMULATION_MODE {
 	test_fd_handoff_rejects_when_dispatcher_is_busy :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		target_handle := make_handle(1, u16(FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID), 0, 1)
+		target_handle := make_handle(1, FD_HANDOFF_BUSY_DISPATCHER_TYPE_ID, 0, 1)
 		listener_args_size, listener_args_payload := sim_test_pack_init_args(
 			bytes_of(&target_handle),
 		)
@@ -294,7 +290,7 @@ when TINA_SIMULATION_MODE {
 
 		listener := cast(^FDHandoffListener)_get_isolate_ptr(
 			&sim.shards[0],
-			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
 		)
 		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
@@ -316,7 +312,7 @@ when TINA_SIMULATION_MODE {
 	test_fd_handoff_late_offer_still_adopts_after_timeout :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		target_handle := make_handle(1, u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0, 1)
+		target_handle := make_handle(1, FD_HANDOFF_DISPATCHER_TYPE_ID, 0, 1)
 		listener_args_size, listener_args_payload := sim_test_pack_init_args(
 			bytes_of(&target_handle),
 		)
@@ -404,12 +400,12 @@ when TINA_SIMULATION_MODE {
 
 		listener := cast(^FDHandoffListener)_get_isolate_ptr(
 			&sim.shards[0],
-			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
 		)
 		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
 			&sim.shards[1],
-			u16(FD_HANDOFF_DISPATCHER_TYPE_ID),
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
 			0,
 		)
 
@@ -440,7 +436,7 @@ when TINA_SIMULATION_MODE {
 	test_fd_handoff_timeout_ignores_late_ack :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
-		target_handle := make_handle(1, u16(FD_HANDOFF_DISPATCHER_TYPE_ID), 0, 1)
+		target_handle := make_handle(1, FD_HANDOFF_DISPATCHER_TYPE_ID, 0, 1)
 		listener_args_size, listener_args_payload := sim_test_pack_init_args(
 			bytes_of(&target_handle),
 		)
@@ -526,15 +522,14 @@ when TINA_SIMULATION_MODE {
 
 		listener := cast(^FDHandoffListener)_get_isolate_ptr(
 			&sim.shards[0],
-			u16(FD_HANDOFF_LISTENER_TYPE_ID),
+			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
 		)
 		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
 			&sim.shards[1],
-			u16(FD_HANDOFF_DISPATCHER_TYPE_ID),
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
 			0,
 		)
-
 		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
 		testing.expect(
 			t,

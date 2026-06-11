@@ -3,14 +3,14 @@ package http_server
 import tina "../../.."
 
 @(private = "package")
-_http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
+_http_dispatcher_init :: proc(self: rawptr, args: []u8) -> tina.Isolate_Transition {
 	dispatcher := cast(^HTTP_Dispatcher)self
 	if len(args) < size_of(HTTP_Dispatcher_Init_Args) {
 		return tina.transition_to_crash(.Init_Failed)
 	}
 
 	init_args := (cast(^HTTP_Dispatcher_Init_Args)raw_data(args))^
-	runtime_allocator := tina.ctx_working_arena(ctx)
+	runtime_allocator := tina.ctx_working_arena()
 
 	dispatcher.shard_runtime = _make_shard_runtime(
 		runtime_allocator,
@@ -27,7 +27,6 @@ _http_dispatcher_init :: proc(self: rawptr, args: []u8, ctx: tina.TinaContext) -
 _http_dispatcher_handler :: proc(
 	self: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
 	dispatcher := cast(^HTTP_Dispatcher)self
 	when tina.TINA_RUNTIME_ASSERTIONS {
@@ -46,13 +45,13 @@ _http_dispatcher_handler :: proc(
 			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		if dispatcher.shard_runtime.draining {
-			return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = client_fd}))
+			return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Close{fd = client_fd}))
 		}
-		if _spawn_connection_local(dispatcher.shard_runtime, ctx, client_fd) {
+		if _spawn_connection_local(dispatcher.shard_runtime, client_fd) {
 			return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
-		_ = _runtime_evict_idle_connection(dispatcher.shard_runtime, ctx)
-		return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Close{fd = client_fd}))
+		_ = _runtime_evict_idle_connection(dispatcher.shard_runtime)
+		return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Close{fd = client_fd}))
 
 	case:
 		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE

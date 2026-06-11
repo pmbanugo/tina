@@ -56,7 +56,7 @@ when TINA_SIMULATION_MODE {
 		sim := _make_fd_invariant_simulator(t, {.FD_Table_Integrity})
 		defer simulator_deinit(&sim)
 		shard := &sim.shards[0]
-		owner := make_handle(0, u16(HARNESS_NOOP_TYPE_ID), 0, 1)
+		owner := make_handle(0, HARNESS_NOOP_TYPE_ID, 0, 1)
 
 		os_fd, sock_error := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, sock_error, Backend_Error.None)
@@ -83,7 +83,7 @@ when TINA_SIMULATION_MODE {
 		sim := _make_fd_invariant_simulator(t, {.FD_Handoff_Integrity}, 2)
 		defer simulator_deinit(&sim)
 		shard := &sim.shards[0]
-		target_handle := make_handle(0, u16(HARNESS_NOOP_TYPE_ID), 0, 1)
+		target_handle := make_handle(0, HARNESS_NOOP_TYPE_ID, 0, 1)
 
 		cleanup_fd, sock_error := backend_control_socket(
 			&shard.reactor.backend,

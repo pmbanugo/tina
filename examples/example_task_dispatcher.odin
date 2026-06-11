@@ -56,8 +56,8 @@ WorkerIsolate :: struct {
 	dispatcher: tina.Isolate_Handle,
 }
 
-worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
-	self := tina.self_as(WorkerIsolate, self_raw, ctx)
+worker_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+	self := tina.self_as(WorkerIsolate, self_raw)
 
 	// 1. Parse the initialization arguments
 	init_args := tina.payload_as(WorkerInitArgs, args)
@@ -70,20 +70,20 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina
 	// If you know Rust, the old handle is a revoked capability, not a dangling pointer.
 
 	// 2. The Check-in Pattern: Tell the boss we are alive and hand over our ephemeral Handle.
-	// If we just crashed and restarted, tina.ctx_self_handle(ctx) is now a brand new Handle!
+	// If we just crashed and restarted, tina.ctx_self_handle() is now a brand new Handle!
 	ready_msg := WorkerReadyMsg {
 		id     = self.id,
-		handle = tina.ctx_self_handle(ctx),
+		handle = tina.ctx_self_handle(),
 	}
-	_ = tina.ctx_send(ctx, self.dispatcher, TAG_WORKER_READY, &ready_msg)
+	_ = tina.ctx_send(self.dispatcher, TAG_WORKER_READY, &ready_msg)
 
 	str := fmt.bprintf(
-		tina.ctx_scratch_arena_bytes(ctx),
+		tina.ctx_scratch_arena_bytes(),
 		"[RECOVER] Worker %d checked in with handle %X",
 		self.id,
-		u64(tina.ctx_self_handle(ctx)),
+		u64(tina.ctx_self_handle()),
 	)
-	tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+	tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
@@ -91,9 +91,8 @@ worker_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina
 worker_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
-	using self := tina.self_as(WorkerIsolate, self_raw, ctx)
+	using self := tina.self_as(WorkerIsolate, self_raw)
 	// log_buf: [128]u8
 
 	switch message.tag {
@@ -102,12 +101,12 @@ worker_handler :: proc(
 
 		if DEMO_CRASH_EVERY > 0 && msg.job_id % u32(DEMO_CRASH_EVERY) == 0 {
 			str := fmt.bprintf(
-				tina.ctx_scratch_arena_bytes(ctx), // log_buf[:],
+				tina.ctx_scratch_arena_bytes(), // log_buf[:],
 				"[FAIL] Worker %d crashed on Job %d. Watch: it will come back with a NEW handle.",
 				id,
 				msg.job_id,
 			)
-			tina.ctx_log(ctx, .ERROR, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+			tina.ctx_log(.ERROR, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 			// The supervisor tears it down and rebuilds from the boot spec.
 			// Old handle becomes permanently stale — sends to it return .stale_handle.
@@ -117,18 +116,18 @@ worker_handler :: proc(
 		// Happy Path: Do the job and report success.
 		// str := fmt.bprintf(log_buf[:], "Worker %d: Completed Job %d.", id, msg.job_id)
 		str := fmt.bprintf(
-			tina.ctx_scratch_arena_bytes(ctx),
+			tina.ctx_scratch_arena_bytes(),
 			"Worker %d: Completed Job %d.",
 			id,
 			msg.job_id,
 		)
-		tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+		tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 		done_msg := JobDoneMsg {
 			job_id    = msg.job_id,
 			worker_id = id,
 		}
-		_ = tina.ctx_send(ctx, dispatcher, TAG_JOB_DONE, &done_msg)
+		_ = tina.ctx_send(dispatcher, TAG_JOB_DONE, &done_msg)
 		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case:
@@ -147,11 +146,10 @@ DispatcherIsolate :: struct {
 	job_counter: u32,
 }
 
-dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> tina.Isolate_Transition {
-	self := tina.self_as(DispatcherIsolate, self_raw, ctx)
+dispatcher_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
+	self := tina.self_as(DispatcherIsolate, self_raw)
 
 	tina.ctx_log(
-		ctx,
 		.INFO,
 		tina.USER_LOG_TAG_BASE,
 		transmute([]u8)string("Dispatcher booting. Spawning workforce..."),
@@ -163,22 +161,22 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 
 		init_args := WorkerInitArgs {
 			id         = u32(i),
-			dispatcher = tina.ctx_self_handle(ctx),
+			dispatcher = tina.ctx_self_handle(),
 		}
 		payload, size := tina.init_args_of(&init_args)
 
 		spec := tina.Spawn_Spec {
 			type_id      = WORKER_ISOLATE_TYPE,
-			group_id     = tina.ctx_supervision_group_id(ctx),
+			group_id     = tina.ctx_supervision_group_id(),
 			restart_type = .permanent,
 			args_payload = payload,
 			args_size    = size,
 		}
-		_ = tina.ctx_spawn(ctx, spec)
+		_ = tina.ctx_spawn(spec)
 	}
 
 	// 2. Start the work loop (fires every 400ms)
-	tina.ctx_register_timer(ctx, 400 * 1_000_000, TAG_DISPATCH_TICK)
+	tina.ctx_register_timer(400 * 1_000_000, TAG_DISPATCH_TICK)
 
 	return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 }
@@ -186,9 +184,8 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8, ctx: tina.TinaContext) -> 
 dispatcher_handler :: proc(
 	self_raw: rawptr,
 	message: ^tina.Message,
-	ctx: tina.TinaContext,
 ) -> tina.Isolate_Transition {
-	using self := tina.self_as(DispatcherIsolate, self_raw, ctx)
+	using self := tina.self_as(DispatcherIsolate, self_raw)
 	log_buf: [128]u8
 
 	switch message.tag {
@@ -207,13 +204,13 @@ dispatcher_handler :: proc(
 				u64(old_handle),
 				u64(msg.handle),
 			)
-			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+			tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 			str2 := fmt.bprintf(
-				tina.ctx_scratch_arena_bytes(ctx),
+				tina.ctx_scratch_arena_bytes(),
 				"[INSIGHT] Same role. New identity. Stale sends fail safely.",
 			)
-			tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str2)
+			tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str2)
 		} else {
 			str := fmt.bprintf(
 				log_buf[:],
@@ -221,7 +218,7 @@ dispatcher_handler :: proc(
 				msg.id,
 				u64(msg.handle),
 			)
-			tina.ctx_log(ctx, .DEBUG, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+			tina.ctx_log(.DEBUG, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 		}
 		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
@@ -233,7 +230,7 @@ dispatcher_handler :: proc(
 			msg.job_id,
 			msg.worker_id,
 		)
-		tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+		tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case TAG_DISPATCH_TICK:
@@ -245,7 +242,7 @@ dispatcher_handler :: proc(
 				job := JobMsg {
 					job_id = job_counter,
 				}
-				res := tina.ctx_send(ctx, target_handle, TAG_JOB, &job)
+				res := tina.ctx_send(target_handle, TAG_JOB, &job)
 
 				// The worker died, so this job gets dropped. No retry, no coordination needed.
 				if res == .stale_handle {
@@ -255,7 +252,7 @@ dispatcher_handler :: proc(
 						target_id,
 						job_counter,
 					)
-					tina.ctx_log(ctx, .WARN, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+					tina.ctx_log(.WARN, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 
 					// Clear the stale handle so we don't try again until it checks in
 					workers[target_id] = tina.ISOLATE_HANDLE_NONE
@@ -266,7 +263,7 @@ dispatcher_handler :: proc(
 						job_counter,
 						target_id,
 					)
-					tina.ctx_log(ctx, .INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+					tina.ctx_log(.INFO, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 				}
 			} else {
 				str := fmt.bprintf(
@@ -275,12 +272,12 @@ dispatcher_handler :: proc(
 					target_id,
 					job_counter,
 				)
-				tina.ctx_log(ctx, .WARN, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
+				tina.ctx_log(.WARN, tina.USER_LOG_TAG_BASE, transmute([]u8)str)
 			}
 		}
 
 		// Re-arm the loop
-		tina.ctx_register_timer(ctx, 300 * 1_000_000, TAG_DISPATCH_TICK)
+		tina.ctx_register_timer(300 * 1_000_000, TAG_DISPATCH_TICK)
 		return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
 	case:

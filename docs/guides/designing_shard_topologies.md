@@ -52,11 +52,10 @@ SymmetricListener :: struct {
 symmetric_listener_init :: proc(
     self_raw: rawptr,
     args: []u8,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(SymmetricListener, self_raw, ctx)
+    self := tina.self_as(SymmetricListener, self_raw)
 
-    fd, error := tina.ctx_socket(ctx, .AF_INET, .STREAM, .TCP)
+    fd, error := tina.ctx_socket(.AF_INET, .STREAM, .TCP)
     if error != .None {
         return tina.transition_to_crash(.Init_Failed)
     }
@@ -65,13 +64,13 @@ symmetric_listener_init :: proc(
     // Both flags required for symmetric topology.
     // SO_REUSEADDR: avoid TIME_WAIT on restart.
     // SO_REUSEPORT: allow multiple Shards to bind the same port.
-    tina.ctx_setsockopt(ctx, self.listen_fd, .SOL_SOCKET, .SO_REUSEADDR, true)
-    tina.ctx_setsockopt(ctx, self.listen_fd, .SOL_SOCKET, .SO_REUSEPORT, true)
+    tina.ctx_setsockopt(self.listen_fd, .SOL_SOCKET, .SO_REUSEADDR, true)
+    tina.ctx_setsockopt(self.listen_fd, .SOL_SOCKET, .SO_REUSEPORT, true)
 
-    tina.ctx_bind(ctx, self.listen_fd, tina.ipv4(0, 0, 0, 0, 8080))
-    tina.ctx_listen(ctx, self.listen_fd, 128)
+    tina.ctx_bind(self.listen_fd, tina.ipv4(0, 0, 0, 0, 8080))
+    tina.ctx_listen(self.listen_fd, 128)
 
-    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = self.listen_fd}))
+    return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = self.listen_fd}))
 }
 ```
 
@@ -175,9 +174,8 @@ Router :: struct {
 router_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
-    self := tina.self_as(Router, self_raw, ctx)
+    self := tina.self_as(Router, self_raw)
 
     switch message.tag {
 
@@ -193,10 +191,10 @@ router_handler :: proc(
                 client_fd  = message.io.fd,
                 request_id = u32(client_id & 0xFFFF_FFFF),
             }
-            _ = tina.ctx_send(ctx, self.coordinators[target], APP_TAG_WORK_REQUEST, &req)
+            _ = tina.ctx_send(self.coordinators[target], APP_TAG_WORK_REQUEST, &req)
         }
         // Keep accepting.
-        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(ctx, tina.IoOp_Accept{listen_fd = /* listen_fd */ {}}))
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = /* listen_fd */ {}}))
 
     case:
         return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -313,7 +311,6 @@ Coordinator :: struct {}
 coordinator_init :: proc(
     self_raw: rawptr,
     args: []u8,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
     // No setup needed. Park and wait for spawn requests.
     return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -322,7 +319,6 @@ coordinator_init :: proc(
 coordinator_handler :: proc(
     self_raw: rawptr,
     message: ^tina.Message,
-    ctx: ^tina.TinaContext,
 ) -> tina.Isolate_Transition {
 
     switch message.tag {
@@ -334,12 +330,12 @@ coordinator_handler :: proc(
         // Spawn the child locally on this Shard.
         spec := tina.Spawn_Spec{
             type_id      = req.type_id,
-            group_id     = tina.ctx_supervision_group_id(ctx),
+            group_id     = tina.ctx_supervision_group_id(),
             restart_type = .temporary,
             handoff_fd   = req.client_fd,
             handoff_mode = .Full,
         }
-        result := tina.ctx_spawn(ctx, spec)
+        result := tina.ctx_spawn(spec)
 
         // Build the response.
         resp: SpawnResponse
@@ -351,7 +347,7 @@ coordinator_handler :: proc(
         }
 
         // Reply to the caller. This completes the caller's call.
-        tina.ctx_reply_typed(ctx, APP_TAG_SPAWN_RESPONSE, &resp)
+        tina.ctx_reply_typed(APP_TAG_SPAWN_RESPONSE, &resp)
         return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
 
     case tina.TAG_SHUTDOWN:
@@ -369,7 +365,6 @@ The requesting Isolate (e.g., a Router on Shard 0) uses `ctx_call` with a timeou
 
 ```odin
 request_remote_spawn :: proc(
-    ctx: tina.TinaContext,
     coordinator_handle: tina.Handle,
     type_id: u8,
     client_id: u64,
@@ -383,7 +378,7 @@ request_remote_spawn :: proc(
 
     // Stage the call. The scheduler commits it only if this handler
     // returns ISOLATE_TRANSITION_WAIT_REPLY.
-    _ = tina.ctx_call_typed(ctx, coordinator_handle, APP_TAG_SPAWN_REQUEST, &req, 5_000_000_000)
+    _ = tina.ctx_call_typed(coordinator_handle, APP_TAG_SPAWN_REQUEST, &req, 5_000_000_000)
     return tina.ISOLATE_TRANSITION_WAIT_REPLY
 }
 ```
@@ -395,7 +390,7 @@ case APP_TAG_SPAWN_RESPONSE:
     resp := tina.payload_as(SpawnResponse, message.user.payload[:message.user.payload_size])
     if resp.handle != tina.HANDLE_NONE {
         // Success — communicate with the new Isolate directly.
-        _ = tina.ctx_send(ctx, resp.handle, APP_TAG_START_WORK, &work_payload)
+        _ = tina.ctx_send(resp.handle, APP_TAG_START_WORK, &work_payload)
     }
     // Continue normal operation.
     return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -411,7 +406,7 @@ Use `key_to_shard` to decide which Coordinator to target:
 ```odin
 target_shard := tina.key_to_shard(client_id, shard_count)
 coordinator  := coordinator_handles[target_shard]
-return request_remote_spawn(ctx, coordinator, WORKER_TYPE, client_id, client_fd)
+return request_remote_spawn(coordinator, WORKER_TYPE, client_id, client_fd)
 ```
 
 ## Choosing Your Topology

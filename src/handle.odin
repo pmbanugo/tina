@@ -8,8 +8,8 @@ ISOLATE_HANDLE_NONE :: Isolate_Handle(0)
 
 make_handle :: #force_inline proc "contextless" (
 	shard_id: Shard_Id,
-	type_id: u16,
-	slot: u32,
+	type_id: Isolate_Type_Id,
+	slot: Isolate_Slot_Index,
 	generation: u32,
 ) -> Isolate_Handle {
 	// shard_id: 8 bits (63-56)
@@ -28,12 +28,12 @@ extract_shard_id :: #force_inline proc "contextless" (h: Isolate_Handle) -> Shar
 	return Shard_Id((u64(h) >> 56) & 0xFF)
 }
 
-extract_type_id :: #force_inline proc "contextless" (h: Isolate_Handle) -> u16 {
-	return u16((u64(h) >> 48) & 0xFF)
+extract_type_id :: #force_inline proc "contextless" (h: Isolate_Handle) -> Isolate_Type_Id {
+	return Isolate_Type_Id((u64(h) >> 48) & 0xFF)
 }
 
-extract_slot :: #force_inline proc "contextless" (h: Isolate_Handle) -> u32 {
-	return u32((u64(h) >> 28) & 0xFFFFF)
+extract_slot :: #force_inline proc "contextless" (h: Isolate_Handle) -> Isolate_Slot_Index {
+	return Isolate_Slot_Index((u64(h) >> 28) & 0xFFFFF)
 }
 
 extract_generation :: #force_inline proc "contextless" (h: Isolate_Handle) -> u32 {
