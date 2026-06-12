@@ -125,6 +125,7 @@ Shard_Counters :: struct {
 	handoff_control_send_failures:    u64,
 	handoff_control_retry_exhaustions: u64,
 	handoff_control_retry_drops:      u64,
+	liveness_control_publish_count:   u64,
 }
 
 Dynamic_Child_Spec :: struct {
@@ -169,6 +170,8 @@ Shard :: struct {
 	// --- Hot Pointers & Slices (8-byte aligned) ---
 	outbound_rings:         []^SPSC_Ring,
 	inbound_rings:          []^SPSC_Ring,
+	outbound_control_channels: []^Shard_Control_Channel,
+	inbound_control_channel:   ^Shard_Control_Channel,
 	type_descriptors:       []IsolateTypeDescriptor,
 	isolate_free_heads:     []u32, // free list heads per Isolate Type
 	dispatch_cursors:       []u32, // Resumption index for budgeted dispatch
@@ -202,11 +205,14 @@ Shard :: struct {
 	handoff_retry_tail:     u32,
 	handoff_retry_count:    u32,
 	dispatch_type_cursor:   u32,
+	liveness_epoch:         u32,
+	liveness_broadcast_epoch: u32,
 	id:                     Shard_Id,
 	shard_count:            u8,
+	liveness_broadcast_state: Shard_State,
 	peer_alive_mask:        Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
 	control_signal:         Control_Signal, // Atomic, mutually exclusive signals from watchdog
-	_padding:               [4]u8,
+	_padding:               [3]u8,
 	watchdog_state_pointer: ^u8, // Points to external watchdog state (config or simulator backing)
 
 	// --- Cold / Massive Storage ---
@@ -215,6 +221,8 @@ Shard :: struct {
 	trap_environment_inner: OS_Trap_Environment,
 	trap_environment_init:  OS_Trap_Environment,
 	reactor:                Reactor,
+	liveness_epoch_seen:    [MAX_SHARDS]u32,
+	liveness_broadcast_pending_mask: Shard_Mask,
 
 	// Placed at the end to prevent possible cache-line shifting of hot fields.
 	using _sim_mixin:       Sim_State_Mixin,
@@ -1091,6 +1099,8 @@ scheduler_tick :: proc(shard: ^Shard) {
 	}
 	now := shard.current_tick
 	backend_set_current_tick(&shard.reactor.backend, now)
+	transport_drain_control_inbound(shard)
+	transport_retry_liveness_broadcast(shard)
 
 	// ========================================================================
 	// Step 1: Drain inbound cross-shard rings → deliver to local mailboxes
@@ -1123,6 +1133,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	// Step 5: Flush outbound cross-shard rings
 	// ========================================================================
+	transport_flush_control_outbound(shard)
 	transport_flush_outbound(shard)
 
 	// ========================================================================
@@ -2136,12 +2147,9 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	// Control Signal reset
 	store_shard_control_signal(shard, .None)
 
-	// Step 6: Notify peers via SHARD_RESTARTED
-	env: Message_Envelope
-	env.source = ISOLATE_HANDLE_NONE
-	env.destination = ISOLATE_HANDLE_NONE
-	env.tag = TAG_SHARD_RESTARTED
-	transport_broadcast_envelope(shard, &env)
+	// Step 6: Notify peers through the control-plane liveness channel.
+	shard_broadcast_liveness_state(shard, .Running)
+	transport_flush_control_outbound(shard)
 }
 
 // Checks if any Isolates are still alive across all types on this Shard.
@@ -2156,6 +2164,58 @@ shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
 		}
 	}
 	return false
+}
+
+@(private = "package")
+shard_broadcast_liveness_state :: proc(shard: ^Shard, state: Shard_State) {
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(shard != nil, "Shard liveness broadcast requires a shard")
+		if shard.shard_count > 0 {
+			assert(int(shard.id) < int(shard.shard_count), "Shard id must be within shard count before liveness broadcast")
+		}
+	}
+	shard.liveness_epoch += 1
+	if shard.liveness_epoch == 0 do shard.liveness_epoch = 1
+
+	shard.liveness_broadcast_epoch = shard.liveness_epoch
+	shard.liveness_broadcast_state = state
+	shard.liveness_broadcast_pending_mask = {}
+
+	for target_index in 0 ..< int(shard.shard_count) {
+		target_shard := Shard_Id(target_index)
+		if target_shard != shard.id {
+			shard_mask_include(&shard.liveness_broadcast_pending_mask, target_shard)
+		}
+	}
+
+	transport_retry_liveness_broadcast(shard)
+}
+
+@(private = "package")
+_process_inbound_control_event :: proc "contextless" (
+	shard: ^Shard,
+	source_shard: Shard_Id,
+	event: ^Shard_Control_Event,
+) {
+	if event.kind != .Liveness do return
+	if source_shard >= Shard_Id(shard.shard_count) do return
+	if event.source != source_shard do return
+	source_index := int(source_shard)
+	if event.epoch == 0 || event.epoch <= shard.liveness_epoch_seen[source_index] do return
+
+	shard.liveness_epoch_seen[source_index] = event.epoch
+
+	switch event.state {
+	case .Running:
+		// A new peer epoch invalidates in-flight handoffs from the old incarnation.
+		_fd_handoff_close_entries_for_target_shard(shard, source_shard, false)
+		shard_mask_include(&shard.peer_alive_mask, source_shard)
+	case .Quarantined:
+		shard_mask_exclude(&shard.peer_alive_mask, source_shard)
+		_fd_handoff_close_entries_for_target_shard(shard, source_shard, false)
+	case .Init, .Shutting_Down, .Terminated:
+		shard_mask_exclude(&shard.peer_alive_mask, source_shard)
+	}
 }
 
 @(private = "package")
@@ -2668,6 +2728,75 @@ test_fd_handoff_peer_quarantine_closes_entries_targeting_that_shard :: proc(t: ^
 	testing.expect(t, lookup_err_target_1_a != .None, "quarantined target shard entries should be reclaimed")
 	testing.expect(t, lookup_err_target_1_b != .None, "all quarantined target shard entries should be reclaimed")
 	testing.expect_value(t, lookup_err_target_2, FD_Handoff_Table_Error.None)
+}
+
+@(test)
+test_liveness_control_channel_delivers_without_data_plane_capacity :: proc(t: ^testing.T) {
+	source := new(Shard)
+	defer free(source)
+	target := new(Shard)
+	defer free(target)
+
+	source.id = 0
+	source.shard_count = 2
+	target.id = 1
+	target.shard_count = 2
+
+	channel_cells: [2]Shard_Control_Channel_Cell
+	channel: Shard_Control_Channel
+	shard_control_channel_init(&channel, 2, channel_cells[:])
+	outbound_control_channels: [1]^Shard_Control_Channel
+	outbound_control_channels[0] = &channel
+	source.outbound_control_channels = outbound_control_channels[:]
+	target.inbound_control_channel = &channel
+
+	handoff_backing: [2]FD_Handoff_Entry
+	_world_raw: rawptr
+	when TINA_SIMULATION_MODE {
+		_w := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_w)
+		_world_raw = cast(rawptr)_w
+	}
+	_init_handoff_test_shard(t, target, handoff_backing[:], _world_raw)
+	defer backend_deinit(&target.reactor.backend)
+
+	ref_target_0 := _alloc_handoff_test_entry(t, target, make_handle(0, 1, 0, 1), 100)
+
+	shard_broadcast_liveness_state(source, .Quarantined)
+	testing.expect(t, !shard_mask_contains(&source.liveness_broadcast_pending_mask, 1), "dedicated source cell should publish liveness without data-plane backpressure")
+	testing.expect_value(t, source.counters.liveness_control_publish_count, u64(1))
+
+	transport_drain_control_inbound(target)
+	_, lookup_error := fd_handoff_table_lookup_index(&target.handoff_table, ref_target_0)
+	testing.expect(t, lookup_error != .None, "delivered quarantine should reclaim target-shard handoffs")
+	testing.expect(t, !shard_mask_contains(&target.peer_alive_mask, 0), "delivered quarantine should clear peer liveness")
+}
+
+@(test)
+test_liveness_restart_epoch_closes_stale_peer_handoffs :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+	handoff_backing: [2]FD_Handoff_Entry
+	_world_raw: rawptr
+	when TINA_SIMULATION_MODE {
+		_w := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(_w)
+		_world_raw = cast(rawptr)_w
+	}
+	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw)
+	defer backend_deinit(&shard.reactor.backend)
+
+	shard.id = 1
+	shard.shard_count = 2
+	shard_mask_exclude(&shard.peer_alive_mask, 0)
+	ref_target_0 := _alloc_handoff_test_entry(t, shard, make_handle(0, 1, 0, 1), 100)
+
+	event := Shard_Control_Event{epoch = 7, source = Shard_Id(0), state = .Running, kind = .Liveness}
+	_process_inbound_control_event(shard, 0, &event)
+
+	_, lookup_error := fd_handoff_table_lookup_index(&shard.handoff_table, ref_target_0)
+	testing.expect(t, lookup_error != .None, "restart epoch should reclaim stale target-shard handoffs")
+	testing.expect(t, shard_mask_contains(&shard.peer_alive_mask, 0), "restart epoch should restore peer liveness")
 }
 
 @(test)

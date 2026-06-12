@@ -17,6 +17,8 @@ when TINA_SIMULATION_MODE {
 		shards:                  []Shard, // Allocated as a flat array
 		watchdog_states:         []u8, // Backing for Shard.watchdog_state_pointer (bypasses watchdog)
 		shard_arena_bytes:       [][]u8,
+		control_channels:        []Shard_Control_Channel,
+		control_channel_cells:   [][]Shard_Control_Channel_Cell,
 		shard_index_order:       []u8,
 		shard_count_initialized: int,
 		network:                 SimulatedNetwork,
@@ -58,8 +60,27 @@ when TINA_SIMULATION_MODE {
 		if error != .None do return error
 		sim.shard_arena_bytes, error = make([][]u8, spec.shard_count, allocator)
 		if error != .None do return error
+		sim.control_channels, error = make([]Shard_Control_Channel, spec.shard_count, allocator)
+		if error != .None do return error
+		sim.control_channel_cells, error = make([][]Shard_Control_Channel_Cell, spec.shard_count, allocator)
+		if error != .None do return error
 		sim.shard_index_order, error = make([]u8, spec.shard_count, allocator)
 		if error != .None do return error
+
+		control_source_count := int(spec.shard_count)
+		for target_index in 0 ..< spec.shard_count {
+			sim.control_channel_cells[target_index], error = make(
+				[]Shard_Control_Channel_Cell,
+				control_source_count,
+				allocator,
+			)
+			if error != .None do return error
+			shard_control_channel_init(
+				&sim.control_channels[target_index],
+				control_source_count,
+				sim.control_channel_cells[target_index],
+			)
+		}
 
 		// Use the validated timer resolution from the spec (uniform across all shards)
 		sim.tick_resolution_ns = spec.timer_resolution_ns
@@ -115,6 +136,15 @@ when TINA_SIMULATION_MODE {
 			shard := &sim.shards[i]
 			shard.id = Shard_Id(i)
 			shard.shard_count = spec.shard_count
+			remote_shard_count := int(spec.shard_count) - 1
+			shard.outbound_control_channels, error = make([]^Shard_Control_Channel, remote_shard_count, allocator)
+			if error != .None do return error
+			shard.inbound_control_channel = &sim.control_channels[i]
+			for peer_index in 0 ..< spec.shard_count {
+				if peer_index == i do continue
+				outbound_index := remote_route_index_from_shard_id(Shard_Id(i), Shard_Id(peer_index))
+				shard.outbound_control_channels[outbound_index] = &sim.control_channels[peer_index]
+			}
 			shard.sim_state.network = &sim.network
 			shard.sim_state.fault_config = &spec.simulation.faults
 			shard.sim_state.crash_prng = &sim.prng_tree.shard_crash[i]
@@ -276,10 +306,14 @@ when TINA_SIMULATION_MODE {
 
 		for shard_index in 0 ..< sim.shard_count_initialized {
 			reactor_deinit(&sim.shards[shard_index].reactor)
+			delete(sim.shards[shard_index].outbound_control_channels, sim.allocator)
 		}
 
 		sim_network_deinit(&sim.network, sim.allocator)
 		prng_tree_deinit(&sim.prng_tree, sim.allocator)
+		for target_index in 0 ..< len(sim.control_channel_cells) {
+			delete(sim.control_channel_cells[target_index], sim.allocator)
+		}
 
 		for shard_arena_bytes in sim.shard_arena_bytes {
 			if len(shard_arena_bytes) > 0 {
@@ -287,6 +321,8 @@ when TINA_SIMULATION_MODE {
 			}
 		}
 		delete(sim.shard_arena_bytes, sim.allocator)
+		delete(sim.control_channel_cells, sim.allocator)
+		delete(sim.control_channels, sim.allocator)
 		delete(sim.shard_index_order, sim.allocator)
 		delete(sim.watchdog_states, sim.allocator)
 		delete(sim.shards, sim.allocator)

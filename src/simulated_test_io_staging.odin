@@ -347,6 +347,15 @@ when TINA_SIMULATION_MODE {
 		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
 		if error != .None do return transition_to_crash(.Init_Failed)
 		s.fd = fd
+		_ = ctx_send_raw(ctx_self_handle(), USER_MESSAGE_TAG_BASE, nil)
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	staging_already_staged_handler :: proc(
+		self: rawptr,
+		message: ^Message,
+	) -> Isolate_Transition {
+		s := cast(^StagingAlreadyStaged)self
 
 		// Claim a staging slot (writes to the turn frame).
 		stage := ctx_claim_send_slot()
@@ -359,20 +368,13 @@ when TINA_SIMULATION_MODE {
 		noop := struct {
 			_payload: [1]u8,
 		}{_payload = {0x33}}
-		s.send_result = ctx_io_send(&noop, fd, noop._payload[:])
+		s.send_result = ctx_io_send(&noop, s.fd, noop._payload[:])
 		s.result_check = true
 
-		// Returning Wait_Io without a committed I/O is a contract violation —
-		// the framework will crash the Isolate and call _teardown_isolate, which
-		// must reclaim the pending staging slot.
-		return ISOLATE_TRANSITION_WAIT_IO
-	}
-
-	staging_already_staged_handler :: proc(
-		self: rawptr,
-		message: ^Message,
-	) -> Isolate_Transition {
-		return ISOLATE_TRANSITION_DONE
+		// The rejected struct-source send must leave the existing staging claim
+		// under normal turn cleanup. Crash-path reclamation is covered separately
+		// by test_staging_slot_claim_then_crash_reclaims.
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
 	@(test)
@@ -430,9 +432,10 @@ when TINA_SIMULATION_MODE {
 
 		stage_pool := &shard.reactor.staging_pool
 		testing.expect_value(t, stage_pool.free_count, stage_pool.slot_count)
+		testing.expect_value(t, shard.metadata[STAGING_TYPE_ID].state[0], Isolate_State.Wait_Message)
 
 		fmt.printfln(
-			"\n[TEST SUCCESS] Staging claim is rejected by struct-source helper and reclaimed on crash. Staging pool: %d/%d free.",
+			"\n[TEST SUCCESS] Staging claim is rejected by struct-source helper and reclaimed by turn cleanup. Staging pool: %d/%d free.",
 			stage_pool.free_count,
 			stage_pool.slot_count,
 		)

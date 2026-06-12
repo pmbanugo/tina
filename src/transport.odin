@@ -1,5 +1,6 @@
 package tina
 
+import "core:math/bits"
 import "core:testing"
 
 // Transport layer abstraction: physical SPSC rings vs. simulated network.
@@ -86,11 +87,77 @@ transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now:
 }
 
 @(private = "package")
+transport_drain_control_inbound :: #force_inline proc(shard: ^Shard) {
+	channel := shard.inbound_control_channel
+	if channel == nil do return
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(channel.source_count >= int(shard.shard_count), "Shard control channel source count must cover shard count")
+	}
+
+	for word_index in 0 ..< SHARD_CONTROL_READY_WORD_COUNT {
+		ready_word := shard_control_channel_take_ready_word(channel, word_index)
+		for ready_word != 0 {
+			word_bit_index := u32(bits.trailing_zeros(ready_word))
+			source_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, word_bit_index)
+			ready_word &= ready_word - 1
+
+			if source_index >= u32(shard.shard_count) do continue
+			source_shard := Shard_Id(source_index)
+			if source_shard == shard.id do continue
+
+			event := shard_control_channel_load_event(channel, source_shard)
+			_process_inbound_control_event(shard, source_shard, &event)
+		}
+	}
+}
+
+@(private = "package")
 transport_flush_outbound :: #force_inline proc "contextless" (shard: ^Shard) {
 	when !TINA_SIMULATION_MODE {
 		for ring in shard.outbound_rings {
 			spsc_ring_flush_producer(ring)
 		}
+	}
+}
+
+@(private = "package")
+transport_flush_control_outbound :: #force_inline proc "contextless" (shard: ^Shard) {
+	_ = shard
+	// MPSC control channels publish source cells immediately; this no-op keeps
+	// recovery call sites symmetric with the batched data-plane transport.
+}
+
+@(private = "package")
+transport_retry_liveness_broadcast :: #force_inline proc(shard: ^Shard) {
+	if len(shard.outbound_control_channels) == 0 do return
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(int(shard.id) < int(shard.shard_count), "Shard id must be within shard count before liveness publish")
+		assert(len(shard.outbound_control_channels) == int(shard.shard_count) - 1, "Outbound control channels must cover every peer shard")
+	}
+	if shard.liveness_broadcast_pending_mask[0] == 0 &&
+	   shard.liveness_broadcast_pending_mask[1] == 0 &&
+	   shard.liveness_broadcast_pending_mask[2] == 0 &&
+	   shard.liveness_broadcast_pending_mask[3] == 0 {
+		return
+	}
+
+	event := Shard_Control_Event {
+		epoch  = shard.liveness_broadcast_epoch,
+		source = shard.id,
+		state  = shard.liveness_broadcast_state,
+		kind   = .Liveness,
+	}
+
+	for target_index in 0 ..< int(shard.shard_count) {
+		target_shard := Shard_Id(target_index)
+		if target_shard == shard.id do continue
+		if !shard_mask_contains(&shard.liveness_broadcast_pending_mask, target_shard) do continue
+
+		route_index := remote_route_index_from_shard_id(shard.id, target_shard)
+		channel := shard.outbound_control_channels[route_index]
+		shard_control_channel_publish(channel, shard.id, &event)
+		shard.counters.liveness_control_publish_count += 1
+		shard_mask_exclude(&shard.liveness_broadcast_pending_mask, target_shard)
 	}
 }
 
@@ -134,32 +201,5 @@ transport_route_envelope :: #force_inline proc "contextless" (
 			source_shard.current_tick,
 			source_shard.sim_state.fault_config,
 		)
-	}
-}
-
-@(private = "package")
-transport_broadcast_envelope :: #force_inline proc "contextless" (
-	shard: ^Shard,
-	env: ^Message_Envelope,
-) {
-	when TINA_SIMULATION_MODE {
-		if shard.sim_state.network != nil {
-		for target_shard in 0 ..< shard.sim_state.network.shard_count {
-				if Shard_Id(target_shard) != shard.id {
-					_ = sim_network_enqueue(
-						shard.sim_state.network,
-						shard,
-						Shard_Id(target_shard),
-						env^,
-						shard.current_tick,
-						shard.sim_state.fault_config,
-					)
-				}
-			}
-		}
-	} else {
-		for outbound_ring in shard.outbound_rings {
-			spsc_ring_enqueue(outbound_ring, env)
-		}
 	}
 }

@@ -44,6 +44,9 @@ pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct:
 
 	// Calculate High-Water Mark for System Messages
 	p.reserved_count = u32(f32(p.slot_count) * reserved_pct)
+	if p.slot_count > 1 && p.reserved_count == 0 {
+		p.reserved_count = 1
+	}
 
 	// Intrusive push. Slot 0 at the head for sequential cache warmth.
 	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
@@ -126,20 +129,27 @@ test_message_pool :: proc(t: ^testing.T) {
 	stats := pool_stats(&pool)
 	testing.expect_value(t, stats.slot_count, 10)
 	testing.expect_value(t, pool.slot_shift, 7) // log2(128) == 7
+	testing.expect_value(t, pool.reserved_count, 1)
 
 	testing.expect_value(t, stats.free_count, 10)
 	testing.expect_value(t, stats.used_count, 0)
 
-	// Allocate all slots
+	// User traffic must stop at the system reserve.
 	indices: [10]u32
-	for i in 0 ..< 10 {
+	for i in 0 ..< 9 {
 		index, error := pool_alloc_user(&pool)
 		testing.expect_value(t, error, Pool_Error.None)
 		indices[i] = index
 	}
 
-	// Pool should now be empty
-	_, empty_error := pool_alloc_user(&pool)
+	_, user_empty_error := pool_alloc_user(&pool)
+	testing.expect_value(t, user_empty_error, Pool_Error.Empty)
+
+	index_system, system_error := pool_alloc_system(&pool)
+	testing.expect_value(t, system_error, Pool_Error.None)
+	indices[9] = index_system
+
+	_, empty_error := pool_alloc_system(&pool)
 	testing.expect_value(t, empty_error, Pool_Error.Empty)
 
 	stats_full := pool_stats(&pool)
@@ -162,4 +172,21 @@ test_message_pool :: proc(t: ^testing.T) {
 	testing.expect_value(t, stats_freed.used_count, 0)
 	testing.expect_value(t, stats_freed.free_count, 10)
 
+}
+
+@(test)
+test_message_pool_small_pool_keeps_system_reserve :: proc(t: ^testing.T) {
+	backing: [MESSAGE_ENVELOPE_SIZE * 2]u8
+	pool: Message_Pool
+	pool_init(&pool, backing[:], MESSAGE_ENVELOPE_SIZE)
+
+	testing.expect_value(t, pool.slot_count, u32(2))
+	testing.expect_value(t, pool.reserved_count, u32(1))
+
+	_, user_error := pool_alloc_user(&pool)
+	testing.expect_value(t, user_error, Pool_Error.None)
+	_, user_empty_error := pool_alloc_user(&pool)
+	testing.expect_value(t, user_empty_error, Pool_Error.Empty)
+	_, system_error := pool_alloc_system(&pool)
+	testing.expect_value(t, system_error, Pool_Error.None)
 }

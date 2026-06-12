@@ -31,6 +31,8 @@ Shard_Config :: struct {
 	// Dense remote routes in ascending shard-id order, excluding self.
 	outbound_rings:    [REMOTE_SHARD_COUNT_MAX]^SPSC_Ring,
 	inbound_rings:     [REMOTE_SHARD_COUNT_MAX]^SPSC_Ring,
+	outbound_control_channels: [REMOTE_SHARD_COUNT_MAX]^Shard_Control_Channel,
+	inbound_control_channel:   ^Shard_Control_Channel,
 	grand_arena_base:  []u8,
 	system_spec:       ^SystemSpec,
 	shard_spec:        ^ShardSpec,
@@ -165,14 +167,47 @@ tina_start :: proc(spec: ^SystemSpec) {
 		}
 	}
 
+	// Control-plane channels carry scheduler-owned lifecycle events. They are
+	// separate from data-plane rings so recovery state does not compete with user traffic.
+	control_memory_size: int = 0
+	control_source_count := int(spec.shard_count)
+	for target in 0 ..< spec.shard_count {
+		channel_memory_size := size_of(Shard_Control_Channel) +
+			control_source_count * size_of(Shard_Control_Channel_Cell)
+		control_memory_size += channel_memory_size
+		raw_mem, alloc_error := os_reserve_arena_with_guard(uint(channel_memory_size))
+		if alloc_error != .None {
+			fmt.eprintfln("[FATAL] Failed to allocate control channel for shard %v", target)
+			os.exit(1)
+		}
+
+		channel := cast(^Shard_Control_Channel)raw_data(raw_mem)
+		cell_pointer := cast([^]Shard_Control_Channel_Cell)(uintptr(raw_data(raw_mem)) +
+			size_of(Shard_Control_Channel))
+		shard_control_channel_init(channel, control_source_count, cell_pointer[:control_source_count])
+
+		// The target scheduler is the single consumer and drains this channel every tick.
+		os_apply_memory_policy(raw_mem, i32(target), spec.memory_init_mode)
+		shard_configs[target].inbound_control_channel = channel
+
+		for source in 0 ..< spec.shard_count {
+			if source == target do continue
+
+			outbound_index := remote_route_index_from_shard_id(Shard_Id(source), Shard_Id(target))
+			shard_configs[source].outbound_control_channels[outbound_index] = channel
+		}
+	}
+
 	for shard_index in 0 ..< spec.shard_count {
 		for route_index in 0 ..< remote_shard_count {
 			assert(shard_configs[shard_index].outbound_rings[route_index] != nil)
 			assert(shard_configs[shard_index].inbound_rings[route_index] != nil)
+			assert(shard_configs[shard_index].outbound_control_channels[route_index] != nil)
 		}
+		assert(shard_configs[shard_index].inbound_control_channel != nil)
 	}
 
-	total_system_memory_size += spsc_memory_size
+	total_system_memory_size += spsc_memory_size + control_memory_size
 	// System Memory Fit Check
 	if total_ram, _, _, _, ram_ok := info.ram_stats(); ram_ok {
 		safety_margin := spec.safety_margin

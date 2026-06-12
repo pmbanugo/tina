@@ -131,14 +131,21 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 	remote_shard_count := int(config.system_spec.shard_count) - 1
 	shard.outbound_rings = config.outbound_rings[:remote_shard_count]
 	shard.inbound_rings = config.inbound_rings[:remote_shard_count]
+	shard.outbound_control_channels = config.outbound_control_channels[:remote_shard_count]
+	shard.inbound_control_channel = config.inbound_control_channel
 
 	assert(len(shard.outbound_rings) == remote_shard_count)
 	assert(len(shard.inbound_rings) == remote_shard_count)
+	assert(len(shard.outbound_control_channels) == remote_shard_count)
+	assert(shard.inbound_control_channel != nil)
 	for ring in shard.outbound_rings {
 		assert(ring != nil)
 	}
 	for ring in shard.inbound_rings {
 		assert(ring != nil)
+	}
+	for channel in shard.outbound_control_channels {
+		assert(channel != nil)
 	}
 
 	// S11. Install shard-level sigsetjmp recovery point
@@ -175,13 +182,9 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 					store_watchdog_state(runtime_state, .Quarantined)
 					_fd_handoff_close_all_entries(shard, false)
 
-					// Single Writer Principle: Shard broadcasts its own quarantine state
-					env: Message_Envelope
-					env.source = ISOLATE_HANDLE_NONE
-					env.destination = ISOLATE_HANDLE_NONE
-					env.tag = TAG_SHARD_QUARANTINED
-					transport_broadcast_envelope(shard, &env)
-					transport_flush_outbound(shard)
+
+					shard_broadcast_liveness_state(shard, .Quarantined)
+					transport_flush_control_outbound(shard)
 				}
 			} else {
 				shard_mass_teardown(shard)
@@ -204,6 +207,9 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			poll_interval := time.Duration(poll_ms) * time.Millisecond
 
 			for load_watchdog_state(runtime_state) == .Quarantined {
+				transport_retry_liveness_broadcast(shard)
+				transport_flush_control_outbound(shard)
+
 				phase := load_process_phase()
 				if phase == .Shutting_Down || phase == .Terminated {
 					store_watchdog_state(runtime_state, .Terminated)
