@@ -107,7 +107,7 @@ All rates default to `Ratio{0, 1}` (disabled). Network partitions isolate a rand
 At configurable intervals during the simulation (and unconditionally at termination), the framework runs **structural checkers** that verify internal invariants:
 
 - **Pool integrity:** `free_count + allocated_count == total_count` for every pool on every Shard.
-- **Generation monotonicity:** Isolate generation counters only increase. A generation of zero is always a violation (zero is reserved as the HANDLE_NONE sentinel).
+- **Generation monotonicity:** Isolate generation counters only increase. A generation of zero is always a violation (zero is reserved as the ISOLATE_HANDLE_NONE sentinel).
 - **User-defined checkers:** Application-level invariant functions that receive read-only access to all Shard state. For example, a banking application can verify that the sum of all account balances equals the initial total — a conservation invariant that must hold regardless of how many Isolates crash, how many messages are dropped, and how many partitions occur.
 
 Checkers are not assertions sprinkled through code. They are external observers that verify the system's structural integrity from the outside, at regular intervals, across the entire distributed state. A checker violation halts the simulation and logs the seed for reproduction.

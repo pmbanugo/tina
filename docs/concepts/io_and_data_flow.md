@@ -39,7 +39,7 @@ Both reactor buffers and transfer buffers follow the same lifecycle principle:
 
 > **Framework-provided data is available during this handler call only. Copy what you need.**
 
-When your handler receives I/O completion data via `ctx_read_buffer()`, that data lives in the reactor's buffer pool — not in your Isolate's memory. When the handler returns, the scheduler reclaims the buffer slot. The same applies to `ctx_transfer_read()` — the transfer slot is freed when the handler returns.
+When your handler receives I/O completion data via `ctx_read_io_slot()`, that data lives in the reactor's buffer pool — not in your Isolate's memory. When the handler returns, the scheduler reclaims the buffer slot. The same applies to `ctx_transfer_read()` — the transfer slot is freed when the handler returns.
 
 This is a structural safety guarantee:
 - **No leaked buffers.** If the handler crashes (panic or segfault), the scheduler reclaims the buffer during teardown. No manual cleanup path required.
@@ -48,7 +48,7 @@ This is a structural safety guarantee:
 
 ## Reactor Buffers: I/O Data
 
-When an I/O read operation completes, the data lands in a slot from the **reactor buffer pool** — a pre-allocated, Shard-owned pool of fixed-size buffers. You access the data via `ctx_read_buffer()`:
+When an I/O read operation completes, the data lands in a slot from the **reactor buffer pool** — a pre-allocated, Shard-owned pool of fixed-size buffers. You access the data via `ctx_read_io_slot()`:
 
 ```odin
     case tina.IO_TAG_RECV_COMPLETE:
@@ -60,7 +60,7 @@ When an I/O read operation completes, the data lands in a slot from the **reacto
         // Read the data from the reactor buffer pool.
         // This slice is valid ONLY during this handler invocation.
         recv_len := u32(message.io.result)
-        data := tina.ctx_read_buffer(message.io.buffer_index, recv_len)
+        data := tina.ctx_read_io_slot(message.io.buffer_index, recv_len)
 
         // Copy what you need into your Isolate's own memory.
         // After this handler returns, the reactor buffer slot is freed.
@@ -86,6 +86,44 @@ return tina.transition_to_wait_io_or_crash(tina.ctx_io_send(self, self.fd, self.
 ```
 
 No allocation. No copy to a staging buffer. The reactor reads directly from your struct. This works because the Isolate is parked during the I/O operation — its memory is stable.
+
+### Staged Writes: When the Payload Isn't in the Struct
+
+`ctx_io_send()` requires the payload to be a slice of the Isolate's own struct memory.
+
+The staging pool is a Shard-owned pool of fixed-size buffers (`staging_slot_size` bytes each, configured in `SystemSpec`). Staging slots are claimed, written, and committed within a single handler call, then auto-freed by the scheduler.
+
+```odin
+// 1. Claim a staging slot. Returns a writable slice.
+data := tina.ctx_claim_send_slot()
+if data == nil {
+    // Staging pool exhausted — shed load.
+    return tina.ISOLATE_TRANSITION_YIELD
+}
+
+// 2. Write the dynamic payload into the staging slot.
+n := serialize_response(data[:])
+
+// 3. Commit as a send operation.
+//    The reactor reads directly from the staging slot.
+return tina.transition_to_wait_io_or_crash(tina.ctx_io_send_staged(self.fd, u32(n)))
+```
+
+The lifecycle:
+
+```
+Handler: ctx_claim_send_slot()  →  write payload  →  ctx_io_send_staged()
+                                                              │
+                                                              ▼
+                                                    Isolate parks on Wait_Io
+                                                              │
+                                                              ▼
+                                                    Reactor reads from staging slot
+                                                    (DMA / io_uring / kqueue)
+                                                              │
+                                                              ▼
+                                                    Completion arrives → slot freed
+```
 
 ## Transfer Buffers: Large Payloads Between Isolates
 

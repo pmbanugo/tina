@@ -13,6 +13,7 @@ For the conceptual background — why three generations, why no malloc, why the 
 | Is it part of the Isolate's fixed state? | **The struct itself** (embedded fields) |
 | Will I need this data on the next handler call? | **Working arena** (`ctx_working_arena()`) |
 | Only for this handler call? | **Scratch arena** (`ctx_scratch_arena()`) |
+| Am I sending outbound data that isn't in my struct? | **Staging slot** (`ctx_claim_send_slot()`) |
 | Am I sending a large payload to another Isolate? | **Transfer buffer** (`ctx_transfer_alloc()`) |
 
 ---
@@ -163,7 +164,33 @@ case tina.TAG_TRANSFER:
 
 ### The rule
 
-**Framework-provided data is available during this handler call only. Copy what you need.** This applies to both transfer buffers (`ctx_transfer_read()`) and I/O buffers (`ctx_read_buffer()`). The scheduler frees the slot when the handler returns — no manual cleanup, no leak risk.
+**Framework-provided data is available during this handler call only. Copy what you need.** This applies to both transfer buffers (`ctx_transfer_read()`) and I/O buffers (`ctx_read_io_slot()`). The scheduler frees the slot when the handler returns — no manual cleanup, no leak risk.
+
+---
+
+## Staging Slots: Dynamic Outbound I/O
+
+`ctx_io_send()` reads directly from your Isolate struct — zero-copy, zero allocation. But it requires the payload to be a slice of the struct itself. When you need to send data that's larger than 4KB (typically), use the **I/O staging pool**. But you can use I/O staging for any I/O send/write if they perform better than reading from struct fields.
+
+```odin
+// Claim a staging slot — returns a writable slice or nil on exhaustion.
+data := tina.ctx_claim_send_slot()
+if data == nil {
+    // Pool exhausted. Shed load or retry next tick.
+    return tina.ISOLATE_TRANSITION_YIELD
+}
+
+// Write the dynamic payload into the slot.
+n := serialize_my_response(data[:])
+
+// Commit as a send. The reactor reads directly from the staging slot.
+return tina.transition_to_wait_io_or_crash(tina.ctx_io_send_staged(self.fd, u32(n)))
+```
+
+**Key properties:**
+- **One slot per handler turn.** `ctx_claim_send_slot()` returns `nil` if already claimed. Claim early.
+- **Auto-freed.** If committed, freed when the Isolate parks on I/O. If claimed but never committed, the scheduler reclaims it on handler return.
+- **Configured system-wide.** `staging_slot_count` and `staging_slot_size` on `SystemSpec` control the pool size. See [Tuning the Boot Spec](tuning_the_boot_spec.md).
 
 ---
 
@@ -174,5 +201,6 @@ case tina.TAG_TRANSFER:
 | Struct fields | Isolate lifetime | Isolate teardown | Fixed-size state: handles, counters, enums, small buffers |
 | `ctx_working_arena()` | Isolate lifetime | Isolate teardown (or explicit reset) | Dynamic-size state: lookup tables, accumulated data, variable collections |
 | `ctx_scratch_arena()` | Single handler call | Scheduler (automatic reset) | Temporaries: string formatting, parsing, intermediate computation |
+| `ctx_claim_send_slot()` | Single handler call | Scheduler (auto-free) | Dynamic outbound I/O payloads (send/write) |
 | `ctx_transfer_alloc()` | Until receiver's handler returns | Scheduler (auto-free) | Large payloads (>96 bytes) between Isolates on the same Shard |
-| `ctx_read_buffer()` | Single handler call | Scheduler (auto-free) | I/O completion data from the reactor |
+| `ctx_read_io_slot()` | Single handler call | Scheduler (auto-free) | I/O completion data from the reactor |

@@ -191,7 +191,7 @@ conn_handler :: proc(
 
         // Read the received data from the reactor's buffer pool.
         recv_len := u32(message.io.result)
-        data := tina.ctx_read_buffer(message.io.buffer_index, recv_len)
+        data := tina.ctx_read_io_slot(message.io.buffer_index, recv_len)
 
         // Copy into our own stable buffer (the reactor buffer is freed after this handler returns).
         self.buffer = {}
@@ -230,9 +230,9 @@ conn_handler :: proc(
 **The read → echo → read loop:**
 
 ```
-  IoOp_Recv ──▶ IO_TAG_RECV_COMPLETE ──▶ ctx_io_send ──▶ IO_TAG_SEND_COMPLETE ──▶ IoOp_Recv ──▶ ...
-       │                                                                            │
-       └────────────────────────────── the loop ────────────────────────────────────┘
+   IoOp_Recv ──▶ IO_TAG_RECV_COMPLETE ──▶ ctx_io_send ──▶ IO_TAG_SEND_COMPLETE ──▶ IoOp_Recv ──▶ ...
+        │                                                                            │
+        └────────────────────────────── the loop ────────────────────────────────────┘
 ```
 
 ---
@@ -301,9 +301,8 @@ main :: proc() {
         shard_specs               = shard_specs[:],
         timer_resolution_ns       = 1_000_000,       // 1ms timer resolution
         pool_slot_count           = 4096,             // message envelope pool
-        timer_spoke_count         = 1024,
         timer_entry_count         = 1024,
-         log_ring_size             = 65536, // Logging Subsystem buffer size (power of 2)
+        log_ring_size             = 65536, // Logging Subsystem buffer size (power of 2)
         default_ring_size         = 32,               // cross-shard channel size
         scratch_arena_size        = 65536,
         fd_table_slot_count       = 128,              // max open file descriptors per shard

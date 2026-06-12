@@ -37,7 +37,7 @@ SIGTERM / SIGINT
 
 `TAG_SHUTDOWN` is system tag `0x0003`. The scheduler delivers it to every live Isolate when the Shard enters shutdown mode.
 
-- **Source:** `HANDLE_NONE` (it's a system message, not from another Isolate).
+- **Source:** `ISOLATE_HANDLE_NONE` (it's a system message, not from another Isolate).
 - **Payload:** Empty.
 - **Delivery:** Via SOA-bypass — zero pool allocation. Deliverable even if the message pool is exhausted.
 - **Priority:** I/O completions are dispatched *before* `TAG_SHUTDOWN`. Your handler will always see pending I/O results first.

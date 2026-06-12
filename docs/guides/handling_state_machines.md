@@ -32,7 +32,7 @@ JobDoneMsg :: struct {
 
 Worker :: struct {
     id:     u32,
-    boss:   tina.Handle,  // who to report results to
+    boss:   tina.Isolate_Handle,  // who to report results to
 }
 
 worker_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
@@ -205,7 +205,7 @@ When a Worker crashes and the supervisor restarts it, the restarted Worker gets 
 
 After restart, each Worker sends its new Handle to the Dispatcher. The Dispatcher updates its table.
 
-> **Why doesn't Tina update the Handle automatically?** Handles encode physical routing information — Shard ID, type ID, slot index, and generation. When the supervisor restarts an Isolate, the new Isolate occupies a (possibly different) slot with a new generation. The old Handle is structurally dead. Automatic forwarding would require a global, lock-protected registry — violating the shared-nothing architecture. The Check-In pattern keeps Handle resolution O(1) and lock-free: one shift, one mask, one generation comparison. No registry. No indirection.
+> **Why doesn't Tina update the Handle automatically?** Handles encode physical routing information — Shard ID, type ID, slot index, and generation. When the supervisor restarts an Isolate, the new Isolate occupies a (possibly different) slot with a new generation. The old Isolate_Handle is structurally dead. Automatic forwarding would require a global, lock-protected registry — violating the shared-nothing architecture. The Check-In pattern keeps Handle resolution O(1) and lock-free: one shift, one mask, one generation comparison. No registry. No indirection.
 
 ```odin
 // ---- Message tags ----
@@ -217,13 +217,13 @@ TAG_DISPATCH_TICK: tina.Message_Tag : tina.USER_MESSAGE_TAG_BASE + 4
 // ---- Init args: tells the Worker who its boss is ----
 WorkerInitArgs :: struct {
     id:         u32,           // logical role (stays the same across restarts)
-    dispatcher: tina.Handle,   // who to check in with
+    dispatcher: tina.Isolate_Handle,   // who to check in with
 }
 
 // ---- The check-in message ----
 WorkerReadyMsg :: struct {
     id:     u32,            // "I am Worker #2"
-    handle: tina.Handle,    // "and here is my new Handle"
+    handle: tina.Isolate_Handle,    // "and here is my new Handle"
 }
 ```
 
@@ -234,7 +234,7 @@ WORKER_TYPE: u8 : 1
 
 WorkerIsolate :: struct {
     id:         u32,
-    dispatcher: tina.Handle,
+    dispatcher: tina.Isolate_Handle,
 }
 
 worker_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
@@ -300,7 +300,7 @@ DISPATCHER_TYPE: u8 : 0
 NUM_WORKERS :: 3
 
 DispatcherIsolate :: struct {
-    workers:     [NUM_WORKERS]tina.Handle,  // indexed by Worker role ID
+    workers:     [NUM_WORKERS]tina.Isolate_Handle,  // indexed by Worker role ID
     job_counter: u32,
 }
 
@@ -310,7 +310,7 @@ dispatcher_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition
     // Spawn the workers. We don't know their Handles yet!
     // They'll check in via TAG_WORKER_READY.
     for i in 0 ..< NUM_WORKERS {
-        self.workers[i] = tina.HANDLE_NONE  // placeholder until check-in
+        self.workers[i] = tina.ISOLATE_HANDLE_NONE  // placeholder until check-in
 
         init_args := WorkerInitArgs{
             id         = u32(i),
@@ -354,7 +354,7 @@ dispatcher_handler :: proc(
             job_counter += 1
             target := workers[i]
 
-            if target == tina.HANDLE_NONE {
+            if target == tina.ISOLATE_HANDLE_NONE {
                 // Worker hasn't checked in yet (still restarting). Skip.
                 continue
             }
@@ -369,7 +369,7 @@ dispatcher_handler :: proc(
             if result == .stale_handle {
                 // Clear the slot. The restarted Worker will check in
                 // with TAG_WORKER_READY and fill it again.
-                workers[i] = tina.HANDLE_NONE
+                workers[i] = tina.ISOLATE_HANDLE_NONE
             }
         }
 
@@ -391,7 +391,7 @@ Tick 2:  Worker #0 crashes on Job #3 → transition_to_crash(.None)
 Tick 3:  Supervisor restarts Worker #0 → new Handle = 0xBB
 Tick 3:  Worker #0's init_handler sends TAG_WORKER_READY{id=0, handle=0xBB}
 Tick 4:  Dispatcher sends Job #6 to Worker #0 (Handle = 0xAA) → .stale_handle!
-         Dispatcher clears workers[0] = HANDLE_NONE
+         Dispatcher clears workers[0] = ISOLATE_HANDLE_NONE
 Tick 5:  Dispatcher receives TAG_WORKER_READY → workers[0] = 0xBB
 Tick 6:  Dispatcher sends Job #9 to Worker #0 (Handle = 0xBB) → .ok ✓
 ```
@@ -446,9 +446,8 @@ main :: proc() {
         shard_specs           = shard_specs[:],
         timer_resolution_ns   = 1_000_000,
         pool_slot_count       = 4096,
-        timer_spoke_count     = 1024,
         timer_entry_count     = 1024,
-         log_ring_size         = 65536, // Logging Subsystem buffer size (power of 2)
+        log_ring_size         = 65536, // Logging Subsystem buffer size (power of 2)
         default_ring_size     = 16,
         scratch_arena_size    = 65536,
         fd_table_slot_count   = 16,

@@ -144,7 +144,7 @@ These are non-batched, non-blocking control-plane operations executed during han
 | `ctx_setsockopt` | Overloaded: `ctx_setsockopt_raw`, `_bool`, `_i32`, `_linger` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Set a socket option. |
 | `ctx_getsockopt` | `ctx_getsockopt(fd, level, option) -> (Socket_Option_Value, Backend_Error)` | value + error | `.Queue_Full`, `.System_Error`, `.Not_Found` | Get a socket option value. |
 | `ctx_shutdown` | `ctx_shutdown(fd: FD_Handle, how: Shutdown_How) -> Backend_Error` | `Backend_Error` | `.Queue_Full`, `.System_Error`, `.Not_Found` | Shutdown a socket connection direction. |
-| `ctx_read_buffer` | `ctx_read_buffer(buffer_index: u16, size: u32) -> []u8` | `[]u8` | — | Read I/O completion data from the reactor buffer pool. Valid for one handler call only. |
+| `ctx_read_io_slot` | `ctx_read_io_slot(slot_index: IO_Slot_Index, size: u32) -> []u8` | `[]u8` | — | Read I/O completion data from the reactor buffer pool. Valid for one handler call only. |
 
 ---
 
@@ -327,15 +327,15 @@ Incoming event to an Isolate handler. Contains a `#raw_union` body:
 | `peer_address` | `Peer_Address` | Peer address from accept/recvfrom. |
 | `fd` | `FD_Handle` | Which FD completed (or new client FD for accept). |
 | `result` | `i32` | Bytes transferred, or negative error code. |
-| `buffer_index` | `u16` | Reactor buffer pool index. Pass to `ctx_read_buffer`. |
+| `buffer_index` | `IO_Slot_Index` | Reactor buffer pool index. Pass to `ctx_read_io_slot`. |
 
 **`message.tag`** — `Message_Tag` discriminant. Switch on this to determine message type.
 
-### `Handle`
+### `Isolate_Handle`
 
 ```odin
-Handle :: distinct u64
-HANDLE_NONE :: Handle(0)
+Isolate_Handle :: distinct u64
+ISOLATE_HANDLE_NONE :: Isolate_Handle(0)
 ```
 
 Packed 64-bit generational handle. Bit layout:
@@ -421,7 +421,7 @@ Handoff_Mode :: enum u8 {
 | `MAX_INIT_ARGS_SIZE` | `64` | Max bytes for `init_handler` args / `Spawn_Spec.args_payload`. |
 | `MAX_PAYLOAD_SIZE` | `96` | Max inline message payload bytes. |
 | `MAX_ISOLATES_PER_TYPE` | `1_048_575` | 20-bit slot index limit. |
-| `HANDLE_NONE` | `Handle(0)` | Sentinel for "no handle". |
+| `ISOLATE_HANDLE_NONE` | `Isolate_Handle(0)` | Sentinel for "no handle". |
 | `FD_HANDLE_NONE` | `FD_Handle(0)` | Sentinel for "no FD". |
 | `SUPERVISION_GROUP_ID_NONE` | `0xFFFF` | Sentinel for "no group". |
 | `SUPERVISION_GROUP_ID_ROOT` | `0` | Root group ID. |

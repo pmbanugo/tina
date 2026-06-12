@@ -28,7 +28,7 @@ Three artifacts per Isolate type:
 ```odin
 MyWorker :: struct {
     id:     u32,
-    boss:   tina.Handle,
+    boss:   tina.Isolate_Handle,
 }
 
 worker_init :: proc(self_raw: rawptr, args: []u8) -> tina.Isolate_Transition {
@@ -87,7 +87,7 @@ The **generation** is the key to safety. When an Isolate is torn down, its arena
 
 This eliminates dangling pointers, use-after-free, and the ABA problem — structurally, without reference counting, garbage collection, or borrow checking.
 
-**HANDLE_NONE** (`0`) is the null sentinel. It always fails validation.
+**ISOLATE_HANDLE_NONE** (`0`) is the null sentinel. It always fails validation.
 
 ## Messaging
 

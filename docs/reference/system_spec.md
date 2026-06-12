@@ -30,7 +30,6 @@ The root boot specification for the entire Tina process.
 | `transfer_slot_count` | `int` | `0` | Transfer buffer pool slot count. |
 | `transfer_slot_size` | `int` | `0` | Bytes per transfer buffer slot. |
 | `fd_handoff_entry_count` | `int` | `0` | Capacity of the per-Shard FD Handoff Table for cross-shard socket handoff. Must be > 0 for multi-shard handoff. Windows rejects > 0 when `shard_count > 1`. |
-| `timer_spoke_count` | `int` | — | **Required.** Timer wheel spoke count. Must be a power of 2. |
 | `timer_entry_count` | `int` | — | **Required.** Timer entry pool size. |
 | `fd_table_slot_count` | `int` | `0` | FD table capacity per Shard. |
 | `fd_entry_size` | `int` | `0` | Size of each FD entry. Use `size_of(tina.FD_Entry)`. |
@@ -324,7 +323,6 @@ These fields must be powers of 2 (1, 2, 4, 8, 16, 32, ...):
 |-------|---------|
 | `pool_slot_count` | — |
 | `log_ring_size` | — |
-| `timer_spoke_count` | — |
 | `default_ring_size` | 16 |
 | `Ring_Override.size` | 16 |
 
@@ -421,7 +419,6 @@ main :: proc() {
         timer_resolution_ns     = 1_000_000,
         pool_slot_count         = 1024,
         log_ring_size           = 4096,
-        timer_spoke_count       = 1024,
         timer_entry_count       = 64,
         default_ring_size       = 16,
         scratch_arena_size      = 4096,

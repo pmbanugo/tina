@@ -167,8 +167,9 @@ WorkRequest :: struct {
 Router :: struct {
     // Handles to the Coordinator on each Compute Shard.
     // Populated from init args or a registry during boot.
-    coordinators: [4]tina.Handle,
+    coordinators: [4]tina.Isolate_Handle,
     shard_count:  u8,
+    listen_fd:    tina.FD_Handle,
 }
 
 router_handler :: proc(
@@ -194,7 +195,7 @@ router_handler :: proc(
             _ = tina.ctx_send(self.coordinators[target], APP_TAG_WORK_REQUEST, &req)
         }
         // Keep accepting.
-        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = /* listen_fd */ {}}))
+        return tina.transition_to_wait_io_or_crash(tina.ctx_submit_io(tina.IoOp_Accept{listen_fd = self.listen_fd}))
 
     case:
         return tina.ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -295,7 +296,7 @@ SpawnRequest :: struct {
 
 // Reply from the Coordinator back to the requester.
 SpawnResponse :: struct {
-    handle: tina.Handle,  // Handle of the newly spawned Isolate, or HANDLE_NONE on failure
+    handle: tina.Isolate_Handle,  // Handle of the newly spawned Isolate, or ISOLATE_HANDLE_NONE on failure
 }
 ```
 
@@ -340,10 +341,10 @@ coordinator_handler :: proc(
         // Build the response.
         resp: SpawnResponse
         switch h in result {
-        case tina.Handle:
+        case tina.Isolate_Handle:
             resp.handle = h
         case tina.Spawn_Error:
-            resp.handle = tina.HANDLE_NONE
+            resp.handle = tina.ISOLATE_HANDLE_NONE
         }
 
         // Reply to the caller. This completes the caller's call.
@@ -365,7 +366,7 @@ The requesting Isolate (e.g., a Router on Shard 0) uses `ctx_call` with a timeou
 
 ```odin
 request_remote_spawn :: proc(
-    coordinator_handle: tina.Handle,
+    coordinator_handle: tina.Isolate_Handle,
     type_id: u8,
     client_id: u64,
     client_fd: tina.FD_Handle,
@@ -388,7 +389,7 @@ Handle the response in the caller's handler:
 ```odin
 case APP_TAG_SPAWN_RESPONSE:
     resp := tina.payload_as(SpawnResponse, message.user.payload[:message.user.payload_size])
-    if resp.handle != tina.HANDLE_NONE {
+    if resp.handle != tina.ISOLATE_HANDLE_NONE {
         // Success — communicate with the new Isolate directly.
         _ = tina.ctx_send(resp.handle, APP_TAG_START_WORK, &work_payload)
     }

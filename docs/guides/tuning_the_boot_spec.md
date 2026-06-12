@@ -72,6 +72,21 @@ ring_overrides := [1]tina.Ring_Override{
 
 ---
 
+## Staging Buffers (`staging_slot_count`, `staging_slot_size`)
+
+**What it controls:** The pool of buffers for outbound I/O payloads that are assembled dynamically at runtime. When your handler builds a response (serialized data, formatted output) and needs to send it, it claims a staging slot via `ctx_claim_send_slot()`, writes the payload, and commits via `ctx_io_send_staged()` or `ctx_io_write_staged()`.
+
+**How it relates to struct-send:** `ctx_io_send()` bypasses staging entirely — it reads directly from the Isolate struct's fixed memory. Staging is only needed when the payload doesn't live in the struct. If most of your sends are from struct fields, you need few staging slots.
+
+**How to size it:**
+
+- `staging_slot_count` — at least as many as the number of Isolates that may need to assemble a dynamic outbound payload simultaneously. Most Isolates need at most one slot (only one outstanding I/O per Isolate).
+- `staging_slot_size` — the maximum payload you expect to send in a single write.
+
+**What happens when it's too small:** `ctx_claim_send_slot()` returns `nil`. The handler must shed load, retry, or bypass staging by writing into struct memory and using `ctx_io_send()`.
+
+**What happens when it's too large:** Wasted memory. `slot_count × slot_size` bytes per Shard.
+
 ## Transfer Buffers (`transfer_slot_count`, `transfer_slot_size`)
 
 **What it controls:** The pool of buffers for sending large payloads (>96 bytes) between Isolates on the same Shard. Allocated via `ctx_transfer_alloc()`, auto-freed when the receiver's handler returns.
@@ -129,21 +144,19 @@ ring_overrides := [1]tina.Ring_Override{
 
 ---
 
-## Timers (`timer_spoke_count`, `timer_entry_count`, `timer_resolution_ns`)
+## Timers (`timer_entry_count`, `timer_resolution_ns`)
 
 **What it controls:**
 
-- `timer_spoke_count` — number of slots in the timer wheel (hash table). Must be a power of 2.
 - `timer_entry_count` — maximum concurrent timer registrations.
 - `timer_resolution_ns` — the tick duration. Timers fire at multiples of this resolution.
 
 **How to size it:**
 
-- `timer_spoke_count` — 1,024–4,096 for most workloads. Larger wheels spread timers more evenly, reducing collision chains.
 - `timer_entry_count` — at least as many as the maximum concurrent timers. Each Isolate using `ctx_register_timer()` holds one entry until the timer fires.
 - `timer_resolution_ns` — 1,000,000 (1ms) for network servers. 16,000,000 (16ms) for game servers (frame-aligned). 100,000 (100µs) for low-latency proxies.
 
-**Rule of thumb:** `timer_spoke_count = 1024`, `timer_entry_count = 1024`, `timer_resolution_ns = 1_000_000`. Adjust based on timer density.
+**Rule of thumb:** `timer_entry_count = 1024`, `timer_resolution_ns = 1_000_000`. Adjust based on timer density.
 
 ---
 
@@ -199,7 +212,6 @@ spec := tina.SystemSpec{
     shard_count               = 4,          // one per core
     pool_slot_count           = 16384,      // lots of messages in flight
     timer_resolution_ns       = 100_000,    // 100µs — tight timer resolution
-    timer_spoke_count         = 4096,
     timer_entry_count         = 4096,       // one timeout per connection
     reactor_buffer_slot_count = 2048,       // many concurrent reads
     reactor_buffer_slot_size  = 4096,
@@ -224,7 +236,6 @@ spec := tina.SystemSpec{
     shard_count               = 2,
     pool_slot_count           = 4096,
     timer_resolution_ns       = 1_000_000,  // 1ms — relaxed
-    timer_spoke_count         = 1024,
     timer_entry_count         = 256,
     reactor_buffer_slot_count = 32,         // few concurrent I/O ops
     reactor_buffer_slot_size  = 16384,      // larger reads (bulk data)
@@ -259,7 +270,6 @@ sim_config := tina.SimulationConfig{
 spec := tina.SystemSpec{
     shard_count               = 4,
     pool_slot_count           = 1024,       // small! stress pool exhaustion
-    timer_spoke_count         = 256,
     timer_entry_count         = 256,
     reactor_buffer_slot_count = 16,         // small! stress buffer contention
     reactor_buffer_slot_size  = 4096,

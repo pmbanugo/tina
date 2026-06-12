@@ -68,7 +68,7 @@ test_my_scenario :: proc(t: ^testing.T) {
         shard_specs = shard_specs[:], simulation = &sim_config,
         pool_slot_count = 1024, reactor_buffer_slot_count = 8,
         reactor_buffer_slot_size = 4096, transfer_slot_count = 4,
-        transfer_slot_size = 4096, timer_spoke_count = 1024,
+        transfer_slot_size = 4096,
         timer_entry_count = 1024, timer_resolution_ns = 1_000_000,
         fd_table_slot_count = 16, fd_entry_size = size_of(FD_Entry),
         fd_handoff_entry_count = 0,
@@ -134,7 +134,7 @@ Built-in checkers verify framework invariants at configurable intervals.
 | Flag                  | What it checks |
 |-----------------------|----------------|
 | `Pool_Integrity`      | `free_count` does not exceed `slot_count` for message pool, reactor buffer pool, and transfer pool. |
-| `Generation_Monotonic`| No isolate generation is zero (reserved for `HANDLE_NONE`). |
+| `Generation_Monotonic`| No isolate generation is zero (reserved for `ISOLATE_HANDLE_NONE`). |
 | `FD_Table_Integrity`  | Active FD entries have non-zero generation and valid OS FD. |
 | `FD_Handoff_Integrity`| Handoff table accounting: `free_count + in_flight == entry_count`. In-flight entries have valid fields. |
 | `Sim_FD_Integrity`    | Simulated descriptor↔object ref counts match actual descriptors and pending ops (simulation only). |
