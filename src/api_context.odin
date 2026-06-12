@@ -180,7 +180,7 @@ ctx_reply_raw :: #force_inline proc(
 	copy(envelope.payload[:], payload)
 
 	result := _send_result_to_reply_result(
-		_route_envelope_user(shard, frame.message_source_handle, &envelope),
+		_route_envelope_reply(shard, frame.message_source_handle, &envelope),
 	)
 	if result == .ok {
 		frame.reply_sent = true
@@ -262,7 +262,7 @@ ctx_transfer_send_with_correlation :: #force_inline proc(
 
 	(cast(^Transfer_Handle)&envelope.payload[0])^ = handle
 
-	return _route_envelope_system(shard, to, &envelope)
+	return _route_envelope_user(shard, to, &envelope)
 }
 
 // Stages a request-reply call. The scheduler commits the staged envelope only if
@@ -362,7 +362,7 @@ ctx_transfer_send :: #force_inline proc(
 
 	(cast(^Transfer_Handle)&envelope.payload[0])^ = handle
 
-	return _route_envelope_system(shard, to, &envelope)
+	return _route_envelope_user(shard, to, &envelope)
 }
 
 // Spawns a new Isolate and attaches it to the specified supervision group.

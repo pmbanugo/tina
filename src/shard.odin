@@ -1355,13 +1355,25 @@ _interpret_transition :: proc(
 
 // --- Message Routing ---
 
+@(private = "file")
+Message_Allocation_Policy :: enum u8 {
+	User,
+	System,
+}
+
+@(private = "file")
+Mailbox_Capacity_Policy :: enum u8 {
+	Respect,
+	Bypass,
+}
+
 @(private = "package")
 _route_envelope_user :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
-	return _route_envelope_internal(shard, to, envelope, true)
+	return _route_envelope_internal(shard, to, envelope, .User, .Respect)
 }
 
 @(private = "package")
@@ -1370,7 +1382,16 @@ _route_envelope_system :: #force_inline proc "contextless" (
 	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
-	return _route_envelope_internal(shard, to, envelope, false)
+	return _route_envelope_internal(shard, to, envelope, .System, .Bypass)
+}
+
+@(private = "package")
+_route_envelope_reply :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Isolate_Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _route_envelope_internal(shard, to, envelope, .System, .Bypass)
 }
 
 @(private = "file")
@@ -1378,12 +1399,13 @@ _route_envelope_internal :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
-	is_user: bool,
+	allocation_policy: Message_Allocation_Policy,
+	capacity_policy: Mailbox_Capacity_Policy,
 ) -> Send_Result {
 	destination := extract_shard_id(to)
 
 	if destination == shard.id {
-		return _enqueue_internal(shard, to, envelope, is_user)
+		return _enqueue_internal(shard, to, envelope, allocation_policy, capacity_policy)
 	} else {
 		return transport_route_envelope(shard, destination, envelope)
 	}
@@ -1395,7 +1417,7 @@ _enqueue_user_msg :: #force_inline proc "contextless" (
 	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
-	return _enqueue_internal(shard, to, envelope, true)
+	return _enqueue_internal(shard, to, envelope, .User, .Respect)
 }
 
 @(private = "package")
@@ -1404,7 +1426,16 @@ _enqueue_system_msg :: #force_inline proc "contextless" (
 	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
 ) -> Send_Result {
-	return _enqueue_internal(shard, to, envelope, false)
+	return _enqueue_internal(shard, to, envelope, .System, .Bypass)
+}
+
+@(private = "package")
+_enqueue_reply_msg :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	to: Isolate_Handle,
+	envelope: ^Message_Envelope,
+) -> Send_Result {
+	return _enqueue_internal(shard, to, envelope, .System, .Bypass)
 }
 
 // Hot path: must remain contextless (no assert/fmt/make/default-allocator calls).
@@ -1414,7 +1445,8 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	to: Isolate_Handle,
 	envelope: ^Message_Envelope,
-	is_user: bool,
+	allocation_policy: Message_Allocation_Policy,
+	capacity_policy: Mailbox_Capacity_Policy,
 ) -> Send_Result {
 	type_id := extract_type_id(to)
 	slot := extract_slot(to)
@@ -1437,7 +1469,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 			shard.counters.stale_delivery_drops += 1
 			return .stale_handle
 		}
-	} else if is_user {
+	} else if capacity_policy == .Respect {
 		// Capacity Check ONLY for normal user messages
 		// Replies and timeouts bypass mailbox limits to prevent deadlocks
 		if soa_meta[slot].inbox_count >= shard.type_descriptors[type_id].mailbox_capacity {
@@ -1449,9 +1481,9 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	// Pool Allocation
 	pool_index: u32
 	error: Pool_Error
-	// Because `is_user` is passed as a constant from the wrapper,
+	// Because `allocation_policy` is passed as a constant from the wrapper,
 	// I expect the compiler will dead-code-eliminate this IF statement.
-	if is_user {
+	if allocation_policy == .User {
 		pool_index, error = pool_alloc_user(&shard.message_pool)
 	} else {
 		pool_index, error = pool_alloc_system(&shard.message_pool)
@@ -2160,7 +2192,11 @@ _process_inbound_envelope :: #force_inline proc "contextless" (
 	case TAG_FD_HANDOFF_ABORT:
 		_process_fd_handoff_abort(shard, envelope)
 	case:
-		_ = _enqueue_user_msg(shard, envelope.destination, envelope)
+		if .Is_Reply in envelope.flags {
+			_ = _enqueue_reply_msg(shard, envelope.destination, envelope)
+		} else {
+			_ = _enqueue_user_msg(shard, envelope.destination, envelope)
+		}
 	}
 }
 
@@ -2393,6 +2429,64 @@ test_dispatchable_find_next_slot_wraps_within_single_word :: proc(t: ^testing.T)
 	slot_index, found = _dispatchable_find_next_slot(shard, 0, Isolate_Slot_Index(6), 63)
 	testing.expect(t, found, "expected wrapped search to reach lower bits in same word")
 	testing.expect_value(t, slot_index, Isolate_Slot_Index(5))
+}
+
+@(test)
+test_message_policy_separates_transfer_from_reply_allocation :: proc(t: ^testing.T) {
+	shard := new(Shard)
+	defer free(shard)
+
+	shard.id = 0
+	shard.type_descriptors = make([]IsolateTypeDescriptor, 1)
+	defer delete(shard.type_descriptors)
+	shard.type_descriptors[0].id = 0
+	shard.type_descriptors[0].mailbox_capacity = 128
+	shard.metadata = make([]#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata)
+	shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
+	defer delete(shard.metadata[0])
+
+	target := make_handle(0, 0, 0, 1)
+	shard.metadata[0][0].generation = extract_generation(target)
+	shard.metadata[0][0].state = .Wait_Message
+
+	message_pool_backing: [MESSAGE_ENVELOPE_SIZE * 128]u8
+	pool_init(&shard.message_pool, message_pool_backing[:], MESSAGE_ENVELOPE_SIZE)
+	testing.expect_value(t, shard.message_pool.reserved_count, u32(1))
+
+	for shard.message_pool.free_count > shard.message_pool.reserved_count {
+		_, pool_error := pool_alloc_user(&shard.message_pool)
+		testing.expect_value(t, pool_error, Pool_Error.None)
+	}
+	testing.expect_value(t, shard.message_pool.free_count, shard.message_pool.reserved_count)
+
+	transfer_envelope := Message_Envelope {
+		source       = target,
+		destination  = target,
+		tag          = TAG_TRANSFER,
+		payload_size = u16(size_of(Transfer_Handle)),
+	}
+	transfer_result := _route_envelope_user(shard, target, &transfer_envelope)
+	testing.expect_value(t, transfer_result, Send_Result.pool_exhausted)
+	testing.expect_value(t, shard.message_pool.free_count, shard.message_pool.reserved_count)
+	testing.expect_value(t, shard.metadata[0][0].inbox_count, u16(0))
+
+	correlation_id := Correlation_Id(7)
+	shard.metadata[0][0].state = .Wait_Reply
+	shard.metadata[0][0].pending_correlation = correlation_id
+	reply_envelope := Message_Envelope {
+		source      = target,
+		destination = target,
+		correlation = correlation_id,
+		tag         = USER_MESSAGE_TAG_BASE,
+		flags       = {.Is_Reply},
+	}
+	reply_result := _route_envelope_reply(shard, target, &reply_envelope)
+	testing.expect_value(t, reply_result, Send_Result.ok)
+	testing.expect_value(t, shard.message_pool.free_count, u32(0))
+	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
+	testing.expect_value(t, shard.metadata[0][0].pending_correlation, Correlation_Id(0))
+	testing.expect_value(t, shard.metadata[0][0].inbox_count, u16(1))
 }
 
 @(test)
