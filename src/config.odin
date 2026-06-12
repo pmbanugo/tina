@@ -529,8 +529,17 @@ _validate_shard_specs :: proc(spec: ^SystemSpec) -> SystemSpecError {
 	}
 
 	for &shard_spec in spec.shard_specs {
-		if error := _validate_supervision_group(&shard_spec.root_group, &valid_types); error != .None {
+		error, group_count := _validate_supervision_group(&shard_spec.root_group, &valid_types)
+		if error != .None {
 			return error
+		}
+		if group_count > spec.supervision_groups_max {
+			fmt.eprintfln(
+				"[FATAL] Supervision tree group count (%v) exceeds supervision_groups_max (%v)",
+				group_count,
+				spec.supervision_groups_max,
+			)
+			return .ValueOutOfBounds
 		}
 	}
 	return .None
@@ -540,19 +549,21 @@ _validate_shard_specs :: proc(spec: ^SystemSpec) -> SystemSpecError {
 _validate_supervision_group :: proc(
 	group: ^Group_Spec,
 	valid_types: ^[MAX_TYPE_DESCRIPTOR_ID + 1]bool,
-) -> SystemSpecError {
+) -> (SystemSpecError, int) {
+	group_count := 1
+
 	if group.restart_count_max < 1 {
 		fmt.eprintfln("[FATAL] Supervision group max_restarts must be >= 1")
-		return .InvalidSupervisionIntensity
+		return .InvalidSupervisionIntensity, group_count
 	}
 	if group.window_duration_ticks == 0 {
 		fmt.eprintfln("[FATAL] Supervision group window_duration_ticks must be > 0")
-		return .InvalidSupervisionIntensity
+		return .InvalidSupervisionIntensity, group_count
 	}
 
 	if group.strategy != .One_For_One && group.child_count_dynamic_max > 0 {
 		fmt.eprintfln("[FATAL] Only .One_For_One groups may have dynamic children")
-		return .InvalidSupervisionStrategy
+		return .InvalidSupervisionStrategy, group_count
 	}
 
 	for &child in group.children {
@@ -560,15 +571,17 @@ _validate_supervision_group :: proc(
 		case Static_Child_Spec:
 			if !valid_types[c.type_id] {
 				fmt.eprintfln("[FATAL] ChildSpec references unregistered type_id: %v", c.type_id)
-				return .InvalidTypeId
+				return .InvalidTypeId, group_count
 			}
 		case Group_Spec:
-			if error := _validate_supervision_group(&c, valid_types); error != .None {
-				return error
+			error, child_group_count := _validate_supervision_group(&c, valid_types)
+			if error != .None {
+				return error, group_count + child_group_count
 			}
+			group_count += child_group_count
 		}
 	}
-	return .None
+	return .None, group_count
 }
 
 @(private = "file")
@@ -851,17 +864,18 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 	spec := SystemSpec {
-		shard_count         = 1,
-		types               = types[:],
-		shard_specs         = shard_specs[:],
-		scratch_arena_size  = 2048, // Intentionally too small
-		pool_slot_count     = 1024,
-		log_ring_size       = 65536,
-		timer_entry_count   = 64,
-		timer_resolution_ns = 1_000_000,
-		default_ring_size   = 16,
-		staging_slot_count  = 4,
-		staging_slot_size   = 1024,
+		shard_count             = 1,
+		types                   = types[:],
+		shard_specs             = shard_specs[:],
+		scratch_arena_size      = 2048, // Intentionally too small
+		pool_slot_count         = 1024,
+		log_ring_size           = 65536,
+		timer_entry_count       = 64,
+		timer_resolution_ns     = 1_000_000,
+		default_ring_size       = 16,
+		staging_slot_count      = 4,
+		staging_slot_size       = 1024,
+		supervision_groups_max  = 1,
 	}
 
 	error := validate_system_spec(&spec)
@@ -914,20 +928,64 @@ test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
 	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 	spec := SystemSpec {
-		shard_count         = 1,
-		types               = types[:],
-		shard_specs         = shard_specs[:],
-		scratch_arena_size  = 1,
-		pool_slot_count     = 16,
-		log_ring_size       = 16,
-		timer_entry_count   = 16,
-		default_ring_size   = 16,
-		staging_slot_count  = 4,
-		staging_slot_size   = 1024,
+		shard_count             = 1,
+		types                   = types[:],
+		shard_specs             = shard_specs[:],
+		scratch_arena_size      = 1,
+		pool_slot_count         = 16,
+		log_ring_size           = 16,
+		timer_entry_count       = 16,
+		default_ring_size       = 16,
+		staging_slot_count      = 4,
+		staging_slot_size       = 1024,
+		supervision_groups_max  = 1,
 	}
 
 	error := validate_system_spec(&spec)
 	testing.expect_value(t, error, SystemSpecError.InvalidTypeId)
+}
+
+@(test)
+test_system_spec_validation_rejects_supervision_group_overflow :: proc(t: ^testing.T) {
+	types := [1]IsolateTypeDescriptor{{id = 0}}
+
+	subgroup_children := [1]Child_Spec{Static_Child_Spec{type_id = 0, restart_type = .permanent}}
+	subgroup := Group_Spec {
+		strategy              = .One_For_One,
+		restart_count_max     = 1,
+		window_duration_ticks = 1,
+		children              = subgroup_children[:],
+	}
+	root_children := [1]Child_Spec{subgroup}
+	root_group := Group_Spec {
+		strategy              = .One_For_One,
+		restart_count_max     = 1,
+		window_duration_ticks = 1,
+		children              = root_children[:],
+	}
+	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+	spec := SystemSpec {
+		shard_count             = 1,
+		types                   = types[:],
+		shard_specs             = shard_specs[:],
+		scratch_arena_size      = 1,
+		pool_slot_count         = 16,
+		log_ring_size           = 16,
+		timer_entry_count       = 16,
+		timer_resolution_ns     = 1,
+		default_ring_size       = 16,
+		staging_slot_count      = 4,
+		staging_slot_size       = 1024,
+		supervision_groups_max  = 1,
+	}
+
+	error := validate_system_spec(&spec)
+	testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
+
+	spec.supervision_groups_max = 2
+	error = validate_system_spec(&spec)
+	testing.expect_value(t, error, SystemSpecError.None)
 }
 
 when TINA_SIMULATION_MODE {
@@ -952,17 +1010,18 @@ when TINA_SIMULATION_MODE {
 		}
 
 		spec := SystemSpec {
-			shard_count         = 1,
-			types               = types[:],
-			shard_specs         = shard_specs[:],
-			pool_slot_count     = 1024,
-			log_ring_size       = 4096,
-			timer_entry_count   = 64,
-			timer_resolution_ns = 1_000_000,
-			default_ring_size   = 16,
-			simulation          = &sim_config,
-			staging_slot_count  = 4,
-			staging_slot_size   = 1024,
+			shard_count             = 1,
+			types                   = types[:],
+			shard_specs             = shard_specs[:],
+			pool_slot_count         = 1024,
+			log_ring_size           = 4096,
+			timer_entry_count       = 64,
+			timer_resolution_ns     = 1_000_000,
+			default_ring_size       = 16,
+			simulation              = &sim_config,
+			staging_slot_count      = 4,
+			staging_slot_size       = 1024,
+			supervision_groups_max  = 1,
 		}
 
 		// Valid config should pass
