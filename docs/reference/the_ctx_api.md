@@ -362,7 +362,7 @@ Isolate_Fault_Reason :: enum u8 {
 Restart_Type :: enum u8 {
     permanent,  // Always restarted on exit.
     transient,  // Restarted only on crash (not normal exit).
-    temporary,  // Never restarted.
+    temporary,  // Never restarted, including sibling-triggered group restarts.
 }
 ```
 
@@ -468,7 +468,7 @@ Handler_Fn :: #type proc(self: rawptr, message: ^Message) -> Isolate_Transition
 |-------|---------|
 | `.permanent` | Always restarted, regardless of exit reason. |
 | `.transient` | Restarted only on crash. Clean exit (`ISOLATE_TRANSITION_DONE`) is not restarted. |
-| `.temporary` | Never restarted. One-shot tasks, connection handlers. |
+| `.temporary` | Never restarted, including sibling-triggered group restarts. One-shot tasks, connection handlers. |
 
 ### `Handoff_Mode`
 

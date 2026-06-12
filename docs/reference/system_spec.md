@@ -202,8 +202,8 @@ Ratio :: struct {
 ```odin
 Supervision_Strategy :: enum u8 {
     One_For_One,   // Only the crashed child is restarted.
-    One_For_All,   // All children are terminated and restarted.
-    Rest_For_One,  // Crashed child and all children after it are restarted.
+    One_For_All,   // All children are terminated; eligible children are restarted.
+    Rest_For_One,  // Crashed child and later children are terminated; eligible children are restarted.
 }
 ```
 
@@ -289,12 +289,12 @@ Scannable lookup for all configuration enums.
 |------|-------|---------|
 | **`Supervision_Strategy`** | | |
 | | `.One_For_One` | Only the crashed child is restarted. |
-| | `.One_For_All` | All children are torn down and restarted. |
-| | `.Rest_For_One` | Crashed child and all children started after it are restarted. |
+| | `.One_For_All` | All children are torn down; eligible children are restarted. |
+| | `.Rest_For_One` | Crashed child and all children started after it are torn down; eligible children are restarted. |
 | **`Restart_Type`** | | |
 | | `.permanent` | Always restarted, regardless of exit reason. |
 | | `.transient` | Restarted only on crash. Clean exit is not restarted. |
-| | `.temporary` | Never restarted. |
+| | `.temporary` | Never restarted, even when affected by `.One_For_All` or `.Rest_For_One`. |
 | **`Memory_Init_Mode`** | | |
 | | `.Production` | Pin to core, NUMA bind, HugePages, pre-fault. |
 | | `.Development` | Lazy commit (OS-default). No pinning, no NUMA policy, no pre-faulting. |

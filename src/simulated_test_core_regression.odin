@@ -499,7 +499,7 @@ when TINA_SIMULATION_MODE {
 		caller := cast(^Timeout_Caller)_get_isolate_ptr(shard, TIMEOUT_CALLER_TYPE_ID, 0)
 		testing.expect(t, caller.call_staged, "caller init must stage the request before waiting for timeout")
 		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].state[0], Isolate_State.Wait_Reply)
-		testing.expect(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation != 0, "caller must have a pending call correlation")
+		testing.expect(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0] != 0, "caller must have a pending call correlation")
 
 		for shard.message_pool.free_count > 0 {
 			_, pool_error := pool_alloc_system(&shard.message_pool)
@@ -511,6 +511,6 @@ when TINA_SIMULATION_MODE {
 		_advance_timers(shard)
 
 		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].state[0], Isolate_State.Runnable)
-		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation, Correlation_Id(0))
+		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0], Correlation_Id(0))
 	}
 }

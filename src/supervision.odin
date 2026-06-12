@@ -264,6 +264,7 @@ _apply_strategy :: proc(shard: ^Shard, group: ^Supervision_Group, child_index_cr
 	}
 
 	for i in restart_start ..< restart_end {
+		if _get_child_restart_type(group, i) == .temporary do continue
 		if _respawn_child_at(shard, group, i) == .Escalated {
 			return .Escalated
 		}

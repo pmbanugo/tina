@@ -7,6 +7,9 @@ when TINA_SIMULATION_MODE {
 	Supervisor :: struct {}
 	Exiter :: struct {}
 	Bystander :: struct {}
+	Restart_Crash :: struct {}
+	Restart_Wait :: struct {}
+	Restart_Temporary :: struct {}
 
 	supervisor_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		bystander_spec := Spawn_Spec {
@@ -44,6 +47,162 @@ when TINA_SIMULATION_MODE {
 
 	bystander_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	restart_wait_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	restart_wait_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	restart_crash_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
+		return ISOLATE_TRANSITION_WAIT_MESSAGE
+	}
+
+	restart_crash_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
+		return transition_to_crash(.Contract_Violation)
+	}
+
+	@(test)
+	test_one_for_all_does_not_respawn_temporary_sibling :: proc(t: ^testing.T) {
+		defer free_all(context.temp_allocator)
+
+		types := [2]IsolateTypeDescriptor {
+			{
+				id = COORDINATOR_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Restart_Crash),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = restart_crash_init,
+				handler_fn = restart_crash_handler,
+			},
+			{
+				id = PING_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Restart_Temporary),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = restart_wait_init,
+				handler_fn = restart_wait_handler,
+			},
+		}
+
+		children := [2]Child_Spec {
+			Static_Child_Spec{type_id = COORDINATOR_TYPE_ID, restart_type = .permanent},
+			Static_Child_Spec{type_id = PING_TYPE_ID, restart_type = .temporary},
+		}
+
+		root_group := sim_test_make_root_group(children[:], .One_For_All)
+		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+		sim_config := SimulationConfig {
+			seed = t.seed,
+			ticks_max = 100,
+			terminate_on_quiescent = true,
+		}
+
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
+
+		sim: Simulator
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
+
+		shard := &sim.shards[0]
+		crash_handle := make_handle(
+			0,
+			COORDINATOR_TYPE_ID,
+			0,
+			shard.metadata[COORDINATOR_TYPE_ID].generation[0],
+		)
+		envelope := Message_Envelope {
+			source = ISOLATE_HANDLE_NONE,
+			destination = crash_handle,
+			tag = APP_TAG_PING,
+		}
+		_ = _route_envelope_user(shard, crash_handle, &envelope)
+
+		simulator_run(&sim)
+
+		testing.expect_value(t, shard.metadata[COORDINATOR_TYPE_ID].state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[PING_TYPE_ID].state[0], Isolate_State.Unallocated)
+		testing.expect_value(t, shard.supervision_groups[0].children_handles[1], ISOLATE_HANDLE_NONE)
+	}
+
+	@(test)
+	test_rest_for_one_does_not_respawn_temporary_successor :: proc(t: ^testing.T) {
+		defer free_all(context.temp_allocator)
+
+		types := [3]IsolateTypeDescriptor {
+			{
+				id = COORDINATOR_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Restart_Wait),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = restart_wait_init,
+				handler_fn = restart_wait_handler,
+			},
+			{
+				id = PING_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Restart_Crash),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = restart_crash_init,
+				handler_fn = restart_crash_handler,
+			},
+			{
+				id = PONG_TYPE_ID,
+				slot_count = 1,
+				stride = size_of(Restart_Temporary),
+				soa_metadata_size = size_of(Isolate_Metadata),
+				init_handler = restart_wait_init,
+				handler_fn = restart_wait_handler,
+			},
+		}
+
+		children := [3]Child_Spec {
+			Static_Child_Spec{type_id = COORDINATOR_TYPE_ID, restart_type = .permanent},
+			Static_Child_Spec{type_id = PING_TYPE_ID, restart_type = .permanent},
+			Static_Child_Spec{type_id = PONG_TYPE_ID, restart_type = .temporary},
+		}
+
+		root_group := sim_test_make_root_group(children[:], .Rest_For_One)
+		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
+
+		sim_config := SimulationConfig {
+			seed = t.seed,
+			ticks_max = 100,
+			terminate_on_quiescent = true,
+		}
+
+		spec := sim_test_make_spec(&sim_config, types[:], shard_specs[:])
+
+		sim: Simulator
+		error := simulator_init(&sim, &spec, context.temp_allocator)
+		testing.expect_value(t, error, mem.Allocator_Error.None)
+		defer simulator_deinit(&sim)
+
+		shard := &sim.shards[0]
+		crash_handle := make_handle(
+			0,
+			PING_TYPE_ID,
+			0,
+			shard.metadata[PING_TYPE_ID].generation[0],
+		)
+		envelope := Message_Envelope {
+			source = ISOLATE_HANDLE_NONE,
+			destination = crash_handle,
+			tag = APP_TAG_PING,
+		}
+		_ = _route_envelope_user(shard, crash_handle, &envelope)
+
+		simulator_run(&sim)
+
+		testing.expect_value(t, shard.metadata[COORDINATOR_TYPE_ID].state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[PING_TYPE_ID].state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[PONG_TYPE_ID].state[0], Isolate_State.Unallocated)
+		testing.expect_value(t, shard.supervision_groups[0].children_handles[2], ISOLATE_HANDLE_NONE)
 	}
 
 	@(test)
