@@ -411,7 +411,9 @@ when TINA_SIMULATION_MODE {
 
 	Timeout_Callee :: struct {}
 	Timeout_Caller :: struct {
-		call_staged: bool,
+		call_staged:         bool,
+		timeout_received:    bool,
+		timeout_correlation: Correlation_Id,
 	}
 	Timeout_Caller_Args :: struct {
 		callee_handle: Isolate_Handle,
@@ -439,6 +441,11 @@ when TINA_SIMULATION_MODE {
 	}
 
 	timeout_caller_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
+		caller := cast(^Timeout_Caller)self
+		if message != nil && message.tag == TAG_CALL_TIMEOUT {
+			caller.timeout_received = true
+			caller.timeout_correlation = message.correlation
+		}
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
@@ -500,6 +507,7 @@ when TINA_SIMULATION_MODE {
 		testing.expect(t, caller.call_staged, "caller init must stage the request before waiting for timeout")
 		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].state[0], Isolate_State.Wait_Reply)
 		testing.expect(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0] != 0, "caller must have a pending call correlation")
+		pending_correlation := shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0]
 
 		for shard.message_pool.free_count > 0 {
 			_, pool_error := pool_alloc_system(&shard.message_pool)
@@ -511,6 +519,15 @@ when TINA_SIMULATION_MODE {
 		_advance_timers(shard)
 
 		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].state[0], Isolate_State.Runnable)
+		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0], pending_correlation)
+		testing.expect(t, .Call_Timeout_Ready in shard.metadata[TIMEOUT_CALLER_TYPE_ID].flags[0], "timeout must be marked as a scheduler event")
+		testing.expect_value(t, shard.message_pool.free_count, u32(0))
+
+		scheduler_tick(shard)
+
+		testing.expect(t, caller.timeout_received, "timeout must be delivered without a message-pool envelope")
+		testing.expect_value(t, caller.timeout_correlation, pending_correlation)
+		testing.expect(t, .Call_Timeout_Ready not_in shard.metadata[TIMEOUT_CALLER_TYPE_ID].flags[0], "timeout event must clear after dispatch")
 		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0], Correlation_Id(0))
 	}
 }

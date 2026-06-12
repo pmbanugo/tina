@@ -61,6 +61,7 @@ Isolate_State :: enum u8 {
 Isolate_Flag :: enum u8 {
 	Shutdown_Pending,
 	IO_Completion_Ready,
+	Call_Timeout_Ready,
 }
 Isolate_Flags :: distinct bit_set[Isolate_Flag;u8]
 
@@ -68,7 +69,7 @@ Isolate_Flags :: distinct bit_set[Isolate_Flag;u8]
 // Stale flag bits from a previous incarnation must not persist. When a
 // new flag variant is added, the author must decide: should it survive
 // slot reuse? If not, add it here.
-ISOLATE_FLAGS_CLEARED_ON_ALLOC :: Isolate_Flags{.IO_Completion_Ready}
+ISOLATE_FLAGS_CLEARED_ON_ALLOC :: Isolate_Flags{.IO_Completion_Ready, .Call_Timeout_Ready}
 
 // Mutually Exclusive Control Signals from Watchdog
 Control_Signal :: enum u8 {
@@ -226,6 +227,7 @@ Dispatch_Kind :: enum u8 {
 	Inbox,
 	Shutdown,
 	Io_Completion,
+	Call_Timeout,
 }
 
 @(private = "file")
@@ -237,6 +239,7 @@ _wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: Isolate_T
 
 	for slot_index in 0 ..< slot_count {
 		if states[slot_index] == .Unallocated do continue
+		flags[slot_index] -= {.Call_Timeout_Ready}
 		_slot_add_shutdown_pending(shard, type_id, Isolate_Slot_Index(slot_index))
 	}
 
@@ -298,6 +301,9 @@ _dispatch_kind_for_slot :: #force_inline proc "contextless" (
 	}
 	if .Shutdown_Pending in flags {
 		return .Shutdown
+	}
+	if .Call_Timeout_Ready in flags {
+		return .Call_Timeout
 	}
 	if inbox_count > 0 && (state == .Runnable || state == .Wait_Message) {
 		return .Inbox
@@ -556,6 +562,39 @@ _slot_set_waiting_for_reply :: #force_inline proc "contextless" (
 }
 
 @(private = "package")
+_wake_call_timeout :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	target: Isolate_Handle,
+	correlation: Correlation_Id,
+) -> bool {
+	type_id := extract_type_id(target)
+	slot_index := extract_slot(target)
+	generation := extract_generation(target)
+
+	if int(type_id) >= len(shard.metadata) ||
+	   int(slot_index) >= len(shard.metadata[type_id]) {
+		shard.counters.stale_delivery_drops += 1
+		return false
+	}
+
+	meta := &shard.metadata[type_id][slot_index]
+	if meta.generation != generation ||
+	   meta.state != .Wait_Reply ||
+	   meta.pending_correlation != correlation {
+		shard.counters.stale_delivery_drops += 1
+		return false
+	}
+
+	// Keep pending_correlation until dispatch so the synthetic timeout message
+	// preserves the call token. The state change is what rejects late replies.
+	_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
+	meta.flags += {.Call_Timeout_Ready}
+	meta.state = .Runnable
+	_dispatchable_refresh_slot(shard, type_id, slot_index)
+	return true
+}
+
+@(private = "package")
 _slot_set_io_operation_kind :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_id: Isolate_Type_Id,
@@ -720,6 +759,7 @@ _dispatch_type_batch :: proc(
 	io_slot_indices := shard.metadata[type_id].io_slot_index[:]
 	io_peer_addresses := shard.metadata[type_id].io_peer_address[:]
 	working_arena_offsets := shard.metadata[type_id].working_arena_offset[:]
+	pending_correlations := shard.metadata[type_id].pending_correlation[:]
 
 	dispatch_budget := u32(work_budget_count)
 	dispatched_count: u32 = 0
@@ -821,6 +861,16 @@ _dispatch_type_batch :: proc(
 
 			message_pointer = &message
 			_slot_clear_shutdown_pending(shard, type_id, slot_index)
+		case .Call_Timeout:
+			correlation = pending_correlations[slot_index]
+			message.tag = TAG_CALL_TIMEOUT
+			message.correlation = correlation
+			message.user.source = ISOLATE_HANDLE_NONE
+			message.user.payload_size = 0
+
+			message_pointer = &message
+			flags[slot_index] -= {.Call_Timeout_Ready}
+			pending_correlations[slot_index] = CORRELATION_ID_NONE
 		case .Inbox:
 			dequeue_result := _dequeue(shard, type_id, slot_index)
 			turn_frame.message_pool_index = dequeue_result.pool_index
@@ -1368,6 +1418,11 @@ _enqueue_internal :: #force_inline proc "contextless" (
 ) -> Send_Result {
 	type_id := extract_type_id(to)
 	slot := extract_slot(to)
+	is_reply := .Is_Reply in envelope.flags
+	is_timeout := envelope.tag == TAG_CALL_TIMEOUT
+	if is_timeout {
+		return _wake_call_timeout(shard, to, envelope.correlation) ? .ok : .stale_handle
+	}
 	soa_meta := shard.metadata[type_id]
 
 	if soa_meta[slot].generation != extract_generation(to) {
@@ -1375,11 +1430,8 @@ _enqueue_internal :: #force_inline proc "contextless" (
 		return .stale_handle
 	}
 
-	is_reply := .Is_Reply in envelope.flags
-	is_timeout := envelope.tag == TAG_CALL_TIMEOUT
-
 	// Validation Only (No Mutation Yet)
-	if is_reply || is_timeout {
+	if is_reply {
 		if soa_meta[slot].state != .Wait_Reply ||
 		   soa_meta[slot].pending_correlation != envelope.correlation {
 			shard.counters.stale_delivery_drops += 1
@@ -1411,7 +1463,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	}
 
 	// Safe State Mutation (We are guaranteed to enqueue now)
-	if is_reply || is_timeout {
+	if is_reply {
 		soa_meta[slot].pending_correlation = 0
 		_slot_set_state(shard, type_id, slot, .Runnable)
 	}
