@@ -350,6 +350,8 @@ main :: proc() {
 		supervision_groups_max = 4,
 		reactor_buffer_slot_count = 16,
 		reactor_buffer_slot_size = 4096,
+		staging_slot_count = 16,
+		staging_slot_size = 1024,
 		transfer_slot_count = 16,
 		transfer_slot_size = 4096,
 		shutdown_timeout_ms = 3_000,
