@@ -5,6 +5,9 @@ import "core:mem"
 @(private = "package")
 _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_Handle) -> Spawn_Result {
 	type_id := spec.type_id
+	if int(type_id) >= len(shard.type_descriptors) {
+		return Spawn_Error.type_not_allocated
+	}
 
 	// 1. Slot Allocation (Popping the LIFO free list)
 	slot_index := shard.isolate_free_heads[type_id]
@@ -236,6 +239,11 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 	}
 
 	_interpret_transition(shard, type_id, child_slot_index, transition, &child_turn_frame)
+	if soa_meta[slot_index].generation != child_generation || soa_meta[slot_index].state == .Unallocated {
+		_turn_cleanup_resources(shard, &child_turn_frame)
+		shard.current_isolate_turn_frame = child_turn_frame.previous_isolate_turn_frame
+		return Spawn_Error.init_failed
+	}
 	_turn_cleanup_resources(shard, &child_turn_frame)
 	shard.current_isolate_turn_frame = child_turn_frame.previous_isolate_turn_frame
 	_dispatchable_refresh_slot(shard, type_id, child_slot_index)

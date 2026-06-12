@@ -40,30 +40,24 @@ Isolate_Turn_Phase :: enum u8 {
 @(private = "package")
 Isolate_Turn_Frame :: struct {
 	previous_isolate_turn_frame: ^Isolate_Turn_Frame,
-
-	staged_effect: Staged_Effect,
-
-	working_arena: mem.Arena,
-	scratch_arena: mem.Arena,
-	previous_allocator:      mem.Allocator,
-	previous_temp_allocator: mem.Allocator,
-
-	isolate_handle:             Isolate_Handle,
-	message_source_handle:      Isolate_Handle,
-	message_correlation_id:     Correlation_Id,
-	transfer_read_handle:       Transfer_Handle,
-
-	current_tick:        u64,
-	timer_resolution_ns: u64,
-
-	message_pool_index:  u32,
-	isolate_slot_index:  Isolate_Slot_Index,
-	isolate_type_id:     Isolate_Type_Id,
-	staging_slot_index:  IO_Slot_Index,
-
-	turn_flags: Isolate_Turn_Flags,
-	phase:      Isolate_Turn_Phase,
-	reply_sent: bool,
+	staged_effect:               Staged_Effect,
+	working_arena:               mem.Arena,
+	scratch_arena:               mem.Arena,
+	previous_allocator:          mem.Allocator,
+	previous_temp_allocator:     mem.Allocator,
+	isolate_handle:              Isolate_Handle,
+	message_source_handle:       Isolate_Handle,
+	message_correlation_id:      Correlation_Id,
+	transfer_read_handle:        Transfer_Handle,
+	current_tick:                u64,
+	timer_resolution_ns:         u64,
+	message_pool_index:          u32,
+	isolate_slot_index:          Isolate_Slot_Index,
+	isolate_type_id:             Isolate_Type_Id,
+	staging_slot_index:          IO_Slot_Index,
+	turn_flags:                  Isolate_Turn_Flags,
+	phase:                       Isolate_Turn_Phase,
+	reply_sent:                  bool,
 }
 
 // Read the active staging claim slot index. Returns IO_SLOT_INDEX_NONE if
@@ -95,7 +89,9 @@ _current_isolate_turn_frame :: #force_inline proc() -> (^Shard, ^Isolate_Turn_Fr
 }
 
 @(private = "file")
-_send_result_to_reply_result :: #force_inline proc "contextless" (result: Send_Result) -> Reply_Result {
+_send_result_to_reply_result :: #force_inline proc "contextless" (
+	result: Send_Result,
+) -> Reply_Result {
 	switch result {
 	case .ok:
 		return .ok
@@ -110,7 +106,11 @@ _send_result_to_reply_result :: #force_inline proc "contextless" (result: Send_R
 }
 
 @(private = "package")
-_current_isolate_turn_frame_require_handle :: #force_inline proc() -> (^Shard, ^Isolate_Turn_Frame) {
+_current_isolate_turn_frame_require_handle :: #force_inline proc(
+) -> (
+	^Shard,
+	^Isolate_Turn_Frame,
+) {
 	shard, frame := _current_isolate_turn_frame()
 	when TINA_RUNTIME_ASSERTIONS {
 		assert(
@@ -155,7 +155,11 @@ ctx_reply_raw :: #force_inline proc(
 		"ctx_reply: Cannot forge system messages. Tag must be >= 0x0040.",
 	)
 	when TINA_RUNTIME_ASSERTIONS {
-		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_reply payload exceeds MAX_PAYLOAD_SIZE", caller_location)
+		assert(
+			len(payload) <= MAX_PAYLOAD_SIZE,
+			"ctx_reply payload exceeds MAX_PAYLOAD_SIZE",
+			caller_location,
+		)
 	}
 
 	shard, frame := _current_isolate_turn_frame_require_handle()
@@ -276,7 +280,11 @@ ctx_call_raw :: #force_inline proc(
 		"ctx_call: Cannot forge system messages. Tag must be >= 0x0040.",
 	)
 	when TINA_RUNTIME_ASSERTIONS {
-		assert(len(payload) <= MAX_PAYLOAD_SIZE, "ctx_call payload exceeds MAX_PAYLOAD_SIZE", caller_location)
+		assert(
+			len(payload) <= MAX_PAYLOAD_SIZE,
+			"ctx_call payload exceeds MAX_PAYLOAD_SIZE",
+			caller_location,
+		)
 		assert(timeout_ns > 0, "ctx_call timeout_ns must be > 0", caller_location)
 	}
 
@@ -306,7 +314,8 @@ ctx_call_raw :: #force_inline proc(
 		if target_meta[target_slot_index].generation != extract_generation(to) {
 			return .stale_handle
 		}
-		if target_meta[target_slot_index].inbox_count >= shard.type_descriptors[target_type_id].mailbox_capacity {
+		if target_meta[target_slot_index].inbox_count >=
+		   shard.type_descriptors[target_type_id].mailbox_capacity {
 			return .mailbox_full
 		}
 	}
@@ -361,29 +370,29 @@ ctx_transfer_send :: #force_inline proc(
 ctx_spawn :: #force_inline proc(spec: Spawn_Spec) -> Spawn_Result {
 	shard, frame := _current_isolate_turn_frame_require_handle()
 
-	// 1. Group Capacity Check (Fail early!)
+	if int(spec.type_id) >= len(shard.type_descriptors) {
+		return Spawn_Error.type_not_allocated
+	}
+
 	group: ^Supervision_Group = nil
+	child_index_reserved: u16
 	if spec.group_id != SUPERVISION_GROUP_ID_NONE {
+		if int(spec.group_id) >= len(shard.supervision_groups) {
+			return Spawn_Error.group_not_allocated
+		}
+
 		group = &shard.supervision_groups[u16(spec.group_id)]
+		if group.boot_spec == nil || group.group_id != spec.group_id {
+			return Spawn_Error.group_not_allocated
+		}
+
 		_assert_group_layout(group)
 		if group.child_count_dynamic >= u16(len(group.dynamic_specs)) {
 			return Spawn_Error.group_full
 		}
-	}
 
-	// 2. Delegate to internal allocation and init
-	res := _make_isolate(shard, spec, frame.isolate_handle)
-
-	child_handle, ok := res.(Isolate_Handle)
-	if !ok {
-		return res
-	}
-
-	// 3. Register with Supervision Group (Always Appends)
-	if group != nil {
-		_assert_group_layout(group)
-		child_index := group.child_count_static + group.child_count_dynamic
-		group.children_handles[child_index] = child_handle
+		child_index_reserved = group.child_count_static + group.child_count_dynamic
+		group.children_handles[child_index_reserved] = ISOLATE_HANDLE_NONE
 
 		dyn := &group.dynamic_specs[group.child_count_dynamic]
 		dyn.type_id = spec.type_id
@@ -393,14 +402,26 @@ ctx_spawn :: #force_inline proc(spec: Spawn_Spec) -> Spawn_Result {
 		group.child_count_dynamic += 1
 	}
 
+	spawn_result := _make_isolate(shard, spec, frame.isolate_handle)
+
+	child_handle, ok := spawn_result.(Isolate_Handle)
+	if !ok {
+		if group != nil {
+			_remove_child_at(group, child_index_reserved)
+		}
+		return spawn_result
+	}
+
+	if group != nil {
+		_assert_group_layout(group)
+		group.children_handles[child_index_reserved] = child_handle
+	}
+
 	return child_handle
 }
 
 @(require_results)
-ctx_fd_handoff :: #force_inline proc(
-	to: Isolate_Handle,
-	fd: FD_Handle,
-) -> FD_Handoff_Result {
+ctx_fd_handoff :: #force_inline proc(to: Isolate_Handle, fd: FD_Handle) -> FD_Handoff_Result {
 	shard, frame := _current_isolate_turn_frame_require_handle()
 
 	if to == ISOLATE_HANDLE_NONE || extract_shard_id(to) == shard.id {
@@ -480,9 +501,7 @@ ctx_timer_acquire :: #force_inline proc() -> Timer_Handle {
 }
 
 // Release an acquired timer slot back to the pool.
-ctx_timer_release :: #force_inline proc(
-	handle: Timer_Handle,
-) {
+ctx_timer_release :: #force_inline proc(handle: Timer_Handle) {
 	shard, _ := _current_isolate_turn_frame_require_handle()
 	timer_release(&shard.timer_wheel, handle)
 }
@@ -505,9 +524,7 @@ ctx_timer_rearm :: #force_inline proc(
 }
 
 // Cancel (disarm) a timer.
-ctx_timer_cancel :: #force_inline proc(
-	handle: Timer_Handle,
-) {
+ctx_timer_cancel :: #force_inline proc(handle: Timer_Handle) {
 	shard, _ := _current_isolate_turn_frame_require_handle()
 	timer_cancel(&shard.timer_wheel, handle)
 }
@@ -652,7 +669,10 @@ payload_offset_of :: #force_inline proc(self: ^$T, data: []u8) -> u16 {
 	offset := data_start - base
 	when TINA_RUNTIME_ASSERTIONS {
 		assert(data_start >= base, "data must point within Isolate struct")
-		assert(offset + uintptr(len(data)) <= uintptr(size_of(T)), "data must not exceed Isolate struct bounds")
+		assert(
+			offset + uintptr(len(data)) <= uintptr(size_of(T)),
+			"data must not exceed Isolate struct bounds",
+		)
 	}
 	return u16(offset)
 }
@@ -682,10 +702,7 @@ _ctx_stage_io_from_struct :: #force_inline proc(
 // Commits a staging-slot-sourced zero-copy I/O stage. Shared body for
 // ctx_io_send_staged / ctx_io_write_staged / ctx_io_sendto_staged.
 @(require_results, private = "file")
-_ctx_stage_io_from_staging :: #force_inline proc(
-	operation: IoOp,
-	size: u32,
-) -> Io_Submit_Result {
+_ctx_stage_io_from_staging :: #force_inline proc(operation: IoOp, size: u32) -> Io_Submit_Result {
 	shard, frame := _current_isolate_turn_frame_require_handle()
 	if frame.staged_effect.kind != .None {
 		return .already_staged
@@ -708,11 +725,7 @@ _ctx_stage_io_from_staging :: #force_inline proc(
 // struct-source path returns .already_staged so the handler cannot accidentally
 // leak the staging claim into a different I/O.
 @(require_results)
-ctx_io_send :: #force_inline proc(
-	self: ^$Isolate,
-	fd: FD_Handle,
-	data: []u8,
-) -> Io_Submit_Result {
+ctx_io_send :: #force_inline proc(self: ^$Isolate, fd: FD_Handle, data: []u8) -> Io_Submit_Result {
 	return _ctx_stage_io_from_struct(
 		IoOp_Send{fd = fd},
 		payload_offset_of(self, data),
@@ -772,10 +785,7 @@ ctx_claim_send_slot :: #force_inline proc() -> []u8 {
 
 // Zero-copy send from staging slot
 @(require_results)
-ctx_io_send_staged :: #force_inline proc(
-	fd: FD_Handle,
-	size: u32,
-) -> Io_Submit_Result {
+ctx_io_send_staged :: #force_inline proc(fd: FD_Handle, size: u32) -> Io_Submit_Result {
 	return _ctx_stage_io_from_staging(IoOp_Send{fd = fd}, size)
 }
 
@@ -824,10 +834,7 @@ ctx_socket :: #force_inline proc(
 	)
 }
 
-ctx_bind :: #force_inline proc(
-	fd: FD_Handle,
-	address: Socket_Address,
-) -> Backend_Error {
+ctx_bind :: #force_inline proc(fd: FD_Handle, address: Socket_Address) -> Backend_Error {
 	shard, frame := _current_isolate_turn_frame_require_handle()
 	return reactor_control_bind(&shard.reactor, fd, frame.isolate_handle, address)
 }
@@ -888,10 +895,7 @@ ctx_setsockopt :: proc {
 	ctx_setsockopt_linger,
 }
 
-ctx_shutdown :: #force_inline proc(
-	fd: FD_Handle,
-	how: Shutdown_How,
-) -> Backend_Error {
+ctx_shutdown :: #force_inline proc(fd: FD_Handle, how: Shutdown_How) -> Backend_Error {
 	shard, frame := _current_isolate_turn_frame_require_handle()
 	return reactor_control_shutdown(&shard.reactor, fd, frame.isolate_handle, how)
 }

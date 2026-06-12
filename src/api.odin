@@ -108,6 +108,7 @@ Io_Submit_Result :: enum u8 {
 Spawn_Error :: enum u8 {
 	arena_full,
 	group_full,
+	group_not_allocated,
 	type_not_allocated,
 	init_failed,
 }
