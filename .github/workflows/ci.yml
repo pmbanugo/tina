@@ -90,6 +90,43 @@ jobs:
       - name: Run simulation tests
         run: odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
+  test-sanitizer:
+    name: Sanitizer tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: address-platform
+            sanitizer: address
+            tina_sim: false
+            experimental: false
+          - name: address-simulation
+            sanitizer: address
+            tina_sim: true
+            experimental: false
+          - name: thread-platform
+            sanitizer: thread
+            tina_sim: false
+            experimental: false
+          - name: memory-platform
+            sanitizer: memory
+            tina_sim: false
+            experimental: true
+          - name: memory-simulation
+            sanitizer: memory
+            tina_sim: true
+            experimental: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-05
+      - name: Run ${{ matrix.name }} tests
+        run: odin test tests/ -all-packages -sanitize:${{ matrix.sanitizer }} -define:TINA_SIM=${{ matrix.tina_sim }} -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+
   compliance-check:
     name: HTTP/1.1 Compliance Check
     runs-on: ubuntu-latest

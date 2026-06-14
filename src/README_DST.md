@@ -13,6 +13,9 @@ odin test . -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 # With debug assertions (structural invariant checks in non-simulation code paths)
 odin test . -define:TINA_SIM=true -define:TINA_ASSERTS=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
+# From the repository root, run the same simulation coverage under AddressSanitizer
+odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -sanitize:address
+
 # Run a specific test
 odin test . -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_NAMES=tina.test_ping_pong_simulation
 
@@ -21,6 +24,51 @@ odin check . -define:TINA_SIM=true
 ```
 
 The flag `TINA_SIM=true` sets `TINA_SIMULATION_MODE` to `true`, which gates all simulation-only code via `when TINA_SIMULATION_MODE`.
+
+## Sanitizer Testing Strategy
+
+Sanitizers are a diagnostic lane, not a replacement for deterministic simulation. DST explores schedules, failures, backpressure, and recovery with replayable seeds. Sanitizers instrument concrete execution to catch memory and threading bugs that a checker may not encode. Tina uses both because they stress different invariants.
+
+CI keeps the normal platform and simulation suites as the portability baseline, then adds a Linux sanitizer matrix:
+
+| Lane | Required? | Why it exists |
+|------|-----------|---------------|
+| Platform + `-sanitize:address` | Yes | Catches stack/global/heap memory faults in the non-DST backend and application-facing APIs. |
+| Simulation + `-sanitize:address` | Yes | Runs deterministic workloads with ASan so a failing seed can be replayed while preserving the same simulated clock, network, and I/O order. |
+| Platform + `-sanitize:thread` | Yes | Catches data races in any test that exercises real OS threads, atomics, or cross-shard runtime paths. |
+| Platform + `-sanitize:memory` | Experimental | Linux/FreeBSD-only lane for uninitialized reads around raw OS/FFI boundaries and explicit non-zeroed allocation paths. Odin's zero-is-initialized rule makes this lower signal than ASan. |
+| Simulation + `-sanitize:memory` | Experimental | Checks the single-threaded DST backend for uninitialized reads in pure framework/application state. |
+
+ThreadSanitizer is intentionally not part of the simulation lane today. Simulation mode is single-threaded by design, so TSan adds little signal there, and tests that deliberately corrupt checker state are not a good race-detection workload. Use TSan on non-DST tests that actually start Tina shards or exercise cross-shard communication.
+
+Sanitizer runs set `ODIN_TEST_THREADS=1`. This keeps the Odin test runner from becoming the concurrency workload under inspection; tests that intentionally create Tina runtime threads still do so explicitly.
+
+Local commands from the repository root:
+
+```sh
+# Platform backend with ASan
+odin test tests/ -all-packages -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -sanitize:address
+
+# Simulation backend with ASan
+odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -sanitize:address
+
+# Platform backend with TSan
+odin test tests/ -all-packages -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -sanitize:thread
+
+# Linux/FreeBSD only: MSan
+odin test tests/ -all-packages -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -sanitize:memory
+```
+
+AddressSanitizer needs one extra Tina-specific design step to reach full value. The normal ASan runtime sees the Grand Arena as one large valid allocation; it cannot know that an isolate slot, message envelope, receive buffer, staging slot, or transfer slot is logically freed while still inside that allocation. Odin's `base:sanitizer` package exposes `address_poison*` and `address_unpoison*` procedures for this exact problem.
+
+Future allocator instrumentation should follow these rules:
+
+1. Poison only in sanitizer builds; production and normal tests must pay zero cost.
+2. Preserve intrusive free-list metadata. For message and I/O slot pools, keep the free-list word addressable while poisoning the rest of the free slot payload, then unpoison the whole slot immediately before allocation and zeroing.
+3. Poison typed isolate memory when the metadata state becomes `.Unallocated`; unpoison it before `init_handler` receives `self`. The free-list state lives in SOA metadata, so the isolate payload can be fully poisoned while free.
+4. Poison working-memory slices together with their owning isolate slot. Scratch memory is turn-scoped and should be considered separately because nested init/spawn turns share the same scratch arena with offset restoration.
+5. Keep sanitizer hooks out of the hot path unless `ODIN_SANITIZER_FLAGS` contains the relevant sanitizer. The hook shape should be small and direct enough that the optimizer erases it in non-sanitized builds.
+6. If a sanitizer report occurs in a DST run, treat the printed seed as the reproduction key and rerun the same sanitizer command with `ODIN_TEST_RANDOM_SEED` or a pinned `SimulationConfig.seed`.
 
 ## Writing a Simulation Test
 
