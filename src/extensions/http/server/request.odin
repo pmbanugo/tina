@@ -320,10 +320,16 @@ query_value_decode :: proc(raw_value: []u8, allocator: mem.Allocator) -> (decode
 	return decoded_value[:decoded_size], true
 }
 
-query_value_decoded :: proc(request: ^Request, name: string) -> (decoded: []u8, ok: bool) {
+Query_Value_Result :: enum u8 {
+	Found,        // `decoded` holds the query value, possibly decoded from percent-encoding.
+	Not_Found,    // The named parameter is not present in the query string.
+	Decode_Error, // The parameter is present but its percent-encoding is malformed.
+}
+
+query_value_decoded :: proc(request: ^Request, name: string) -> (decoded: []u8, result: Query_Value_Result) {
 	raw_value := query_value(request, name)
 	if raw_value == nil {
-		return nil, true
+		return nil, .Not_Found
 	}
 
 	decode_required := false
@@ -334,10 +340,14 @@ query_value_decoded :: proc(request: ^Request, name: string) -> (decoded: []u8, 
 		}
 	}
 	if !decode_required {
-		return raw_value, true
+		return raw_value, .Found
 	}
 
-	return query_value_decode(raw_value, request_scratch(request))
+	decoded_value, decode_ok := query_value_decode(raw_value, request_scratch(request))
+	if !decode_ok {
+		return nil, .Decode_Error
+	}
+	return decoded_value, .Found
 }
 
 expects_continue :: #force_inline proc (request: ^Request) -> bool {
@@ -586,8 +596,8 @@ test_query_value_decoded_borrows_plain_bytes :: proc(t: ^testing.T) {
 	request := http_test_fixture_request(&fixture, frame)
 
 	plain_raw := query_value(&request, "plain")
-	plain, plain_ok := query_value_decoded(&request, "plain")
-	testing.expect_value(t, plain_ok, true)
+	plain, plain_result := query_value_decoded(&request, "plain")
+	testing.expect_value(t, plain_result, Query_Value_Result.Found)
 	testing.expect_value(t, string(plain), "hello")
 	testing.expect(t, raw_data(plain) == raw_data(plain_raw), "plain query should not allocate or copy")
 }

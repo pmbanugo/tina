@@ -343,9 +343,6 @@ _connection_process_header_bytes :: proc(
 		}
 		request := _connection_make_request(connection, buffer)
 		response := _connection_make_response(connection)
-		if state.request.method == .HEAD {
-			state.response.mode = .Head_Suppressed
-		}
 		step := _dispatch_route(&request, &response)
 		if state.request.route_index != ROUTE_INDEX_NONE {
 			descriptor := runtime.router.descriptors[state.request.route_index]
@@ -388,9 +385,6 @@ _connection_dispatch_match :: proc(
 	#partial switch match_result.outcome {
 	case .Found:
 		state.request.route_index = match_result.route_index
-		if state.request.method == .HEAD {
-			state.response.mode = .Head_Suppressed
-		}
 		step := _dispatch_route(&request, &response)
 		return _dispatch_step(connection, step)
 
@@ -454,7 +448,7 @@ _connection_handle_send_complete :: proc(
 		state.response.egress_size_sent += Egress_Size_Sent(sent)
 		remaining -= sent
 		if remaining > 0 {
-			start_offset := int(state.response.egress_size_sent)
+			start_offset := state.response.egress_size_sent
 			_connection_arm_send_timeout(connection)
 			return tina.transition_to_wait_io_or_crash(
 				tina.ctx_io_send(
@@ -1004,7 +998,7 @@ _dispatch_step :: proc(
 			state.response_flush_final = true
 		}
 		remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
-		start_offset := int(state.response.egress_size_sent)
+		start_offset := state.response.egress_size_sent
 		return tina.transition_to_wait_io_or_crash(
 			tina.ctx_io_send(
 				connection,
@@ -1028,7 +1022,7 @@ _dispatch_step :: proc(
 				state.state = .Sending
 				_connection_arm_send_timeout(connection)
 				remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
-				start_offset := int(state.response.egress_size_sent)
+				start_offset := state.response.egress_size_sent
 				return tina.transition_to_wait_io_or_crash(
 					tina.ctx_io_send(
 						connection,
@@ -1045,7 +1039,7 @@ _dispatch_step :: proc(
 			state.response_flush_final = final
 			state.state = .Sending
 			_connection_arm_send_timeout(connection)
-			start_offset := int(state.response.egress_size_sent)
+			start_offset := state.response.egress_size_sent
 			return tina.transition_to_wait_io_or_crash(
 				tina.ctx_io_send(
 					connection,
@@ -1169,7 +1163,7 @@ _connection_drive_body_read :: proc(
 	if int(state.response.egress_size) > int(state.response.egress_size_sent) {
 		state.state = .Sending
 		_connection_arm_send_timeout(connection)
-		start_offset := int(state.response.egress_size_sent)
+		start_offset := state.response.egress_size_sent
 		remaining := int(state.response.egress_size) - int(state.response.egress_size_sent)
 		return tina.transition_to_wait_io_or_crash(
 			tina.ctx_io_send(

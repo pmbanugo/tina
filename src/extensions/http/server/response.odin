@@ -44,6 +44,7 @@ HTTP_CHUNKED_PAYLOAD_BUDGET :: HTTP_EGRESS_BUFFER_SIZE - HTTP_CHUNKED_FRAMING_RE
 #assert(HTTP_EGRESS_BUFFER_SIZE >= HTTP_EGRESS_BUFFER_SIZE_MIN)
 #assert(HTTP_EGRESS_BUFFER_SIZE_MIN >= 256)
 #assert(HTTP_EGRESS_BUFFER_SIZE >= HTTP_EGRESS_BUFFER_SIZE_MIN + HTTP_CHUNKED_FRAMING_RESERVE)
+#assert(HTTP_EGRESS_BUFFER_SIZE <= max(u16))
 #assert(HTTP_RESPONSE_HEADERS_MAX > 0 && HTTP_RESPONSE_HEADERS_MAX <= 255)
 
 // Bytes staged in egress_buffer ready to send.
@@ -52,12 +53,22 @@ Egress_Size :: distinct u16
 // Bytes already transmitted from egress_buffer.
 Egress_Size_Sent :: distinct u16
 
+// What happens to the response body on the wire. This is orthogonal to the
+// transport framing mode because the same transport (Fixed_Length) can either
+// send bytes or suppress them (HEAD), and some status codes forbid body
+// framing headers entirely (1xx, 204, 304).
+@(private = "package")
+Response_Body_Policy :: enum u8 {
+	Send, // Body is sent as declared by the framing mode.
+	Suppress_With_Length, // Body is suppressed, but Content-Length is emitted (HEAD).
+	Suppress_Without_Framing, // Body is suppressed and no framing header is emitted (1xx, 204, 304).
+}
+
 @(private = "package")
 Response_Mode :: enum u8 {
 	Not_Started, // No status / headers staged yet; entries empty.
 	Fixed_Length, // Content-Length framing; body_size_total is authoritative.
 	Chunked, // Transfer-Encoding: chunked; no Content-Length.
-	Head_Suppressed, // /dev/null body sink for HEAD / 204 / 304 (DR-9).
 	Closed, // Final flush issued; further mutations are programmer errors.
 }
 
@@ -71,7 +82,6 @@ Response_Flag :: enum u8 {
 	Aborted, // Response surface poisoned (double-response, library failure).
 	In_Drain, // Server is draining; no new keep-alive after current response.
 	Interim_100_Sent, // 100 Continue staged or flushed; duplicate sends are no-ops.
-	User_Set_Date, // User called header_set/add with name == "Date" (skip auto-Date at commit).
 }
 
 @(private = "package")
@@ -83,6 +93,47 @@ Response_Header_Entry :: struct {
 	name_size:    u16,
 	value_offset: u16,
 	value_size:   u16,
+}
+
+Header_Result :: enum u8 {
+	Staged,
+	Reserved_Name,
+	Invalid_Name,
+	Header_Count_Exceeded,
+	Header_Bytes_Exceeded,
+	Already_Committed,
+	Aborted,
+}
+
+Response_Begin_Result :: enum u8 {
+	Begun,
+	Already_Committed,
+	Aborted,
+	Header_Count_Exceeded,
+	Header_Bytes_Exceeded,
+	Egress_Buffer_Exceeded,
+}
+
+Body_Reservation_Result :: enum u8 {
+	Reserved,
+	Suppressed,
+	Backpressured,
+	Body_Too_Large,
+	Closed,
+	Invalid_Mode,
+}
+
+Body_Commit_Result :: enum u8 {
+	Committed,
+	Stale,
+}
+
+Body_Reservation :: struct {
+	payload:               []u8,
+	egress_size_before:    Egress_Size,
+	egress_size_commit:    Egress_Size,
+	body_size_sent_before: u64,
+	body_size_sent_commit: u64,
 }
 #assert(
 	size_of(Response_Header_Entry) == 8,
@@ -100,6 +151,7 @@ Response_State :: struct {
 	status_code:       HTTP_Status,
 	header_count:      u8,
 	mode:              Response_Mode,
+	body_policy:       Response_Body_Policy,
 	flags:             Response_Flags,
 }
 
@@ -148,6 +200,7 @@ response_state_reset :: #force_inline proc "contextless" (response: ^Response_St
 	response^ = Response_State {
 		status_code = HTTP_STATUS_DEFAULT,
 		mode        = .Not_Started,
+		body_policy = .Send,
 	}
 }
 
@@ -156,7 +209,7 @@ response_header_set :: proc "contextless" (
 	bytes_region: []u8,
 	name: []u8,
 	value: []u8,
-) -> bool {
+) -> Header_Result {
 	return _stage_header(response, bytes_region, name, value, replace_existing = true)
 }
 
@@ -165,13 +218,13 @@ response_header_add :: proc "contextless" (
 	bytes_region: []u8,
 	name: []u8,
 	value: []u8,
-) -> bool {
+) -> Header_Result {
 	return _stage_header(response, bytes_region, name, value, replace_existing = false)
 }
 
 // Internal staging core. Held in one place so that `header_set` and
-// `header_add` cannot drift apart in their reserved-name handling, Date
-// detection, or overflow accounting.
+// `header_add` cannot drift apart in their reserved-name handling or
+// overflow accounting.
 @(private = "file")
 _stage_header :: proc "contextless" (
 	response: ^Response_State,
@@ -179,18 +232,12 @@ _stage_header :: proc "contextless" (
 	name: []u8,
 	value: []u8,
 	replace_existing: bool,
-) -> bool {
-	if .Headers_Committed in response.flags do return false
-	if .Aborted in response.flags do return false
-	if len(name) == 0 do return false
+) -> Header_Result {
+	if .Headers_Committed in response.flags do return .Already_Committed
+	if .Aborted in response.flags do return .Aborted
+	if len(name) == 0 do return .Invalid_Name
 
-	if _name_is_reserved_framing(name) do return true
-
-	// Track user-set Date so the framework can skip auto-injection at commit
-	// time without rescanning entries.
-	if equal_bytes_ci_with_rhs_lowercase(name, "date") {
-		response.flags += {.User_Set_Date}
-	}
+	if _name_is_reserved(name) do return .Reserved_Name
 
 	cursor := int(response.header_bytes_used)
 	region_size := len(bytes_region)
@@ -205,25 +252,25 @@ _stage_header :: proc "contextless" (
 			// Pre-flight the budget so a failure leaves the cursor at its
 			// pre-call position — staging is transactional.
 			new_header_bytes_used := u32(cursor) + u32(len(value))
-			if new_header_bytes_used > u32(max(u16)) do return false
-			if int(new_header_bytes_used) > region_size do return false
+			if new_header_bytes_used > u32(max(u16)) do return .Header_Bytes_Exceeded
+			if int(new_header_bytes_used) > region_size do return .Header_Bytes_Exceeded
 
 			if len(value) > 0 do copy(bytes_region[cursor:], value)
 			response.headers[index].value_offset = u16(cursor)
 			response.headers[index].value_size = u16(len(value))
 			response.header_bytes_used = u16(new_header_bytes_used)
-			return true
+			return .Staged
 		}
 	}
 
 	// Append path. The entry-array budget is the structural slot space.
-	if response.header_count >= HTTP_RESPONSE_HEADERS_MAX do return false
+	if response.header_count >= HTTP_RESPONSE_HEADERS_MAX do return .Header_Count_Exceeded
 
 	// Pre-flight name + value together so a partial name copy cannot leave
 	// the cursor advanced when the subsequent value copy would overflow.
 	new_header_bytes_used := u32(cursor) + u32(len(name)) + u32(len(value))
-	if new_header_bytes_used > u32(max(u16)) do return false
-	if int(new_header_bytes_used) > region_size do return false
+	if new_header_bytes_used > u32(max(u16)) do return .Header_Bytes_Exceeded
+	if int(new_header_bytes_used) > region_size do return .Header_Bytes_Exceeded
 
 	if len(name) > 0 do copy(bytes_region[cursor:], name)
 	if len(value) > 0 do copy(bytes_region[cursor + len(name):], value)
@@ -236,12 +283,14 @@ _stage_header :: proc "contextless" (
 	}
 	response.header_count += 1
 	response.header_bytes_used = u16(new_header_bytes_used)
-	return true
+	return .Staged
 }
 
 @(private = "file")
-_name_is_reserved_framing :: #force_inline proc "contextless" (name: []u8) -> bool {
+_name_is_reserved :: #force_inline proc "contextless" (name: []u8) -> bool {
 	switch len(name) {
+	case 4:
+		return equal_bytes_ci_with_rhs_lowercase(name, "date")
 	case 10:
 		return equal_bytes_ci_with_rhs_lowercase(name, "connection")
 	case 14:
@@ -434,14 +483,13 @@ status_reason_phrase :: #force_inline proc "contextless" (code: HTTP_Status) -> 
 //
 // Inputs:
 //   destination       — writable slice (typically HTTP_Connection.egress_buffer[:])
-//   response          — staged headers and mode
+//   response          — staged headers, mode, and body policy
 //   bytes_region      — Working Memory slice the entry offsets index into
 //   date_value        — pre-formatted Date value (e.g. "Wed, 01 May 2026 12:34:56 GMT").
-//                       Empty disables auto-Date emission. Caller suppresses it
-//                       when `User_Set_Date` is set in `response.flags`.
+//                       Empty disables auto-Date emission.
 //
 // The caller is responsible for setting `response.body_size_total` for
-// `Fixed_Length` and `Head_Suppressed` modes before calling.
+// `Fixed_Length` and `.Suppress_With_Length` body policy before calling.
 
 @(private = "package")
 serialize_response_headers :: proc "contextless" (
@@ -468,8 +516,8 @@ serialize_response_headers :: proc "contextless" (
 	}
 	cursor = _write_bytes_into(destination, cursor, transmute([]u8)string("\r\n")) or_return
 
-	// 2. Date — auto-injected unless the user staged one explicitly.
-	if len(date_value) > 0 && !(.User_Set_Date in response.flags) {
+	// 2. Date — framework-owned, always auto-injected when a value is supplied.
+	if len(date_value) > 0 {
 		cursor = _write_bytes_into(destination, cursor, transmute([]u8)string("Date: ")) or_return
 		cursor = _write_bytes_into(destination, cursor, date_value) or_return
 		cursor = _write_bytes_into(destination, cursor, transmute([]u8)string("\r\n")) or_return
@@ -486,24 +534,34 @@ serialize_response_headers :: proc "contextless" (
 		) or_return
 	}
 
-	// 4. Framing header per response mode (library-owned, written here only).
-	switch response.mode {
-	case .Not_Started:
-		// Treat Not_Started identically to Fixed_Length 0 — the caller may
-		// have called serialize without a respond_*() (e.g. raw 204 hand-off).
-		cursor = _write_content_length(destination, cursor, 0) or_return
-	case .Fixed_Length, .Head_Suppressed:
+	// 4. Framing header per response body policy and transport mode
+	//    (library-owned, written here only).
+	#partial switch response.body_policy {
+	case .Suppress_Without_Framing:
+		// 1xx, 204, and 304 responses must not carry Content-Length or
+		// Transfer-Encoding framing headers (RFC 9110/9112).
+	case .Suppress_With_Length:
+		// HEAD responses describe the would-be body size but never send it.
 		cursor = _write_content_length(destination, cursor, response.body_size_total) or_return
-	case .Chunked:
-		cursor = _write_bytes_into(
-			destination,
-			cursor,
-			transmute([]u8)string("Transfer-Encoding: chunked\r\n"),
-		) or_return
-	case .Closed:
-		// Closed responses must never round-trip through the serializer; the
-		// state machine writes the canned 500 directly. Treat as overflow.
-		return
+	case .Send:
+		#partial switch response.mode {
+		case .Not_Started:
+			// Treat Not_Started identically to Fixed_Length 0 — the caller may
+			// have called serialize without a respond_*() (e.g. raw hand-off).
+			cursor = _write_content_length(destination, cursor, 0) or_return
+		case .Fixed_Length:
+			cursor = _write_content_length(destination, cursor, response.body_size_total) or_return
+		case .Chunked:
+			cursor = _write_bytes_into(
+				destination,
+				cursor,
+				transmute([]u8)string("Transfer-Encoding: chunked\r\n"),
+			)		or_return
+		case .Closed:
+			// Closed responses must never round-trip through the serializer; the
+			// state machine writes the canned 500 directly. Treat as overflow.
+			return
+		}
 	}
 
 	// 5. User headers — entries are live by construction (DR-1 update-in-place).
@@ -558,14 +616,10 @@ _response_stage_internal_server_error :: proc "contextless" (
 
 @(private = "file")
 _response_preserve_flags :: proc "contextless" (state: ^Response_State) {
-	head_suppressed := state.mode == .Head_Suppressed
 	close_after_send := .Close_After_Send in state.flags
 	in_drain := .In_Drain in state.flags
 	interim_100_sent := .Interim_100_Sent in state.flags
 	response_state_reset(state)
-	if head_suppressed {
-		state.mode = .Head_Suppressed
-	}
 	if close_after_send {
 		state.flags += {.Close_After_Send}
 	}
@@ -577,21 +631,75 @@ _response_preserve_flags :: proc "contextless" (state: ^Response_State) {
 	}
 }
 
-status :: #force_inline proc "contextless" (response: ^Response, code: HTTP_Status) {
-	state := _response_state(response)
-	state.status_code = code
-	if code == HTTP_STATUS_NO_CONTENT ||
-	   code == HTTP_STATUS_NOT_MODIFIED ||
-	   code == HTTP_STATUS_CONTINUE {
-		state.mode = .Head_Suppressed
-	}
+@(private = "file")
+_response_prepare_begin :: proc "contextless" (state: ^Response_State) -> Response_Begin_Result {
+	if .Headers_Committed in state.flags do return .Already_Committed
+	if .Aborted in state.flags do return .Aborted
+
+	headers := state.headers
+	header_count := state.header_count
+	header_bytes_used := state.header_bytes_used
+	_response_preserve_flags(state)
+	state.headers = headers
+	state.header_count = header_count
+	state.header_bytes_used = header_bytes_used
+	return .Begun
 }
 
+@(private = "file")
+_response_begin_result_from_header :: #force_inline proc "contextless" (
+	header_result: Header_Result,
+) -> Response_Begin_Result {
+	switch header_result {
+	case .Staged, .Reserved_Name:
+		return .Begun
+	case .Header_Count_Exceeded:
+		return .Header_Count_Exceeded
+	case .Header_Bytes_Exceeded, .Invalid_Name:
+		return .Header_Bytes_Exceeded
+	case .Already_Committed:
+		return .Already_Committed
+	case .Aborted:
+		return .Aborted
+	}
+	return .Aborted
+}
+
+status :: #force_inline proc (response: ^Response, code: HTTP_Status) {
+	state := _response_state(response)
+	when tina.TINA_RUNTIME_ASSERTIONS {
+		if .Headers_Committed in state.flags {
+			assert(false, "status: cannot change status after headers are committed")
+		}
+	}
+	state.status_code = code
+	state.body_policy = _body_policy_from_status(code, response.connection.connection_state.request.method)
+}
+
+@(private = "file")
+_body_policy_from_status :: #force_inline proc "contextless" (
+	code: HTTP_Status,
+	method: Method,
+) -> Response_Body_Policy {
+	// Informational responses and statuses that forbid a message body must
+	// not carry Content-Length or Transfer-Encoding framing headers.
+	if code < 200 || code == HTTP_STATUS_NO_CONTENT || code == HTTP_STATUS_NOT_MODIFIED {
+		return .Suppress_Without_Framing
+	}
+	// HEAD responses describe the would-be GET body via Content-Length but
+	// never send the body itself.
+	if method == .HEAD {
+		return .Suppress_With_Length
+	}
+	return .Send
+}
+
+@(require_results)
 header_set :: #force_inline proc "contextless" (
 	response: ^Response,
 	name: string,
 	value: string,
-) -> bool {
+) -> Header_Result {
 	return response_header_set(
 		_response_state(response),
 		response.connection.connection_state.response_header_bytes,
@@ -600,11 +708,12 @@ header_set :: #force_inline proc "contextless" (
 	)
 }
 
+@(require_results)
 header_add :: #force_inline proc "contextless" (
 	response: ^Response,
 	name: string,
 	value: string,
-) -> bool {
+) -> Header_Result {
 	return response_header_add(
 		_response_state(response),
 		response.connection.connection_state.response_header_bytes,
@@ -638,15 +747,18 @@ respond_bytes :: #force_inline proc(
 	return _respond_bytes(response, status_code, content_type, body)
 }
 
-begin_stream :: #force_inline proc(
+@(require_results)
+begin_stream :: proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	content_type: string,
-) {
+) -> Response_Begin_Result {
 	state := _response_state(response)
-	_response_preserve_flags(state)
-	state.status_code = status_code
-	if state.mode != .Head_Suppressed {
+	if result := _response_prepare_begin(state); result != .Begun {
+		return result
+	}
+	status(response, status_code)
+	if state.body_policy == .Send {
 		state.mode = .Chunked
 	}
 	state.body_size_total = 0
@@ -654,22 +766,30 @@ begin_stream :: #force_inline proc(
 	state.egress_size = Egress_Size(0)
 	state.egress_size_sent = Egress_Size_Sent(0)
 	_response_clear_sendfile_plan(response)
-	_ = header_set(response, "content-type", content_type)
-	if !_response_commit_headers(response) {
-		return
+	header_result := header_set(response, "Content-Type", content_type)
+	if header_result != .Staged {
+		_response_stage_internal_server_error(response, state)
+		return _response_begin_result_from_header(header_result)
 	}
+	if !_response_commit_headers(response) {
+		return .Egress_Buffer_Exceeded
+	}
+	return .Begun
 }
 
-begin_fixed_stream :: #force_inline proc(
+@(require_results)
+begin_fixed_stream :: proc(
 	response: ^Response,
 	status_code: HTTP_Status,
 	content_type: string,
 	total_size: u64,
-) {
+) -> Response_Begin_Result {
 	state := _response_state(response)
-	_response_preserve_flags(state)
-	state.status_code = status_code
-	if state.mode != .Head_Suppressed {
+	if result := _response_prepare_begin(state); result != .Begun {
+		return result
+	}
+	status(response, status_code)
+	if state.body_policy == .Send {
 		state.mode = .Fixed_Length
 	}
 	state.body_size_total = total_size
@@ -677,10 +797,15 @@ begin_fixed_stream :: #force_inline proc(
 	state.egress_size = Egress_Size(0)
 	state.egress_size_sent = Egress_Size_Sent(0)
 	_response_clear_sendfile_plan(response)
-	_ = header_set(response, "Content-Type", content_type)
-	if !_response_commit_headers(response) {
-		return
+	header_result := header_set(response, "Content-Type", content_type)
+	if header_result != .Staged {
+		_response_stage_internal_server_error(response, state)
+		return _response_begin_result_from_header(header_result)
 	}
+	if !_response_commit_headers(response) {
+		return .Egress_Buffer_Exceeded
+	}
+	return .Begun
 }
 
 respond_file :: proc(
@@ -690,9 +815,12 @@ respond_file :: proc(
 	content_type: string,
 ) -> Route_Step {
 	state := _response_state(response)
-	_response_preserve_flags(state)
-	state.status_code = HTTP_STATUS_OK
-	if state.mode != .Head_Suppressed {
+	if _response_prepare_begin(state) != .Begun {
+		_response_stage_internal_server_error(response, state)
+		return .Flush_Final
+	}
+	status(response, HTTP_STATUS_OK)
+	if state.body_policy == .Send {
 		state.mode = .Fixed_Length
 	}
 	state.body_size_total = file_size
@@ -700,13 +828,16 @@ respond_file :: proc(
 	state.egress_size = 0
 	state.egress_size_sent = 0
 	_response_clear_sendfile_plan(response)
-	_ = header_set(response, "Content-Type", content_type)
+	if header_set(response, "Content-Type", content_type) != .Staged {
+		_response_stage_internal_server_error(response, state)
+		return .Flush_Final
+	}
 
 	if !_response_commit_headers(response) {
 		return .Flush_Final
 	}
 
-	if state.mode == .Head_Suppressed || file_size == 0 {
+	if state.body_policy != .Send || file_size == 0 {
 		return .Flush_Final
 	}
 
@@ -719,36 +850,26 @@ respond_file :: proc(
 
 continue_100 :: proc(response: ^Response) {
 	state := _response_state(response)
-	if .Interim_100_Sent in state.flags {
+	if .Interim_100_Sent in state.flags || .Headers_Committed in state.flags {
 		return
 	}
 	_response_preserve_flags(state)
-	state.status_code = HTTP_STATUS_CONTINUE
-	state.mode = .Head_Suppressed
+	status(response, HTTP_STATUS_CONTINUE)
 	state.body_size_total = 0
 	state.body_size_sent = 0
 	state.egress_size = 0
 	state.egress_size_sent = 0
 	_response_clear_sendfile_plan(response)
 
-	size, ok := serialize_response_headers(
-		response.connection.egress_buffer[:],
-		state,
-		response.connection.connection_state.response_header_bytes,
-		_connection_date_value(response.connection),
-	)
-	if !ok {
-		_response_stage_internal_server_error(response, state)
+	if !_response_commit_headers(response) {
 		return
 	}
-
-	state.flags += {.Headers_Committed, .Interim_100_Sent}
-	state.egress_size = size
+	state.flags += {.Interim_100_Sent}
 }
 
 write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 	state := _response_state(response)
-	if state.mode == .Head_Suppressed {
+	if state.body_policy != .Send {
 		accepted_size := u16(min(len(data), int(max(u16))))
 		state.body_size_sent += u64(accepted_size)
 		return accepted_size
@@ -815,6 +936,112 @@ write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 	return u16(copy_size)
 }
 
+@(require_results)
+reserve_body_exact :: proc "contextless" (
+	response: ^Response,
+	body_size: u32,
+) -> (
+	reservation: Body_Reservation,
+	result: Body_Reservation_Result,
+) {
+	state := _response_state(response)
+	if body_size > u32(max(u16)) {
+		return reservation, .Body_Too_Large
+	}
+	if state.body_policy != .Send {
+		state.body_size_sent += u64(body_size)
+		return reservation, .Suppressed
+	}
+	if state.mode == .Closed {
+		return reservation, .Closed
+	}
+	if state.mode != .Chunked && state.mode != .Fixed_Length {
+		return reservation, .Invalid_Mode
+	}
+	if state.mode == .Fixed_Length && state.body_size_sent + u64(body_size) > state.body_size_total {
+		return reservation, .Body_Too_Large
+	}
+
+	cursor := int(state.egress_size)
+	remaining := len(response.connection.egress_buffer) - cursor
+	if remaining < 0 {
+		return reservation, .Backpressured
+	}
+
+	body_size_u16 := u16(body_size)
+	reservation.egress_size_before = state.egress_size
+	reservation.body_size_sent_before = state.body_size_sent
+	reservation.body_size_sent_commit = state.body_size_sent + u64(body_size)
+
+	if state.mode == .Chunked {
+		if body_size == 0 {
+			reservation.egress_size_commit = state.egress_size
+			return reservation, .Reserved
+		}
+		buffer_free := u16(len(response.connection.egress_buffer) - HTTP_CHUNKED_FRAMING_RESERVE)
+		max_body_ever := admit_chunk_payload(buffer_free, buffer_free)
+		if body_size_u16 > max_body_ever {
+			return reservation, .Body_Too_Large
+		}
+		if remaining <= HTTP_CHUNKED_FRAMING_RESERVE {
+			state.flags += {.Backpressured}
+			return reservation, .Backpressured
+		}
+		free := u16(remaining - HTTP_CHUNKED_FRAMING_RESERVE)
+		if admit_chunk_payload(free, body_size_u16) != body_size_u16 {
+			state.flags += {.Backpressured}
+			return reservation, .Backpressured
+		}
+
+		next_cursor, ok := _write_hex_u16(response.connection.egress_buffer[:], cursor, body_size_u16)
+		if !ok do return reservation, .Backpressured
+		next_cursor, ok = _write_bytes_into(
+			response.connection.egress_buffer[:],
+			next_cursor,
+			transmute([]u8)string("\r\n"),
+		)
+		if !ok do return reservation, .Backpressured
+		payload_begin := next_cursor
+		next_cursor += int(body_size)
+		if next_cursor > len(response.connection.egress_buffer) {
+			return reservation, .Backpressured
+		}
+		next_cursor, ok = _write_bytes_into(
+			response.connection.egress_buffer[:],
+			next_cursor,
+			transmute([]u8)string("\r\n"),
+		)
+		if !ok do return reservation, .Backpressured
+
+		reservation.payload = response.connection.egress_buffer[payload_begin:][:int(body_size)]
+		reservation.egress_size_commit = Egress_Size(next_cursor)
+		return reservation, .Reserved
+	}
+
+	if int(body_size) > remaining {
+		state.flags += {.Backpressured}
+		return reservation, .Backpressured
+	}
+	reservation.payload = response.connection.egress_buffer[cursor:][:int(body_size)]
+	reservation.egress_size_commit = Egress_Size(cursor + int(body_size))
+	return reservation, .Reserved
+}
+
+@(require_results)
+commit_body :: proc "contextless" (
+	response: ^Response,
+	reservation: Body_Reservation,
+) -> Body_Commit_Result {
+	state := _response_state(response)
+	if state.egress_size != reservation.egress_size_before ||
+	   state.body_size_sent != reservation.body_size_sent_before {
+		return .Stale
+	}
+	state.egress_size = reservation.egress_size_commit
+	state.body_size_sent = reservation.body_size_sent_commit
+	return .Committed
+}
+
 flush :: proc(final: bool = false) -> Route_Step {
 	return .Flush_Final if final else .Flush
 }
@@ -830,12 +1057,12 @@ _response_append_chunked_terminator :: proc "contextless" (
 	state: ^Response_State,
 	egress_buffer: []u8,
 ) -> bool {
-	cursor := int(state.egress_size)
-	if cursor + 5 > len(egress_buffer) {
+	cursor := state.egress_size
+	if int(cursor) + 5 > len(egress_buffer) {
 		return false
 	}
 	copy(egress_buffer[cursor:], transmute([]u8)string("0\r\n\r\n"))
-	state.egress_size = Egress_Size(cursor + 5)
+	state.egress_size = cursor + 5
 	return true
 }
 
@@ -967,43 +1194,44 @@ _respond_bytes :: proc(
 	body: []u8,
 ) -> Route_Step {
 	state := _response_state(response)
-	_response_preserve_flags(state)
-	state.status_code = status_code
-	state.body_size_total = u64(len(body))
-	state.body_size_sent = 0
-	if state.mode != .Head_Suppressed {
+	if _response_prepare_begin(state) != .Begun {
+		_response_stage_internal_server_error(response, state)
+		return .Flush_Final
+	}
+	status(response, status_code)
+	if state.body_policy == .Send {
 		state.mode = .Fixed_Length
 	}
+	state.body_size_total = u64(len(body))
+	state.body_size_sent = 0
 	state.egress_size = Egress_Size(0)
 	state.egress_size_sent = Egress_Size_Sent(0)
 	_response_clear_sendfile_plan(response)
-	_ = header_set(response, "Content-Type", content_type)
-
-	size, ok := serialize_response_headers(
-		response.connection.egress_buffer[:],
-		state,
-		response.connection.connection_state.response_header_bytes,
-		_connection_date_value(response.connection),
-	)
-	if !ok {
+	if header_set(response, "Content-Type", content_type) != .Staged {
 		_response_stage_internal_server_error(response, state)
 		return .Flush_Final
 	}
 
-	if state.mode != .Head_Suppressed {
+	if !_response_commit_headers(response) {
+		return .Flush_Final
+	}
+
+	switch state.body_policy {
+	case .Send:
 		body_size := len(body)
-		if int(size) + body_size > len(response.connection.egress_buffer) {
+		if int(state.egress_size) + body_size > len(response.connection.egress_buffer) {
 			_response_stage_internal_server_error(response, state)
 			return .Flush_Final
 		}
-		copy(response.connection.egress_buffer[int(size):], body)
-		state.egress_size = Egress_Size(int(size) + body_size)
+		copy(response.connection.egress_buffer[state.egress_size:], body)
+		state.egress_size = Egress_Size(int(state.egress_size) + body_size)
 		state.body_size_sent = u64(body_size)
-	} else {
-		state.egress_size = size
+	case .Suppress_With_Length:
 		state.body_size_sent = state.body_size_total
+	case .Suppress_Without_Framing:
+		state.body_size_total = 0
+		state.body_size_sent = 0
 	}
-	state.flags += {.Headers_Committed}
 	return .Flush_Final
 }
 
@@ -1158,7 +1386,7 @@ test_response_state_reset_baseline :: proc(t: ^testing.T) {
 	response.status_code = 404
 	response.header_count = 5
 	response.header_bytes_used = 99
-	response.flags = {.Headers_Committed, .User_Set_Date}
+	response.flags = {.Headers_Committed}
 	response.mode = .Chunked
 	response.egress_size = 123
 
@@ -1187,7 +1415,7 @@ test_response_header_set_appends_when_absent :: proc(t: ^testing.T) {
 		transmute([]u8)string("application/json"),
 	)
 
-	testing.expect(t, ok)
+	testing.expect_value(t, ok, Header_Result.Staged)
 	testing.expect_value(t, response.header_count, 1)
 	testing.expect_value(t, response.headers[0].name_size, u16(12))
 	testing.expect_value(t, response.headers[0].value_size, u16(16))
@@ -1215,7 +1443,7 @@ test_response_header_set_updates_in_place :: proc(t: ^testing.T) {
 		transmute([]u8)string("content-type"), // case-insensitive match
 		transmute([]u8)string("application/json"),
 	)
-	testing.expect(t, ok)
+	testing.expect_value(t, ok, Header_Result.Staged)
 	testing.expect_value(t, response.header_count, 1)
 	testing.expect_value(t, response.headers[0].value_size, u16(16))
 
@@ -1250,9 +1478,9 @@ test_response_header_add_creates_separate_entries :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_response_header_set_reserved_silently_ignored :: proc(t: ^testing.T) {
-	// Library-owned framing names must not be staged. The contract returns
-	// `true` so middleware does not 500 on a no-op.
+test_response_header_set_reserved_names_are_not_staged :: proc(t: ^testing.T) {
+	// Library-owned headers must not be staged. The result is explicit so
+	// callers can distinguish safe no-op policy from storage exhaustion.
 	response: Response_State
 	response_state_reset(&response)
 	region: [256]u8
@@ -1275,32 +1503,44 @@ test_response_header_set_reserved_silently_ignored :: proc(t: ^testing.T) {
 		transmute([]u8)string("Connection"),
 		transmute([]u8)string("close"),
 	)
+	ok_d := response_header_set(
+		&response,
+		region[:],
+		transmute([]u8)string("Date"),
+		transmute([]u8)string("Wed, 01 May 2026 12:00:00 GMT"),
+	)
 
-	testing.expect(t, ok_a && ok_b && ok_c)
+	testing.expect_value(t, ok_a, Header_Result.Reserved_Name)
+	testing.expect_value(t, ok_b, Header_Result.Reserved_Name)
+	testing.expect_value(t, ok_c, Header_Result.Reserved_Name)
+	testing.expect_value(t, ok_d, Header_Result.Reserved_Name)
 	testing.expect_value(t, response.header_count, 0)
 	testing.expect_value(t, response.header_bytes_used, u16(0))
 }
 
 @(test)
-test_response_header_set_user_date_flag :: proc(t: ^testing.T) {
+test_response_header_set_date_is_reserved :: proc(t: ^testing.T) {
+	// Date is framework-owned, just like Connection, Content-Length, and
+	// Transfer-Encoding. User attempts to stage it are rejected explicitly.
 	response: Response_State
 	response_state_reset(&response)
 	region: [256]u8
 
-	_ = response_header_set(
+	ok := response_header_set(
 		&response,
 		region[:],
 		transmute([]u8)string("date"),
 		transmute([]u8)string("Wed, 01 May 2026 12:00:00 GMT"),
 	)
-	testing.expect(t, .User_Set_Date in response.flags)
+	testing.expect_value(t, ok, Header_Result.Reserved_Name)
+	testing.expect_value(t, response.header_count, 0)
+	testing.expect_value(t, response.header_bytes_used, u16(0))
 }
 
 @(test)
 test_response_header_set_bytes_region_overflow :: proc(t: ^testing.T) {
 	// Fill the bytes region until the next staging call must overflow. The
-	// helper returns `false` so the connection state machine can transition
-	// to the transactional 500 path (DR-6 / Phase 7).
+	// result is explicit and transactional so callers can map it to policy.
 	response: Response_State
 	response_state_reset(&response)
 	region: [16]u8 // intentionally tiny
@@ -1312,7 +1552,7 @@ test_response_header_set_bytes_region_overflow :: proc(t: ^testing.T) {
 		transmute([]u8)string("Name"),
 		transmute([]u8)string("value!"),
 	)
-	testing.expect(t, ok)
+	testing.expect_value(t, ok, Header_Result.Staged)
 	testing.expect_value(t, response.header_bytes_used, u16(10))
 
 	// Adding another header with combined name+value > 6 bytes must fail.
@@ -1322,7 +1562,7 @@ test_response_header_set_bytes_region_overflow :: proc(t: ^testing.T) {
 		transmute([]u8)string("XXXXXX"),
 		transmute([]u8)string("YYYY"),
 	)
-	testing.expect(t, !overflow_ok, "bytes-region overflow must return false")
+	testing.expect_value(t, overflow_ok, Header_Result.Header_Bytes_Exceeded)
 	// Cursor must remain at the pre-attempt position so the response state
 	// stays coherent for the 500 path.
 	testing.expect_value(t, response.header_bytes_used, u16(10))
@@ -1345,7 +1585,7 @@ test_response_header_set_entry_array_overflow :: proc(t: ^testing.T) {
 			transmute([]u8)string("Set-Cookie"),
 			transmute([]u8)string("k=v"),
 		)
-		testing.expectf(t, ok, "fill index %d should succeed", index)
+		testing.expectf(t, ok == .Staged, "fill index %d should succeed", index)
 	}
 	testing.expect_value(t, int(response.header_count), HTTP_RESPONSE_HEADERS_MAX)
 
@@ -1355,7 +1595,7 @@ test_response_header_set_entry_array_overflow :: proc(t: ^testing.T) {
 		transmute([]u8)string("Set-Cookie"),
 		transmute([]u8)string("k=v"),
 	)
-	testing.expect(t, !overflow_ok, "entry-array overflow must return false")
+	testing.expect_value(t, overflow_ok, Header_Result.Header_Count_Exceeded)
 	testing.expect_value(t, int(response.header_count), HTTP_RESPONSE_HEADERS_MAX)
 }
 
@@ -1372,7 +1612,7 @@ test_response_header_set_after_commit_fails :: proc(t: ^testing.T) {
 		transmute([]u8)string("X-Late"),
 		transmute([]u8)string("v"),
 	)
-	testing.expect(t, !ok, "writes after commit must fail")
+	testing.expect_value(t, ok, Header_Result.Already_Committed)
 }
 
 // ─── admit_chunk_payload ───────────────────────────────────────────────────
@@ -1570,27 +1810,6 @@ test_serialize_close_after_send_emits_connection_close :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_serialize_user_set_date_skips_auto_date :: proc(t: ^testing.T) {
-	response: Response_State
-	response_state_reset(&response)
-	response.mode = .Fixed_Length
-	response.flags += {.User_Set_Date}
-
-	region: [256]u8
-	destination: [HTTP_EGRESS_BUFFER_SIZE]u8
-
-	size, ok := serialize_response_headers(
-		destination[:],
-		&response,
-		region[:],
-		transmute([]u8)string("Wed, 01 May 2026 12:00:00 GMT"),
-	)
-	testing.expect(t, ok)
-	head := string(destination[:size])
-	testing.expect(t, strings.index(head, "Date:") < 0, "auto-Date must be suppressed")
-}
-
-@(test)
 test_serialize_unknown_status_writes_empty_reason :: proc(t: ^testing.T) {
 	response: Response_State
 	response_state_reset(&response)
@@ -1624,11 +1843,10 @@ test_serialize_egress_overflow_returns_zero_false :: proc(t: ^testing.T) {
 
 @(test)
 test_serialize_head_suppressed_emits_content_length :: proc(t: ^testing.T) {
-	// HEAD responses must emit Content-Length "as if GET" so the client can
-	// size the absent body (DR-9 / §3.6).
 	response: Response_State
 	response_state_reset(&response)
-	response.mode = .Head_Suppressed
+	response.mode = .Fixed_Length
+	response.body_policy = .Suppress_With_Length
 	response.body_size_total = 1234
 
 	region: [64]u8
@@ -1638,6 +1856,32 @@ test_serialize_head_suppressed_emits_content_length :: proc(t: ^testing.T) {
 	testing.expect(t, ok)
 	head := string(destination[:size])
 	testing.expect(t, strings.index(head, "\r\nContent-Length: 1234\r\n") >= 0)
+}
+
+@(test)
+test_staged_header_survives_respond_text :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Staged_Header_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	staged_header_test_state := Staged_Header_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&staged_header_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Staged_Header_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			header_result := header_set(&response, "X-Trace", "abc")
+			testing.expect_value(test_state.t, header_result, Header_Result.Staged)
+
+			step := respond_text(&response, HTTP_STATUS_OK, "ok")
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+
+			state := _response_state(&response)
+			wire := string(test_state.fixture.connection.egress_buffer[:state.egress_size])
+			testing.expect(test_state.t, strings.index(wire, "\r\nX-Trace: abc\r\n") >= 0)
+			testing.expect(test_state.t, strings.index(wire, "\r\nContent-Length: 2\r\n") >= 0)
+		},
+	)
 }
 
 @(test)
@@ -1652,17 +1896,74 @@ test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testi
 		proc(user_data: rawptr) {
 			test_state := cast(^Begin_Stream_Test_State)user_data
 			response := http_test_fixture_response(test_state.fixture)
-			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			begin_result := begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
 			state := _response_state(&response)
 			testing.expect(test_state.t, .Headers_Committed in state.flags)
-			head_size := int(state.egress_size)
+			head_size := state.egress_size
 			testing.expect(test_state.t, head_size > 0)
 			committed_head := string(test_state.fixture.connection.egress_buffer[:head_size])
 			testing.expect(test_state.t, strings.index(committed_head, "\r\nTransfer-Encoding: chunked\r\n") >= 0)
 			admitted := write_bytes(&response, transmute([]u8)string("hello"))
 			testing.expect_value(test_state.t, admitted, u16(5))
-			wire_chunk := string(test_state.fixture.connection.egress_buffer[head_size:int(state.egress_size)])
+			wire_chunk := string(test_state.fixture.connection.egress_buffer[head_size:state.egress_size])
 			testing.expect_value(test_state.t, wire_chunk, "5\r\nhello\r\n")
+		},
+	)
+}
+
+@(test)
+test_reserve_body_exact_commits_one_chunk :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Reserve_Body_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	reserve_body_test_state := Reserve_Body_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&reserve_body_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Reserve_Body_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			begin_result := begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
+			state := _response_state(&response)
+			head_size := int(state.egress_size)
+
+			reservation, reserve_result := reserve_body_exact(&response, 11)
+			testing.expect_value(test_state.t, reserve_result, Body_Reservation_Result.Reserved)
+			copy(reservation.payload, transmute([]u8)string("hello world"))
+			commit_result := commit_body(&response, reservation)
+			testing.expect_value(test_state.t, commit_result, Body_Commit_Result.Committed)
+
+			wire_chunk := string(test_state.fixture.connection.egress_buffer[head_size:state.egress_size])
+			testing.expect_value(test_state.t, wire_chunk, "b\r\nhello world\r\n")
+			testing.expect_value(test_state.t, state.body_size_sent, u64(11))
+		},
+	)
+}
+
+@(test)
+test_reserve_body_exact_oversized_chunk_is_body_too_large :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Reserve_Backpressure_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	reserve_backpressure_test_state := Reserve_Backpressure_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&reserve_backpressure_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Reserve_Backpressure_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			begin_result := begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
+			state := _response_state(&response)
+			egress_size_before := state.egress_size
+			body_size_sent_before := state.body_size_sent
+
+			_, reserve_result := reserve_body_exact(&response, u32(HTTP_EGRESS_BUFFER_SIZE))
+			testing.expect_value(test_state.t, reserve_result, Body_Reservation_Result.Body_Too_Large)
+			testing.expect_value(test_state.t, state.egress_size, egress_size_before)
+			testing.expect_value(test_state.t, state.body_size_sent, body_size_sent_before)
 		},
 	)
 }
@@ -1679,16 +1980,17 @@ test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing
 		proc(user_data: rawptr) {
 			test_state := cast(^Prepare_Flush_Test_State)user_data
 			response := http_test_fixture_response(test_state.fixture)
-			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			begin_result := begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
 			_ = write_bytes(&response, transmute([]u8)string("ab"))
 			state := _response_state(&response)
-			pre_flush_size := int(state.egress_size)
+			pre_flush_size := state.egress_size
 			ok := _response_prepare_flush(&response, true)
 			testing.expect(test_state.t, ok)
 			testing.expect(test_state.t, state.mode == .Closed)
 			testing.expect_value(
 				test_state.t,
-				string(test_state.fixture.connection.egress_buffer[pre_flush_size:int(state.egress_size)]),
+				string(test_state.fixture.connection.egress_buffer[pre_flush_size:state.egress_size]),
 				"0\r\n\r\n",
 			)
 		},
@@ -1699,7 +2001,7 @@ test_response_prepare_flush_final_appends_chunked_terminator :: proc(t: ^testing
 test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) {
 	fixture: HTTP_Test_Fixture
 	http_test_fixture_init(&fixture)
-	fixture.connection.connection_state.response.mode = .Head_Suppressed
+	fixture.connection.connection_state.request.method = .HEAD
 	Head_Suppressed_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
 	head_suppressed_test_state := Head_Suppressed_Test_State {fixture = &fixture, t = t}
 	tina.test_with_turn_frame(
@@ -1708,12 +2010,13 @@ test_head_suppressed_write_bytes_accepts_without_staging :: proc(t: ^testing.T) 
 		proc(user_data: rawptr) {
 			test_state := cast(^Head_Suppressed_Test_State)user_data
 			response := http_test_fixture_response(test_state.fixture)
-			begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			begin_result := begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
 			state := _response_state(&response)
-			header_size := int(state.egress_size)
+			header_size := state.egress_size
 			accepted := write_bytes(&response, transmute([]u8)string("payload"))
 			testing.expect_value(test_state.t, accepted, u16(7))
-			testing.expect_value(test_state.t, int(state.egress_size), header_size)
+			testing.expect_value(test_state.t, state.egress_size, header_size)
 			testing.expect_value(test_state.t, state.body_size_sent, u64(7))
 		},
 	)
@@ -1737,6 +2040,157 @@ test_respond_file_sets_sendfile_plan_and_returns_flush :: proc(t: ^testing.T) {
 			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_offset, u64(0))
 			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_size_remaining, u64(8192))
 			testing.expect_value(test_state.t, test_state.fixture.connection.connection_state.sendfile_active, true)
+		},
+	)
+}
+
+@(test)
+test_100_continue_has_no_body_framing_headers :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Continue_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	continue_test_state := Continue_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&continue_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Continue_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			continue_100(&response)
+			state := _response_state(&response)
+			wire := string(test_state.fixture.connection.egress_buffer[:state.egress_size])
+			testing.expect(test_state.t, strings.index(wire, "HTTP/1.1 100 Continue\r\n") == 0)
+			testing.expect(test_state.t, strings.index(wire, "Content-Length") < 0)
+			testing.expect(test_state.t, strings.index(wire, "Transfer-Encoding") < 0)
+			testing.expect(test_state.t, .Interim_100_Sent in state.flags)
+		},
+	)
+}
+
+@(test)
+test_100_continue_reset_allows_final_response :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Continue_Final_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	continue_final_test_state := Continue_Final_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&continue_final_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Continue_Final_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			continue_100(&response)
+			_response_prepare_next_message(&test_state.fixture.connection.connection_state.response)
+			step := respond_text(&response, HTTP_STATUS_OK, "ok")
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			state := _response_state(&response)
+			wire := string(test_state.fixture.connection.egress_buffer[:state.egress_size])
+			testing.expect(test_state.t, strings.index(wire, "HTTP/1.1 200 OK\r\n") == 0)
+			testing.expect(test_state.t, strings.index(wire, "Content-Length: 2\r\n") >= 0)
+			testing.expect(test_state.t, .Interim_100_Sent in state.flags)
+		},
+	)
+}
+
+@(test)
+test_204_response_has_no_body_framing_headers :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	No_Content_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	no_content_test_state := No_Content_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&no_content_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^No_Content_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			step := respond_text(&response, HTTP_STATUS_NO_CONTENT, "should-be-ignored")
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			state := _response_state(&response)
+			wire := string(test_state.fixture.connection.egress_buffer[:state.egress_size])
+			testing.expect(test_state.t, strings.index(wire, "HTTP/1.1 204 No Content\r\n") == 0)
+			testing.expect(test_state.t, strings.index(wire, "Content-Length") < 0)
+			testing.expect(test_state.t, strings.index(wire, "Transfer-Encoding") < 0)
+			testing.expect_value(test_state.t, state.body_size_sent, u64(0))
+		},
+	)
+}
+
+@(test)
+test_304_response_has_no_body_framing_headers :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Not_Modified_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	not_modified_test_state := Not_Modified_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&not_modified_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Not_Modified_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			step := respond_text(&response, HTTP_STATUS_NOT_MODIFIED, "should-be-ignored")
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			state := _response_state(&response)
+			wire := string(test_state.fixture.connection.egress_buffer[:state.egress_size])
+			testing.expect(test_state.t, strings.index(wire, "HTTP/1.1 304 Not Modified\r\n") == 0)
+			testing.expect(test_state.t, strings.index(wire, "Content-Length") < 0)
+			testing.expect(test_state.t, strings.index(wire, "Transfer-Encoding") < 0)
+			testing.expect_value(test_state.t, state.body_size_sent, u64(0))
+		},
+	)
+}
+
+@(test)
+test_head_response_emits_content_length_without_body :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	fixture.connection.connection_state.request.method = .HEAD
+	Head_Response_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	head_response_test_state := Head_Response_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&head_response_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Head_Response_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			step := respond_text(&response, HTTP_STATUS_OK, "ok")
+			testing.expect_value(test_state.t, step, Route_Step.Flush_Final)
+			state := _response_state(&response)
+			wire := string(test_state.fixture.connection.egress_buffer[:state.egress_size])
+			testing.expect(test_state.t, strings.index(wire, "HTTP/1.1 200 OK\r\n") == 0)
+			testing.expect(test_state.t, strings.index(wire, "Content-Length: 2\r\n") >= 0)
+			testing.expect(test_state.t, strings.index(wire, "\r\n\r\nok") < 0)
+			testing.expect_value(test_state.t, state.body_size_sent, u64(2))
+		},
+	)
+}
+
+@(test)
+test_reserve_body_exact_backpressure_when_room_too_small :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Reserve_Backpressure_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	reserve_backpressure_test_state := Reserve_Backpressure_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&reserve_backpressure_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Reserve_Backpressure_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			begin_result := begin_stream(&response, HTTP_STATUS_OK, "text/plain")
+			testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
+			state := _response_state(&response)
+
+			big_reserve, big_result := reserve_body_exact(&response, 3800)
+			testing.expect_value(test_state.t, big_result, Body_Reservation_Result.Reserved)
+			testing.expect_value(test_state.t, commit_body(&response, big_reserve), Body_Commit_Result.Committed)
+
+			egress_size_before := state.egress_size
+			body_size_sent_before := state.body_size_sent
+			_, small_result := reserve_body_exact(&response, 200)
+			testing.expect_value(test_state.t, small_result, Body_Reservation_Result.Backpressured)
+			testing.expect_value(test_state.t, state.egress_size, egress_size_before)
+			testing.expect_value(test_state.t, state.body_size_sent, body_size_sent_before)
 		},
 	)
 }

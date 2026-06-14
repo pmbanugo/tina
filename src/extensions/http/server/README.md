@@ -37,7 +37,7 @@ A complete, production-ready HTTP server with routing requires minimal boilerpla
 ```odin
 package main
 
-import http "tina/extensions/http"
+import http "tina/extensions/http/server"
 import tina "tina/src"
 
 health :: proc(request: ^http.Request, response: ^http.Response) -> http.Route_Step {
@@ -46,8 +46,7 @@ health :: proc(request: ^http.Request, response: ^http.Response) -> http.Route_S
 
 get_user :: proc(request: ^http.Request, response: ^http.Response) -> http.Route_Step {
     id := http.param(request, "id")
-    http.header_set(response, "Content-Type", "application/json")
-    return http.respond_bytes(response, 200, "application/json", /* ... JSON bytes ... */)
+    return http.respond_bytes(response, http.HTTP_STATUS_OK, "application/json", /* ... JSON bytes ... */)
 }
 
 main :: proc() {
@@ -78,11 +77,11 @@ The API is intentionally flat and explicit. Handlers are simple functions that r
 ### Routing & Setup
 ```odin
 // Route Builders
-http.get(pattern: string, handler: Request_Handler) -> Route
-http.post(pattern: string, handler: Request_Handler, body_size_max: u32 = 0) -> Route
+http.get(pattern: string, handler: Request_Handler, body_size_max: u32 = 0, body_mode: Route_Body_Mode = .None) -> Route
+http.post(pattern: string, handler: Request_Handler, body_size_max: u32 = 0, body_mode: Route_Body_Mode = .None) -> Route
 
 // Evented Builders (for streaming, downstream I/O, or SSE)
-http.get_event(pattern: string, handler: Route_Event_Handler, state_size: u16 = 0) -> Route
+http.get_event(pattern: string, handler: Route_Event_Handler, state_size: u16 = 0, body_size_max: u32 = 0, body_mode: Route_Body_Mode = .None) -> Route
 
 // Bootstrap
 http.install_development_defaults(server: ^Server) -> tina.SystemSpec
@@ -97,35 +96,70 @@ http.path(request: ^Request) ->[]u8
 http.header(request: ^Request, name: string) ->[]u8
 http.param(request: ^Request, name: string) ->[]u8
 http.query_value(request: ^Request, name: string) -> []u8
-http.query_value_decoded(request: ^Request, name: string) -> (decoded: []u8, ok: bool)
+http.query_value_decoded(request: ^Request, name: string) -> (decoded: []u8, result: Query_Value_Result)
 
 // For .Buffered routes only: returns the complete body
 http.body_buffered(request: ^Request) ->[]u8  
 ```
 
 ### Response Writing (Simple)
-Helpers that construct a full response and return `.Flush_Final`.
+Helpers that construct a full response and return `.Flush_Final`. Headers staged
+with `header_set` / `header_add` before these calls are preserved, except
+`Content-Type` which each helper sets to its own value (`text/plain; charset=utf-8`,
+`application/json`, etc.). Framework-owned headers (`Date`, `Content-Length`,
+`Transfer-Encoding`, `Connection`) are ignored by policy and reported as
+`.Reserved_Name`.
 ```odin
-http.respond_text(response: ^Response, status: HTTP_Status, body: string) -> Route_Step
-http.respond_json(response: ^Response, status: HTTP_Status, body: string) -> Route_Step
-http.respond_bytes(response: ^Response, status: HTTP_Status, content_type: string, body:[]u8) -> Route_Step
+http.header_set(response: ^Response, name: string, value: string) -> Header_Result
+http.header_add(response: ^Response, name: string, value: string) -> Header_Result
+
+http.respond_text(response: ^Response, status_code: HTTP_Status, body: string) -> Route_Step
+http.respond_json(response: ^Response, status_code: HTTP_Status, body: string) -> Route_Step
+http.respond_bytes(response: ^Response, status_code: HTTP_Status, content_type: string, body:[]u8) -> Route_Step
 
 // Zero-copy file-to-socket transfer
-http.respond_file(response: ^Response, fd: tina.FD_Handle, size: u64, content_type: string) -> Route_Step
+http.respond_file(response: ^Response, fd_file: tina.FD_Handle, file_size: u64, content_type: string) -> Route_Step
+
+// Send 100 Continue to a client that sent Expect: 100-continue
+http.continue_100(response: ^Response)
 ```
 
 ### Response Writing (Streaming & SSE)
-For chunked transfer encoding or manual flushing.
+For chunked transfer encoding or manual flushing. Stage application headers first,
+then begin the response. `begin_stream` commits the HTTP response head and uses
+HTTP/1.1 chunked transfer encoding; Tina owns `Connection`, `Content-Length`, and
+`Transfer-Encoding` so callers cannot create invalid framing.
 ```odin
-http.begin_stream(response: ^Response, status: HTTP_Status, content_type: string)
-http.begin_fixed_stream(response: ^Response, status: HTTP_Status, content_type: string, total_size: u64)
+http.header_set(response: ^Response, name: string, value: string) -> Header_Result
+http.header_add(response: ^Response, name: string, value: string) -> Header_Result
 
-http.header_set(response: ^Response, name: string, value: string)
-http.header_add(response: ^Response, name: string, value: string)
+http.begin_stream(response: ^Response, status_code: HTTP_Status, content_type: string) -> Response_Begin_Result
+http.begin_fixed_stream(response: ^Response, status_code: HTTP_Status, content_type: string, total_size: u64) -> Response_Begin_Result
+
 http.write_bytes(response: ^Response, data:[]u8) -> u16
+
+// Exact reservation for one atomic body record. Useful for protocols such as SSE
+// that must not commit partial records on backpressure.
+http.reserve_body_exact(response: ^Response, body_size: u32) -> (Body_Reservation, Body_Reservation_Result)
+http.commit_body(response: ^Response, reservation: Body_Reservation) -> Body_Commit_Result
+
+// Return .Read_Body to pause the handler until the next body chunk arrives (streamed routes).
+http.read_body() -> Route_Step
 
 http.flush(final: bool = false) -> Route_Step
 http.close() -> Route_Step
+```
+
+Minimal SSE setup:
+
+```odin
+_ = http.header_set(response, "Cache-Control", "no-cache")
+_ = http.header_set(response, "X-Accel-Buffering", "no")
+if http.begin_stream(response, http.HTTP_STATUS_OK, "text/event-stream") != .Begun {
+    return http.close()
+}
+_ = http.write_bytes(response, transmute([]u8)string("retry: 2000\n\n"))
+return http.flush()
 ```
 
 ### Downstream Messaging & Async Events

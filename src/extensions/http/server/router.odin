@@ -65,7 +65,7 @@ Compiled_Router :: struct {
 	wildcard_count:               u16,
 	global_methods_mask:          Method_Mask,
 	options_asterisk_route_index: Route_Index,
-	options_asterisk_response:    []u8,
+	options_asterisk_allow:       []u8,
 }
 
 @(private = "package")
@@ -420,12 +420,13 @@ compile_router :: proc(
 		literal_cursor += u32(len(aggregate.pattern_bytes))
 	}
 
-	// Phase 8: build the canned `OPTIONS *` response if the user did not
-	// register an explicit handler. The response bytes are immutable for the
-	// lifetime of the router.
-	options_response: []u8
+	// Phase 8: build the canned `OPTIONS *` Allow value if the user did not
+	// register an explicit handler. The value is immutable for the lifetime
+	// of the router; the actual response is produced through the normal
+	// response writer so Date, Connection, and framing policy stay correct.
+	options_allow: []u8
 	if options_asterisk_route_index == ROUTE_INDEX_NONE {
-		options_response = build_options_asterisk_response(global_methods_mask, output_allocator)
+		options_allow = build_options_asterisk_allow(global_methods_mask, output_allocator)
 	}
 
 	router = Compiled_Router {
@@ -438,7 +439,7 @@ compile_router :: proc(
 		wildcard_count               = wildcard_count,
 		global_methods_mask          = global_methods_mask,
 		options_asterisk_route_index = options_asterisk_route_index,
-		options_asterisk_response    = options_response,
+		options_asterisk_allow       = options_allow,
 	}
 	return router, .None, -1
 }
@@ -452,8 +453,8 @@ compiled_router_destroy :: proc(router: ^Compiled_Router, allocator := context.a
 	mem.delete(router.literal_buffer)
 	mem.delete(router.route_parts)
 	mem.delete(router.descriptors)
-	if len(router.options_asterisk_response) > 0 {
-		mem.delete(router.options_asterisk_response)
+	if len(router.options_asterisk_allow) > 0 {
+		mem.delete(router.options_asterisk_allow)
 	}
 	router^ = {}
 }
@@ -874,50 +875,21 @@ allow_value_write :: proc(output_buffer: []u8, methods_mask: Method_Mask) -> u8 
 // Serializes the canned `OPTIONS *` response once at install time. Format:
 //
 //   HTTP/1.1 204 No Content\r\n
-//   Content-Length: 0\r\n
-//   Allow: <methods>\r\n     (omitted when methods_mask is empty)
-//   \r\n
-//
-// Connection policy headers (Date, Connection) are added by the response writer
-// at runtime so the canned bytes do not encode keep-alive/drain decisions.
+// Builds the immutable Allow value for the implicit `OPTIONS *` response.
+// The actual response is produced through the normal response writer so
+// Date, Connection, and framing policy stay correct.
 @(private = "file")
-build_options_asterisk_response :: proc(
+build_options_asterisk_allow :: proc(
 	methods_mask: Method_Mask,
 	allocator := context.allocator,
 ) -> []u8 {
-	// Stack-local assembly — no heap allocation during construction.
-	// Worst case: status line (27) + CL header (21) + Allow header (7 + ~64 + 2)
-	// + terminator (2) ≈ 123 bytes.
-	staging_buffer: [256]u8
-	write_index := 0
-
-	STATUS_LINE :: "HTTP/1.1 204 No Content\r\n"
-	CONTENT_LENGTH :: "Content-Length: 0\r\n"
-	ALLOW_PREFIX :: "Allow: "
-	CRLF :: "\r\n"
-
-	copy(staging_buffer[write_index:], STATUS_LINE)
-	write_index += len(STATUS_LINE)
-	copy(staging_buffer[write_index:], CONTENT_LENGTH)
-	write_index += len(CONTENT_LENGTH)
-
 	allow_buffer: [128]u8
 	allow_size := allow_value_write(allow_buffer[:], methods_mask)
-	if allow_size > 0 {
-		copy(staging_buffer[write_index:], ALLOW_PREFIX)
-		write_index += len(ALLOW_PREFIX)
-		copy(staging_buffer[write_index:], allow_buffer[:allow_size])
-		write_index += int(allow_size)
-		copy(staging_buffer[write_index:], CRLF)
-		write_index += len(CRLF)
+	if allow_size == 0 {
+		return nil
 	}
-	copy(staging_buffer[write_index:], CRLF)
-	write_index += len(CRLF)
-
-	// Single allocation into the caller-provided allocator (Grand Arena at
-	// boot time). The staging buffer is stack-local and dies with this frame.
-	output := make([]u8, write_index, allocator)
-	copy(output, staging_buffer[:write_index])
+	output := make([]u8, int(allow_size), allocator)
+	copy(output, allow_buffer[:allow_size])
 	return output
 }
 
@@ -1075,17 +1047,14 @@ test_compile_options_asterisk_split_out :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_compile_options_asterisk_canned_response_built :: proc(t: ^testing.T) {
+test_compile_options_asterisk_allow_built :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/health", methods_mask = {.GET}}}
 	router, error, _ := compile_router(routes)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, router.options_asterisk_route_index, ROUTE_INDEX_NONE)
-	testing.expect(t, len(router.options_asterisk_response) > 0, "canned response should be built")
-	canned := string(router.options_asterisk_response)
-	testing.expect(t, strings.contains(canned, "204 No Content"), "must be 204")
-	testing.expect(t, strings.contains(canned, "Content-Length: 0"), "must declare CL: 0")
-	testing.expect(t, strings.contains(canned, "Allow: GET, HEAD"), "Allow must list GET+HEAD")
+	testing.expect(t, len(router.options_asterisk_allow) > 0, "Allow value should be built")
+	testing.expect_value(t, string(router.options_asterisk_allow), "GET, HEAD")
 }
 
 @(test)

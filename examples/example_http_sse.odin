@@ -187,9 +187,11 @@ events_stream :: proc(
 				"publisher not ready",
 			)
 		}
-		http.begin_stream(response, http.HTTP_STATUS_OK, "text/event-stream")
 		_ = http.header_set(response, "Cache-Control", "no-cache")
 		_ = http.header_set(response, "X-Accel-Buffering", "no")
+		if http.begin_stream(response, http.HTTP_STATUS_OK, "text/event-stream") != .Begun {
+			return http.close()
+		}
 		_ = http.write_bytes(response, transmute([]u8)string("retry: 2000\n\n"))
 		return http.flush()
 

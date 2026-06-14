@@ -30,15 +30,20 @@ Hello_State :: struct {
 	streaming:  bool,
 }
 
-INDEX_HTML :: `<!DOCTYPE html>
+INDEX_HTML ::
+	`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tina Datastar Hello World</title>
-<script type="module" src="` + DATASTAR_CDN_URL + `"></script>
+<script type="module" src="` +
+	DATASTAR_CDN_URL +
+	`"></script>
 <style>
-@import url('` + SILKSCREEN_CSS_URL + `');
+@import url('` +
+	SILKSCREEN_CSS_URL +
+	`');
 :root{color-scheme:light dark;font-family:-apple-system,system-ui,sans-serif;--font-pixel:Silkscreen,sans-serif;--red-6:oklch(57.7% .245 27.325);--orange-6:oklch(64.6% .222 41.116);--green-6:oklch(62.7% .194 149.214);--blue-6:oklch(54.6% .245 262.881);--purple-6:oklch(55.8% .288 302.321);--_color:var(--blue-6)}
 body{margin:0;padding:2rem;background:Canvas;color:CanvasText}main{max-width:64rem;margin:0 auto;display:grid;gap:1.5rem}.hero{display:grid;justify-items:center;gap:.75rem;text-align:center}.odin-logo{width:clamp(4rem,12vw,7rem);height:auto;filter:brightness(0) invert(1) drop-shadow(0 0 1.25rem color-mix(in oklab,var(--blue-6) 45%,transparent))}section{border:1px solid color-mix(in oklab,CanvasText 20%,transparent);border-radius:.75rem;padding:1.25rem}.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(20rem,1fr);gap:1rem;align-items:start}label,input,button{font:inherit}input{max-width:8rem;padding:.45rem .6rem}button{padding:.5rem .85rem;border:0;border-radius:.5rem;background:#2563eb;color:white;cursor:pointer}button:disabled,input:disabled{opacity:.6;cursor:wait}
 #message{font-family:var(--font-pixel);font-size:clamp(2rem,8vw,5rem);font-weight:400;line-height:1.1;letter-spacing:.12em;text-transform:uppercase;-webkit-font-smoothing:none;-moz-osx-font-smoothing:auto;margin:1rem 0 0;background:var(--_color);background-clip:text;-webkit-background-clip:text;-webkit-text-fill-color:transparent}.success{--_color:linear-gradient(to right in oklab,var(--red-6),var(--orange-6),var(--green-6),var(--blue-6))}.warning{--_color:linear-gradient(to right in oklab,var(--orange-6),var(--green-6),var(--blue-6),var(--purple-6))}.error{--_color:linear-gradient(to right in oklab,var(--red-6),var(--orange-6),var(--purple-6))}.sse{--_color:linear-gradient(to right in oklab,var(--red-6),var(--orange-6),var(--green-6),var(--blue-6),var(--purple-6))}
@@ -48,7 +53,9 @@ body{margin:0;padding:2rem;background:Canvas;color:CanvasText}main{max-width:64r
 <body>
 <main>
   <header class="hero">
-    <img class="odin-logo" alt="Odin logo" src="` + ODIN_LOGO_URL + `">
+    <img class="odin-logo" alt="Odin logo" src="` +
+	ODIN_LOGO_URL +
+	`">
     <h1>Tina Datastar SDK — Hello World</h1>
   </header>
   <section id="hello">
@@ -101,35 +108,64 @@ hello_world :: proc(
 	case http.Request_Start:
 		hello_state^ = Hello_State{}
 		if error := datastar.read_signals(request, &hello_state.store); error != .None {
-			return http.respond_text(response, http.HTTP_STATUS_BAD_REQUEST, "invalid datastar signals")
+			return http.respond_text(
+				response,
+				http.HTTP_STATUS_BAD_REQUEST,
+				"invalid datastar signals",
+			)
 		}
 
-		sse := datastar.server_sent_event_generator(request, response)
+		generator, start_error := datastar.start_sse(request, response)
+		if start_error != .None {
+			return http.close()
+		}
 		if hello_state.store.Interval == 0 {
 			classes := []string{"success", "warning", "error"}
 			class_index := hello_state.store.LastClassIndex + 1
 			if class_index >= len(classes) || class_index < 0 do class_index = 0
 
-			datastar.patch_elements(&sse, hello_element(HELLO_MESSAGE, classes[class_index]))
+			if datastar.patch_elements(
+				   &generator,
+				   hello_element(request, HELLO_MESSAGE, classes[class_index]),
+			   ) !=
+			   .None {
+				return http.close()
+			}
 
-			code_buffer := make([]u8, 512, context.temp_allocator)
-			datastar.patch_elements(
-				&sse,
-				fmt.bprintf(code_buffer, `<code>HTTP/1.1 200 OK<br>Content-Type: text/html<br><br>&lt;h3 id="message"&gt;%s&lt;/h3&gt;</code>`, HELLO_MESSAGE),
-				datastar.Patch_Elements_Options{selector = "#networkResponse", mode = .Inner},
-			)
+			code_buffer := make([]u8, 512, http.request_scratch(request))
+			if datastar.patch_elements(
+				   &generator,
+				   fmt.bprintf(
+					   code_buffer,
+					   `<code>HTTP/1.1 200 OK<br>Content-Type: text/html<br><br>&lt;h3 id="message"&gt;%s&lt;/h3&gt;</code>`,
+					   HELLO_MESSAGE,
+				   ),
+				   datastar.Patch_Elements_Options{selector = "#networkResponse", mode = .Inner},
+			   ) !=
+			   .None {
+				return http.close()
+			}
 
 			signal_buffer: [64]u8
-			datastar.patch_signals(&sse, fmt.bprintf(signal_buffer[:], `{{"lastClassIndex": %d}}`, class_index))
+			if datastar.patch_signals(
+				   &generator,
+				   fmt.bprintf(signal_buffer[:], `{{"lastClassIndex": %d}}`, class_index),
+			   ) !=
+			   .None {
+				return http.close()
+			}
 			return http.flush(final = true)
 		}
 
 		hello_state.streaming = true
-		datastar.patch_elements(
-			&sse,
-			`<code>HTTP/1.1 200 OK<br>Content-Type: text/event-stream<br><br></code>`,
-			datastar.Patch_Elements_Options{selector = "#networkResponse", mode = .Inner},
-		)
+		if datastar.patch_elements(
+			   &generator,
+			   `<code>HTTP/1.1 200 OK<br>Content-Type: text/event-stream<br><br></code>`,
+			   datastar.Patch_Elements_Options{selector = "#networkResponse", mode = .Inner},
+		   ) !=
+		   .None {
+			return http.close()
+		}
 		return http.flush()
 
 	case http.Send_Ready:
@@ -154,21 +190,32 @@ hello_world :: proc(
 		}
 
 		hello_state.next_index = next_index + 1
-		msg := message[:int(next_index)+1]
-		sse := datastar.ServerSentEventGenerator{request = request, response = response}
-		datastar.patch_elements(&sse, hello_element(msg, "sse"))
+		msg := message[:int(next_index) + 1]
+		sse := datastar.resume(response)
+		if datastar.patch_elements(&sse, hello_element(request, msg, "sse")) != .None {
+			return http.close()
+		}
 
-		code_buffer := make([]u8, 512, context.temp_allocator)
-		datastar.patch_elements(
-			&sse,
-			fmt.bprintf(
-				code_buffer,
-				`<code>event: datastar-patch-elements<br>data: elements &lt;h3 id="message"&gt;%s&lt;/h3&gt;<br><br></code>`,
-				msg,
-			),
-			datastar.Patch_Elements_Options{selector = "#networkResponse", mode = .Append},
-		)
-		datastar.execute_script(&sse, "networkResponse.scrollTop = networkResponse.scrollHeight")
+		code_buffer := make([]u8, 512, http.request_scratch(request))
+		if datastar.patch_elements(
+			   &sse,
+			   fmt.bprintf(
+				   code_buffer,
+				   `<code>event: datastar-patch-elements<br>data: elements &lt;h3 id="message"&gt;%s&lt;/h3&gt;<br><br></code>`,
+				   msg,
+			   ),
+			   datastar.Patch_Elements_Options{selector = "#networkResponse", mode = .Append},
+		   ) !=
+		   .None {
+			return http.close()
+		}
+		if datastar.execute_script(
+			   &sse,
+			   "networkResponse.scrollTop = networkResponse.scrollHeight",
+		   ) !=
+		   .None {
+			return http.close()
+		}
 		return http.flush()
 
 	case http.Body_Chunk, http.Application_Notification, http.Peer_Closed, http.Server_Drain:
@@ -178,8 +225,8 @@ hello_world :: proc(
 	return http.close()
 }
 
-hello_element :: proc(message: string, class: string) -> string {
-	buffer := make([]u8, 256, context.temp_allocator)
+hello_element :: proc(request: ^http.Request, message: string, class: string) -> string {
+	buffer := make([]u8, 256, http.request_scratch(request))
 	return fmt.bprintf(buffer, `<h3 id="message" class="%s">%s</h3>`, class, message)
 }
 
@@ -188,7 +235,11 @@ main :: proc() {
 		routes = []http.Route {
 			http.get("/", index),
 			http.get("/health", health),
-			http.get_event("/api/hello-world", hello_world, state_size = u16(size_of(Hello_State))),
+			http.get_event(
+				"/api/hello-world",
+				hello_world,
+				state_size = u16(size_of(Hello_State)),
+			),
 		},
 	}
 	server := http.Server {
