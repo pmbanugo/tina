@@ -7,14 +7,13 @@ serializes Datastar events, and reads incoming `datastar` signal JSON.
 ## Start a Datastar SSE response
 
 ```odin
-sse, error := datastar.start_sse(request, response)
+sse, error := datastar.start_sse(response)
 if error != .None {
     return http.close()
 }
 ```
 
-The constructor accepts `request` and `response` to match Datastar SDK shape,
-but the `Generator` stores only the response. Request data belongs to
+The constructor accepts only the response. Request data belongs to
 `read_signals`; retaining the request pointer would add unused state to every
 generator.
 

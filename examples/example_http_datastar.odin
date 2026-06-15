@@ -115,7 +115,7 @@ hello_world :: proc(
 			)
 		}
 
-		generator, start_error := datastar.start_sse(request, response)
+		generator, start_error := datastar.start_sse(response)
 		if start_error != .None {
 			return http.close()
 		}

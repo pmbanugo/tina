@@ -94,34 +94,38 @@ Generator :: struct {
 
 ServerSentEventGenerator :: Generator
 
-@(private = "file")
-Send_Options :: struct {
+SSE_Options :: struct {
 	event_id:          string,
 	retry_duration_ms: u32,
 }
 
 Patch_Elements_Options :: struct {
 	selector:                 string,
-	mode:                     Patch_Mode,
-	flags:                    Patch_Elements_Flags,
 	view_transition_selector: string,
-	namespace:                Namespace,
 	event_id:                 string,
 	retry_duration_ms:        u32,
+	mode:                     Patch_Mode,
+	flags:                    Patch_Elements_Flags,
+	namespace:                Namespace,
 }
 
 Patch_Signals_Options :: struct {
-	flags:             Patch_Signals_Flags,
 	event_id:          string,
 	retry_duration_ms: u32,
+	flags:             Patch_Signals_Flags,
 }
 
 Execute_Script_Options :: struct {
-	lifetime:          Script_Lifetime,
 	attributes:        []string,
 	event_id:          string,
 	retry_duration_ms: u32,
+	lifetime:          Script_Lifetime,
 }
+
+#assert(size_of(SSE_Options) == 24)
+#assert(size_of(Patch_Elements_Options) == 56)
+#assert(size_of(Patch_Signals_Options) == 24)
+#assert(size_of(Execute_Script_Options) == 40)
 
 @(private = "file")
 Data_Field :: struct {
@@ -137,14 +141,7 @@ Script_Payload :: struct {
 }
 
 @(require_results)
-start_sse :: proc(
-	request: ^http.Request, // TODO: remove because this parameter isn't used.
-	response: ^http.Response,
-) -> (
-	generator: Generator,
-	error: SSE_Start_Error,
-) {
-	_ = request
+start_sse :: proc(response: ^http.Response) -> (generator: Generator, error: SSE_Start_Error) {
 	if response == nil {
 		return generator, .Invalid_Argument
 	}
@@ -218,7 +215,7 @@ patch_elements :: proc(
 		field_count += 1
 	}
 
-	send_options := Send_Options {
+	sse_options := SSE_Options {
 		event_id          = options.event_id,
 		retry_duration_ms = options.retry_duration_ms,
 	}
@@ -229,7 +226,7 @@ patch_elements :: proc(
 		"elements",
 		elements,
 		{},
-		send_options,
+		sse_options,
 	)
 }
 
@@ -253,7 +250,7 @@ patch_signals :: proc(
 		field_count += 1
 	}
 
-	send_options := Send_Options {
+	sse_options := SSE_Options {
 		event_id          = options.event_id,
 		retry_duration_ms = options.retry_duration_ms,
 	}
@@ -264,7 +261,7 @@ patch_signals :: proc(
 		"signals",
 		signals,
 		{},
-		send_options,
+		sse_options,
 	)
 }
 
@@ -284,11 +281,11 @@ execute_script :: proc(
 		attributes = options.attributes,
 		lifetime   = options.lifetime,
 	}
-	send_options := Send_Options {
+	sse_options := SSE_Options {
 		event_id          = options.event_id,
 		retry_duration_ms = options.retry_duration_ms,
 	}
-	return _send_event(generator, .Patch_Elements, fields[:], "", "", script_payload, send_options)
+	return _send_event(generator, .Patch_Elements, fields[:], "", "", script_payload, sse_options)
 }
 
 @(require_results)
@@ -333,7 +330,7 @@ _send_event :: proc(
 	line_name: string,
 	lines: string,
 	script: Script_Payload,
-	options: Send_Options,
+	options: SSE_Options,
 ) -> SSE_Send_Error {
 	event_size := _emit_event_payload(
 		false,
@@ -392,7 +389,7 @@ _emit_event_payload :: proc(
 	line_name: string,
 	lines: string,
 	script: Script_Payload,
-	options: Send_Options,
+	options: SSE_Options,
 ) -> int {
 	cursor := _emit_event_begin(WRITE, destination, event_type, options)
 	for field in fields {
@@ -407,11 +404,11 @@ _emit_event_payload :: proc(
 }
 
 @(private = "file")
-_emit_event_begin :: proc(
+_emit_event_begin :: #force_inline proc(
 	$WRITE: bool,
 	destination: []u8,
 	event_type: Event_Type,
-	options: Send_Options,
+	options: SSE_Options,
 ) -> int {
 	cursor := 0
 	cursor = _emit_literal(WRITE, destination, cursor, SSE_PREFIX_EVENT)
@@ -435,7 +432,7 @@ _emit_event_begin :: proc(
 }
 
 @(private = "file")
-_emit_data_field :: proc(
+_emit_data_field :: #force_inline proc(
 	$WRITE: bool,
 	destination: []u8,
 	cursor: int,
@@ -451,7 +448,7 @@ _emit_data_field :: proc(
 }
 
 @(private = "file")
-_emit_data_lines :: proc(
+_emit_data_lines :: #force_inline proc(
 	$WRITE: bool,
 	destination: []u8,
 	cursor: int,
@@ -489,7 +486,7 @@ _emit_data_lines :: proc(
 }
 
 @(private = "file")
-_emit_script_element :: proc(
+_emit_script_element :: #force_inline proc(
 	$WRITE: bool,
 	destination: []u8,
 	cursor: int,
@@ -641,7 +638,7 @@ test_event_payload_serializes_patch_elements_in_one_buffer :: proc(t: ^testing.T
 		{name = "selector", value = "#feed"},
 		{name = "mode", value = "append"},
 	}
-	options := Send_Options {
+	options := SSE_Options {
 		event_id          = "123",
 		retry_duration_ms = 2000,
 	}
@@ -690,7 +687,7 @@ test_script_event_serializes_auto_remove_and_attributes :: proc(t: ^testing.T) {
 	options := Execute_Script_Options {
 		attributes = []string{"type=\"application/javascript\""},
 	}
-	send_options := Send_Options{}
+	sse_options := SSE_Options{}
 	script := Script_Payload {
 		content    = "one()\ntwo()",
 		attributes = options.attributes,
@@ -704,7 +701,7 @@ test_script_event_serializes_auto_remove_and_attributes :: proc(t: ^testing.T) {
 		"",
 		"",
 		script,
-		send_options,
+		sse_options,
 	)
 
 	buffer: [512]u8
@@ -716,7 +713,7 @@ test_script_event_serializes_auto_remove_and_attributes :: proc(t: ^testing.T) {
 		"",
 		"",
 		script,
-		send_options,
+		sse_options,
 	)
 
 	testing.expect_value(t, written, size)
@@ -739,7 +736,7 @@ test_script_event_persistent_lifetime_omits_remove_effect :: proc(t: ^testing.T)
 		content  = "console.log('hi')",
 		lifetime = .Persistent,
 	}
-	send_options := Send_Options{}
+	sse_options := SSE_Options{}
 	size := _emit_event_payload(
 		false,
 		nil,
@@ -748,7 +745,7 @@ test_script_event_persistent_lifetime_omits_remove_effect :: proc(t: ^testing.T)
 		"",
 		"",
 		script,
-		send_options,
+		sse_options,
 	)
 
 	buffer: [512]u8
@@ -760,7 +757,7 @@ test_script_event_persistent_lifetime_omits_remove_effect :: proc(t: ^testing.T)
 		"",
 		"",
 		script,
-		send_options,
+		sse_options,
 	)
 
 	testing.expect_value(t, written, size)
@@ -778,7 +775,7 @@ test_script_event_persistent_lifetime_omits_remove_effect :: proc(t: ^testing.T)
 @(test)
 test_default_options_omit_id_and_retry :: proc(t: ^testing.T) {
 	fields := [?]Data_Field{{name = "selector", value = "#feed"}}
-	send_options := Send_Options{}
+	sse_options := SSE_Options{}
 	elements := "<div></div>"
 	size := _emit_event_payload(
 		false,
@@ -788,7 +785,7 @@ test_default_options_omit_id_and_retry :: proc(t: ^testing.T) {
 		"elements",
 		elements,
 		{},
-		send_options,
+		sse_options,
 	)
 
 	buffer: [512]u8
@@ -800,7 +797,7 @@ test_default_options_omit_id_and_retry :: proc(t: ^testing.T) {
 		"elements",
 		elements,
 		{},
-		send_options,
+		sse_options,
 	)
 
 	testing.expect_value(t, written, size)
@@ -817,7 +814,7 @@ test_default_options_omit_id_and_retry :: proc(t: ^testing.T) {
 @(test)
 test_crlf_line_endings_are_normalized :: proc(t: ^testing.T) {
 	fields := [?]Data_Field{}
-	send_options := Send_Options{}
+	sse_options := SSE_Options{}
 	elements := "a\r\nb\r\nc"
 	size := _emit_event_payload(
 		false,
@@ -827,7 +824,7 @@ test_crlf_line_endings_are_normalized :: proc(t: ^testing.T) {
 		"elements",
 		elements,
 		{},
-		send_options,
+		sse_options,
 	)
 
 	buffer: [512]u8
@@ -839,7 +836,7 @@ test_crlf_line_endings_are_normalized :: proc(t: ^testing.T) {
 		"elements",
 		elements,
 		{},
-		send_options,
+		sse_options,
 	)
 
 	testing.expect_value(t, written, size)
