@@ -23,7 +23,7 @@ SSE_PREFIX_RETRY :: "retry: "
 @(private = "file")
 SSE_PREFIX_DATA :: "data: "
 @(private = "file")
-SSE_SCRIPT_DATA_PREFIX :: "data: elements "
+SSE_PREFIX_SCRIPT_DATA :: "data: elements "
 
 Patch_Mode :: enum u8 {
 	Outer,
@@ -496,7 +496,7 @@ _emit_script_element :: proc(
 	script: Script_Payload,
 ) -> int {
 	write_index := cursor
-	write_index = _emit_literal(WRITE, destination, write_index, SSE_SCRIPT_DATA_PREFIX)
+	write_index = _emit_literal(WRITE, destination, write_index, SSE_PREFIX_SCRIPT_DATA)
 	write_index = _emit_literal(WRITE, destination, write_index, "<script")
 	for attribute in script.attributes {
 		if len(attribute) == 0 do continue
@@ -522,7 +522,7 @@ _emit_script_element :: proc(
 		line := line_trim_end_cr(script_bytes[line_begin:line_end])
 		write_index = _emit_literal(WRITE, destination, write_index, transmute(string)line)
 		write_index = _emit_byte(WRITE, destination, write_index, '\n')
-		write_index = _emit_literal(WRITE, destination, write_index, SSE_SCRIPT_DATA_PREFIX)
+		write_index = _emit_literal(WRITE, destination, write_index, SSE_PREFIX_SCRIPT_DATA)
 		line_begin = line_end + 1
 	}
 	if line_begin < len(script_bytes) {
