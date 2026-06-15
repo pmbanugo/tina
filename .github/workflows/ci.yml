@@ -138,7 +138,7 @@ jobs:
           release: dev-2026-05
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version: v2.7.14
       - name: Clone h1spec
         run: git clone --depth 1 https://github.com/uNetworking/h1spec.git
       - name: HTTP Compliance check
