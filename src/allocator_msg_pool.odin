@@ -27,7 +27,12 @@ Pool_Error :: enum u8 {
 	Empty,
 }
 
-pool_init :: proc(p: ^Message_Pool, backing: []u8, slot_size: u32, reserved_pct: f32 = 0.01) {
+pool_init :: proc(
+	p: ^Message_Pool,
+	backing: []u8,
+	slot_size: u32,
+	reserved_pct: f32 = 0.01,
+) {
 	assert(slot_size >= 4, "slot_size must be >= 4 bytes for intrusive free list")
 	assert((slot_size & (slot_size - 1)) == 0, "slot_size must be a power of 2")
 
@@ -93,6 +98,77 @@ pool_free_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool, index
 	slot_pointer.next_free_slot = p.free_head
 	p.free_head = index
 	p.free_count += 1
+}
+
+@(private = "package")
+pool_reset :: proc "contextless" (p: ^Message_Pool) {
+	p.free_count = p.slot_count
+	p.free_head = POOL_NONE_INDEX
+	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
+		index := u32(i)
+		slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+		slot_pointer.next_free_slot = p.free_head
+		p.free_head = index
+	}
+}
+
+@(private = "package")
+pool_init_tina_owned :: proc(
+	p: ^Message_Pool,
+	backing: []u8,
+	slot_size: u32,
+	reserved_pct: f32 = 0.01,
+) {
+	pool_init(p, backing, slot_size, reserved_pct)
+	for index in 0 ..< p.slot_count {
+		_sanitizer_address_poison_message_slot_payload(p, index)
+	}
+}
+
+@(private = "package")
+pool_alloc_user_tina_owned :: #force_inline proc "contextless" (p: ^Message_Pool) -> (u32, Pool_Error) {
+	if p.free_count <= p.reserved_count do return POOL_NONE_INDEX, .Empty
+	return pool_alloc_unchecked_tina_owned(p), .None
+}
+
+@(private = "package")
+pool_alloc_system_tina_owned :: #force_inline proc "contextless" (p: ^Message_Pool) -> (u32, Pool_Error) {
+	if p.free_count == 0 do return POOL_NONE_INDEX, .Empty
+	return pool_alloc_unchecked_tina_owned(p), .None
+}
+
+@(private = "package")
+pool_alloc_unchecked_tina_owned :: #force_inline proc "contextless" (p: ^Message_Pool) -> u32 {
+	slot_index := p.free_head
+	slot_pointer := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
+	p.free_head = slot_pointer.next_free_slot
+	_sanitizer_address_unpoison_message_slot(p, slot_index)
+	p.free_count -= 1
+	mem.zero(slot_pointer, int(p.slot_size))
+	return slot_index
+}
+
+@(private = "package")
+pool_free_unchecked_tina_owned :: #force_inline proc "contextless" (p: ^Message_Pool, index: u32) {
+	slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+	slot_pointer.next_free_slot = p.free_head
+	p.free_head = index
+	p.free_count += 1
+	_sanitizer_address_poison_message_slot_payload(p, index)
+}
+
+@(private = "package")
+pool_reset_tina_owned :: proc "contextless" (p: ^Message_Pool) {
+	p.free_count = p.slot_count
+	p.free_head = POOL_NONE_INDEX
+	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
+		index := u32(i)
+		_sanitizer_address_unpoison_message_slot(p, index)
+		slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+		slot_pointer.next_free_slot = p.free_head
+		p.free_head = index
+		_sanitizer_address_poison_message_slot_payload(p, index)
+	}
 }
 
 // Resolves a pool index to its message envelope.

@@ -57,9 +57,16 @@ when TINA_SIMULATION_MODE {
 		// Set a 3-tick delay on channel 0->1
 		net.channels[0][1].delay_ticks = 3
 
-		// Create a minimal shard stub for source (shard 0)
-		source_shard := new(Shard)
-		defer free(source_shard)
+		// Build a source shard through the sanctioned fixture builder.
+		source_fixture := test_shard_fixture_init(
+			Test_Shard_Spec{
+				type_count  = 1,
+				slot_counts = {0},
+				subsystems  = {.Metadata},
+			},
+		)
+		defer test_shard_fixture_deinit(source_fixture)
+		source_shard := &source_fixture.shard
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{} // all disabled
@@ -113,8 +120,15 @@ when TINA_SIMULATION_MODE {
 		net, drop_prng := _make_test_network(16, context.temp_allocator)
 		net.drop_prng = &drop_prng
 
-		source_shard := new(Shard)
-		defer free(source_shard)
+		source_fixture := test_shard_fixture_init(
+			Test_Shard_Spec{
+				type_count  = 1,
+				slot_counts = {0},
+				subsystems  = {.Metadata},
+			},
+		)
+		defer test_shard_fixture_deinit(source_fixture)
+		source_shard := &source_fixture.shard
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{}
@@ -141,8 +155,15 @@ when TINA_SIMULATION_MODE {
 		net, drop_prng := _make_test_network(16, context.temp_allocator)
 		net.drop_prng = &drop_prng
 
-		source_shard := new(Shard)
-		defer free(source_shard)
+		source_fixture := test_shard_fixture_init(
+			Test_Shard_Spec{
+				type_count  = 1,
+				slot_counts = {0},
+				subsystems  = {.Metadata},
+			},
+		)
+		defer test_shard_fixture_deinit(source_fixture)
+		source_shard := &source_fixture.shard
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{}
@@ -166,8 +187,15 @@ when TINA_SIMULATION_MODE {
 		net, drop_prng := _make_test_network(16, context.temp_allocator)
 		net.drop_prng = &drop_prng
 
-		source_shard := new(Shard)
-		defer free(source_shard)
+		source_fixture := test_shard_fixture_init(
+			Test_Shard_Spec{
+				type_count  = 1,
+				slot_counts = {0},
+				subsystems  = {.Metadata},
+			},
+		)
+		defer test_shard_fixture_deinit(source_fixture)
+		source_shard := &source_fixture.shard
 		source_shard.id = 0
 		source_shard.sim_state.network = &net
 		source_shard.sim_state.fault_config = &FaultConfig{}

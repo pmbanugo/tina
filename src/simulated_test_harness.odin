@@ -22,6 +22,11 @@ when TINA_SIMULATION_MODE {
 	}
 	HarnessTrapChild :: struct {}
 
+	HARNESS_TRAP_DIAG_SPAWN_FAILED:         Diagnostic_Field_Id : 0
+	HARNESS_TRAP_DIAG_CONTINUED_AFTER_TRAP: Diagnostic_Field_Id : 1
+	HARNESS_TRAP_DIAG_PARENT_HANDLE:        Diagnostic_Field_Id : 2
+	HARNESS_TRAP_DIAG_GROUP_ID:             Diagnostic_Field_Id : 3
+
 	harness_noop_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -57,6 +62,12 @@ when TINA_SIMULATION_MODE {
 		parent.parent_handle = ctx_self_handle()
 		parent.group_id = ctx_supervision_group_id()
 		parent.continued_after_trap = true
+
+		ctx_test_diagnostic_write_u64(HARNESS_TRAP_DIAG_SPAWN_FAILED, parent.spawn_failed ? 1 : 0)
+		ctx_test_diagnostic_write_u64(HARNESS_TRAP_DIAG_CONTINUED_AFTER_TRAP, parent.continued_after_trap ? 1 : 0)
+		ctx_test_diagnostic_write_u64(HARNESS_TRAP_DIAG_PARENT_HANDLE, u64(parent.parent_handle))
+		ctx_test_diagnostic_write_u64(HARNESS_TRAP_DIAG_GROUP_ID, u64(parent.group_id))
+
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
@@ -144,18 +155,41 @@ when TINA_SIMULATION_MODE {
 		defer simulator_deinit(&sim)
 
 		shard := &sim.shards[0]
-		parent_pointer := cast(^HarnessTrapParent)_get_isolate_ptr(
+
+		shard_test_diagnostic_expect_u64(
+			t,
 			shard,
 			HARNESS_TRAP_PARENT_TYPE_ID,
 			0,
+			HARNESS_TRAP_DIAG_SPAWN_FAILED,
+			1,
 		)
-
-		testing.expect(t, parent_pointer.spawn_failed, "child init trap must return Spawn_Error.init_failed")
-		testing.expect(t, parent_pointer.continued_after_trap, "parent turn must continue after child init trap")
-		testing.expect_value(t, extract_type_id(parent_pointer.parent_handle), HARNESS_TRAP_PARENT_TYPE_ID)
-		testing.expect_value(t, parent_pointer.group_id, Supervision_Group_Id(0))
-		testing.expect_value(t, shard.metadata[HARNESS_TRAP_PARENT_TYPE_ID].state[0], Isolate_State.Wait_Message)
-		testing.expect_value(t, shard.metadata[HARNESS_TRAP_CHILD_TYPE_ID].state[0], Isolate_State.Unallocated)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			HARNESS_TRAP_PARENT_TYPE_ID,
+			0,
+			HARNESS_TRAP_DIAG_CONTINUED_AFTER_TRAP,
+			1,
+		)
+		parent_handle, parent_handle_found := shard_diagnostic_read(
+			shard,
+			HARNESS_TRAP_PARENT_TYPE_ID,
+			0,
+			HARNESS_TRAP_DIAG_PARENT_HANDLE,
+		)
+		testing.expect(t, parent_handle_found, "parent-handle diagnostic not found")
+		testing.expect_value(t, extract_type_id(Isolate_Handle(parent_handle)), HARNESS_TRAP_PARENT_TYPE_ID)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			HARNESS_TRAP_PARENT_TYPE_ID,
+			0,
+			HARNESS_TRAP_DIAG_GROUP_ID,
+			u64(0),
+		)
+		testing.expect_value(t, shard.metadata[HARNESS_TRAP_PARENT_TYPE_ID]._state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[HARNESS_TRAP_CHILD_TYPE_ID]._state[0], Isolate_State.Unallocated)
 		testing.expect_value(t, shard.current_isolate_turn_frame, nil)
 		testing.expect_value(t, shard.current_trap_environment, nil)
 	}

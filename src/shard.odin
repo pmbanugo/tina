@@ -83,49 +83,49 @@ Control_Signal :: enum u8 {
 
 // Isolate metadata
 Isolate_Metadata :: struct {
-	io_peer_address:       Peer_Address,
-	inbox_head:            u32,
-	inbox_tail:            u32,
-	pending_correlation:   Correlation_Id,
-	io_fd:                 FD_Handle,
-	io_result:             i32,
-	generation:            u32,
-	working_arena_offset:  u32,
-	inbox_count:           u16,
-	group_id:              Supervision_Group_Id,
-	io_operation_kind:     IO_Operation_Kind,
-	io_slot_index:         IO_Slot_Index,
-	state:                 Isolate_State,
-	flags:                 Isolate_Flags, // Replaces shutdown_pending: u8
-	io_sequence:           u8,
+	io_peer_address:      Peer_Address,
+	inbox_head:           u32,
+	inbox_tail:           u32,
+	pending_correlation:  Correlation_Id,
+	io_fd:                FD_Handle,
+	io_result:            i32,
+	generation:           u32,
+	working_arena_offset: u32,
+	inbox_count:          u16,
+	group_id:             Supervision_Group_Id,
+	io_operation_kind:    IO_Operation_Kind,
+	io_slot_index:        IO_Slot_Index,
+	_state:               Isolate_State,
+	flags:                Isolate_Flags, // Replaces shutdown_pending: u8
+	io_sequence:          u8,
 }
 
 Shard_Counters :: struct {
-	stale_delivery_drops:      u64,
-	ring_full_drops:           u64,
-	quarantine_drops:          u64,
-	pool_exhaustion_drops:     u64,
-	mailbox_full_drops:        u64,
-	io_receive_exhaustions:    u64,
-	io_staging_exhaustions:    u64,
-	io_submission_exhaustions: u64,
-	io_awaiting_count:         u64,
-	io_stale_completions:      u64, // TODO: In simulation, consider verifying that this counter
+	stale_delivery_drops:              u64,
+	ring_full_drops:                   u64,
+	quarantine_drops:                  u64,
+	pool_exhaustion_drops:             u64,
+	mailbox_full_drops:                u64,
+	io_receive_exhaustions:            u64,
+	io_staging_exhaustions:            u64,
+	io_submission_exhaustions:         u64,
+	io_awaiting_count:                 u64,
+	io_stale_completions:              u64, // TODO: In simulation, consider verifying that this counter
 	// equals the number of timer-wakes + shutdown-wakes that
 	// interrupted WAITING_FOR_IO Isolates. A mismatch would indicate
 	// a stale completion was lost (buffer leak) or double-counted.
 	// Might require tracking a separate "io_wakes" counter to compare against.
-	io_recv_no_buffers_count:  u64,
-	staging_slot_leaks:        u64, // leak signal.
-	transfer_exhaustions:      u64,
-	transfer_stale_reads:      u64,
-	handoff_exhaustions:       u64,
-	handoff_timeouts:          u64,
-	handoff_rejects:           u64,
-	handoff_control_send_failures:    u64,
+	io_recv_no_buffers_count:          u64,
+	staging_slot_leaks:                u64, // leak signal.
+	transfer_exhaustions:              u64,
+	transfer_stale_reads:              u64,
+	handoff_exhaustions:               u64,
+	handoff_timeouts:                  u64,
+	handoff_rejects:                   u64,
+	handoff_control_send_failures:     u64,
 	handoff_control_retry_exhaustions: u64,
-	handoff_control_retry_drops:      u64,
-	liveness_control_publish_count:   u64,
+	handoff_control_retry_drops:       u64,
+	liveness_control_publish_count:    u64,
 }
 
 Dynamic_Child_Spec :: struct {
@@ -158,8 +158,25 @@ when TINA_SIMULATION_MODE {
 		fault_config: ^FaultConfig,
 		crash_prng:   ^Prng,
 	}
+
+	Diagnostic_Field_Id :: distinct u16
+
+	Diagnostic_Record :: struct {
+		isolate_type_id: Isolate_Type_Id,
+		slot_index:      Isolate_Slot_Index,
+		field_id:        Diagnostic_Field_Id,
+		value:           u64,
+		write_count:     u32,
+	}
+
+	Diagnostic_Table :: struct {
+		records:      []Diagnostic_Record,
+		record_count: u32,
+	}
+
 	Sim_State_Mixin :: struct {
-		sim_state: Simulation_State,
+		sim_state:   Simulation_State,
+		diagnostics: Diagnostic_Table,
 	}
 } else {
 	Sim_State_Mixin :: struct {}
@@ -168,64 +185,63 @@ when TINA_SIMULATION_MODE {
 @(private = "package")
 Shard :: struct {
 	// --- Hot Pointers & Slices (8-byte aligned) ---
-	outbound_rings:         []^SPSC_Ring,
-	inbound_rings:          []^SPSC_Ring,
-	outbound_control_channels: []^Shard_Control_Channel,
-	inbound_control_channel:   ^Shard_Control_Channel,
-	type_descriptors:       []IsolateTypeDescriptor,
-	isolate_free_heads:     []u32, // free list heads per Isolate Type
-	dispatch_cursors:       []u32, // Resumption index for budgeted dispatch
-	dispatch_credit_counts: []Scheduler_Credit_Count,
-	dispatchable_slot_words: [][]u64,
-	dispatchable_slot_counts: []u32,
-	dispatchable_type_words: []u64,
-	dispatch_ready_type_words: []u64,
-	isolate_memory:         [][]u8,
-	working_memory:         [][]u8, // Base slices for working memory
-	scratch_memory:         []u8, // Base slice for scratch arena
-	transfer_generations:   []u16,
-	metadata:               []#soa[]Isolate_Metadata,
-	supervision_groups:     []Supervision_Group,
-	handoff_table:          FD_Handoff_Table,
+	outbound_rings:                  []^SPSC_Ring,
+	inbound_rings:                   []^SPSC_Ring,
+	outbound_control_channels:       []^Shard_Control_Channel,
+	inbound_control_channel:         ^Shard_Control_Channel,
+	type_descriptors:                []IsolateTypeDescriptor,
+	isolate_free_heads:              []u32, // free list heads per Isolate Type
+	dispatch_cursors:                []u32, // Resumption index for budgeted dispatch
+	dispatch_credit_counts:          []Scheduler_Credit_Count,
+	dispatchable_slot_words:         [][]u64,
+	dispatchable_slot_counts:        []u32,
+	dispatchable_type_words:         []u64,
+	dispatch_ready_type_words:       []u64,
+	isolate_memory:                  [][]u8,
+	working_memory:                  [][]u8, // Base slices for working memory
+	scratch_memory:                  []u8, // Base slice for scratch arena
+	transfer_generations:            []u16,
+	metadata:                        []#soa[]Isolate_Metadata,
+	supervision_groups:              []Supervision_Group,
+	handoff_table:                   FD_Handoff_Table,
 
 	// --- Hot Embedded Structs (8-byte aligned) ---
-	log_ring:               Log_Ring_Buffer,
-	message_pool:           Message_Pool,
-	transfer_pool:          IO_Slot_Pool,
-	counters:               Shard_Counters,
+	log_ring:                        Log_Ring_Buffer,
+	message_pool:                    Message_Pool,
+	transfer_pool:                   IO_Slot_Pool,
+	counters:                        Shard_Counters,
 
 	// --- Hot Scalars (Ordered largest to smallest) ---
-	current_tick:           u64, // The current time quantized to the resolution
-	timer_resolution_ns:    u64, // E.g., 1_000_000 for 1ms ticks
-	heartbeat_tick:         u64,
-	current_isolate_turn_frame: ^Isolate_Turn_Frame,
-	current_trap_environment:    ^OS_Trap_Environment,
-	next_correlation_id:    Correlation_Id,
-	handoff_retry_head:     u32,
-	handoff_retry_tail:     u32,
-	handoff_retry_count:    u32,
-	dispatch_type_cursor:   u32,
-	liveness_epoch:         u32,
-	liveness_broadcast_epoch: u32,
-	id:                     Shard_Id,
-	shard_count:            u8,
-	liveness_broadcast_state: Shard_State,
-	peer_alive_mask:        Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
-	control_signal:         Control_Signal, // Atomic, mutually exclusive signals from watchdog
-	_padding:               [3]u8,
-	watchdog_state_pointer: ^u8, // Points to external watchdog state (config or simulator backing)
+	current_tick:                    u64, // The current time quantized to the resolution
+	timer_resolution_ns:             u64, // E.g., 1_000_000 for 1ms ticks
+	heartbeat_tick:                  u64,
+	current_isolate_turn_frame:      ^Isolate_Turn_Frame,
+	current_trap_environment:        ^OS_Trap_Environment,
+	next_correlation_id:             Correlation_Id,
+	handoff_retry_head:              u32,
+	handoff_retry_tail:              u32,
+	handoff_retry_count:             u32,
+	dispatch_type_cursor:            u32,
+	liveness_epoch:                  u32,
+	liveness_broadcast_epoch:        u32,
+	id:                              Shard_Id,
+	shard_count:                     u8,
+	liveness_broadcast_state:        Shard_State,
+	peer_alive_mask:                 Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
+	control_signal:                  Control_Signal, // Atomic, mutually exclusive signals from watchdog
+	watchdog_state_pointer:          ^u8, // Points to external watchdog state (config or simulator backing)
 
 	// --- Cold / Massive Storage ---
-	timer_wheel:            Timer_Wheel,
-	trap_environment_outer: OS_Trap_Environment,
-	trap_environment_inner: OS_Trap_Environment,
-	trap_environment_init:  OS_Trap_Environment,
-	reactor:                Reactor,
-	liveness_epoch_seen:    [MAX_SHARDS]u32,
+	timer_wheel:                     Timer_Wheel,
+	trap_environment_outer:          OS_Trap_Environment,
+	trap_environment_inner:          OS_Trap_Environment,
+	trap_environment_init:           OS_Trap_Environment,
+	reactor:                         Reactor,
+	liveness_epoch_seen:             [MAX_SHARDS]u32,
 	liveness_broadcast_pending_mask: Shard_Mask,
 
 	// Placed at the end to prevent possible cache-line shifting of hot fields.
-	using _sim_mixin:       Sim_State_Mixin,
+	using _sim_mixin:                Sim_State_Mixin,
 }
 
 @(private = "file")
@@ -239,8 +255,12 @@ Dispatch_Kind :: enum u8 {
 }
 
 @(private = "file")
-_wake_type_for_shutdown :: proc "contextless" (shard: ^Shard, type_id: Isolate_Type_Id, slot_count: u32) {
-	states := shard.metadata[type_id].state[:]
+_wake_type_for_shutdown :: proc "contextless" (
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_count: u32,
+) {
+	states := shard.metadata[type_id]._state[:]
 	flags := shard.metadata[type_id].flags[:]
 	io_sequences := shard.metadata[type_id].io_sequence[:]
 	pending_correlations := shard.metadata[type_id].pending_correlation[:]
@@ -322,6 +342,26 @@ _dispatch_kind_for_slot :: #force_inline proc "contextless" (
 	return .None
 }
 
+// Package-private helper for simulation checkers. Returns true if the scheduler
+// would consider this slot dispatchable given its current metadata and flags.
+// This intentionally reuses the production dispatchability rule so checkers do
+// not drift from scheduler behavior.
+@(private = "package")
+_slot_should_be_dispatchable :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+) -> bool {
+	soa_meta := shard.metadata[type_id]
+	dispatch_kind := _dispatch_kind_for_slot(
+		soa_meta[slot_index]._state,
+		soa_meta[slot_index].flags,
+		soa_meta[slot_index].inbox_count,
+		soa_meta[slot_index].io_operation_kind,
+	)
+	return dispatch_kind != .None
+}
+
 @(private = "package")
 _dispatch_word_count :: #force_inline proc "contextless" (bit_count: int) -> int {
 	return bitmap_word_count_from_bit_count(bit_count)
@@ -345,8 +385,20 @@ _bitset_clear :: #force_inline proc "contextless" (words: []u64, bit_index: u32)
 	words[word_index] &= ~bitmap_mask_from_bit_index(bit_index)
 }
 
+@(private = "package")
+_bitset_is_set :: #force_inline proc "contextless" (words: []u64, bit_index: u32) -> bool {
+	if len(words) == 0 {
+		return false
+	}
+	word_index := bitmap_word_index_from_bit_index(bit_index)
+	return words[word_index] & bitmap_mask_from_bit_index(bit_index) != 0
+}
+
 @(private = "file")
-_dispatchable_type_refresh :: #force_inline proc "contextless" (shard: ^Shard, type_id: Isolate_Type_Id) {
+_dispatchable_type_refresh :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+) {
 	if int(type_id) >= len(shard.dispatchable_slot_counts) {
 		return
 	}
@@ -427,7 +479,7 @@ _dispatchable_refresh_slot :: #force_inline proc "contextless" (
 		return
 	}
 	dispatch_kind := _dispatch_kind_for_slot(
-		soa_meta[slot_index].state,
+		soa_meta[slot_index]._state,
 		soa_meta[slot_index].flags,
 		soa_meta[slot_index].inbox_count,
 		soa_meta[slot_index].io_operation_kind,
@@ -474,7 +526,10 @@ _bitset_find_next_set_bit :: proc "contextless" (
 		}
 
 		word_bit_index := u32(bits.trailing_zeros(word))
-		bit_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, word_bit_index)
+		bit_index := bitmap_bit_index_from_word_index_and_word_bit_index(
+			word_index,
+			word_bit_index,
+		)
 		if bit_index < bit_count {
 			return bit_index, true
 		}
@@ -497,7 +552,10 @@ _bitset_find_next_set_bit :: proc "contextless" (
 			}
 
 			word_bit_index := u32(bits.trailing_zeros(word))
-			bit_index := bitmap_bit_index_from_word_index_and_word_bit_index(word_index, word_bit_index)
+			bit_index := bitmap_bit_index_from_word_index_and_word_bit_index(
+				word_index,
+				word_bit_index,
+			)
 			if bit_index < bit_count {
 				return bit_index, true
 			}
@@ -517,7 +575,11 @@ _dispatchable_find_next_slot :: proc "contextless" (
 	Isolate_Slot_Index,
 	bool,
 ) {
-	result, found := _bitset_find_next_set_bit(shard.dispatchable_slot_words[type_id], u32(start_slot_index), slot_count)
+	result, found := _bitset_find_next_set_bit(
+		shard.dispatchable_slot_words[type_id],
+		u32(start_slot_index),
+		slot_count,
+	)
 	return Isolate_Slot_Index(result), found
 }
 
@@ -549,10 +611,144 @@ _slot_set_state :: #force_inline proc "contextless" (
 	slot_index: Isolate_Slot_Index,
 	state: Isolate_State,
 ) {
-	old_state := shard.metadata[type_id][slot_index].state
+	old_state := shard.metadata[type_id][slot_index]._state
 	_slot_track_io_awaiting_transition(shard, old_state, state)
-	shard.metadata[type_id][slot_index].state = state
+	shard.metadata[type_id][slot_index]._state = state // ALLOWLIST_STATE_SETTER
+	if state == .Unallocated {
+		_sanitizer_address_poison_isolate_slot(shard, type_id, slot_index)
+	}
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
+}
+
+// _slot_set_state_no_dispatch tracks io_awaiting and poisons but does NOT
+// refresh the dispatchable bitmap. For production composite procedures and
+// tests that want to manually control dispatchable state.
+@(private = "package")
+_slot_set_state_no_dispatch :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+	state: Isolate_State,
+) {
+	old_state := shard.metadata[type_id][slot_index]._state
+	_slot_track_io_awaiting_transition(shard, old_state, state)
+	shard.metadata[type_id][slot_index]._state = state // ALLOWLIST_STATE_SETTER
+	if state == .Unallocated {
+		_sanitizer_address_poison_isolate_slot(shard, type_id, slot_index)
+	}
+}
+
+// _slot_set_state_bare writes state directly with NO invariant maintenance.
+// Caller is responsible for track_io_awaiting, dispatchable_refresh, and poison.
+// The reason parameter documents WHY the invariants are being bypassed.
+// This is for production composite procedures and tests that decompose the invariants.
+@(private = "package")
+_slot_set_state_bare :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+	state: Isolate_State,
+	reason: string,
+) {
+	_ = reason
+	shard.metadata[type_id][slot_index]._state = state // ALLOWLIST_STATE_SETTER
+}
+
+when TINA_SIMULATION_MODE {
+	// Table-level diagnostic write. This is the canonical implementation; the
+	// shard wrapper below is just a convenience for simulation code that owns
+	// the Shard. Keeping the logic here lets focused tests verify the table
+	// behavior without fabricating a full Shard lifetime.
+	@(private = "package")
+	diagnostic_table_write :: proc(
+		table: ^Diagnostic_Table,
+		type_id: Isolate_Type_Id,
+		slot_index: Isolate_Slot_Index,
+		field_id: Diagnostic_Field_Id,
+		value: u64,
+	) {
+		for i in 0 ..< table.record_count {
+			record := &table.records[i]
+			if record.isolate_type_id == type_id &&
+			   record.slot_index == slot_index &&
+			   record.field_id == field_id {
+				record.value = value
+				record.write_count += 1
+				return
+			}
+		}
+		if int(table.record_count) < len(table.records) {
+			table.records[table.record_count] = Diagnostic_Record {
+				isolate_type_id = type_id,
+				slot_index      = slot_index,
+				field_id        = field_id,
+				value           = value,
+				write_count     = 1,
+			}
+			table.record_count += 1
+			return
+		}
+		panic("diagnostic record capacity exhausted; increase diagnostic_record_count_per_shard")
+	}
+
+	@(private = "package")
+	diagnostic_table_read :: proc(
+		table: ^Diagnostic_Table,
+		type_id: Isolate_Type_Id,
+		slot_index: Isolate_Slot_Index,
+		field_id: Diagnostic_Field_Id,
+	) -> (
+		value: u64,
+		found: bool,
+	) {
+		for i in 0 ..< table.record_count {
+			rec := &table.records[i]
+			if rec.isolate_type_id == type_id &&
+			   rec.slot_index == slot_index &&
+			   rec.field_id == field_id {
+				return rec.value, true
+			}
+		}
+		return 0, false
+	}
+
+	shard_diagnostic_write :: proc(
+		shard: ^Shard,
+		type_id: Isolate_Type_Id,
+		slot_index: Isolate_Slot_Index,
+		field_id: Diagnostic_Field_Id,
+		value: u64,
+	) {
+		diagnostic_table_write(&shard.diagnostics, type_id, slot_index, field_id, value)
+	}
+
+	shard_diagnostic_read :: proc(
+		shard: ^Shard,
+		type_id: Isolate_Type_Id,
+		slot_index: Isolate_Slot_Index,
+		field_id: Diagnostic_Field_Id,
+	) -> (
+		value: u64,
+		found: bool,
+	) {
+		return diagnostic_table_read(&shard.diagnostics, type_id, slot_index, field_id)
+	}
+
+	shard_test_diagnostic_expect_u64 :: proc(
+		t: ^testing.T,
+		shard: ^Shard,
+		type_id: Isolate_Type_Id,
+		slot_index: Isolate_Slot_Index,
+		field_id: Diagnostic_Field_Id,
+		expected: u64,
+		loc := #caller_location,
+	) {
+		value, found := shard_diagnostic_read(shard, type_id, slot_index, field_id)
+		testing.expect(t, found, "diagnostic record not found", loc = loc)
+		if found {
+			testing.expect_value(t, value, expected, loc = loc)
+		}
+	}
 }
 
 @(private = "package")
@@ -563,9 +759,15 @@ _slot_set_waiting_for_reply :: #force_inline proc "contextless" (
 	correlation_id: Correlation_Id,
 ) {
 	meta := &shard.metadata[type_id][slot_index]
-	_slot_track_io_awaiting_transition(shard, meta.state, .Wait_Reply)
+	_slot_track_io_awaiting_transition(shard, meta._state, .Wait_Reply)
 	meta.pending_correlation = correlation_id
-	meta.state = .Wait_Reply
+	_slot_set_state_bare(
+		shard,
+		type_id,
+		slot_index,
+		.Wait_Reply,
+		"_slot_set_waiting_for_reply: track_io above, dispatchable_refresh below",
+	)
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
 
@@ -579,15 +781,14 @@ _wake_call_timeout :: #force_inline proc "contextless" (
 	slot_index := extract_slot(target)
 	generation := extract_generation(target)
 
-	if int(type_id) >= len(shard.metadata) ||
-	   int(slot_index) >= len(shard.metadata[type_id]) {
+	if int(type_id) >= len(shard.metadata) || int(slot_index) >= len(shard.metadata[type_id]) {
 		shard.counters.stale_delivery_drops += 1
 		return false
 	}
 
 	meta := &shard.metadata[type_id][slot_index]
 	if meta.generation != generation ||
-	   meta.state != .Wait_Reply ||
+	   meta._state != .Wait_Reply ||
 	   meta.pending_correlation != correlation {
 		shard.counters.stale_delivery_drops += 1
 		return false
@@ -595,9 +796,15 @@ _wake_call_timeout :: #force_inline proc "contextless" (
 
 	// Keep pending_correlation until dispatch so the synthetic timeout message
 	// preserves the call token. The state change is what rejects late replies.
-	_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
+	_slot_track_io_awaiting_transition(shard, meta._state, .Runnable)
 	meta.flags += {.Call_Timeout_Ready}
-	meta.state = .Runnable
+	_slot_set_state_bare(
+		shard,
+		type_id,
+		slot_index,
+		.Runnable,
+		"_wake_call_timeout: flags interleaved; track_io above, dispatchable below",
+	)
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 	return true
 }
@@ -667,9 +874,20 @@ _slot_set_io_completion_ready :: #force_inline proc "contextless" (
 	meta.io_result = completion_result
 	meta.io_slot_index = buffer_index
 	meta.flags += {.IO_Completion_Ready}
-	if meta.state == .Wait_Io {
-		_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
-		meta.state = .Runnable
+	_sanitizer_address_unpoison_reactor_io_slot(
+		&shard.reactor,
+		io_operation_pool_affinity(operation_kind),
+		buffer_index,
+	)
+	if meta._state == .Wait_Io {
+		_slot_track_io_awaiting_transition(shard, meta._state, .Runnable)
+		_slot_set_state_bare(
+			shard,
+			type_id,
+			slot_index,
+			.Runnable,
+			"_slot_set_io_completion_ready: conditional; io fields set above, dispatchable below",
+		)
 	}
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
@@ -687,8 +905,14 @@ _slot_set_io_submit_failure :: #force_inline proc "contextless" (
 	meta.io_result = completion_result
 	meta.io_slot_index = IO_SLOT_INDEX_NONE
 	meta.flags += {.IO_Completion_Ready}
-	_slot_track_io_awaiting_transition(shard, meta.state, .Runnable)
-	meta.state = .Runnable
+	_slot_track_io_awaiting_transition(shard, meta._state, .Runnable)
+	_slot_set_state_bare(
+		shard,
+		type_id,
+		slot_index,
+		.Runnable,
+		"_slot_set_io_submit_failure: io fields set above; track_io above, dispatchable below",
+	)
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
 
@@ -705,14 +929,17 @@ _io_slot_return_to_pool :: #force_inline proc(
 	switch affinity {
 	case .Receive:
 		if backend_recv_uses_provided_buffers(&reactor.backend) {
+			when TINA_ASAN_POISONING {
+				_sanitizer_address_poison_io_slot(&reactor.receive_pool, slot_index)
+			}
 			backend_replenish_recv_buffer(&reactor.backend, slot_index)
 		} else {
-			io_slot_pool_free(&reactor.receive_pool, slot_index)
+			_reactor_receive_pool_free(reactor, slot_index)
 		}
 	case .Staging:
-		io_slot_pool_free(&reactor.staging_pool, slot_index)
+		_reactor_staging_pool_free(reactor, slot_index)
 	case .None:
-		// No pool slot involved — nothing to return
+	// No pool slot involved — nothing to return
 	}
 }
 
@@ -743,21 +970,21 @@ _dispatch_type_batch :: proc(
 	// Hoisted
 	turn_frame := Isolate_Turn_Frame {
 		previous_isolate_turn_frame = shard.current_isolate_turn_frame,
-		isolate_handle             = ISOLATE_HANDLE_NONE, // Assigned per turn
-		message_source_handle      = ISOLATE_HANDLE_NONE, // Assigned per turn
-		message_correlation_id     = CORRELATION_ID_NONE, // Assigned per turn
-		transfer_read_handle       = TRANSFER_HANDLE_NONE,
-		turn_flags             = {}, // Assigned per turn
-		timer_resolution_ns    = shard.timer_resolution_ns,
-		current_tick           = shard.current_tick,
-		isolate_type_id         = type_id,
-		isolate_slot_index      = 0, // Assigned per turn
-		message_pool_index     = POOL_NONE_INDEX,
-		staging_slot_index     = IO_SLOT_INDEX_NONE,
+		isolate_handle              = ISOLATE_HANDLE_NONE, // Assigned per turn
+		message_source_handle       = ISOLATE_HANDLE_NONE, // Assigned per turn
+		message_correlation_id      = CORRELATION_ID_NONE, // Assigned per turn
+		transfer_read_handle        = TRANSFER_HANDLE_NONE,
+		turn_flags                  = {}, // Assigned per turn
+		timer_resolution_ns         = shard.timer_resolution_ns,
+		current_tick                = shard.current_tick,
+		isolate_type_id             = type_id,
+		isolate_slot_index          = 0, // Assigned per turn
+		message_pool_index          = POOL_NONE_INDEX,
+		staging_slot_index          = IO_SLOT_INDEX_NONE,
 	}
 
 	// Extract 1D slices to bypass 2D lookups for the entire dispatch inner-loop.
-	states := shard.metadata[type_id].state[:]
+	states := shard.metadata[type_id]._state[:]
 	flags := shard.metadata[type_id].flags[:]
 	inbox_counts := shard.metadata[type_id].inbox_count[:]
 	io_operation_kinds := shard.metadata[type_id].io_operation_kind[:]
@@ -813,7 +1040,12 @@ _dispatch_type_batch :: proc(
 	}
 
 	slot_loop: for dispatched_count < dispatch_budget {
-		slot_index, found := _dispatchable_find_next_slot(shard, type_id, Isolate_Slot_Index(cursor), slot_count)
+		slot_index, found := _dispatchable_find_next_slot(
+			shard,
+			type_id,
+			Isolate_Slot_Index(cursor),
+			slot_count,
+		)
 		if !found {
 			shard.dispatch_cursors[type_id] = 0
 			break slot_loop
@@ -901,7 +1133,8 @@ _dispatch_type_batch :: proc(
 			slot_index,
 			generations[slot_index],
 		)
-		turn_frame.message_source_handle = message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : ISOLATE_HANDLE_NONE
+		turn_frame.message_source_handle =
+			message_pointer != nil && !is_io_completion && message.tag != TAG_SHUTDOWN ? message.user.source : ISOLATE_HANDLE_NONE
 		turn_frame.message_correlation_id = correlation
 		turn_frame.turn_flags = turn_flags
 		turn_frame.isolate_slot_index = slot_index
@@ -921,7 +1154,8 @@ _dispatch_type_batch :: proc(
 		working_stride := type_descriptor.working_memory_size
 		if working_stride > 0 {
 			start_index := int(slot_index) * working_stride
-			working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
+			working_slice := shard.working_memory[type_id][start_index:start_index +
+			working_stride]
 			turn_frame.working_arena = mem.Arena {
 				data   = working_slice,
 				offset = int(working_arena_offsets[slot_index]),
@@ -969,7 +1203,11 @@ _dispatch_type_batch :: proc(
 			flags[slot_index] -= {.IO_Completion_Ready}
 			io_peer_addresses[slot_index] = {}
 			if buffer_to_free != IO_SLOT_INDEX_NONE {
-				_io_slot_return_to_pool(&shard.reactor, io_operation_pool_affinity(dispatch_io_operation_kind), buffer_to_free)
+				_io_slot_return_to_pool(
+					&shard.reactor,
+					io_operation_pool_affinity(dispatch_io_operation_kind),
+					buffer_to_free,
+				)
 				io_slot_indices[slot_index] = IO_SLOT_INDEX_NONE
 			}
 		}
@@ -1036,7 +1274,11 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 			dispatch_since_io_service_count = 0
 		}
 
-		type_index, found := _dispatch_ready_find_next_type(shard, shard.dispatch_type_cursor, type_count)
+		type_index, found := _dispatch_ready_find_next_type(
+			shard,
+			shard.dispatch_type_cursor,
+			type_count,
+		)
 		if !found {
 			break
 		}
@@ -1056,11 +1298,13 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 			dispatch_since_io_service_count,
 		)
 
-		dispatched_count := u32(_dispatch_type_batch(
-			shard,
-			shard.type_descriptors[type_index],
-			Scheduler_Work_Count(type_work_budget_count),
-		))
+		dispatched_count := u32(
+			_dispatch_type_batch(
+				shard,
+				shard.type_descriptors[type_index],
+				Scheduler_Work_Count(type_work_budget_count),
+			),
+		)
 
 		if dispatched_count == 0 {
 			_dispatchable_type_refresh(shard, Isolate_Type_Id(type_index))
@@ -1068,7 +1312,9 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 		}
 
 		scanned_type_count = 0
-		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(credit_count - dispatched_count)
+		shard.dispatch_credit_counts[type_index] = Scheduler_Credit_Count(
+			credit_count - dispatched_count,
+		)
 		_dispatchable_type_refresh(shard, Isolate_Type_Id(type_index))
 		turn_work_budget_count -= dispatched_count
 		dispatch_since_io_service_count += dispatched_count
@@ -1155,11 +1401,69 @@ ISOLATE_FAULT_REASONS_INTERPRETED := [Isolate_Fault_Reason]string {
 }
 
 @(private = "package")
+_shard_message_pool_alloc_user :: #force_inline proc "contextless" (
+	shard: ^Shard,
+) -> (
+	u32,
+	Pool_Error,
+) {
+	when TINA_ASAN_POISONING {
+		return pool_alloc_user_tina_owned(&shard.message_pool)
+	} else {
+		return pool_alloc_user(&shard.message_pool)
+	}
+}
+
+@(private = "package")
+_shard_message_pool_alloc_system :: #force_inline proc "contextless" (
+	shard: ^Shard,
+) -> (
+	u32,
+	Pool_Error,
+) {
+	when TINA_ASAN_POISONING {
+		return pool_alloc_system_tina_owned(&shard.message_pool)
+	} else {
+		return pool_alloc_system(&shard.message_pool)
+	}
+}
+
+@(private = "package")
+_shard_message_pool_free_unchecked :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	index: u32,
+) {
+	when TINA_ASAN_POISONING {
+		pool_free_unchecked_tina_owned(&shard.message_pool, index)
+	} else {
+		pool_free_unchecked(&shard.message_pool, index)
+	}
+}
+
+@(private = "package")
+_reactor_receive_pool_free :: #force_inline proc(reactor: ^Reactor, index: IO_Slot_Index) {
+	when TINA_ASAN_POISONING {
+		io_slot_pool_free_tina_owned(&reactor.receive_pool, index)
+	} else {
+		io_slot_pool_free(&reactor.receive_pool, index)
+	}
+}
+
+@(private = "package")
+_reactor_staging_pool_free :: #force_inline proc(reactor: ^Reactor, index: IO_Slot_Index) {
+	when TINA_ASAN_POISONING {
+		io_slot_pool_free_tina_owned(&reactor.staging_pool, index)
+	} else {
+		io_slot_pool_free(&reactor.staging_pool, index)
+	}
+}
+
+@(private = "package")
 _turn_cleanup_resources :: proc(shard: ^Shard, frame: ^Isolate_Turn_Frame) {
 	if frame == nil do return
 
 	if frame.message_pool_index != POOL_NONE_INDEX {
-		pool_free_unchecked(&shard.message_pool, frame.message_pool_index)
+		_shard_message_pool_free_unchecked(shard, frame.message_pool_index)
 		frame.message_pool_index = POOL_NONE_INDEX
 	}
 
@@ -1169,7 +1473,7 @@ _turn_cleanup_resources :: proc(shard: ^Shard, frame: ^Isolate_Turn_Frame) {
 	}
 
 	if frame.staging_slot_index != IO_SLOT_INDEX_NONE {
-		io_slot_pool_free(&shard.reactor.staging_pool, frame.staging_slot_index)
+		_reactor_staging_pool_free(&shard.reactor, frame.staging_slot_index)
 		frame.staging_slot_index = IO_SLOT_INDEX_NONE
 	}
 }
@@ -1260,7 +1564,7 @@ _commit_staged_io :: proc(
 		// If staging slot was claimed but IO failed, free it
 		staging_slot := turn_frame.staging_slot_index
 		if staging_slot != IO_SLOT_INDEX_NONE {
-			io_slot_pool_free(&shard.reactor.staging_pool, staging_slot)
+			_reactor_staging_pool_free(&shard.reactor, staging_slot)
 			turn_frame.staging_slot_index = IO_SLOT_INDEX_NONE
 		}
 	} else {
@@ -1475,7 +1779,7 @@ _enqueue_internal :: #force_inline proc "contextless" (
 
 	// Validation Only (No Mutation Yet)
 	if is_reply {
-		if soa_meta[slot].state != .Wait_Reply ||
+		if soa_meta[slot]._state != .Wait_Reply ||
 		   soa_meta[slot].pending_correlation != envelope.correlation {
 			shard.counters.stale_delivery_drops += 1
 			return .stale_handle
@@ -1495,9 +1799,9 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	// Because `allocation_policy` is passed as a constant from the wrapper,
 	// I expect the compiler will dead-code-eliminate this IF statement.
 	if allocation_policy == .User {
-		pool_index, error = pool_alloc_user(&shard.message_pool)
+		pool_index, error = _shard_message_pool_alloc_user(shard)
 	} else {
-		pool_index, error = pool_alloc_system(&shard.message_pool)
+		pool_index, error = _shard_message_pool_alloc_system(shard)
 	}
 
 	if error != .None {
@@ -1512,27 +1816,21 @@ _enqueue_internal :: #force_inline proc "contextless" (
 	}
 
 	// Link into Mailbox
-	envelope_destination := pool_get_ptr_unchecked(
-		&shard.message_pool,
-		pool_index,
-	)
+	envelope_destination := pool_get_ptr_unchecked(&shard.message_pool, pool_index)
 	envelope_destination^ = envelope^
 	envelope_destination.next_in_mailbox = POOL_NONE_INDEX
 
 	if soa_meta[slot].inbox_head == POOL_NONE_INDEX {
 		soa_meta[slot].inbox_head = pool_index
 	} else {
-		tail_envelope := pool_get_ptr_unchecked(
-			&shard.message_pool,
-			soa_meta[slot].inbox_tail,
-		)
+		tail_envelope := pool_get_ptr_unchecked(&shard.message_pool, soa_meta[slot].inbox_tail)
 		tail_envelope.next_in_mailbox = pool_index
 	}
 
 	soa_meta[slot].inbox_tail = pool_index
 	_slot_increment_inbox_count(shard, type_id, slot)
 
-	if soa_meta[slot].state == .Wait_Message {
+	if soa_meta[slot]._state == .Wait_Message {
 		_slot_set_state(shard, type_id, slot, .Runnable)
 	}
 	return .ok
@@ -1540,10 +1838,10 @@ _enqueue_internal :: #force_inline proc "contextless" (
 
 @(private = "package")
 Dequeue_Result :: struct {
-	pool_index:   u32,
-	correlation:  Correlation_Id,
-	message:      Message,
-	flags:        Envelope_Flags,
+	pool_index:  u32,
+	correlation: Correlation_Id,
+	message:     Message,
+	flags:       Envelope_Flags,
 }
 
 @(private = "package")
@@ -1611,7 +1909,7 @@ _fd_handoff_retry_enqueue :: proc "contextless" (
 	shard: ^Shard,
 	envelope: ^Message_Envelope,
 ) -> bool {
-	retry_pool_index, pool_error := pool_alloc_system(&shard.message_pool)
+	retry_pool_index, pool_error := _shard_message_pool_alloc_system(shard)
 	if pool_error != .None {
 		return false
 	}
@@ -1623,10 +1921,7 @@ _fd_handoff_retry_enqueue :: proc "contextless" (
 	if shard.handoff_retry_head == POOL_NONE_INDEX {
 		shard.handoff_retry_head = retry_pool_index
 	} else {
-		tail_envelope := pool_get_ptr_unchecked(
-			&shard.message_pool,
-			shard.handoff_retry_tail,
-		)
+		tail_envelope := pool_get_ptr_unchecked(&shard.message_pool, shard.handoff_retry_tail)
 		tail_envelope.next_in_mailbox = retry_pool_index
 	}
 
@@ -1641,10 +1936,7 @@ _fd_handoff_retry_scan :: proc "contextless" (shard: ^Shard) {
 	previous_pool_index: u32 = POOL_NONE_INDEX
 
 	for retry_pool_index != POOL_NONE_INDEX {
-		retry_envelope := pool_get_ptr_unchecked(
-			&shard.message_pool,
-			retry_pool_index,
-		)
+		retry_envelope := pool_get_ptr_unchecked(&shard.message_pool, retry_pool_index)
 		next_pool_index := retry_envelope.next_in_mailbox
 
 		route_result := _route_envelope_system(shard, retry_envelope.destination, retry_envelope)
@@ -1671,7 +1963,7 @@ _fd_handoff_retry_scan :: proc "contextless" (shard: ^Shard) {
 				shard.handoff_retry_tail = previous_pool_index
 			}
 
-			pool_free_unchecked(&shard.message_pool, retry_pool_index)
+			_shard_message_pool_free_unchecked(shard, retry_pool_index)
 			shard.handoff_retry_count -= 1
 		}
 
@@ -1753,10 +2045,7 @@ _resolve_target_slot :: #force_inline proc "contextless" (
 		return {}, false
 	}
 
-	return Target_Slot {
-		type_id    = type_id,
-		slot_index = slot_index,
-	}, true
+	return Target_Slot{type_id = type_id, slot_index = slot_index}, true
 }
 
 @(private = "file")
@@ -1861,14 +2150,21 @@ _inject_fd_handoff_accept :: proc "contextless" (
 	}
 
 	soa_meta := shard.metadata[target_slot.type_id]
-	if soa_meta[target_slot.slot_index].state == .Unallocated || soa_meta[target_slot.slot_index].state == .Crashed {
+	if soa_meta[target_slot.slot_index]._state == .Unallocated ||
+	   soa_meta[target_slot.slot_index]._state == .Crashed {
 		return .Invalid_Target
 	}
-	if soa_meta[target_slot.slot_index].state == .Wait_Io || soa_meta[target_slot.slot_index].io_operation_kind != .None {
+	if soa_meta[target_slot.slot_index]._state == .Wait_Io ||
+	   soa_meta[target_slot.slot_index].io_operation_kind != .None {
 		return .Target_Busy
 	}
 
-	_slot_set_io_operation_kind(shard, target_slot.type_id, target_slot.slot_index, .Accept_Complete)
+	_slot_set_io_operation_kind(
+		shard,
+		target_slot.type_id,
+		target_slot.slot_index,
+		.Accept_Complete,
+	)
 	soa_meta[target_slot.slot_index].io_result = 0
 	soa_meta[target_slot.slot_index].io_fd = fd
 	soa_meta[target_slot.slot_index].io_slot_index = IO_SLOT_INDEX_NONE
@@ -2024,18 +2320,20 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	log_flush(shard)
 
 	// 1. Reset Pools (Message & Transfer)
-	shard.message_pool.free_count = shard.message_pool.slot_count
-	shard.message_pool.free_head = POOL_NONE_INDEX
-	for i := int(shard.message_pool.slot_count) - 1; i >= 0; i -= 1 {
-		slot_pointer := pool_get_ptr(&shard.message_pool, u32(i))
-		slot_pointer.next_free_slot = shard.message_pool.free_head
-		shard.message_pool.free_head = u32(i)
+	when TINA_ASAN_POISONING {
+		pool_reset_tina_owned(&shard.message_pool)
+	} else {
+		pool_reset(&shard.message_pool)
 	}
 	shard.handoff_retry_head = POOL_NONE_INDEX
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
 
-	io_slot_pool_reset(&shard.transfer_pool)
+	when TINA_ASAN_POISONING {
+		io_slot_pool_reset_tina_owned(&shard.transfer_pool)
+	} else {
+		io_slot_pool_reset(&shard.transfer_pool)
+	}
 	for i in 0 ..< shard.transfer_pool.slot_count {
 		shard.transfer_generations[i] += 1
 		if shard.transfer_generations[i] == 0 do shard.transfer_generations[i] = 1
@@ -2056,7 +2354,8 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 				buffer_index,
 			)
 		}
-		if int(type_index) < len(shard.metadata) && int(slot_index) < len(shard.metadata[type_index]) {
+		if int(type_index) < len(shard.metadata) &&
+		   int(slot_index) < len(shard.metadata[type_index]) {
 			shard.metadata[type_index][slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 		}
 	}
@@ -2066,7 +2365,8 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]
 
-		if entry.reader_isolate != ISOLATE_HANDLE_NONE || entry.writer_isolate != ISOLATE_HANDLE_NONE {
+		if entry.reader_isolate != ISOLATE_HANDLE_NONE ||
+		   entry.writer_isolate != ISOLATE_HANDLE_NONE {
 			backend_control_close(&shard.reactor.backend, entry.os_fd)
 			fd_handle := fd_handle_make(u16(i), entry.generation)
 			fd_table_free(&shard.reactor.fd_table, fd_handle)
@@ -2109,7 +2409,13 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			if new_generation == 0 do new_generation = 1
 
 			soa_meta[slot].generation = new_generation
-			soa_meta[slot].state = .Unallocated
+			_slot_set_state_bare(
+				shard,
+				type_id,
+				Isolate_Slot_Index(slot),
+				.Unallocated,
+				"mass_teardown: bulk io_awaiting+dispatchable reset after loop; poison called separately",
+			)
 			soa_meta[slot].inbox_count = 0
 			soa_meta[slot].inbox_tail = POOL_NONE_INDEX
 			soa_meta[slot].pending_correlation = 0
@@ -2120,6 +2426,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 			// Re-link the intrusive free list!
 			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
 			shard.isolate_free_heads[type_id] = u32(slot)
+			_sanitizer_address_poison_isolate_slot(shard, type_id, Isolate_Slot_Index(slot))
 		}
 	}
 
@@ -2156,7 +2463,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 @(private)
 shard_has_live_isolates :: proc(shard: ^Shard) -> bool {
 	for type_desc in shard.type_descriptors {
-		states := shard.metadata[type_desc.id].state[:]
+		states := shard.metadata[type_desc.id]._state[:]
 		for i in 0 ..< type_desc.slot_count {
 			if states[i] != .Unallocated {
 				return true
@@ -2171,7 +2478,10 @@ shard_broadcast_liveness_state :: proc(shard: ^Shard, state: Shard_State) {
 	when TINA_RUNTIME_ASSERTIONS {
 		assert(shard != nil, "Shard liveness broadcast requires a shard")
 		if shard.shard_count > 0 {
-			assert(int(shard.id) < int(shard.shard_count), "Shard id must be within shard count before liveness broadcast")
+			assert(
+				int(shard.id) < int(shard.shard_count),
+				"Shard id must be within shard count before liveness broadcast",
+			)
 		}
 	}
 	shard.liveness_epoch += 1
@@ -2261,39 +2571,18 @@ _process_inbound_envelope :: #force_inline proc "contextless" (
 }
 
 @(private = "file")
-_init_handoff_test_shard :: proc(
-	t: ^testing.T,
-	shard: ^Shard,
-	handoff_backing: []FD_Handoff_Entry,
-	sim_world_raw: rawptr = nil,
-) {
-	shard.peer_alive_mask = {~u64(0), ~u64(0), ~u64(0), ~u64(0)}
-	shard.handoff_retry_head = POOL_NONE_INDEX
-	shard.handoff_retry_tail = POOL_NONE_INDEX
-	shard.handoff_retry_count = 0
-	fd_handoff_table_init(&shard.handoff_table, handoff_backing)
-	backend_config := Backend_Config {
-		queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
-	}
-	when TINA_SIMULATION_MODE {
-		world := (cast(^Sim_IO_World)sim_world_raw)
-		_sim_world_init(world)
-		backend_config.sim_config = Simulation_IO_Config {
-			world = world,
-		}
-	}
-	error := backend_init(&shard.reactor.backend, backend_config)
-	testing.expect_value(t, error, Backend_Error.None)
-}
-
-@(private = "file")
 _alloc_handoff_test_entry :: proc(
 	t: ^testing.T,
 	shard: ^Shard,
 	target_handle: Isolate_Handle,
 	deadline_tick: u64,
 ) -> FD_Handoff_Ref {
-	cleanup_fd, sock_error := backend_control_socket(&shard.reactor.backend, .AF_INET, .STREAM, .TCP)
+	cleanup_fd, sock_error := backend_control_socket(
+		&shard.reactor.backend,
+		.AF_INET,
+		.STREAM,
+		.TCP,
+	)
 	testing.expect_value(t, sock_error, Backend_Error.None)
 
 	ref, alloc_error := fd_handoff_table_alloc(
@@ -2308,80 +2597,82 @@ _alloc_handoff_test_entry :: proc(
 	return ref
 }
 
+@(private = "file")
+_make_handoff_test_fixture :: proc(
+	t: ^testing.T,
+	handoff_entry_count: int = 4,
+) -> ^Test_Shard_Fixture {
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec {
+			type_count = 1,
+			slot_counts = {0},
+			subsystems = {.Metadata, .Reactor, .Handoff_Table},
+			reactor_buffer_count = 4,
+			reactor_buffer_bytes = 1024,
+			staging_slot_count = 2,
+			staging_slot_size = 1024,
+			fd_table_slot_count = 8,
+			handoff_entry_count = handoff_entry_count,
+		},
+	)
+
+	fixture.shard.peer_alive_mask = {~u64(0), ~u64(0), ~u64(0), ~u64(0)}
+	fixture.shard.handoff_retry_head = POOL_NONE_INDEX
+	fixture.shard.handoff_retry_tail = POOL_NONE_INDEX
+	fixture.shard.handoff_retry_count = 0
+
+	when TINA_SIMULATION_MODE {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
+		backend_deinit(&fixture.shard.reactor.backend)
+		config := Backend_Config {
+			queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
+			sim_config = Simulation_IO_Config{world = cast(rawptr)world},
+		}
+		error := backend_init(&fixture.shard.reactor.backend, config)
+		testing.expect_value(t, error, Backend_Error.None)
+	}
+
+	return fixture
+}
+
 @(private = "package")
-_make_teardown_test_shard :: proc(t: ^testing.T) -> (^Shard, ^Grand_Arena) {
+_make_teardown_test_shard :: proc(t: ^testing.T) -> ^Test_Shard_Fixture {
 	return _make_teardown_test_shard_with_slots(t, 1)
 }
 
 @(private = "package")
-_make_teardown_test_shard_with_slots :: proc(t: ^testing.T, isolate_slot_count: int) -> (^Shard, ^Grand_Arena) {
-	types := [1]IsolateTypeDescriptor {
-		{
-			id                      = 0,
-			slot_count              = isolate_slot_count,
-			stride                  = 8,
-			soa_metadata_size       = size_of(Isolate_Metadata),
-			working_memory_size     = 0,
-			scratch_requirement_max = 0,
+_make_teardown_test_shard_with_slots :: proc(
+	t: ^testing.T,
+	isolate_slot_count: int,
+) -> ^Test_Shard_Fixture {
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec {
+			type_count = 1,
+			slot_counts = {isolate_slot_count},
+			subsystems = {.Metadata, .Message_Pool, .Reactor, .Transfer_Pool, .Handoff_Table},
+			message_pool_slots = 16,
+			reactor_buffer_count = 4,
+			reactor_buffer_bytes = 1024,
+			transfer_slot_count = 4,
+			transfer_slot_size = 1024,
+			staging_slot_count = 2,
+			staging_slot_size = 1024,
+			fd_table_slot_count = 8,
+			handoff_entry_count = 8,
 		},
-	}
-	root_children := [1]Child_Spec{Static_Child_Spec{type_id = 0, restart_type = .temporary}}
-	root_group := Group_Spec {
-		strategy              = .One_For_One,
-		restart_count_max     = 1,
-		window_duration_ticks = 1,
-		children              = root_children[:],
-	}
-	shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
-	spec := SystemSpec {
-		shard_count                = 1,
-		types                      = types[:],
-		shard_specs                = shard_specs[:],
-		pool_slot_count            = 16,
-		reactor_buffer_slot_count  = 4,
-		reactor_buffer_slot_size   = 1024,
-		transfer_slot_count        = 4,
-		transfer_slot_size         = 1024,
-		staging_slot_count         = 2,
-		staging_slot_size          = 1024,
-		fd_table_slot_count        = 8,
-		fd_entry_size              = size_of(FD_Entry),
-		timer_entry_count          = 16,
-		log_ring_size              = 16,
-		supervision_groups_max     = 4,
-		scratch_arena_size         = 16,
-		default_ring_size          = 16,
-	}
-
-	total_memory_size := compute_shard_memory_total(&spec)
-	arena := new(Grand_Arena)
-	error := grand_arena_init(arena, total_memory_size)
-	testing.expect_value(t, error, mem.Allocator_Error.None)
-
-	shard := new(Shard)
-	when TINA_SIMULATION_MODE {
-		_mt_world := new(Sim_IO_World, context.temp_allocator)
-		_sim_world_init(_mt_world)
-		_mt_sim_config := new(SimulationConfig, context.temp_allocator)
-		_mt_sim_config^ = SimulationConfig {
-			sim_io_world = cast(rawptr)_mt_world,
-		}
-		spec.simulation = _mt_sim_config
-	}
-	carve_error := hydrate_shard(arena, &spec, shard)
-	testing.expect_value(t, carve_error, mem.Allocator_Error.None)
-	return shard, arena
+	)
+	return fixture
 }
 
 @(test)
 test_io_awaiting_count_tracks_slot_state_transitions :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
-
-	shard.metadata = make([]#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata)
-	shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata[0])
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{type_count = 1, slot_counts = {1}, subsystems = {.Metadata}},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+	test_shard_slot_activate(fixture, make_handle(0, 0, 0, 1), .Runnable)
 
 	_slot_set_state(shard, 0, 0, .Runnable)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
@@ -2392,23 +2683,23 @@ test_io_awaiting_count_tracks_slot_state_transitions :: proc(t: ^testing.T) {
 	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
-	_slot_set_io_completion_ready(shard, 0, 0, .Recv_Complete, 8, 3)
+	_slot_set_io_completion_ready(shard, 0, 0, .Recv_Complete, 8, IO_SLOT_INDEX_NONE)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
-	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
+	testing.expect_value(t, shard.metadata[0][0]._state, Isolate_State.Runnable)
 
 	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
 	_slot_set_io_submit_failure(shard, 0, 0, .Recv_Complete, i32(IO_ERR_RESOURCE_EXHAUSTED))
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
-	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
+	testing.expect_value(t, shard.metadata[0][0]._state, Isolate_State.Runnable)
 
 	_slot_set_state(shard, 0, 0, .Wait_Io)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 
 	_slot_set_waiting_for_reply(shard, 0, 0, 7)
 	testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
-	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Wait_Reply)
+	testing.expect_value(t, shard.metadata[0][0]._state, Isolate_State.Wait_Reply)
 
 	// Pending_IO_Reuse: transitioning from Wait_Io to Pending_IO_Reuse
 	// should NOT decrement the counter — the slot is still I/O-blocked.
@@ -2425,28 +2716,18 @@ test_io_awaiting_count_tracks_slot_state_transitions :: proc(t: ^testing.T) {
 
 @(test)
 test_dispatchable_refresh_slot_updates_type_summary :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
-
-	shard.metadata = make([]#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata)
-	shard.metadata[0] = make(#soa[]Isolate_Metadata, 2)
-	defer delete(shard.metadata[0])
-	shard.dispatchable_slot_words = make([][]u64, 1)
-	defer delete(shard.dispatchable_slot_words)
-	shard.dispatchable_slot_words[0] = make([]u64, _dispatch_word_count(2))
-	defer delete(shard.dispatchable_slot_words[0])
-	shard.dispatchable_slot_counts = make([]u32, 1)
-	defer delete(shard.dispatchable_slot_counts)
-	shard.dispatch_credit_counts = make([]Scheduler_Credit_Count, 1)
-	defer delete(shard.dispatch_credit_counts)
-	shard.dispatchable_type_words = make([]u64, _dispatch_word_count(1))
-	defer delete(shard.dispatchable_type_words)
-	shard.dispatch_ready_type_words = make([]u64, _dispatch_word_count(1))
-	defer delete(shard.dispatch_ready_type_words)
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec {
+			type_count = 1,
+			slot_counts = {2},
+			subsystems = {.Metadata, .Dispatchable},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	shard.dispatch_credit_counts[0] = 1
-	shard.metadata[0][1].state = .Runnable
+	_slot_set_state_no_dispatch(shard, 0, 1, .Runnable)
 	_dispatchable_refresh_slot(shard, 0, 1)
 
 	testing.expect_value(t, shard.dispatchable_slot_counts[0], u32(1))
@@ -2462,7 +2743,7 @@ test_dispatchable_refresh_slot_updates_type_summary :: proc(t: ^testing.T) {
 	shard.dispatch_credit_counts[0] = 1
 	_dispatchable_type_refresh(shard, 0)
 
-	shard.metadata[0][1].state = .Wait_Io
+	_slot_set_state_no_dispatch(shard, 0, 1, .Wait_Io)
 	_dispatchable_refresh_slot(shard, 0, 1)
 
 	testing.expect_value(t, shard.dispatchable_slot_counts[0], u32(0))
@@ -2473,13 +2754,16 @@ test_dispatchable_refresh_slot_updates_type_summary :: proc(t: ^testing.T) {
 
 @(test)
 test_dispatchable_find_next_slot_wraps_within_single_word :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec {
+			type_count = 1,
+			slot_counts = {64},
+			subsystems = {.Metadata, .Dispatchable},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
-	shard.dispatchable_slot_words = make([][]u64, 1)
-	defer delete(shard.dispatchable_slot_words)
-	shard.dispatchable_slot_words[0] = make([]u64, 1)
-	defer delete(shard.dispatchable_slot_words[0])
 	shard.dispatchable_slot_words[0][0] = (u64(1) << 5) | (u64(1) << 63)
 
 	slot_index, found := _dispatchable_find_next_slot(shard, 0, Isolate_Slot_Index(6), 64)
@@ -2493,29 +2777,27 @@ test_dispatchable_find_next_slot_wraps_within_single_word :: proc(t: ^testing.T)
 
 @(test)
 test_message_policy_separates_transfer_from_reply_allocation :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec {
+			type_count = 1,
+			slot_counts = {1},
+			subsystems = {.Metadata, .Message_Pool},
+			message_pool_slots = 128,
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	shard.id = 0
-	shard.type_descriptors = make([]IsolateTypeDescriptor, 1)
-	defer delete(shard.type_descriptors)
-	shard.type_descriptors[0].id = 0
 	shard.type_descriptors[0].mailbox_capacity = 128
-	shard.metadata = make([]#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata)
-	shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata[0])
 
 	target := make_handle(0, 0, 0, 1)
-	shard.metadata[0][0].generation = extract_generation(target)
-	shard.metadata[0][0].state = .Wait_Message
+	test_shard_slot_activate(fixture, target, .Wait_Message)
 
-	message_pool_backing: [MESSAGE_ENVELOPE_SIZE * 128]u8
-	pool_init(&shard.message_pool, message_pool_backing[:], MESSAGE_ENVELOPE_SIZE)
 	testing.expect_value(t, shard.message_pool.reserved_count, u32(1))
 
 	for shard.message_pool.free_count > shard.message_pool.reserved_count {
-		_, pool_error := pool_alloc_user(&shard.message_pool)
+		_, pool_error := _shard_message_pool_alloc_user(shard)
 		testing.expect_value(t, pool_error, Pool_Error.None)
 	}
 	testing.expect_value(t, shard.message_pool.free_count, shard.message_pool.reserved_count)
@@ -2532,7 +2814,7 @@ test_message_policy_separates_transfer_from_reply_allocation :: proc(t: ^testing
 	testing.expect_value(t, shard.metadata[0][0].inbox_count, u16(0))
 
 	correlation_id := Correlation_Id(7)
-	shard.metadata[0][0].state = .Wait_Reply
+	_slot_set_state_no_dispatch(shard, 0, 0, .Wait_Reply)
 	shard.metadata[0][0].pending_correlation = correlation_id
 	reply_envelope := Message_Envelope {
 		source      = target,
@@ -2544,15 +2826,23 @@ test_message_policy_separates_transfer_from_reply_allocation :: proc(t: ^testing
 	reply_result := _route_envelope_reply(shard, target, &reply_envelope)
 	testing.expect_value(t, reply_result, Send_Result.ok)
 	testing.expect_value(t, shard.message_pool.free_count, u32(0))
-	testing.expect_value(t, shard.metadata[0][0].state, Isolate_State.Runnable)
+	testing.expect_value(t, shard.metadata[0][0]._state, Isolate_State.Runnable)
 	testing.expect_value(t, shard.metadata[0][0].pending_correlation, Correlation_Id(0))
 	testing.expect_value(t, shard.metadata[0][0].inbox_count, u16(1))
 }
 
 @(test)
 test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec {
+			type_count = 1,
+			slot_counts = {0},
+			subsystems = {.Metadata, .Message_Pool},
+			message_pool_slots = 4,
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	shard.id = 1
 	shard.shard_count = 2
@@ -2560,9 +2850,6 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
 	shard_mask_include(&shard.peer_alive_mask, 0)
-
-	msg_pool_backing: [MESSAGE_ENVELOPE_SIZE * 4]u8
-	pool_init(&shard.message_pool, msg_pool_backing[:], MESSAGE_ENVELOPE_SIZE)
 
 	when TINA_SIMULATION_MODE {
 		defer free_all(context.temp_allocator)
@@ -2577,14 +2864,23 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 		prng_init(&drop_prng, 0xD10D)
 
 		network: SimulatedNetwork
-		network_error := sim_network_init(&network, 2, ring_sizes, &drop_prng, context.temp_allocator)
+		network_error := sim_network_init(
+			&network,
+			2,
+			ring_sizes,
+			&drop_prng,
+			context.temp_allocator,
+		)
 		testing.expect_value(t, network_error, mem.Allocator_Error.None)
 
 		fault_config := FaultConfig{}
 		shard.sim_state.network = &network
 		shard.sim_state.fault_config = &fault_config
 
-		prefill_envelope := Message_Envelope {source = make_handle(1, 1, 0, 1), destination = ISOLATE_HANDLE_NONE}
+		prefill_envelope := Message_Envelope {
+			source      = make_handle(1, 1, 0, 1),
+			destination = ISOLATE_HANDLE_NONE,
+		}
 		prefill_result := sim_network_enqueue(
 			&network,
 			shard,
@@ -2599,8 +2895,15 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 		ring: SPSC_Ring
 		spsc_ring_init(&ring, 1, ring_backing[:])
 
-		prefill_envelope := Message_Envelope{source = make_handle(1, 1, 0, 1), destination = make_handle(0, 1, 0, 1)}
-		testing.expect_value(t, spsc_ring_enqueue(&ring, &prefill_envelope), Enqueue_Result.Success)
+		prefill_envelope := Message_Envelope {
+			source      = make_handle(1, 1, 0, 1),
+			destination = make_handle(0, 1, 0, 1),
+		}
+		testing.expect_value(
+			t,
+			spsc_ring_enqueue(&ring, &prefill_envelope),
+			Enqueue_Result.Success,
+		)
 
 		outbound_rings: [1]^SPSC_Ring
 		outbound_rings[0] = &ring
@@ -2619,8 +2922,11 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 	testing.expect_value(t, shard.counters.handoff_control_send_failures, u64(1))
 
 	when TINA_SIMULATION_MODE {
-		target_shard := new(Shard)
-		defer free(target_shard)
+		target_fixture := test_shard_fixture_init(
+			Test_Shard_Spec{type_count = 1, slot_counts = {0}, subsystems = {.Metadata}},
+		)
+		defer test_shard_fixture_deinit(target_fixture)
+		target_shard := &target_fixture.shard
 		target_shard.id = 0
 		target_shard.sim_state.network = shard.sim_state.network
 		target_shard.sim_state.fault_config = shard.sim_state.fault_config
@@ -2641,13 +2947,9 @@ test_fd_handoff_send_ack_defers_and_retries_when_ring_is_full :: proc(t: ^testin
 
 @(test)
 test_shard_mass_teardown_resets_scheduler_state :: proc(t: ^testing.T) {
-	shard, arena := _make_teardown_test_shard(t)
-	defer {
-		reactor_deinit(&shard.reactor)
-		os_release_arena_with_guard(arena.base)
-		free(arena)
-		free(shard)
-	}
+	fixture := _make_teardown_test_shard(t)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	shard.dispatch_credit_counts[0] = 7
 	shard.dispatch_type_cursor = 1
@@ -2664,21 +2966,26 @@ test_shard_mass_teardown_resets_scheduler_state :: proc(t: ^testing.T) {
 
 @(test)
 test_fd_handoff_retry_scan_drops_unroutable_control_messages :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec {
+			type_count = 1,
+			slot_counts = {0},
+			subsystems = {.Metadata, .Message_Pool},
+			message_pool_slots = 2,
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	shard.id = 0
 	shard.handoff_retry_head = POOL_NONE_INDEX
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
 
-	msg_pool_backing: [MESSAGE_ENVELOPE_SIZE * 2]u8
-	pool_init(&shard.message_pool, msg_pool_backing[:], MESSAGE_ENVELOPE_SIZE)
-
 	retry_envelope := Message_Envelope {
-		source = make_handle(0, 1, 0, 1),
-		destination = make_handle(1, 1, 0, 1),
-		tag = TAG_FD_HANDOFF_REJECT,
+		source       = make_handle(0, 1, 0, 1),
+		destination  = make_handle(1, 1, 0, 1),
+		tag          = TAG_FD_HANDOFF_REJECT,
 		payload_size = u16(size_of(FD_Handoff_Reject)),
 	}
 
@@ -2698,26 +3005,18 @@ test_fd_handoff_retry_scan_drops_unroutable_control_messages :: proc(t: ^testing
 
 @(test)
 test_fd_handoff_peer_quarantine_closes_entries_targeting_that_shard :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
-	handoff_backing: [4]FD_Handoff_Entry
-	_world_raw: rawptr
-	when TINA_SIMULATION_MODE {
-		_w := new(Sim_IO_World, context.temp_allocator)
-		_sim_world_init(_w)
-		_world_raw = cast(rawptr)_w
-	}
-	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw)
-	defer backend_deinit(&shard.reactor.backend)
+	fixture := _make_handoff_test_fixture(t, 4)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	ref_target_1_a := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 0, 1), 100)
 	ref_target_1_b := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 1, 1), 100)
 	ref_target_2 := _alloc_handoff_test_entry(t, shard, make_handle(2, 1, 0, 1), 100)
 
 	quarantine_envelope := Message_Envelope {
-		source = ISOLATE_HANDLE_NONE,
+		source      = ISOLATE_HANDLE_NONE,
 		destination = ISOLATE_HANDLE_NONE,
-		tag = TAG_SHARD_QUARANTINED,
+		tag         = TAG_SHARD_QUARANTINED,
 	}
 	_process_inbound_envelope(shard, 1, &quarantine_envelope)
 
@@ -2725,17 +3024,30 @@ test_fd_handoff_peer_quarantine_closes_entries_targeting_that_shard :: proc(t: ^
 	_, lookup_err_target_1_b := fd_handoff_table_lookup_index(&shard.handoff_table, ref_target_1_b)
 	_, lookup_err_target_2 := fd_handoff_table_lookup_index(&shard.handoff_table, ref_target_2)
 
-	testing.expect(t, lookup_err_target_1_a != .None, "quarantined target shard entries should be reclaimed")
-	testing.expect(t, lookup_err_target_1_b != .None, "all quarantined target shard entries should be reclaimed")
+	testing.expect(
+		t,
+		lookup_err_target_1_a != .None,
+		"quarantined target shard entries should be reclaimed",
+	)
+	testing.expect(
+		t,
+		lookup_err_target_1_b != .None,
+		"all quarantined target shard entries should be reclaimed",
+	)
 	testing.expect_value(t, lookup_err_target_2, FD_Handoff_Table_Error.None)
 }
 
 @(test)
 test_liveness_control_channel_delivers_without_data_plane_capacity :: proc(t: ^testing.T) {
-	source := new(Shard)
-	defer free(source)
-	target := new(Shard)
-	defer free(target)
+	source_fixture := test_shard_fixture_init(
+		Test_Shard_Spec{type_count = 1, slot_counts = {0}, subsystems = {.Metadata}},
+	)
+	defer test_shard_fixture_deinit(source_fixture)
+	source := &source_fixture.shard
+
+	target_fixture := _make_handoff_test_fixture(t, 2)
+	defer test_shard_fixture_deinit(target_fixture)
+	target := &target_fixture.shard
 
 	source.id = 0
 	source.shard_count = 2
@@ -2750,67 +3062,67 @@ test_liveness_control_channel_delivers_without_data_plane_capacity :: proc(t: ^t
 	source.outbound_control_channels = outbound_control_channels[:]
 	target.inbound_control_channel = &channel
 
-	handoff_backing: [2]FD_Handoff_Entry
-	_world_raw: rawptr
-	when TINA_SIMULATION_MODE {
-		_w := new(Sim_IO_World, context.temp_allocator)
-		_sim_world_init(_w)
-		_world_raw = cast(rawptr)_w
-	}
-	_init_handoff_test_shard(t, target, handoff_backing[:], _world_raw)
-	defer backend_deinit(&target.reactor.backend)
-
 	ref_target_0 := _alloc_handoff_test_entry(t, target, make_handle(0, 1, 0, 1), 100)
 
 	shard_broadcast_liveness_state(source, .Quarantined)
-	testing.expect(t, !shard_mask_contains(&source.liveness_broadcast_pending_mask, 1), "dedicated source cell should publish liveness without data-plane backpressure")
+	testing.expect(
+		t,
+		!shard_mask_contains(&source.liveness_broadcast_pending_mask, 1),
+		"dedicated source cell should publish liveness without data-plane backpressure",
+	)
 	testing.expect_value(t, source.counters.liveness_control_publish_count, u64(1))
 
 	transport_drain_control_inbound(target)
 	_, lookup_error := fd_handoff_table_lookup_index(&target.handoff_table, ref_target_0)
-	testing.expect(t, lookup_error != .None, "delivered quarantine should reclaim target-shard handoffs")
-	testing.expect(t, !shard_mask_contains(&target.peer_alive_mask, 0), "delivered quarantine should clear peer liveness")
+	testing.expect(
+		t,
+		lookup_error != .None,
+		"delivered quarantine should reclaim target-shard handoffs",
+	)
+	testing.expect(
+		t,
+		!shard_mask_contains(&target.peer_alive_mask, 0),
+		"delivered quarantine should clear peer liveness",
+	)
 }
 
 @(test)
 test_liveness_restart_epoch_closes_stale_peer_handoffs :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
-	handoff_backing: [2]FD_Handoff_Entry
-	_world_raw: rawptr
-	when TINA_SIMULATION_MODE {
-		_w := new(Sim_IO_World, context.temp_allocator)
-		_sim_world_init(_w)
-		_world_raw = cast(rawptr)_w
-	}
-	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw)
-	defer backend_deinit(&shard.reactor.backend)
+	fixture := _make_handoff_test_fixture(t, 2)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	shard.id = 1
 	shard.shard_count = 2
 	shard_mask_exclude(&shard.peer_alive_mask, 0)
 	ref_target_0 := _alloc_handoff_test_entry(t, shard, make_handle(0, 1, 0, 1), 100)
 
-	event := Shard_Control_Event{epoch = 7, source = Shard_Id(0), state = .Running, kind = .Liveness}
+	event := Shard_Control_Event {
+		epoch  = 7,
+		source = Shard_Id(0),
+		state  = .Running,
+		kind   = .Liveness,
+	}
 	_process_inbound_control_event(shard, 0, &event)
 
 	_, lookup_error := fd_handoff_table_lookup_index(&shard.handoff_table, ref_target_0)
-	testing.expect(t, lookup_error != .None, "restart epoch should reclaim stale target-shard handoffs")
-	testing.expect(t, shard_mask_contains(&shard.peer_alive_mask, 0), "restart epoch should restore peer liveness")
+	testing.expect(
+		t,
+		lookup_error != .None,
+		"restart epoch should reclaim stale target-shard handoffs",
+	)
+	testing.expect(
+		t,
+		shard_mask_contains(&shard.peer_alive_mask, 0),
+		"restart epoch should restore peer liveness",
+	)
 }
 
 @(test)
 test_fd_handoff_close_all_entries_reclaims_all_in_flight_entries :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
-	handoff_backing: [4]FD_Handoff_Entry
-	_world_raw_b: rawptr
-	when TINA_SIMULATION_MODE {
-		_wb := new(Sim_IO_World, context.temp_allocator)
-		_world_raw_b = cast(rawptr)_wb
-	}
-	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw_b)
-	defer backend_deinit(&shard.reactor.backend)
+	fixture := _make_handoff_test_fixture(t, 4)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	ref_a := _alloc_handoff_test_entry(t, shard, make_handle(1, 1, 0, 1), 100)
 	ref_b := _alloc_handoff_test_entry(t, shard, make_handle(2, 1, 0, 1), 100)
@@ -2827,16 +3139,9 @@ test_fd_handoff_close_all_entries_reclaims_all_in_flight_entries :: proc(t: ^tes
 
 @(test)
 test_fd_handoff_timeout_scan_counts_but_keeps_entry :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
-	handoff_backing: [2]FD_Handoff_Entry
-	_world_raw_c: rawptr
-	when TINA_SIMULATION_MODE {
-		_wc := new(Sim_IO_World, context.temp_allocator)
-		_world_raw_c = cast(rawptr)_wc
-	}
-	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw_c)
-	defer backend_deinit(&shard.reactor.backend)
+	fixture := _make_handoff_test_fixture(t, 2)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	target_handle := make_handle(1, 1, 0, 1)
 	ref := _alloc_handoff_test_entry(t, shard, target_handle, 5)
@@ -2872,16 +3177,9 @@ test_scheduler_dispatch_batch_count_limit_respects_io_service_interval :: proc(t
 
 @(test)
 test_shard_mass_teardown_reclaims_in_flight_handoff_entries :: proc(t: ^testing.T) {
-	shard := new(Shard)
-	defer free(shard)
-	handoff_backing: [2]FD_Handoff_Entry
-	_world_raw_d: rawptr
-	when TINA_SIMULATION_MODE {
-		_wd := new(Sim_IO_World, context.temp_allocator)
-		_world_raw_d = cast(rawptr)_wd
-	}
-	_init_handoff_test_shard(t, shard, handoff_backing[:], _world_raw_d)
-	defer backend_deinit(&shard.reactor.backend)
+	fixture := _make_handoff_test_fixture(t, 2)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	target_handle := make_handle(1, 1, 0, 1)
 	ref := _alloc_handoff_test_entry(t, shard, target_handle, 100)
@@ -2889,7 +3187,11 @@ test_shard_mass_teardown_reclaims_in_flight_handoff_entries :: proc(t: ^testing.
 	shard_mass_teardown(shard)
 
 	_, lookup_error := fd_handoff_table_lookup_index(&shard.handoff_table, ref)
-	testing.expect(t, lookup_error != .None, "mass teardown should reclaim in-flight handoff entries")
+	testing.expect(
+		t,
+		lookup_error != .None,
+		"mass teardown should reclaim in-flight handoff entries",
+	)
 	testing.expect_value(t, shard.handoff_table.free_count, shard.handoff_table.entry_count)
 	testing.expect_value(t, shard.counters.handoff_timeouts, u64(0))
 }

@@ -17,6 +17,8 @@ when TINA_SIMULATION_MODE {
 		run_count: u32,
 	}
 
+	STARVATION_DIAG_RUN_COUNT: Diagnostic_Field_Id : 0
+
 	starvation_coord_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		// Spawn 300 workers to exceed one same-type dispatch batch.
 		for i in 0 ..< 300 {
@@ -47,6 +49,7 @@ when TINA_SIMULATION_MODE {
 	) -> Isolate_Transition {
 		w := cast(^StarvationWorker)self
 		w.run_count += 1
+		ctx_test_diagnostic_write_u64(STARVATION_DIAG_RUN_COUNT, u64(w.run_count))
 		// Yielding keeps us in .Runnable state, ensuring we always consume budget
 		return ISOLATE_TRANSITION_YIELD
 	}
@@ -90,11 +93,12 @@ when TINA_SIMULATION_MODE {
 		shard_specs := [1]ShardSpec{{shard_id = 0, root_group = root_group}}
 
 		sim_config := SimulationConfig {
-			seed                   = t.seed,
-			ticks_max              = 10, // Exactly 10 ticks. One weight earns 256 credits per tick by default.
-			terminate_on_quiescent = false, // Never quiescent because workers always yield
-			builtin_checkers       = CHECKER_FLAGS_ALL,
-			checker_interval_ticks = 10,
+			seed                              = t.seed,
+			ticks_max                         = 10, // Exactly 10 ticks. One weight earns 256 credits per tick by default.
+			terminate_on_quiescent            = false, // Never quiescent because workers always yield
+			builtin_checkers                  = CHECKER_FLAGS_ALL,
+			checker_interval_ticks            = 10,
+			diagnostic_record_count_per_shard = 400,
 		}
 
 		spec := SystemSpec {
@@ -131,15 +135,21 @@ when TINA_SIMULATION_MODE {
 
 		// Verify every single worker got a fair share of the 2,560 total dispatches
 		for i in 0 ..< 300 {
-			worker_pointer := _get_isolate_ptr(shard, STARVATION_WORKER_ID, Isolate_Slot_Index(i))
-			worker := cast(^StarvationWorker)worker_pointer
+			run_count, run_count_found := shard_diagnostic_read(
+				shard,
+				STARVATION_WORKER_ID,
+				Isolate_Slot_Index(i),
+				STARVATION_DIAG_RUN_COUNT,
+			)
+			testing.expect(t, run_count_found, "worker run-count diagnostic not found")
 
-			if worker.run_count == 0 {
+			if run_count == 0 {
 				starved_count += 1
 			}
 
-			if worker.run_count < min_runs do min_runs = worker.run_count
-			if worker.run_count > max_runs do max_runs = worker.run_count
+			worker_run_count := u32(run_count)
+			if worker_run_count < min_runs do min_runs = worker_run_count
+			if worker_run_count > max_runs do max_runs = worker_run_count
 		}
 
 		// If the bug exists, starved_count will be exactly 44 (slots 256 to 299)

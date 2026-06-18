@@ -1116,6 +1116,7 @@ Checker_Flag :: enum u8 {
 	FD_Table_Integrity,
 	FD_Handoff_Integrity,
 	Sim_FD_Integrity,
+	State_Transition_Integrity,
 }
 
 CHECKER_FLAGS_ALL :: Checker_Flags {
@@ -1124,6 +1125,7 @@ CHECKER_FLAGS_ALL :: Checker_Flags {
 	.FD_Table_Integrity,
 	.FD_Handoff_Integrity,
 	.Sim_FD_Integrity,
+	.State_Transition_Integrity,
 }
 CHECKER_FLAGS_NONE :: Checker_Flags{}
 
@@ -1136,8 +1138,9 @@ SimulationConfig :: struct {
 	faults:                 FaultConfig,
 	builtin_checkers:       Checker_Flags,
 	user_checkers:          []Checker_Fn,
-	checker_interval_ticks: u32,
-	sim_io_world:           rawptr, // ^Sim_IO_World; set by simulator_init before hydration
+	checker_interval_ticks:            u32,
+	diagnostic_record_count_per_shard: u32, // 0 = default 64; simulation-only diagnostic table capacity
+	sim_io_world:                      rawptr, // ^Sim_IO_World; set by simulator_init before hydration
 }
 
 // --- Topology / Painter's Algorithm ---

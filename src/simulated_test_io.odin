@@ -178,7 +178,7 @@ when TINA_SIMULATION_MODE {
 
 		shard := &sim.shards[0]
 
-		iso_state := shard.metadata[IO_TIMEOUT_TYPE_ID].state[0]
+		iso_state := shard.metadata[IO_TIMEOUT_TYPE_ID]._state[0]
 		testing.expect_value(t, iso_state, Isolate_State.Unallocated)
 		testing.expect(
 			t,
@@ -339,6 +339,12 @@ when TINA_SIMULATION_MODE {
 		received_count: u8,
 	}
 
+	PRIORITY_DIAG_RECEIVED_COUNT: Diagnostic_Field_Id : 0
+	PRIORITY_DIAG_TAG_0:          Diagnostic_Field_Id : 1
+	PRIORITY_DIAG_TAG_1:          Diagnostic_Field_Id : 2
+	PRIORITY_DIAG_TAG_2:          Diagnostic_Field_Id : 3
+	PRIORITY_DIAG_TAG_3:          Diagnostic_Field_Id : 4
+
 	priority_test_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -347,7 +353,10 @@ when TINA_SIMULATION_MODE {
 		iso := cast(^PriorityTestIsolate)self
 		if iso.received_count < 4 {
 			iso.received_tags[iso.received_count] = message.tag
+			tag_field := Diagnostic_Field_Id(int(PRIORITY_DIAG_TAG_0) + int(iso.received_count))
+			ctx_test_diagnostic_write_u64(tag_field, u64(message.tag))
 			iso.received_count += 1
+			ctx_test_diagnostic_write_u64(PRIORITY_DIAG_RECEIVED_COUNT, u64(iso.received_count))
 		}
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -416,11 +425,11 @@ when TINA_SIMULATION_MODE {
 
 		shard := &sim.shards[0]
 
-		buffer_index, buffer_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
+		buffer_index, buffer_error := io_slot_pool_alloc_tina_owned(&shard.reactor.receive_pool)
 		testing.expect_value(t, buffer_error, IO_Slot_Pool_Error.None)
 
 		soa := shard.metadata[PRIORITY_TYPE_ID]
-		soa[0].state = .Runnable
+		_slot_set_state(shard, PRIORITY_TYPE_ID, 0, .Runnable)
 		soa[0].flags += {.Shutdown_Pending}
 		_slot_set_io_completion_ready(
 			shard,
@@ -433,18 +442,21 @@ when TINA_SIMULATION_MODE {
 
 		simulator_run(&sim)
 
-		received := cast(^PriorityTestIsolate)_get_isolate_ptr(shard, PRIORITY_TYPE_ID, 0)
-		testing.expect_value(t, received.received_count, u8(2))
-		testing.expect_value(t, received.received_tags[0], IO_TAG_RECV_COMPLETE)
-		testing.expect_value(t, received.received_tags[1], TAG_SHUTDOWN)
+		shard_test_diagnostic_expect_u64(t, shard, PRIORITY_TYPE_ID, 0, PRIORITY_DIAG_RECEIVED_COUNT, 2)
+		tag_0, tag_0_found := shard_diagnostic_read(shard, PRIORITY_TYPE_ID, 0, PRIORITY_DIAG_TAG_0)
+		tag_1, tag_1_found := shard_diagnostic_read(shard, PRIORITY_TYPE_ID, 0, PRIORITY_DIAG_TAG_1)
+		testing.expect(t, tag_0_found, "priority tag-0 diagnostic not found")
+		testing.expect(t, tag_1_found, "priority tag-1 diagnostic not found")
+		testing.expect_value(t, Message_Tag(tag_0), IO_TAG_RECV_COMPLETE)
+		testing.expect_value(t, Message_Tag(tag_1), TAG_SHUTDOWN)
 
 		pool := &shard.reactor.receive_pool
 		testing.expect_value(t, pool.free_count, pool.slot_count)
 
 		fmt.printfln(
 			"\n[TEST SUCCESS] Shutdown dispatch priority verified: I/O completion (0x%04X) delivered before TAG_SHUTDOWN (0x%04X).",
-			u16(received.received_tags[0]),
-			u16(received.received_tags[1]),
+			u16(Message_Tag(tag_0)),
+			u16(Message_Tag(tag_1)),
 		)
 	}
 }

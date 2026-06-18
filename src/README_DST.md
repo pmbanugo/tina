@@ -1,6 +1,6 @@
 # Deterministic Simulation Testing (DST)
 
-Tina's simulation mode replaces the OS clock, cross-shard transport, and I/O backend with deterministic substitutes. Everything runs single-threaded. Same seed + same `SystemSpec` = same execution = same outcome.
+Tina's simulation mode replaces the OS clock, cross-shard transport, and I/O backend with deterministic substitutes. Same seed + same `SystemSpec` = same execution = same outcome.
 
 ## Build and Run
 
@@ -133,7 +133,8 @@ test_my_scenario :: proc(t: ^testing.T) {
     // 6. Assert on post-run state
     testing.expect_value(t, sim.termination_reason, Termination_Reason.Quiescent)
     shard := &sim.shards[0]
-    // ... inspect shard.metadata, shard.counters, isolate memory, etc.
+    // ... inspect shard.metadata, shard.counters, and diagnostics only.
+    // Do not read isolate payload memory after simulator_run returns.
 }
 ```
 
@@ -186,6 +187,7 @@ Built-in checkers verify framework invariants at configurable intervals.
 | `FD_Table_Integrity`  | Active FD entries have non-zero generation and valid OS FD. |
 | `FD_Handoff_Integrity`| Handoff table accounting: `free_count + in_flight == entry_count`. In-flight entries have valid fields. |
 | `Sim_FD_Integrity`    | Simulated descriptor↔object ref counts match actual descriptors and pending ops (simulation only). |
+| `State_Transition_Integrity` | `io_awaiting_count`, dispatchable bitmaps, per-type dispatchable counts, and type summary words are consistent with metadata state and flags. |
 
 Enable all with `CHECKER_FLAGS_ALL`. Disable all with `CHECKER_FLAGS_NONE`.
 
@@ -199,12 +201,21 @@ A checker violation stops the simulation immediately. The `Simulator.termination
 
 Register application-level invariant checkers to verify domain logic during simulation.
 
+User checkers run while the simulation is active, so they may inspect live isolate payload memory through the sanctioned helper. They must not read payload memory after `simulator_run` returns; that memory is logically freed and may be ASan-poisoned.
+
 ```odin
 balance_checker :: proc(shards: []Shard, tick: u64) -> Check_Result {
     total: i64 = 0
     for &shard in shards {
         for slot in 0 ..< shard.type_descriptors[ACCOUNT_TYPE_ID].slot_count {
-            account := cast(^Account)_get_isolate_ptr(&shard, u16(ACCOUNT_TYPE_ID), u32(slot))
+            account := cast(^Account)sim_checker_get_live_isolate_ptr(
+                &shard,
+                ACCOUNT_TYPE_ID,
+                Isolate_Slot_Index(slot),
+            )
+            if account == nil {
+                continue // slot is not live at this tick
+            }
             total += account.balance
         }
     }
@@ -238,6 +249,65 @@ result2 := run_simulation(seed)
 assert(result1 == result2)
 ```
 
+## How Tests Observe Simulation Results
+
+After `simulator_run` returns, tests must not read isolate payload memory. Free slots are ASan-poisoned and live slots may have been reclaimed. Instead, tests observe results through:
+
+1. **Metadata SOA** — state, generation, flags, inbox counts, pending correlation, I/O fields.
+2. **Counters** — backpressure, I/O, transfer, and handoff counters on `Shard_Counters`.
+3. **Simulation diagnostic table** — scalar facts written by handlers while payload memory is live.
+4. **Checker results** — built-in and user checker violations.
+
+### Simulation Diagnostics
+
+Handlers write scalar diagnostic records using the simulation-only API:
+
+```odin
+DIAG_PING_COUNT: Diagnostic_Field_Id : 0
+
+ping_handler :: proc(self: rawptr, message: ^Message) -> Isolate_Transition {
+    ping := cast(^PingIsolate)self
+    ping.count += 1
+    ctx_test_diagnostic_write_u64(DIAG_PING_COUNT, u64(ping.count))
+    // ...
+}
+```
+
+Tests read the records after `simulator_run`:
+
+```odin
+shard_test_diagnostic_expect_u64(
+    t,
+    shard,
+    PING_TYPE_ID,
+    0,
+    DIAG_PING_COUNT,
+    100,
+)
+```
+
+The diagnostic table is dense, append-only, and keyed by `(isolate_type_id, slot_index, field_id)`. It stores only `u64` scalars — no pointers, slices, strings, or payload snapshots. Capacity defaults to 64 records per shard; large tests can override it:
+
+```odin
+sim_config.diagnostic_record_count_per_shard = 400
+```
+
+This is used by tests such as the fairness test, where 300 workers each write a run-count diagnostic.
+
+### During-Run Payload Inspection
+
+User checkers run during the simulation while payload memory is still live. If a checker must inspect full isolate payload state, use the sanctioned helper:
+
+```odin
+account := cast(^Account)sim_checker_get_live_isolate_ptr(
+    &shard,
+    ACCOUNT_TYPE_ID,
+    Isolate_Slot_Index(slot),
+)
+```
+
+This helper returns `nil` if the slot is `.Unallocated` so the checker does not read poisoned memory. It is only valid inside a checker or other during-run context.
+
 ## Post-Run Inspection
 
 After `simulator_run` returns, inspect:
@@ -247,9 +317,9 @@ sim.termination_reason  // .Ticks_Max, .Quiescent, or .Checker_Violation
 sim.final_round         // last round executed
 
 shard := &sim.shards[0]
-shard.metadata[type_id].state[slot]       // isolate state
-shard.metadata[type_id].generation[slot]  // handle generation
-shard.counters                            // backpressure and I/O counters
+shard.metadata[type_id]._state[slot]       // isolate state
+shard.metadata[type_id].generation[slot]   // handle generation
+shard.counters                             // backpressure and I/O counters
 ```
 
 The simulation prints a summary to stdout:
@@ -261,6 +331,71 @@ The simulation prints a summary to stdout:
 ```
 
 When a test fails, the seed in the summary is the reproduction key. Re-run with that seed to replay the exact same execution.
+
+## Test Fixtures for Non-Simulation Unit Tests
+
+Unit tests that need a `Shard` must use the `Test_Shard_Fixture` builder instead of allocating a `Shard` directly. The fixture owns the Grand Arena and records which subsystems were actually initialized, so teardown is precise and production lifetime rules are preserved.
+
+```odin
+fixture := test_shard_fixture_init(
+    Test_Shard_Spec{
+        type_count  = 1,
+        slot_counts = {4},
+        subsystems  = {.Metadata, .Dispatchable, .Message_Pool},
+    },
+)
+defer test_shard_fixture_deinit(fixture)
+
+shard := &fixture.shard
+```
+
+Declare only the subsystems the test needs:
+
+| Subsystem | Provides |
+|-----------|----------|
+| `Metadata` | Mandatory base: type descriptors, isolate memory, SOA metadata, free lists. |
+| `Dispatchable` | Per-slot and per-type dispatchable bitmaps. |
+| `Message_Pool` | Framework-owned message envelope pool. |
+| `Timer_Wheel` | Timer entries and armed bitmap. |
+| `Reactor` | FD table, receive/staging pools, and backend. |
+| `Transfer_Pool` | Large-payload transfer buffer pool. |
+| `Handoff_Table` | FD handoff entries for cross-isolate socket transfer. |
+| `Supervision` | Supervision group table. |
+| `Scratch` | Scratch arena backing memory. |
+
+Activate and release isolate slots through the ownership helpers:
+
+```odin
+test_shard_slot_activate(fixture, make_handle(0, 0, 2, 1), .Runnable)
+// ... exercise the slot ...
+test_shard_slot_release(fixture, 0, 2)
+```
+
+Rules:
+
+- Do not edit `isolate_free_heads`, `generation`, or `._state` directly in tests.
+- Do not allocate `new(Shard)` except in sanctioned hydrate-shard tests marked with `ALLOWLIST_FILE(hydrate_shard_fixture)`.
+- Manual free-list mutation is not a fixture API; use `test_shard_slot_activate` and `test_shard_slot_release`.
+- Tests that need special I/O metadata may set those fields after activation, but activation itself must go through `test_shard_slot_activate`.
+- Initially free fixture slots are ASan-poisoned in sanitizer builds; activation unpoisons payload and working memory, and release re-poisons them.
+
+## Sequential Verification Gate
+
+Before resuming ASan feature work, collect verification evidence from these commands run **sequentially** in the same workspace. Do not run multiple `odin test` invocations concurrently when collecting gate evidence; the runner may share build/test artifacts.
+
+```sh
+# 1. Structural hygiene (no Odin toolchain required)
+scripts/check_test_hygiene.sh
+
+# 2. Normal test suite
+odin test tests/ -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_FANCY=false
+
+# 3. Simulation test suite
+odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_FANCY=false
+
+# 4. Single-thread simulation suite (sanitizer-runner configuration)
+odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_FANCY=false
+```
 
 ## Reproducing Failures
 

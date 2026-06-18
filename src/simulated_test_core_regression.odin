@@ -20,6 +20,9 @@ when TINA_SIMULATION_MODE {
 	}
 	Init_Contract_Child :: struct {}
 
+	INIT_CONTRACT_DIAG_SPAWN_SUCCEEDED:    Diagnostic_Field_Id : 0
+	INIT_CONTRACT_DIAG_INIT_FAILED_RESULT: Diagnostic_Field_Id : 1
+
 	init_contract_child_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_REPLY
 	}
@@ -44,6 +47,9 @@ when TINA_SIMULATION_MODE {
 		case Spawn_Error:
 			parent.init_failed_result = result == .init_failed
 		}
+
+		ctx_test_diagnostic_write_u64(INIT_CONTRACT_DIAG_SPAWN_SUCCEEDED, parent.spawn_succeeded ? 1 : 0)
+		ctx_test_diagnostic_write_u64(INIT_CONTRACT_DIAG_INIT_FAILED_RESULT, parent.init_failed_result ? 1 : 0)
 
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -95,16 +101,25 @@ when TINA_SIMULATION_MODE {
 		defer simulator_deinit(&sim)
 
 		shard := &sim.shards[0]
-		parent := cast(^Init_Contract_Parent)_get_isolate_ptr(
+
+		init_failed_result, init_failed_found := shard_diagnostic_read(
 			shard,
 			INIT_CONTRACT_PARENT_TYPE_ID,
 			0,
+			INIT_CONTRACT_DIAG_INIT_FAILED_RESULT,
 		)
-
-		testing.expect(t, parent.init_failed_result, "contract-violating init must return Spawn_Error.init_failed")
-		testing.expect(t, !parent.spawn_succeeded, "contract-violating init must not return a stale child handle")
+		testing.expect(t, init_failed_found, "init-failed diagnostic not found")
+		testing.expect(t, init_failed_result != 0, "contract-violating init must return Spawn_Error.init_failed")
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			INIT_CONTRACT_PARENT_TYPE_ID,
+			0,
+			INIT_CONTRACT_DIAG_SPAWN_SUCCEEDED,
+			0,
+		)
 		testing.expect_value(t, shard.supervision_groups[0].child_count_dynamic, u16(0))
-		testing.expect_value(t, shard.metadata[INIT_CONTRACT_CHILD_TYPE_ID].state[0], Isolate_State.Unallocated)
+		testing.expect_value(t, shard.metadata[INIT_CONTRACT_CHILD_TYPE_ID]._state[0], Isolate_State.Unallocated)
 	}
 
 	REENTRANT_PARENT_TYPE_ID: Isolate_Type_Id : 0
@@ -121,6 +136,11 @@ when TINA_SIMULATION_MODE {
 		nested_spawn_succeeded:  bool,
 	}
 	Reentrant_Second_Child :: struct {}
+
+	REENTRANT_DIAG_PARENT_SPAWN_SUCCEEDED:      Diagnostic_Field_Id : 0
+	REENTRANT_DIAG_PARENT_SPAWN_FAILED:         Diagnostic_Field_Id : 1
+	REENTRANT_DIAG_CHILD_NESTED_GROUP_FULL:     Diagnostic_Field_Id : 0
+	REENTRANT_DIAG_CHILD_NESTED_SPAWN_SUCCEEDED: Diagnostic_Field_Id : 1
 
 	reentrant_second_child_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -146,6 +166,9 @@ when TINA_SIMULATION_MODE {
 			child.nested_spawn_group_full = result == .group_full
 		}
 
+		ctx_test_diagnostic_write_u64(REENTRANT_DIAG_CHILD_NESTED_GROUP_FULL, child.nested_spawn_group_full ? 1 : 0)
+		ctx_test_diagnostic_write_u64(REENTRANT_DIAG_CHILD_NESTED_SPAWN_SUCCEEDED, child.nested_spawn_succeeded ? 1 : 0)
+
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
 
@@ -169,6 +192,9 @@ when TINA_SIMULATION_MODE {
 		case Spawn_Error:
 			parent.spawn_failed = true
 		}
+
+		ctx_test_diagnostic_write_u64(REENTRANT_DIAG_PARENT_SPAWN_SUCCEEDED, parent.spawn_succeeded ? 1 : 0)
+		ctx_test_diagnostic_write_u64(REENTRANT_DIAG_PARENT_SPAWN_FAILED, parent.spawn_failed ? 1 : 0)
 
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -228,17 +254,43 @@ when TINA_SIMULATION_MODE {
 		defer simulator_deinit(&sim)
 
 		shard := &sim.shards[0]
-		parent := cast(^Reentrant_Parent)_get_isolate_ptr(shard, REENTRANT_PARENT_TYPE_ID, 0)
-		child := cast(^Reentrant_First_Child)_get_isolate_ptr(shard, REENTRANT_FIRST_CHILD_TYPE_ID, 0)
 
-		testing.expect(t, parent.spawn_succeeded, "outer dynamic spawn must succeed")
-		testing.expect(t, !parent.spawn_failed, "outer dynamic spawn must not fail")
-		testing.expect(t, child.nested_spawn_group_full, "nested spawn must see the reserved final group slot")
-		testing.expect(t, !child.nested_spawn_succeeded, "nested spawn must not consume stale dynamic capacity")
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			REENTRANT_PARENT_TYPE_ID,
+			0,
+			REENTRANT_DIAG_PARENT_SPAWN_SUCCEEDED,
+			1,
+		)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			REENTRANT_PARENT_TYPE_ID,
+			0,
+			REENTRANT_DIAG_PARENT_SPAWN_FAILED,
+			0,
+		)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			REENTRANT_FIRST_CHILD_TYPE_ID,
+			0,
+			REENTRANT_DIAG_CHILD_NESTED_GROUP_FULL,
+			1,
+		)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			REENTRANT_FIRST_CHILD_TYPE_ID,
+			0,
+			REENTRANT_DIAG_CHILD_NESTED_SPAWN_SUCCEEDED,
+			0,
+		)
 		testing.expect_value(t, shard.supervision_groups[0].child_count_dynamic, u16(1))
 		testing.expect_value(t, shard.supervision_groups[0].dynamic_specs[0].type_id, REENTRANT_FIRST_CHILD_TYPE_ID)
-		testing.expect_value(t, shard.metadata[REENTRANT_FIRST_CHILD_TYPE_ID].state[0], Isolate_State.Wait_Message)
-		testing.expect_value(t, shard.metadata[REENTRANT_SECOND_CHILD_TYPE_ID].state[0], Isolate_State.Unallocated)
+		testing.expect_value(t, shard.metadata[REENTRANT_FIRST_CHILD_TYPE_ID]._state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[REENTRANT_SECOND_CHILD_TYPE_ID]._state[0], Isolate_State.Unallocated)
 	}
 
 	INVALID_TYPE_PARENT_TYPE_ID: Isolate_Type_Id : 0
@@ -248,6 +300,9 @@ when TINA_SIMULATION_MODE {
 		spawn_succeeded:             bool,
 		type_not_allocated_returned: bool,
 	}
+
+	INVALID_TYPE_DIAG_SPAWN_SUCCEEDED:      Diagnostic_Field_Id : 0
+	INVALID_TYPE_DIAG_TYPE_NOT_ALLOCATED:   Diagnostic_Field_Id : 1
 
 	invalid_type_parent_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		parent := cast(^Invalid_Type_Parent)self
@@ -264,6 +319,9 @@ when TINA_SIMULATION_MODE {
 		case Spawn_Error:
 			parent.type_not_allocated_returned = result == .type_not_allocated
 		}
+
+		ctx_test_diagnostic_write_u64(INVALID_TYPE_DIAG_SPAWN_SUCCEEDED, parent.spawn_succeeded ? 1 : 0)
+		ctx_test_diagnostic_write_u64(INVALID_TYPE_DIAG_TYPE_NOT_ALLOCATED, parent.type_not_allocated_returned ? 1 : 0)
 
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -307,10 +365,23 @@ when TINA_SIMULATION_MODE {
 		defer simulator_deinit(&sim)
 
 		shard := &sim.shards[0]
-		parent := cast(^Invalid_Type_Parent)_get_isolate_ptr(shard, INVALID_TYPE_PARENT_TYPE_ID, 0)
 
-		testing.expect(t, parent.type_not_allocated_returned, "invalid type_id must return Spawn_Error.type_not_allocated")
-		testing.expect(t, !parent.spawn_succeeded, "invalid type_id must not return a handle")
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			INVALID_TYPE_PARENT_TYPE_ID,
+			0,
+			INVALID_TYPE_DIAG_TYPE_NOT_ALLOCATED,
+			1,
+		)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			INVALID_TYPE_PARENT_TYPE_ID,
+			0,
+			INVALID_TYPE_DIAG_SPAWN_SUCCEEDED,
+			0,
+		)
 		testing.expect_value(t, shard.supervision_groups[0].child_count_dynamic, u16(0))
 	}
 
@@ -323,6 +394,9 @@ when TINA_SIMULATION_MODE {
 		spawn_rejected:  bool,
 	}
 	Invalid_Group_Child :: struct {}
+
+	INVALID_GROUP_DIAG_SPAWN_SUCCEEDED: Diagnostic_Field_Id : 0
+	INVALID_GROUP_DIAG_SPAWN_REJECTED:  Diagnostic_Field_Id : 1
 
 	invalid_group_child_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -347,6 +421,9 @@ when TINA_SIMULATION_MODE {
 		case Spawn_Error:
 			parent.spawn_rejected = true
 		}
+
+		ctx_test_diagnostic_write_u64(INVALID_GROUP_DIAG_SPAWN_SUCCEEDED, parent.spawn_succeeded ? 1 : 0)
+		ctx_test_diagnostic_write_u64(INVALID_GROUP_DIAG_SPAWN_REJECTED, parent.spawn_rejected ? 1 : 0)
 
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -398,11 +475,24 @@ when TINA_SIMULATION_MODE {
 		defer simulator_deinit(&sim)
 
 		shard := &sim.shards[0]
-		parent := cast(^Invalid_Group_Parent)_get_isolate_ptr(shard, INVALID_GROUP_PARENT_TYPE_ID, 0)
 
-		testing.expect(t, parent.spawn_rejected, "invalid group_id must return Spawn_Error")
-		testing.expect(t, !parent.spawn_succeeded, "invalid group_id must not return a handle")
-		testing.expect_value(t, shard.metadata[INVALID_GROUP_CHILD_TYPE_ID].state[0], Isolate_State.Unallocated)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			INVALID_GROUP_PARENT_TYPE_ID,
+			0,
+			INVALID_GROUP_DIAG_SPAWN_REJECTED,
+			1,
+		)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			INVALID_GROUP_PARENT_TYPE_ID,
+			0,
+			INVALID_GROUP_DIAG_SPAWN_SUCCEEDED,
+			0,
+		)
+		testing.expect_value(t, shard.metadata[INVALID_GROUP_CHILD_TYPE_ID]._state[0], Isolate_State.Unallocated)
 	}
 
 	TIMEOUT_CALLEE_TYPE_ID: Isolate_Type_Id : 0
@@ -422,6 +512,10 @@ when TINA_SIMULATION_MODE {
 		value: u32,
 	}
 
+	TIMEOUT_DIAG_CALL_STAGED:         Diagnostic_Field_Id : 0
+	TIMEOUT_DIAG_TIMEOUT_RECEIVED:    Diagnostic_Field_Id : 1
+	TIMEOUT_DIAG_TIMEOUT_CORRELATION: Diagnostic_Field_Id : 2
+
 	timeout_callee_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -437,6 +531,7 @@ when TINA_SIMULATION_MODE {
 
 		call_result := ctx_call(init_args.callee_handle, TIMEOUT_REQUEST_TAG, &request, 1)
 		caller.call_staged = call_result == .ok
+		ctx_test_diagnostic_write_u64(TIMEOUT_DIAG_CALL_STAGED, caller.call_staged ? 1 : 0)
 		return ISOLATE_TRANSITION_WAIT_REPLY
 	}
 
@@ -445,6 +540,8 @@ when TINA_SIMULATION_MODE {
 		if message != nil && message.tag == TAG_CALL_TIMEOUT {
 			caller.timeout_received = true
 			caller.timeout_correlation = message.correlation
+			ctx_test_diagnostic_write_u64(TIMEOUT_DIAG_TIMEOUT_RECEIVED, 1)
+			ctx_test_diagnostic_write_u64(TIMEOUT_DIAG_TIMEOUT_CORRELATION, u64(caller.timeout_correlation))
 		}
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -503,14 +600,20 @@ when TINA_SIMULATION_MODE {
 		defer simulator_deinit(&sim)
 
 		shard := &sim.shards[0]
-		caller := cast(^Timeout_Caller)_get_isolate_ptr(shard, TIMEOUT_CALLER_TYPE_ID, 0)
-		testing.expect(t, caller.call_staged, "caller init must stage the request before waiting for timeout")
-		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].state[0], Isolate_State.Wait_Reply)
+		call_staged, call_staged_found := shard_diagnostic_read(
+			shard,
+			TIMEOUT_CALLER_TYPE_ID,
+			0,
+			TIMEOUT_DIAG_CALL_STAGED,
+		)
+		testing.expect(t, call_staged_found, "caller call-staged diagnostic not found")
+		testing.expect(t, call_staged != 0, "caller init must stage the request before waiting for timeout")
+		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID]._state[0], Isolate_State.Wait_Reply)
 		testing.expect(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0] != 0, "caller must have a pending call correlation")
 		pending_correlation := shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0]
 
 		for shard.message_pool.free_count > 0 {
-			_, pool_error := pool_alloc_system(&shard.message_pool)
+			_, pool_error := _shard_message_pool_alloc_system(shard)
 			testing.expect_value(t, pool_error, Pool_Error.None)
 		}
 		testing.expect_value(t, shard.message_pool.free_count, u32(0))
@@ -518,15 +621,29 @@ when TINA_SIMULATION_MODE {
 		shard.current_tick = 1
 		_advance_timers(shard)
 
-		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].state[0], Isolate_State.Runnable)
+		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID]._state[0], Isolate_State.Runnable)
 		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0], pending_correlation)
 		testing.expect(t, .Call_Timeout_Ready in shard.metadata[TIMEOUT_CALLER_TYPE_ID].flags[0], "timeout must be marked as a scheduler event")
 		testing.expect_value(t, shard.message_pool.free_count, u32(0))
 
 		scheduler_tick(shard)
 
-		testing.expect(t, caller.timeout_received, "timeout must be delivered without a message-pool envelope")
-		testing.expect_value(t, caller.timeout_correlation, pending_correlation)
+		timeout_received, timeout_received_found := shard_diagnostic_read(
+			shard,
+			TIMEOUT_CALLER_TYPE_ID,
+			0,
+			TIMEOUT_DIAG_TIMEOUT_RECEIVED,
+		)
+		testing.expect(t, timeout_received_found, "timeout-received diagnostic not found")
+		testing.expect(t, timeout_received != 0, "timeout must be delivered without a message-pool envelope")
+		timeout_correlation, timeout_correlation_found := shard_diagnostic_read(
+			shard,
+			TIMEOUT_CALLER_TYPE_ID,
+			0,
+			TIMEOUT_DIAG_TIMEOUT_CORRELATION,
+		)
+		testing.expect(t, timeout_correlation_found, "timeout-correlation diagnostic not found")
+		testing.expect_value(t, Correlation_Id(timeout_correlation), pending_correlation)
 		testing.expect(t, .Call_Timeout_Ready not_in shard.metadata[TIMEOUT_CALLER_TYPE_ID].flags[0], "timeout event must clear after dispatch")
 		testing.expect_value(t, shard.metadata[TIMEOUT_CALLER_TYPE_ID].pending_correlation[0], Correlation_Id(0))
 	}

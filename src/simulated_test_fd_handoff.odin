@@ -25,6 +25,13 @@ when TINA_SIMULATION_MODE {
 		fd: FD_Handle,
 	}
 
+	// Simulation-only diagnostic field IDs for FD handoff observation.
+	FD_HANDOFF_DIAG_LISTENER_RESULT:   Diagnostic_Field_Id : 0
+	FD_HANDOFF_DIAG_LISTENER_OFFERED:  Diagnostic_Field_Id : 1
+	FD_HANDOFF_DIAG_DISPATCHER_ACCEPT: Diagnostic_Field_Id : 0
+	FD_HANDOFF_DIAG_DISPATCHER_CLIENT_FD: Diagnostic_Field_Id : 1
+	FD_HANDOFF_DIAG_DISPATCHER_PEER_PORT: Diagnostic_Field_Id : 2
+
 	fd_handoff_listener_init :: proc(self: rawptr, args: []u8) -> Isolate_Transition {
 		iso := cast(^FDHandoffListener)self
 		fd, error := ctx_socket(.AF_INET, .STREAM, .TCP)
@@ -54,6 +61,8 @@ when TINA_SIMULATION_MODE {
 		if message != nil && message.tag == IO_TAG_ACCEPT_COMPLETE {
 			iso.handoff_result = ctx_fd_handoff(iso.target_handle, message.io.fd)
 			iso.hand_offered = iso.handoff_result == .ok
+			ctx_test_diagnostic_write_u64(FD_HANDOFF_DIAG_LISTENER_RESULT, u64(iso.handoff_result))
+			ctx_test_diagnostic_write_u64(FD_HANDOFF_DIAG_LISTENER_OFFERED, iso.hand_offered ? 1 : 0)
 			return ISOLATE_TRANSITION_WAIT_MESSAGE
 		}
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
@@ -72,6 +81,9 @@ when TINA_SIMULATION_MODE {
 			iso.received_accept = true
 			iso.client_fd = message.io.fd
 			iso.peer_port = message.io.peer_address.port
+			ctx_test_diagnostic_write_u64(FD_HANDOFF_DIAG_DISPATCHER_ACCEPT, 1)
+			ctx_test_diagnostic_write_u64(FD_HANDOFF_DIAG_DISPATCHER_CLIENT_FD, u64(iso.client_fd))
+			ctx_test_diagnostic_write_u64(FD_HANDOFF_DIAG_DISPATCHER_PEER_PORT, u64(iso.peer_port))
 		}
 		return ISOLATE_TRANSITION_WAIT_MESSAGE
 	}
@@ -175,34 +187,53 @@ when TINA_SIMULATION_MODE {
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {0, 0}
 		simulator_run(&sim)
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(
-			&sim.shards[0],
+		shard_0 := &sim.shards[0]
+		shard_1 := &sim.shards[1]
+
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard_0,
 			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
+			FD_HANDOFF_DIAG_LISTENER_RESULT,
+			u64(FD_Handoff_Result.ok),
 		)
-		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
-			&sim.shards[1],
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard_0,
+			FD_HANDOFF_LISTENER_TYPE_ID,
+			0,
+			FD_HANDOFF_DIAG_LISTENER_OFFERED,
+			1,
+		)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard_1,
 			FD_HANDOFF_DISPATCHER_TYPE_ID,
 			0,
+			FD_HANDOFF_DIAG_DISPATCHER_ACCEPT,
+			1,
 		)
-
-		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
-		testing.expect(t, listener.hand_offered, "listener should successfully initiate handoff")
-		testing.expect(
+		client_fd, client_fd_found := shard_diagnostic_read(
+			shard_1,
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
+			0,
+			FD_HANDOFF_DIAG_DISPATCHER_CLIENT_FD,
+		)
+		testing.expect(t, client_fd_found, "dispatcher client-fd diagnostic not found")
+		testing.expect(t, client_fd != u64(FD_HANDLE_NONE), "dispatcher should receive adopted FD")
+		shard_test_diagnostic_expect_u64(
 			t,
-			dispatcher.received_accept,
-			"dispatcher should receive injected accept completion",
+			shard_1,
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
+			0,
+			FD_HANDOFF_DIAG_DISPATCHER_PEER_PORT,
+			u64(9999),
 		)
-		testing.expect(
-			t,
-			dispatcher.client_fd != FD_HANDLE_NONE,
-			"dispatcher should receive adopted FD",
-		)
-		testing.expect_value(t, dispatcher.peer_port, u16(9999))
 		testing.expect_value(
 			t,
-			sim.shards[0].handoff_table.free_count,
-			sim.shards[0].handoff_table.entry_count,
+			shard_0.handoff_table.free_count,
+			shard_0.handoff_table.entry_count,
 		)
 	}
 
@@ -288,12 +319,14 @@ when TINA_SIMULATION_MODE {
 		sim.shards[1].reactor.backend.config.delay_range_ticks = {64, 64}
 		simulator_run(&sim)
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(
+		shard_test_diagnostic_expect_u64(
+			t,
 			&sim.shards[0],
 			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
+			FD_HANDOFF_DIAG_LISTENER_RESULT,
+			u64(FD_Handoff_Result.ok),
 		)
-		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
 		testing.expect_value(t, sim.shards[0].counters.handoff_rejects, u64(1))
 		testing.expect_value(
 			t,
@@ -398,37 +431,49 @@ when TINA_SIMULATION_MODE {
 			scheduler_tick(&sim.shards[1])
 		}
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(
-			&sim.shards[0],
+		shard_0 := &sim.shards[0]
+		shard_1 := &sim.shards[1]
+
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard_0,
 			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
+			FD_HANDOFF_DIAG_LISTENER_RESULT,
+			u64(FD_Handoff_Result.ok),
 		)
-		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
-			&sim.shards[1],
-			FD_HANDOFF_DISPATCHER_TYPE_ID,
-			0,
-		)
-
-		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
 		// The critical assertion: even though the source observed a timeout,
 		// the destination must still successfully adopt the socket from the
 		// delayed OFFER. If this fails, the offered FD was closed prematurely.
-		testing.expect(
+		shard_test_diagnostic_expect_u64(
 			t,
-			dispatcher.received_accept,
-			"late OFFER must still be adoptable after source timeout",
+			shard_1,
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
+			0,
+			FD_HANDOFF_DIAG_DISPATCHER_ACCEPT,
+			1,
 		)
-		testing.expect(
+		client_fd, client_fd_found := shard_diagnostic_read(
+			shard_1,
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
+			0,
+			FD_HANDOFF_DIAG_DISPATCHER_CLIENT_FD,
+		)
+		testing.expect(t, client_fd_found, "dispatcher client-fd diagnostic not found")
+		testing.expect(t, client_fd != u64(FD_HANDLE_NONE), "dispatcher should receive adopted FD")
+		shard_test_diagnostic_expect_u64(
 			t,
-			dispatcher.client_fd != FD_HANDLE_NONE,
-			"dispatcher should receive adopted FD",
+			shard_1,
+			FD_HANDOFF_DISPATCHER_TYPE_ID,
+			0,
+			FD_HANDOFF_DIAG_DISPATCHER_PEER_PORT,
+			u64(9999),
 		)
-		testing.expect_value(t, dispatcher.peer_port, u16(9999))
-		testing.expect_value(t, sim.shards[0].counters.handoff_timeouts, u64(1))
+		testing.expect_value(t, shard_0.counters.handoff_timeouts, u64(1))
 		testing.expect_value(
 			t,
-			sim.shards[0].handoff_table.free_count,
-			sim.shards[0].handoff_table.entry_count,
+			shard_0.handoff_table.free_count,
+			shard_0.handoff_table.entry_count,
 		)
 	}
 
@@ -520,28 +565,31 @@ when TINA_SIMULATION_MODE {
 			scheduler_tick(&sim.shards[1])
 		}
 
-		listener := cast(^FDHandoffListener)_get_isolate_ptr(
-			&sim.shards[0],
+		shard_0 := &sim.shards[0]
+		shard_1 := &sim.shards[1]
+
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard_0,
 			FD_HANDOFF_LISTENER_TYPE_ID,
 			0,
+			FD_HANDOFF_DIAG_LISTENER_RESULT,
+			u64(FD_Handoff_Result.ok),
 		)
-		dispatcher := cast(^FDHandoffDispatcher)_get_isolate_ptr(
-			&sim.shards[1],
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard_1,
 			FD_HANDOFF_DISPATCHER_TYPE_ID,
 			0,
+			FD_HANDOFF_DIAG_DISPATCHER_ACCEPT,
+			1,
 		)
-		testing.expect_value(t, listener.handoff_result, FD_Handoff_Result.ok)
-		testing.expect(
-			t,
-			dispatcher.received_accept,
-			"dispatcher should still receive adopted socket before timeout",
-		)
-		testing.expect_value(t, sim.shards[0].counters.handoff_timeouts, u64(1))
-		testing.expect_value(t, sim.shards[0].counters.handoff_rejects, u64(0))
+		testing.expect_value(t, shard_0.counters.handoff_timeouts, u64(1))
+		testing.expect_value(t, shard_0.counters.handoff_rejects, u64(0))
 		testing.expect_value(
 			t,
-			sim.shards[0].handoff_table.free_count,
-			sim.shards[0].handoff_table.entry_count,
+			shard_0.handoff_table.free_count,
+			shard_0.handoff_table.entry_count,
 		)
 	}
 }

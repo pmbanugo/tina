@@ -18,8 +18,8 @@ when TINA_SIMULATION_MODE {
 				for slot in 0 ..< slot_count {
 					if shard.metadata[type_id].inbox_count[slot] > 0 do return false
 					if shard.metadata[type_id].io_operation_kind[slot] != .None do return false
-					if shard.metadata[type_id].state[slot] == .Runnable do return false
-					if shard.metadata[type_id].state[slot] == .Wait_Io do return false
+					if shard.metadata[type_id]._state[slot] == .Runnable do return false
+					if shard.metadata[type_id]._state[slot] == .Wait_Io do return false
 				}
 			}
 

@@ -466,10 +466,16 @@ test_on_child_exit_does_not_restart_during_process_shutdown :: proc(t: ^testing.
 		children              = children,
 	}
 
-	shard := new(Shard)
-	defer free(shard)
-	shard.supervision_groups = make([]Supervision_Group, 1)
-	defer delete(shard.supervision_groups)
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count              = 2,
+			slot_counts             = {0, 0},
+			subsystems              = {.Metadata, .Supervision},
+			supervision_group_count = 1,
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	group := &shard.supervision_groups[0]
 	group.group_id = 0

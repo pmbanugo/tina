@@ -379,7 +379,7 @@ _advance_timers :: proc(
 					   int(target_slot) < len(shard.metadata[target_type]) &&
 					   shard.metadata[target_type][target_slot].generation == target_gen {
 						soa_meta := shard.metadata[target_type]
-						if soa_meta[target_slot].state == .Wait_Io {
+						if soa_meta[target_slot]._state == .Wait_Io {
 							soa_meta[target_slot].io_sequence += 1
 							_slot_set_state(shard, target_type, target_slot, .Runnable)
 						}
@@ -690,7 +690,7 @@ test_renewable_deadline_wakes_waiting_for_io_target :: proc(t: ^testing.T) {
 			_advance_timers(shard)
 
 			soa_meta := shard.metadata[extract_type_id(state.handle)]
-			state.target_state = soa_meta[extract_slot(state.handle)].state
+			state.target_state = soa_meta[extract_slot(state.handle)]._state
 			state.target_io_sequence = soa_meta[extract_slot(state.handle)].io_sequence
 
 			timer_release(wheel, timer_handle)

@@ -44,7 +44,6 @@ Reactor :: struct {
 	staging_pool:        IO_Slot_Pool,    // For claim-based sends (Isolate writes here)
 	pending_count:       u16,
 	io_in_flight_count:  u32,
-	_padding:            [2]u8,
 }
 
 // Initialize the Reactor with memory carved from the Grand Arena.
@@ -58,8 +57,18 @@ reactor_init :: proc(
 	reactor.pending_count = 0
 	reactor.io_in_flight_count = 0
 	fd_table_init(&reactor.fd_table, fd_backing)
-	io_slot_pool_init(&reactor.receive_pool, receive_pool_config.backing_memory, receive_pool_config.slot_size, receive_pool_config.slot_count)
-	io_slot_pool_init(&reactor.staging_pool, staging_pool_config.backing_memory, staging_pool_config.slot_size, staging_pool_config.slot_count)
+	io_slot_pool_init(
+		&reactor.receive_pool,
+		receive_pool_config.backing_memory,
+		receive_pool_config.slot_size,
+		receive_pool_config.slot_count,
+	)
+	io_slot_pool_init(
+		&reactor.staging_pool,
+		staging_pool_config.backing_memory,
+		staging_pool_config.slot_size,
+		staging_pool_config.slot_count,
+	)
 
 	backend_config := config
 	backend_config.backing_memory_base = raw_data(receive_pool_config.backing_memory)
@@ -72,7 +81,37 @@ reactor_init :: proc(
 	return .None
 }
 
+@(private = "package")
+reactor_init_tina_owned :: proc(
+	reactor: ^Reactor,
+	config: Backend_Config,
+	fd_backing: []FD_Entry,
+	receive_pool_config: IO_Slot_Pool_Config,
+	staging_pool_config: IO_Slot_Pool_Config,
+) -> Backend_Error {
+	error := reactor_init(reactor, config, fd_backing, receive_pool_config, staging_pool_config)
+	if error != .None do return error
+
+	when TINA_ASAN_POISONING {
+		if backend_recv_uses_provided_buffers(&reactor.backend) {
+			_sanitizer_address_poison_io_pool_slots(&reactor.receive_pool)
+		} else {
+			for index in u16(0) ..< reactor.receive_pool.slot_count {
+				_sanitizer_address_poison_io_slot_payload(&reactor.receive_pool, IO_Slot_Index(index))
+			}
+		}
+		for index in u16(0) ..< reactor.staging_pool.slot_count {
+			_sanitizer_address_poison_io_slot_payload(&reactor.staging_pool, IO_Slot_Index(index))
+		}
+	}
+	return .None
+}
+
 reactor_deinit :: proc(reactor: ^Reactor) {
+	when TINA_ASAN_POISONING {
+		_sanitizer_address_unpoison_io_pool_slots(&reactor.receive_pool)
+		_sanitizer_address_unpoison_io_pool_slots(&reactor.staging_pool)
+	}
 	backend_deinit(&reactor.backend)
 	reactor.pending_count = 0
 	reactor.io_in_flight_count = 0
@@ -457,8 +496,8 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 		// a peer's pending op) has a matching generation → classified live
 		// and dispatched to the handler with result = -ECANCELED.
 		is_live :=
-			soa_meta[slot_index].state != .Unallocated &&
-			soa_meta[slot_index].state != .Pending_IO_Reuse &&
+			soa_meta[slot_index]._state != .Unallocated &&
+			soa_meta[slot_index]._state != .Pending_IO_Reuse &&
 			u8(soa_meta[slot_index].generation) == token_gen &&
 			soa_meta[slot_index].io_sequence == token_seq
 
@@ -470,7 +509,7 @@ reactor_collect_completions :: proc(reactor: ^Reactor, shard: ^Shard, timeout_ns
 			)
 			_reactor_completion_close_on_completion(reactor, soa_meta, slot_index)
 
-			if soa_meta[slot_index].state == .Pending_IO_Reuse {
+			if soa_meta[slot_index]._state == .Pending_IO_Reuse {
 				soa_meta[slot_index].io_operation_kind = .None
 				soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 				soa_meta[slot_index].io_fd = FD_HANDLE_NONE
@@ -566,9 +605,9 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 			flush_affinity := io_operation_pool_affinity(flush_operation_kind)
 			switch flush_affinity {
 			case .Receive:
-				io_slot_pool_free(&reactor.receive_pool, buffer_index)
+				_reactor_receive_pool_free(reactor, buffer_index)
 			case .Staging:
-				io_slot_pool_free(&reactor.staging_pool, buffer_index)
+				_reactor_staging_pool_free(reactor, buffer_index)
 			case .None:
 				// No pool slot — nothing to free
 			}
@@ -608,7 +647,13 @@ reactor_flush_submissions_if_needed :: proc(reactor: ^Reactor, shard: ^Shard) {
 // accurate regardless of the caller's submission path.
 @(private, require_results)
 _reactor_alloc_receive_slot :: proc(reactor: ^Reactor, shard: ^Shard) -> (IO_Slot_Index, IO_Error) {
-	index, error := io_slot_pool_alloc_unzeroed(&reactor.receive_pool)
+	index: IO_Slot_Index
+	error: IO_Slot_Pool_Error
+	when TINA_ASAN_POISONING {
+		index, error = io_slot_pool_alloc_unzeroed_tina_owned(&reactor.receive_pool)
+	} else {
+		index, error = io_slot_pool_alloc_unzeroed(&reactor.receive_pool)
+	}
 	if error != .None {
 		shard.counters.io_receive_exhaustions += 1
 		return IO_SLOT_INDEX_NONE, IO_ERR_RESOURCE_EXHAUSTED
@@ -635,7 +680,7 @@ _reactor_resubmit_recv_after_no_buffer :: proc(
 	// the invariant self-documenting (and safe under (possible?) future
 	// multi-threaded completion handling).
 	// A non-Wait_Io slot must not be re-submitted.
-	if soa_meta[slot_index].state != .Wait_Io do return
+	if soa_meta[slot_index]._state != .Wait_Io do return
 
 	fd_handle := soa_meta[slot_index].io_fd
 	if fd_handle == FD_HANDLE_NONE do return
@@ -698,7 +743,7 @@ reactor_submit_io :: proc(
 	// already in WAITING_FOR_IO. The io_sequence mechanism assumes at most one
 	// in-flight operation per Isolate — if two were in flight, bumping the
 	// sequence would only invalidate one, leaving the other to corrupt state.
-	if meta.state == .Wait_Io {
+	if meta._state == .Wait_Io {
 		if _, is_close := io_op.(IoOp_Close); is_close {
 			// A close supersedes the abandoned in-flight operation. Bump once to
 			// stale the older completion, then again below for the new close
@@ -1164,25 +1209,26 @@ test_close_submission_supersedes_waiting_io_sequence :: proc(t: ^testing.T) {
 	reactor_init(reactor, config, fd_backing[:], IO_Slot_Pool_Config{buffer_backing[:], 1024, 1}, IO_Slot_Pool_Config{staging_backing[:], 1024, 1})
 	defer {reactor_deinit(reactor); free(reactor)}
 
-	shard := new(Shard)
-	defer free(shard)
-	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
-	defer delete(shard.metadata)
-	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata[1])
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count  = 2,
+			slot_counts = {0, 1},
+			subsystems  = {.Metadata},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
 
 	owner := make_handle(0, 1, 0, 1)
-	meta := &shard.metadata[1][0]
-	meta.generation = 1
-	meta.state = .Wait_Io
-	meta.io_sequence = 7
+	test_shard_slot_activate(fixture, owner, .Wait_Io)
+	shard.metadata[1][0].io_sequence = 7
 
 	fd_handle, sock_error := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, sock_error, Reactor_Socket_Error.None)
 
 	io_error := reactor_submit_io(reactor, shard, owner, IoOp_Close {fd = fd_handle})
 	testing.expect_value(t, io_error, IO_ERR_NONE)
-	testing.expect_value(t, meta.io_sequence, u8(9))
+	testing.expect_value(t, shard.metadata[1][0].io_sequence, u8(9))
 	testing.expect_value(t, reactor.pending_count, u16(1))
 	#partial switch close_op in reactor.pending_submissions[0].operation {
 	case Submission_Op_Close:
@@ -1218,15 +1264,16 @@ test_fixed_file_index_set_on_recv :: proc(t: ^testing.T) {
 	testing.expect_value(t, sock_error, Reactor_Socket_Error.None)
 	testing.expect(t, fd_handle != FD_HANDLE_NONE, "Valid FD handle expected")
 
-	// Build a minimal Shard stub with metadata for type_id=1
-	shard := new(Shard)
-	defer free(shard)
-	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
-	defer delete(shard.metadata)
-	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata[1])
-	shard.metadata[1][0].generation = 1
-	shard.metadata[1][0].state = .Runnable
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count  = 2,
+			slot_counts = {0, 1},
+			subsystems  = {.Metadata},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+	test_shard_slot_activate(fixture, owner, .Runnable)
 
 	// Submit an IoOp_Recv
 	io_error := reactor_submit_io(
@@ -1268,14 +1315,16 @@ test_fixed_file_index_excluded_for_close :: proc(t: ^testing.T) {
 	fd_handle, sock_error := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, sock_error, Reactor_Socket_Error.None)
 
-	shard := new(Shard)
-	defer free(shard)
-	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
-	defer delete(shard.metadata)
-	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata[1])
-	shard.metadata[1][0].generation = 1
-	shard.metadata[1][0].state = .Runnable
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count  = 2,
+			slot_counts = {0, 1},
+			subsystems  = {.Metadata},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+	test_shard_slot_activate(fixture, owner, .Runnable)
 
 	// Submit a close — fixed_file_index must be NONE (safety invariant)
 	io_error := reactor_submit_io(reactor, shard, owner, IoOp_Close{fd = fd_handle})
@@ -1307,14 +1356,16 @@ test_close_submission_preserves_fd_handle_for_completion_identity :: proc(t: ^te
 	fd_handle, sock_error := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	testing.expect_value(t, sock_error, Reactor_Socket_Error.None)
 
-	shard := new(Shard)
-	defer free(shard)
-	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
-	defer delete(shard.metadata)
-	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata[1])
-	shard.metadata[1][0].generation = 1
-	shard.metadata[1][0].state = .Runnable
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count  = 2,
+			slot_counts = {0, 1},
+			subsystems  = {.Metadata},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+	test_shard_slot_activate(fixture, owner, .Runnable)
 
 	io_error := reactor_submit_io(reactor, shard, owner, IoOp_Close{fd = fd_handle})
 	testing.expect_value(t, io_error, IO_ERR_NONE)
@@ -1352,14 +1403,16 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	fd_handle_a, _ := reactor_control_socket(reactor, owner, .AF_INET, .STREAM, .TCP)
 	slot_a := fd_handle_index(fd_handle_a)
 
-	shard := new(Shard)
-	defer free(shard)
-	shard.metadata = make([]#soa[]Isolate_Metadata, 2)
-	defer delete(shard.metadata)
-	shard.metadata[1] = make(#soa[]Isolate_Metadata, 1)
-	defer delete(shard.metadata[1])
-	shard.metadata[1][0].generation = 1
-	shard.metadata[1][0].state = .Runnable
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count  = 2,
+			slot_counts = {0, 1},
+			subsystems  = {.Metadata},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+	test_shard_slot_activate(fixture, owner, .Runnable)
 
 	// 1. Close fd_handle_a — frees slot back to free list
 	io_err1 := reactor_submit_io(reactor, shard, owner, IoOp_Close{fd = fd_handle_a})
@@ -1374,10 +1427,11 @@ test_fixed_file_close_then_reuse_ordering :: proc(t: ^testing.T) {
 	slot_b := fd_handle_index(fd_handle_b)
 	testing.expect_value(t, slot_b, slot_a) // LIFO reuse: same slot index
 
-	// 3. Submit recv on the new socket — should use the reused slot index
-	shard.metadata[1][0].io_sequence += 1
-	shard.metadata[1][0].generation += 1 // bump to match new handle
-	owner_b := make_handle(0, 1, 0, u32(shard.metadata[1][0].generation))
+	// 3. Simulate handle reuse: release the isolate slot and reactivate with
+	// generation 2, then hand off the new FD and submit recv.
+	test_shard_slot_release(fixture, 1, 0)
+	owner_b := make_handle(0, 1, 0, 2)
+	test_shard_slot_activate(fixture, owner_b, .Runnable)
 	fd_table_handoff(&reactor.fd_table, fd_handle_b, owner_b, .Full)
 
 	io_err2 := reactor_submit_io(
@@ -1398,7 +1452,7 @@ emergency_print_stalled_io_snapshot :: proc "contextless" (shard: ^Shard) {
 	for type_index in 0 ..< len(shard.metadata) {
 		soa_meta := shard.metadata[type_index]
 		for slot_index in 0 ..< len(soa_meta) {
-			if soa_meta[slot_index].state == .Wait_Io {
+			if soa_meta[slot_index]._state == .Wait_Io {
 				buf: [128]u8
 				n := 0
 				n = _sig_append_str(buf[:], n, "[STALLED IO] Shard: ")
@@ -1440,19 +1494,19 @@ when TINA_SIMULATION_MODE {
 		defer {reactor_deinit(reactor); free(reactor)}
 
 		// 2. Setup Mock Shard Metadata
-		shard := new(Shard)
-		defer free(shard)
-		shard.metadata = make([]#soa[]Isolate_Metadata, 1)
-		defer delete(shard.metadata)
-		shard.metadata[0] = make(#soa[]Isolate_Metadata, 1)
-		defer delete(shard.metadata[0])
-
-		meta := &shard.metadata[0][0]
-		meta.generation = 1
-		meta.io_sequence = 1
-		meta.state = .Runnable
+		fixture := test_shard_fixture_init(
+			Test_Shard_Spec{
+				type_count  = 1,
+				slot_counts = {1},
+				subsystems  = {.Metadata},
+			},
+		)
+		defer test_shard_fixture_deinit(fixture)
+		shard := &fixture.shard
 
 		owner := make_handle(0, 0, 0, 1)
+		test_shard_slot_activate(fixture, owner, .Runnable)
+		shard.metadata[0][0].io_sequence = 1
 
 		// 3. Anchor the I/O: Create a UDP socket. It will block forever on Recv.
 		fd, sock_error := reactor_control_socket(reactor, owner, .AF_INET, .DGRAM, .UDP)
@@ -1480,8 +1534,8 @@ when TINA_SIMULATION_MODE {
 		reactor_flush_submissions(reactor, shard)
 
 		// 5. Simulate the Timer Wake (The ADR Structural Guarantee)
-		meta.io_sequence += 1
-		meta.state = .Runnable
+		shard.metadata[0][0].io_sequence += 1
+		_slot_set_state_no_dispatch(shard, 0, 0, .Runnable)
 
 		// 6. Simulate Isolate closing the socket as a timeout response.
 		// This triggers the kqueue sweep, the io_uring cancel, or the IOCP abort.

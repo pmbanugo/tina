@@ -64,10 +64,18 @@ _vectored_exception_handler :: proc "system" (exception_info: ^win.EXCEPTION_POI
 test_windows_veh_exception_recovery :: proc(t: ^testing.T) {
 	os_signals_init_process()
 
-	shard := new(Shard)
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count  = 1,
+			slot_counts = {0},
+			subsystems  = {.Metadata},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+
+	shard := &fixture.shard
 	shard_old := g_current_shard_pointer
 	defer g_current_shard_pointer = shard_old
-	defer free(shard)
 	g_current_shard_pointer = shard
 
 	result := os_trap_save(&shard.trap_environment_outer)

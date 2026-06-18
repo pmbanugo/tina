@@ -492,8 +492,24 @@ ctx_self_handle :: #force_inline proc() -> Isolate_Handle {
 	return frame.isolate_handle
 }
 
+when TINA_SIMULATION_MODE {
+	// Write a scalar diagnostic fact for the currently executing isolate.
+	// This is a simulation-only control-plane observation API; handlers use it
+	// to record facts while payload memory is live so tests can assert on dense
+	// scalar records instead of reading freed isolate slots.
+	ctx_test_diagnostic_write_u64 :: #force_inline proc(field_id: Diagnostic_Field_Id, value: u64) {
+		shard, frame := _current_isolate_turn_frame_require_handle()
+		shard_diagnostic_write(
+			shard,
+			frame.isolate_type_id,
+			frame.isolate_slot_index,
+			field_id,
+			value,
+		)
+	}
+}
+
 // Acquire a pre-allocated timer slot. Returns a handle.
-// Strictly zero-dynamic allocation.
 @(require_results)
 ctx_timer_acquire :: #force_inline proc() -> Timer_Handle {
 	shard, frame := _current_isolate_turn_frame_require_handle()
@@ -561,7 +577,13 @@ ctx_working_arena_bytes :: #force_inline proc() -> []u8 {
 @(require_results)
 ctx_transfer_alloc :: #force_inline proc() -> Transfer_Alloc_Result {
 	shard, _ := _current_isolate_turn_frame()
-	index, error := io_slot_pool_alloc(&shard.transfer_pool)
+	index: IO_Slot_Index
+	error: IO_Slot_Pool_Error
+	when TINA_ASAN_POISONING {
+		index, error = io_slot_pool_alloc_tina_owned(&shard.transfer_pool)
+	} else {
+		index, error = io_slot_pool_alloc(&shard.transfer_pool)
+	}
 	if error != .None {
 		shard.counters.transfer_exhaustions += 1
 		return Transfer_Alloc_Error.Pool_Exhausted
@@ -774,7 +796,13 @@ ctx_claim_send_slot :: #force_inline proc() -> []u8 {
 	if _staging_claim_read(frame) != IO_SLOT_INDEX_NONE {
 		return nil // Already claimed
 	}
-	index, error := io_slot_pool_alloc(&shard.reactor.staging_pool)
+	index: IO_Slot_Index
+	error: IO_Slot_Pool_Error
+	when TINA_ASAN_POISONING {
+		index, error = io_slot_pool_alloc_tina_owned(&shard.reactor.staging_pool)
+	} else {
+		index, error = io_slot_pool_alloc(&shard.reactor.staging_pool)
+	}
 	if error != .None {
 		shard.counters.io_staging_exhaustions += 1
 		return nil
@@ -954,7 +982,11 @@ ctx_getsockopt :: #force_inline proc(
 
 @(private = "package")
 _transfer_pool_free :: #force_inline proc(shard: ^Shard, index: IO_Slot_Index) {
-	io_slot_pool_free(&shard.transfer_pool, index)
+	when TINA_ASAN_POISONING {
+		io_slot_pool_free_tina_owned(&shard.transfer_pool, index)
+	} else {
+		io_slot_pool_free(&shard.transfer_pool, index)
+	}
 	shard.transfer_generations[index] += 1
 	if shard.transfer_generations[index] == 0 do shard.transfer_generations[index] = 1
 }

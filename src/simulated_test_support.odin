@@ -16,7 +16,8 @@ when TINA_SIMULATION_MODE {
 		log_ring_size:             int,
 		supervision_groups_max:    int,
 		scratch_arena_size:        int,
-		default_ring_size:         u32,
+		default_ring_size:                 u32,
+		diagnostic_record_count_per_shard: int,
 	}
 
 	SIM_TEST_SPEC_DEFAULTS :: Sim_Test_Spec_Options {
@@ -35,6 +36,7 @@ when TINA_SIMULATION_MODE {
 		supervision_groups_max = 4,
 		scratch_arena_size = 8192,
 		default_ring_size = 16,
+		diagnostic_record_count_per_shard = 64,
 	}
 
 	@(private = "package")
@@ -83,6 +85,11 @@ when TINA_SIMULATION_MODE {
 		if options.supervision_groups_max != 0 do opts.supervision_groups_max = options.supervision_groups_max
 		if options.scratch_arena_size != 0 do opts.scratch_arena_size = options.scratch_arena_size
 		if options.default_ring_size != 0 do opts.default_ring_size = options.default_ring_size
+		if options.diagnostic_record_count_per_shard != 0 do opts.diagnostic_record_count_per_shard = options.diagnostic_record_count_per_shard
+
+		if sim_config.diagnostic_record_count_per_shard == 0 {
+			sim_config.diagnostic_record_count_per_shard = u32(opts.diagnostic_record_count_per_shard)
+		}
 
 		return SystemSpec {
 			shard_count = u8(len(shard_specs)),

@@ -125,8 +125,8 @@ when TINA_SIMULATION_MODE {
 
 		simulator_run(&sim)
 
-		testing.expect_value(t, shard.metadata[COORDINATOR_TYPE_ID].state[0], Isolate_State.Wait_Message)
-		testing.expect_value(t, shard.metadata[PING_TYPE_ID].state[0], Isolate_State.Unallocated)
+		testing.expect_value(t, shard.metadata[COORDINATOR_TYPE_ID]._state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[PING_TYPE_ID]._state[0], Isolate_State.Unallocated)
 		testing.expect_value(t, shard.supervision_groups[0].children_handles[1], ISOLATE_HANDLE_NONE)
 	}
 
@@ -199,9 +199,9 @@ when TINA_SIMULATION_MODE {
 
 		simulator_run(&sim)
 
-		testing.expect_value(t, shard.metadata[COORDINATOR_TYPE_ID].state[0], Isolate_State.Wait_Message)
-		testing.expect_value(t, shard.metadata[PING_TYPE_ID].state[0], Isolate_State.Wait_Message)
-		testing.expect_value(t, shard.metadata[PONG_TYPE_ID].state[0], Isolate_State.Unallocated)
+		testing.expect_value(t, shard.metadata[COORDINATOR_TYPE_ID]._state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[PING_TYPE_ID]._state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[PONG_TYPE_ID]._state[0], Isolate_State.Unallocated)
 		testing.expect_value(t, shard.supervision_groups[0].children_handles[2], ISOLATE_HANDLE_NONE)
 	}
 
@@ -324,11 +324,11 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		// Exiter should be torn down (temporary + normal exit = no restart)
-		exiter_state := shard.metadata[EXITER_TYPE_ID].state[0]
+		exiter_state := shard.metadata[EXITER_TYPE_ID]._state[0]
 		testing.expect_value(t, exiter_state, Isolate_State.Unallocated)
 
 		// Bystander must still be alive — no escalation should have occurred
-		bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[0]
+		bystander_state := shard.metadata[BYSTANDER_TYPE_ID]._state[0]
 		testing.expect_value(t, bystander_state, Isolate_State.Wait_Message)
 	}
 
@@ -479,9 +479,9 @@ when TINA_SIMULATION_MODE {
 		)
 		testing.expect_value(t, extract_slot(root.children_handles[0]), Isolate_Slot_Index(1))
 
-		subgroup_bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[0]
-		dynamic_bystander_state := shard.metadata[BYSTANDER_TYPE_ID].state[1]
-		exiter_state := shard.metadata[EXITER_TYPE_ID].state[0]
+		subgroup_bystander_state := shard.metadata[BYSTANDER_TYPE_ID]._state[0]
+		dynamic_bystander_state := shard.metadata[BYSTANDER_TYPE_ID]._state[1]
+		exiter_state := shard.metadata[EXITER_TYPE_ID]._state[0]
 
 		testing.expect_value(t, subgroup_bystander_state, Isolate_State.Wait_Message)
 		testing.expect_value(t, dynamic_bystander_state, Isolate_State.Wait_Message)

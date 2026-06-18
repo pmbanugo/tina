@@ -141,6 +141,80 @@ io_slot_pool_reset :: #force_inline proc(pool: ^IO_Slot_Pool) {
 }
 
 @(private = "package")
+io_slot_pool_init_tina_owned :: proc(
+	pool: ^IO_Slot_Pool,
+	backing_memory: []u8,
+	slot_size: u32,
+	slot_count: u16,
+) {
+	io_slot_pool_init(pool, backing_memory, slot_size, slot_count)
+	for index in 0 ..< pool.slot_count {
+		_sanitizer_address_poison_io_slot_payload(pool, IO_Slot_Index(index))
+	}
+}
+
+@(private = "package")
+io_slot_pool_alloc_tina_owned :: #force_inline proc(
+	pool: ^IO_Slot_Pool,
+) -> (IO_Slot_Index, IO_Slot_Pool_Error) {
+	if pool.free_head == IO_SLOT_INDEX_NONE {
+		return IO_SLOT_INDEX_NONE, .Empty
+	}
+
+	index := pool.free_head
+	slot_pointer := _io_slot_pool_pointer(pool, index)
+
+	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
+	_sanitizer_address_unpoison_io_slot(pool, index)
+	pool.free_count -= 1
+
+	mem.zero(slot_pointer, int(pool.slot_size))
+
+	return index, .None
+}
+
+@(private = "package")
+io_slot_pool_alloc_unzeroed_tina_owned :: #force_inline proc(
+	pool: ^IO_Slot_Pool,
+) -> (IO_Slot_Index, IO_Slot_Pool_Error) {
+	if pool.free_head == IO_SLOT_INDEX_NONE {
+		return IO_SLOT_INDEX_NONE, .Empty
+	}
+	index := pool.free_head
+	slot_pointer := _io_slot_pool_pointer(pool, index)
+	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
+	_sanitizer_address_unpoison_io_slot(pool, index)
+	pool.free_count -= 1
+	return index, .None
+}
+
+@(private = "package")
+io_slot_pool_free_tina_owned :: #force_inline proc(pool: ^IO_Slot_Pool, index: IO_Slot_Index) {
+	assert(u16(index) < pool.slot_count, "IO_Slot Pool index out of bounds")
+
+	slot_pointer := _io_slot_pool_pointer(pool, index)
+
+	(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
+	pool.free_head = index
+	pool.free_count += 1
+	_sanitizer_address_poison_io_slot_payload(pool, index)
+}
+
+@(private = "package")
+io_slot_pool_reset_tina_owned :: #force_inline proc(pool: ^IO_Slot_Pool) {
+	pool.free_count = pool.slot_count
+	pool.free_head = IO_SLOT_INDEX_NONE
+	for i := int(pool.slot_count) - 1; i >= 0; i -= 1 {
+		slot_index := IO_Slot_Index(i)
+		_sanitizer_address_unpoison_io_slot(pool, slot_index)
+		slot_pointer := _io_slot_pool_pointer(pool, slot_index)
+		(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
+		pool.free_head = slot_index
+		_sanitizer_address_poison_io_slot_payload(pool, slot_index)
+	}
+}
+
+@(private = "package")
 _io_slot_pool_pointer :: #force_inline proc "contextless" (pool: ^IO_Slot_Pool, index: IO_Slot_Index) -> [^]u8 {
 	offset := u32(index) << pool.slot_shift
 	return raw_data(pool.backing_memory[offset:])

@@ -92,13 +92,12 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		shard := &sim.shards[0]
-		ping_pointer := _get_isolate_ptr(shard, PING_TYPE_ID, 0)
-		ping_memory := cast(^PingIsolate)ping_pointer
+		ping_count, _ := shard_diagnostic_read(shard, PING_TYPE_ID, 0, PING_DIAGNOSTIC_COUNT)
 
 		return Ping_Pong_Run_Result {
-			ping_state = shard.metadata[PING_TYPE_ID].state[0],
-			pong_state = shard.metadata[PONG_TYPE_ID].state[0],
-			ping_count = ping_memory.count,
+			ping_state = shard.metadata[PING_TYPE_ID]._state[0],
+			pong_state = shard.metadata[PONG_TYPE_ID]._state[0],
+			ping_count = u32(ping_count),
 			io_stale_completions = shard.counters.io_stale_completions,
 			ring_full_drops = shard.counters.ring_full_drops,
 			quarantine_drops = shard.counters.quarantine_drops,
@@ -212,13 +211,12 @@ when TINA_SIMULATION_MODE {
 			simulator_run(&sim)
 
 			shard := &sim.shards[0]
-			ping_pointer := _get_isolate_ptr(shard, PING_TYPE_ID, 0)
-			ping_memory := cast(^PingIsolate)ping_pointer
+			ping_count, _ := shard_diagnostic_read(shard, PING_TYPE_ID, 0, PING_DIAGNOSTIC_COUNT)
 
 			return Ping_Pong_Run_Result {
-				ping_state = shard.metadata[PING_TYPE_ID].state[0],
-				pong_state = shard.metadata[PONG_TYPE_ID].state[0],
-				ping_count = ping_memory.count,
+				ping_state = shard.metadata[PING_TYPE_ID]._state[0],
+				pong_state = shard.metadata[PONG_TYPE_ID]._state[0],
+				ping_count = u32(ping_count),
 				io_stale_completions = shard.counters.io_stale_completions,
 				ring_full_drops = shard.counters.ring_full_drops,
 				quarantine_drops = shard.counters.quarantine_drops,

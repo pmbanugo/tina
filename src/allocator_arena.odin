@@ -247,49 +247,58 @@ hydrate_shard :: proc(
 	// 3. Allocate Type-Specific Data (Inner slices)
 	for t, i in spec.types {
 		// Apply defaults at startup
-		desc := t
-		type_index := int(u16(desc.id))
+		type_descriptor := t
+		type_index := int(type_descriptor.id)
 		assert(type_index == i, "IsolateTypeDescriptor ids must match dense descriptor index")
-		if desc.budget_weight == 0 do desc.budget_weight = 1
-		if desc.mailbox_capacity == 0 do desc.mailbox_capacity = 256
+		if type_descriptor.budget_weight == 0 do type_descriptor.budget_weight = 1
+		if type_descriptor.mailbox_capacity == 0 do type_descriptor.mailbox_capacity = 256
 
-		shard.type_descriptors[type_index] = desc
+		shard.type_descriptors[type_index] = type_descriptor
 		shard.isolate_free_heads[type_index] = POOL_NONE_INDEX // Initialize
 
-		if desc.slot_count > 0 && desc.stride > 0 {
+		if type_descriptor.slot_count > 0 && type_descriptor.stride > 0 {
 			grand_arena_allocator_set_name(&alloc_data, "Typed_Arena", type_index)
-			shard.isolate_memory[type_index] = make([]u8, desc.slot_count * desc.stride, alloc) or_return
+			shard.isolate_memory[type_index] = make([]u8, type_descriptor.slot_count * type_descriptor.stride, alloc) or_return
 		}
-		if desc.slot_count > 0 {
+		if type_descriptor.slot_count > 0 {
 			grand_arena_allocator_set_name(&alloc_data, "Dispatchable_Slots", type_index)
 			shard.dispatchable_slot_words[type_index] = make(
 				[]u64,
-				_dispatch_word_count(desc.slot_count),
+				_dispatch_word_count(type_descriptor.slot_count),
 				alloc,
 			) or_return
 		}
 
-		aligned_count := _aligned_capacity(desc.slot_count)
+		aligned_count := _aligned_capacity(type_descriptor.slot_count)
 		if aligned_count > 0 {
 			grand_arena_allocator_set_name(&alloc_data, "SOA_Metadata", type_index)
 			shard.metadata[type_index] = make(#soa[]Isolate_Metadata, aligned_count, alloc) or_return
 
 			// Build the intrusive free list for this Type Arena
 			// We iterate backwards so slot 0 is at the head of the free list
-			for slot := int(desc.slot_count) - 1; slot >= 0; slot -= 1 {
+			for slot := int(type_descriptor.slot_count) - 1; slot >= 0; slot -= 1 {
 				shard.metadata[type_index][slot].inbox_head = shard.isolate_free_heads[type_index]
-				shard.metadata[type_index][slot].state = .Unallocated
+				_slot_set_state_bare(shard, Isolate_Type_Id(type_index), Isolate_Slot_Index(slot), .Unallocated,
+					"hydrate_shard bootstrap: no invariants active during memory carving")
 				shard.metadata[type_index][slot].generation = 1 // Enforce ADR rule: generations start at 1
 				shard.isolate_free_heads[type_index] = u32(slot)
 			}
 		}
-		if desc.working_memory_size > 0 {
+		if type_descriptor.working_memory_size > 0 {
 			shard.working_memory[type_index] = grand_arena_alloc_slice(
 				arena,
 				"Working_Memory",
-				desc.slot_count * desc.working_memory_size,
+				type_descriptor.slot_count * type_descriptor.working_memory_size,
 				type_index,
 			) or_return
+		}
+
+		for slot in 0 ..< type_descriptor.slot_count {
+			_sanitizer_address_poison_isolate_slot(
+				shard,
+				Isolate_Type_Id(type_index),
+				Isolate_Slot_Index(slot),
+			)
 		}
 	}
 
@@ -299,7 +308,7 @@ hydrate_shard :: proc(
 		"Message_Pool",
 		spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE,
 	) or_return
-	pool_init(&shard.message_pool, msg_pool_buf, MESSAGE_ENVELOPE_SIZE)
+	pool_init_tina_owned(&shard.message_pool, msg_pool_buf, MESSAGE_ENVELOPE_SIZE)
 	shard.handoff_retry_head = POOL_NONE_INDEX
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
@@ -309,7 +318,7 @@ hydrate_shard :: proc(
 		"Transfer_Buffer_Pool",
 		spec.transfer_slot_count * spec.transfer_slot_size,
 	) or_return
-	io_slot_pool_init(
+	io_slot_pool_init_tina_owned(
 		&shard.transfer_pool,
 		transfer_buf,
 		u32(spec.transfer_slot_size),
@@ -399,7 +408,7 @@ hydrate_shard :: proc(
 		}
 	}
 
-	reactor_error := reactor_init(
+	reactor_error := reactor_init_tina_owned(
 		&shard.reactor,
 		backend_config,
 		fd_buf,
@@ -454,6 +463,9 @@ arena_print_layout :: proc(arena: ^Grand_Arena) {
 }
 
 // === TESTS ===
+// ALLOWLIST_FILE(hydrate_shard_fixture): The tests below exercise the real
+// hydrate_shard production path. They are approved hydrate-shard fixtures,
+// not partial hardcoded Shard fixtures.
 @(test)
 test_grand_arena :: proc(t: ^testing.T) {
 	types := [1]IsolateTypeDescriptor {
@@ -498,6 +510,9 @@ test_grand_arena :: proc(t: ^testing.T) {
 
 	defer os_release_arena_with_guard(arena.base)
 
+	// ALLOWLIST(hydrate_shard_fixture): This test exercises the production
+	// hydrate_shard path itself; the Shard must be allocated separately so
+	// hydration can carve into it.
 	shard := new(Shard)
 	defer free(shard)
 
@@ -562,6 +577,8 @@ test_hydrate_shard_reports_undersized_arena_make_failure :: proc(t: ^testing.T) 
 	init_error := grand_arena_init_from_memory(&arena, undersized_memory, undersized_memory_size)
 	testing.expect_value(t, init_error, mem.Allocator_Error.None)
 
+	// ALLOWLIST(hydrate_shard_fixture): This test intentionally drives
+	// hydrate_shard into an OOM path; the Shard must be stack/heap separate.
 	shard := new(Shard)
 	defer free(shard)
 

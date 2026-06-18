@@ -166,6 +166,20 @@ when TINA_SIMULATION_MODE {
 				fmt.eprintfln("[SIM FATAL] Failed to hydrate Shard %d: %v", i, error)
 				return error
 			}
+
+			// Allocate the simulation-only diagnostic table. Capacity is a
+			// control-plane resource: handlers write scalar facts while payload
+			// memory is live, and tests read them after simulator_run. The table
+			// is intentionally not part of the Grand Arena — it belongs to the
+			// simulator's control-plane allocator.
+			diagnostic_capacity := u32(64)
+			if spec.simulation != nil && spec.simulation.diagnostic_record_count_per_shard != 0 {
+				diagnostic_capacity = spec.simulation.diagnostic_record_count_per_shard
+			}
+			shard.diagnostics.records, error = make([]Diagnostic_Record, diagnostic_capacity, allocator)
+			if error != .None do return error
+			shard.diagnostics.record_count = 0
+
 			sim.shard_count_initialized += 1
 
 			// Wire up watchdog_state_pointer before tree building (ctx_spawn reads it)
@@ -304,9 +318,26 @@ when TINA_SIMULATION_MODE {
 			return
 		}
 
-		for shard_index in 0 ..< sim.shard_count_initialized {
-			reactor_deinit(&sim.shards[shard_index].reactor)
-			delete(sim.shards[shard_index].outbound_control_channels, sim.allocator)
+	for shard_index in 0 ..< sim.shard_count_initialized {
+		reactor_deinit(&sim.shards[shard_index].reactor)
+		_sanitizer_address_unpoison_shard_memory(&sim.shards[shard_index])
+		delete(sim.shards[shard_index].diagnostics.records, sim.allocator)
+		delete(sim.shards[shard_index].outbound_control_channels, sim.allocator)
+	}
+
+		// Partially-hydrated shards: hydration failed after ASan poison was
+		// applied but before shard_count_initialized was incremented. The
+		// backing arena contains poisoned subregions that must be unpoisoned
+		// before the raw bytes are freed. Structured unpoison iteration
+		// would be unsafe on partially-built metadata, so we unpoison
+		// the entire backing allocation as a single raw region.
+		for shard_index in sim.shard_count_initialized ..< len(sim.shard_arena_bytes) {
+			arena_bytes := sim.shard_arena_bytes[shard_index]
+			if len(arena_bytes) > 0 {
+				_sanitizer_address_unpoison_raw(raw_data(arena_bytes), len(arena_bytes))
+				reactor_deinit(&sim.shards[shard_index].reactor)
+				delete(sim.shards[shard_index].outbound_control_channels, sim.allocator)
+			}
 		}
 
 		sim_network_deinit(&sim.network, sim.allocator)

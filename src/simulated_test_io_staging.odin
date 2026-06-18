@@ -40,6 +40,11 @@ when TINA_SIMULATION_MODE {
 
 	StagingNoop :: struct {}
 
+	// Simulation-only diagnostic field IDs for staging observation.
+	STAGING_DIAG_FIRED:        Diagnostic_Field_Id : 0
+	STAGING_DIAG_SEND_RESULT:  Diagnostic_Field_Id : 1
+	STAGING_DIAG_RESULT_CHECK: Diagnostic_Field_Id : 2
+
 	// ----------------------------------------------------------------------------
 	// Test 1: Claim → send-staged → Wait_Io → completion → slot freed exactly once
 	//
@@ -80,6 +85,7 @@ when TINA_SIMULATION_MODE {
 		s := cast(^StagingStager)self
 		if message != nil && message.tag == IO_TAG_SEND_COMPLETE {
 			s.fired = true
+			ctx_test_diagnostic_write_u64(STAGING_DIAG_FIRED, 1)
 			return ISOLATE_TRANSITION_DONE
 		}
 		return ISOLATE_TRANSITION_DONE
@@ -134,8 +140,7 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		shard := &sim.shards[0]
-		stager := cast(^StagingStager)_get_isolate_ptr(shard, STAGING_TYPE_ID, 0)
-		testing.expect(t, stager.fired, "stager should have received SEND_COMPLETE")
+		shard_test_diagnostic_expect_u64(t, shard, STAGING_TYPE_ID, 0, STAGING_DIAG_FIRED, 1)
 
 		stage_pool := &shard.reactor.staging_pool
 		testing.expect_value(t, stage_pool.free_count, stage_pool.slot_count)
@@ -370,6 +375,8 @@ when TINA_SIMULATION_MODE {
 		}{_payload = {0x33}}
 		s.send_result = ctx_io_send(&noop, s.fd, noop._payload[:])
 		s.result_check = true
+		ctx_test_diagnostic_write_u64(STAGING_DIAG_SEND_RESULT, u64(s.send_result))
+		ctx_test_diagnostic_write_u64(STAGING_DIAG_RESULT_CHECK, s.result_check ? 1 : 0)
 
 		// The rejected struct-source send must leave the existing staging claim
 		// under normal turn cleanup. Crash-path reclamation is covered separately
@@ -425,14 +432,19 @@ when TINA_SIMULATION_MODE {
 		simulator_run(&sim)
 
 		shard := &sim.shards[0]
-		isolate_ptr := _get_isolate_ptr(shard, STAGING_TYPE_ID, 0)
-		result_holder := cast(^StagingAlreadyStaged)isolate_ptr
-		testing.expect_value(t, result_holder.result_check, true)
-		testing.expect_value(t, result_holder.send_result, Io_Submit_Result.already_staged)
+		shard_test_diagnostic_expect_u64(t, shard, STAGING_TYPE_ID, 0, STAGING_DIAG_RESULT_CHECK, 1)
+		shard_test_diagnostic_expect_u64(
+			t,
+			shard,
+			STAGING_TYPE_ID,
+			0,
+			STAGING_DIAG_SEND_RESULT,
+			u64(Io_Submit_Result.already_staged),
+		)
 
 		stage_pool := &shard.reactor.staging_pool
 		testing.expect_value(t, stage_pool.free_count, stage_pool.slot_count)
-		testing.expect_value(t, shard.metadata[STAGING_TYPE_ID].state[0], Isolate_State.Wait_Message)
+		testing.expect_value(t, shard.metadata[STAGING_TYPE_ID]._state[0], Isolate_State.Wait_Message)
 
 		fmt.printfln(
 			"\n[TEST SUCCESS] Staging claim is rejected by struct-source helper and reclaimed by turn cleanup. Staging pool: %d/%d free.",
@@ -458,21 +470,17 @@ when TINA_SIMULATION_MODE {
 
 	@(test)
 	test_mass_teardown_preserves_in_flight_pool_slots :: proc(t: ^testing.T) {
-		shard, arena := _make_teardown_test_shard_with_slots(t, 2)
-		defer {
-			reactor_deinit(&shard.reactor)
-			os_release_arena_with_guard(arena.base)
-			free(arena)
-			free(shard)
-		}
+		fixture := _make_teardown_test_shard_with_slots(t, 2)
+		defer test_shard_fixture_deinit(fixture)
+		shard := &fixture.shard
 
 		// Use the same type/slot as the helper provides. Reserve a fresh
 		// receive pool slot for the in-flight case and another for the
 		// completed case so we can check both behaviors.
-		in_flight_index, in_flight_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
+		in_flight_index, in_flight_error := io_slot_pool_alloc_tina_owned(&shard.reactor.receive_pool)
 		testing.expect_value(t, in_flight_error, IO_Slot_Pool_Error.None)
 
-		completed_index, completed_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
+		completed_index, completed_error := io_slot_pool_alloc_tina_owned(&shard.reactor.receive_pool)
 		testing.expect_value(t, completed_error, IO_Slot_Pool_Error.None)
 
 		receive_pool := &shard.reactor.receive_pool
@@ -486,14 +494,14 @@ when TINA_SIMULATION_MODE {
 		// Slot 0: in-flight recv. io_operation_kind is set at
 		// submission (the regression), but IO_Completion_Ready is NOT set.
 		// Pre-fix mass teardown would free the receive pool slot here.
-		soa_meta[0].state = .Wait_Io
+		_slot_set_state(shard, 0, 0, .Wait_Io)
 		soa_meta[0].io_operation_kind = .Recv_Complete
 		soa_meta[0].io_slot_index = in_flight_index
 		soa_meta[0].flags = {}
 
 		// Slot 1: completed recv. IO_Completion_Ready IS set. Mass teardown
 		// must free this receive pool slot.
-		soa_meta[1].state = .Runnable
+		_slot_set_state(shard, 0, 1, .Runnable)
 		soa_meta[1].io_operation_kind = .Recv_Complete
 		soa_meta[1].io_slot_index = completed_index
 		soa_meta[1].flags = {.IO_Completion_Ready}
@@ -528,26 +536,25 @@ when TINA_SIMULATION_MODE {
 	// =========================================================================
 	@(test)
 	test_pending_io_reuse_resolves_on_stale_completion :: proc(t: ^testing.T) {
-		shard, arena := _make_teardown_test_shard_with_slots(t, 1)
-		defer {
-			reactor_deinit(&shard.reactor)
-			os_release_arena_with_guard(arena.base)
-			free(arena)
-			free(shard)
-		}
+		fixture := _make_teardown_test_shard_with_slots(t, 1)
+		defer test_shard_fixture_deinit(fixture)
+		shard := &fixture.shard
 
 		soa_meta := shard.metadata[0]
 		type_id: Isolate_Type_Id = 0
 		slot_index: u32 = 0
-
-		// --- Setup: simulate a live Isolate with in-flight struct-source write ---
-		// Remove slot from free list (simulating _make_isolate having allocated it).
-		shard.isolate_free_heads[type_id] = POOL_NONE_INDEX
-
 		generation: u32 = 1
 		io_sequence: u8 = 1
-		soa_meta[slot_index].generation = generation
-		soa_meta[slot_index].state = .Wait_Io
+
+		// --- Setup: simulate a live Isolate with in-flight struct-source write ---
+		// Activate the slot through the fixture helper, then specialize it for
+		// the teardown scenario. The helper removes the slot from the free list
+		// and unpoisons payload memory; the test then sets the I/O metadata.
+		test_shard_slot_activate(
+			fixture,
+			make_handle(0, type_id, Isolate_Slot_Index(slot_index), generation),
+			.Runnable,
+		)
 		soa_meta[slot_index].io_operation_kind = .Send_Complete
 		soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE // struct-source: no pool slot
 		soa_meta[slot_index].io_fd = FD_HANDLE_NONE
@@ -558,13 +565,16 @@ when TINA_SIMULATION_MODE {
 		soa_meta[slot_index].inbox_count = 0
 		soa_meta[slot_index].group_id = SUPERVISION_GROUP_ID_NONE
 
-		// Counter: one slot is waiting for I/O.
-		shard.counters.io_awaiting_count = 1
+		_slot_set_state(shard, type_id, Isolate_Slot_Index(slot_index), .Wait_Io)
+		// Counter must reflect the Wait_Io state.
+		when TINA_RUNTIME_ASSERTIONS {
+			assert(shard.counters.io_awaiting_count == 1)
+		}
 
 		// --- Step 1: Teardown — should enter Pending_IO_Reuse, not Unallocated ---
 		_teardown_isolate(shard, type_id, Isolate_Slot_Index(slot_index), .Normal)
 
-		testing.expect_value(t, soa_meta[slot_index].state, Isolate_State.Pending_IO_Reuse)
+		testing.expect_value(t, soa_meta[slot_index]._state, Isolate_State.Pending_IO_Reuse)
 		// Counter must still be 1 — the slot is still I/O-blocked.
 		testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
 		// Free list must still be empty — slot is NOT reusable yet.
@@ -591,7 +601,7 @@ when TINA_SIMULATION_MODE {
 		// --- Step 3: Collect completions — should resolve Pending_IO_Reuse ---
 		reactor_collect_completions(&shard.reactor, shard, 0)
 
-		testing.expect_value(t, soa_meta[slot_index].state, Isolate_State.Unallocated)
+		testing.expect_value(t, soa_meta[slot_index]._state, Isolate_State.Unallocated)
 		testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 		testing.expect_value(t, shard.isolate_free_heads[type_id], slot_index)
 		testing.expect_value(t, shard.reactor.io_in_flight_count, u32(0))
@@ -610,29 +620,28 @@ when TINA_SIMULATION_MODE {
 	// =========================================================================
 	@(test)
 	test_recv_teardown_does_not_enter_pending_io_reuse :: proc(t: ^testing.T) {
-		shard, arena := _make_teardown_test_shard_with_slots(t, 1)
-		defer {
-			reactor_deinit(&shard.reactor)
-			os_release_arena_with_guard(arena.base)
-			free(arena)
-			free(shard)
-		}
+		fixture := _make_teardown_test_shard_with_slots(t, 1)
+		defer test_shard_fixture_deinit(fixture)
+		shard := &fixture.shard
 
 		soa_meta := shard.metadata[0]
 		type_id: Isolate_Type_Id = 0
 		slot_index: u32 = 0
-
-		// Remove slot from free list.
-		shard.isolate_free_heads[type_id] = POOL_NONE_INDEX
-
-		// Allocate a receive pool slot to simulate in-flight recv.
-		recv_slot, recv_error := io_slot_pool_alloc(&shard.reactor.receive_pool)
-		testing.expect_value(t, recv_error, IO_Slot_Pool_Error.None)
-
 		generation: u32 = 1
 		io_sequence: u8 = 1
-		soa_meta[slot_index].generation = generation
-		soa_meta[slot_index].state = .Wait_Io
+
+		// Activate the slot through the fixture helper, then specialize it for
+		// the teardown scenario.
+		test_shard_slot_activate(
+			fixture,
+			make_handle(0, type_id, Isolate_Slot_Index(slot_index), generation),
+			.Runnable,
+		)
+
+		// Allocate a receive pool slot to simulate in-flight recv.
+		recv_slot, recv_error := io_slot_pool_alloc_tina_owned(&shard.reactor.receive_pool)
+		testing.expect_value(t, recv_error, IO_Slot_Pool_Error.None)
+
 		soa_meta[slot_index].io_operation_kind = .Recv_Complete
 		soa_meta[slot_index].io_slot_index = recv_slot // receive pool slot
 		soa_meta[slot_index].io_fd = FD_HANDLE_NONE
@@ -643,12 +652,15 @@ when TINA_SIMULATION_MODE {
 		soa_meta[slot_index].inbox_count = 0
 		soa_meta[slot_index].group_id = SUPERVISION_GROUP_ID_NONE
 
-		shard.counters.io_awaiting_count = 1
+		_slot_set_state(shard, type_id, Isolate_Slot_Index(slot_index), .Wait_Io)
+		when TINA_RUNTIME_ASSERTIONS {
+			assert(shard.counters.io_awaiting_count == 1)
+		}
 
 		// Teardown: recv is NOT struct memory — should go directly to Unallocated.
 		_teardown_isolate(shard, type_id, Isolate_Slot_Index(slot_index), .Normal)
 
-		testing.expect_value(t, soa_meta[slot_index].state, Isolate_State.Unallocated)
+		testing.expect_value(t, soa_meta[slot_index]._state, Isolate_State.Unallocated)
 		testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
 		testing.expect_value(t, shard.isolate_free_heads[type_id], slot_index)
 

@@ -1,8 +1,29 @@
 package tina
 
 import "core:fmt"
-
 when TINA_SIMULATION_MODE {
+
+	// Helper for during-run payload inspection by user checkers.
+	// It verifies the slot is live before reading its payload so that user
+	// checkers do not trigger ASan reports on free slots.
+	sim_checker_get_live_isolate_ptr :: proc(
+		shard: ^Shard,
+		type_id: Isolate_Type_Id,
+		slot_index: Isolate_Slot_Index,
+	) -> rawptr {
+		if int(type_id) >= len(shard.metadata) {
+			return nil
+		}
+		soa_meta := shard.metadata[type_id]
+		if int(slot_index) >= len(soa_meta) {
+			return nil
+		}
+		if soa_meta[slot_index]._state == .Unallocated {
+			return nil
+		}
+		return _get_isolate_ptr(shard, type_id, slot_index, _state_check = false)
+	}
+
 	// Structural checkers are kept separate from the harness loop so later work
 	// can add checker flags, user-defined checkers, and final summary reporting
 	// without reopening bootstrap or scheduling logic.
@@ -97,7 +118,8 @@ when TINA_SIMULATION_MODE {
 				for slot in 0 ..< int(fd_table.slot_count) {
 					entry := &fd_table.entries[slot]
 					active :=
-						entry.reader_isolate != ISOLATE_HANDLE_NONE || entry.writer_isolate != ISOLATE_HANDLE_NONE
+						entry.reader_isolate != ISOLATE_HANDLE_NONE ||
+						entry.writer_isolate != ISOLATE_HANDLE_NONE
 					if active {
 						if entry.generation == 0 {
 							fmt.eprintfln(
@@ -230,6 +252,108 @@ when TINA_SIMULATION_MODE {
 							descriptor_refs[object_index],
 							object.inflight_count,
 							pending_refs[object_index],
+						)
+						return true
+					}
+				}
+			}
+			if .State_Transition_Integrity in flags {
+				expected_io_awaiting: u64 = 0
+
+				for type_desc in shard.type_descriptors {
+					type_id := type_desc.id
+					soa_meta := shard.metadata[type_id]
+					expected_dispatchable_slot_count: u32 = 0
+
+					for slot in 0 ..< type_desc.slot_count {
+						state := soa_meta[slot]._state
+						if state == .Wait_Io || state == .Pending_IO_Reuse {
+							expected_io_awaiting += 1
+						}
+
+						expected_dispatchable := _slot_should_be_dispatchable(
+							shard,
+							type_id,
+							Isolate_Slot_Index(slot),
+						)
+						actual_dispatchable := _bitset_is_set(
+							shard.dispatchable_slot_words[type_id],
+							u32(slot),
+						)
+						if expected_dispatchable != actual_dispatchable {
+							fmt.eprintfln(
+								"[CHECKER] Shard %d: dispatchable bitmap mismatch at type=%d slot=%d (expected=%v actual=%v, round %d)",
+								i,
+								type_id,
+								slot,
+								expected_dispatchable,
+								actual_dispatchable,
+								round,
+							)
+							return true
+						}
+
+						if expected_dispatchable {
+							expected_dispatchable_slot_count += 1
+						}
+					}
+
+					if expected_dispatchable_slot_count !=
+					   shard.dispatchable_slot_counts[type_id] {
+						fmt.eprintfln(
+							"[CHECKER] Shard %d: dispatchable_slot_counts mismatch for type=%d (expected=%d actual=%d, round %d)",
+							i,
+							type_id,
+							expected_dispatchable_slot_count,
+							shard.dispatchable_slot_counts[type_id],
+							round,
+						)
+						return true
+					}
+				}
+
+				if expected_io_awaiting != shard.counters.io_awaiting_count {
+					fmt.eprintfln(
+						"[CHECKER] Shard %d: io_awaiting_count mismatch (expected=%d actual=%d, round %d)",
+						i,
+						expected_io_awaiting,
+						shard.counters.io_awaiting_count,
+						round,
+					)
+					return true
+				}
+
+				// Recompute type summary words from the now-validated per-type counts.
+				for type_desc in shard.type_descriptors {
+					type_id := type_desc.id
+					has_dispatchable := shard.dispatchable_slot_counts[type_id] > 0
+					has_ready := has_dispatchable && shard.dispatch_credit_counts[type_id] > 0
+
+					actual_type_bit := _bitset_is_set(shard.dispatchable_type_words, u32(type_id))
+					if has_dispatchable != actual_type_bit {
+						fmt.eprintfln(
+							"[CHECKER] Shard %d: dispatchable_type_words mismatch for type=%d (expected=%v actual=%v, round %d)",
+							i,
+							type_id,
+							has_dispatchable,
+							actual_type_bit,
+							round,
+						)
+						return true
+					}
+
+					actual_ready_bit := _bitset_is_set(
+						shard.dispatch_ready_type_words,
+						u32(type_id),
+					)
+					if has_ready != actual_ready_bit {
+						fmt.eprintfln(
+							"[CHECKER] Shard %d: dispatch_ready_type_words mismatch for type=%d (expected=%v actual=%v, round %d)",
+							i,
+							type_id,
+							has_ready,
+							actual_ready_bit,
+							round,
 						)
 						return true
 					}

@@ -45,6 +45,9 @@ when TINA_SIMULATION_MODE {
 		pong_handle: Isolate_Handle,
 	}
 
+	// Simulation-only diagnostic field IDs for Ping observation.
+	PING_DIAGNOSTIC_COUNT: Diagnostic_Field_Id : 0
+
 	Coordinator :: struct {}
 	PingIsolate :: struct {
 		pong_handle: Isolate_Handle,
@@ -112,7 +115,12 @@ when TINA_SIMULATION_MODE {
 
 		count += 1
 
-		// Stop after 100 round trips
+		// Write a control-plane diagnostic on every invocation so fault-
+		// injected runs that crash midway still capture the last known count.
+		// Tests read this scalar record after simulator_run instead of
+		// accessing freed isolate payload memory.
+		ctx_test_diagnostic_write_u64(PING_DIAGNOSTIC_COUNT, u64(count))
+
 		if count >= 100 {
 			return ISOLATE_TRANSITION_DONE
 		}
@@ -226,21 +234,21 @@ when TINA_SIMULATION_MODE {
 		shard := &sim.shards[0]
 
 		// Assert Ping terminated cleanly
-		ping_state := shard.metadata[PING_TYPE_ID].state[0]
+		ping_state := shard.metadata[PING_TYPE_ID]._state[0]
 		testing.expect_value(t, ping_state, Isolate_State.Unallocated)
 
 		// Assert Pong is quiescent
-		pong_state := shard.metadata[PONG_TYPE_ID].state[0]
+		pong_state := shard.metadata[PONG_TYPE_ID]._state[0]
 		testing.expect_value(t, pong_state, Isolate_State.Wait_Message)
 
-		// Prove Ping hit 100 iterations
-		ping_pointer := _get_isolate_ptr(shard, PING_TYPE_ID, 0)
-		ping_memory := cast(^PingIsolate)ping_pointer
-		testing.expect_value(t, ping_memory.count, 100)
+		// Prove Ping hit 100 iterations. The count is captured by the
+		// handler on every invocation, so it survives isolate teardown.
+		shard_test_diagnostic_expect_u64(t, shard, PING_TYPE_ID, 0, PING_DIAGNOSTIC_COUNT, 100)
+		ping_count, _ := shard_diagnostic_read(shard, PING_TYPE_ID, 0, PING_DIAGNOSTIC_COUNT)
 
 		fmt.printfln(
 			"\n[TEST SUCCESS] Ping completed exactly %d round trips before terminating.",
-			ping_memory.count,
+			ping_count,
 		)
 	}
 

@@ -81,7 +81,8 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 	}
 
 	// 3. Initialize Isolate memory and durable slot metadata.
-	soa_meta[slot_index].state = .Runnable
+	_slot_set_state_bare(shard, type_id, child_slot_index, .Runnable,
+		"spawn: Unallocated→Runnable no-op for io tracking; dispatchable_refresh follows")
 	soa_meta[slot_index].group_id = spec.group_id
 
 	soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
@@ -93,6 +94,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 
 	isolate_pointer := _get_isolate_ptr(shard, type_id, child_slot_index)
 	stride := shard.type_descriptors[type_id].stride
+	_sanitizer_address_unpoison_isolate_slot(shard, type_id, child_slot_index)
 	if isolate_pointer != nil && stride > 0 {
 		mem.zero(isolate_pointer, stride)
 	}
@@ -132,9 +134,11 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 			shard.sim_state.fault_config.init_failure_rate,
 			shard.sim_state.crash_prng,
 		) {
-			soa_meta[slot_index].state = .Unallocated
+			_slot_set_state_bare(shard, type_id, child_slot_index, .Unallocated,
+				"sim init failure: free-list/poison/dispatchable_refresh handled below")
 			soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
 			shard.isolate_free_heads[type_id] = slot_index
+			_sanitizer_address_poison_isolate_slot(shard, type_id, child_slot_index)
 			_dispatchable_refresh_slot(shard, type_id, child_slot_index)
 			return Spawn_Error.init_failed
 		}
@@ -239,7 +243,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 	}
 
 	_interpret_transition(shard, type_id, child_slot_index, transition, &child_turn_frame)
-	if soa_meta[slot_index].generation != child_generation || soa_meta[slot_index].state == .Unallocated {
+	if soa_meta[slot_index].generation != child_generation || soa_meta[slot_index]._state == .Unallocated {
 		_turn_cleanup_resources(shard, &child_turn_frame)
 		shard.current_isolate_turn_frame = child_turn_frame.previous_isolate_turn_frame
 		return Spawn_Error.init_failed
@@ -329,8 +333,9 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: Isolate_Type_Id, slot_index: I
 			soa_meta[slot_index].io_slot_index == IO_SLOT_INDEX_NONE
 
 		if is_struct_source_write {
-			_slot_track_io_awaiting_transition(shard, soa_meta[slot_index].state, .Pending_IO_Reuse)
-			soa_meta[slot_index].state = .Pending_IO_Reuse
+			_slot_track_io_awaiting_transition(shard, soa_meta[slot_index]._state, .Pending_IO_Reuse)
+			_slot_set_state_bare(shard, type_id, slot_index, .Pending_IO_Reuse,
+				"teardown: deferred slot for in-flight write; track_io+dispatchable handled separately")
 			_dispatchable_refresh_slot(shard, type_id, slot_index)
 
 			_drain_mailbox(shard, soa_meta, slot_index)
@@ -348,10 +353,12 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: Isolate_Type_Id, slot_index: I
 	_drain_mailbox(shard, soa_meta, slot_index)
 
 	// Step 4: Free arena slot & push back to free list
-	_slot_track_io_awaiting_transition(shard, soa_meta[slot_index].state, .Unallocated)
-	soa_meta[slot_index].state = .Unallocated
+	_slot_track_io_awaiting_transition(shard, soa_meta[slot_index]._state, .Unallocated)
+	_slot_set_state_bare(shard, type_id, slot_index, .Unallocated,
+		"teardown: track_io above; free-list/poison/dispatchable handled below")
 	soa_meta[slot_index].inbox_head = shard.isolate_free_heads[type_id]
 	shard.isolate_free_heads[type_id] = u32(slot_index)
+	_sanitizer_address_poison_isolate_slot(shard, type_id, slot_index)
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 
 	// Step 5: Invoke supervision subsystem
@@ -379,7 +386,7 @@ _drain_mailbox :: proc(shard: ^Shard, soa_meta: #soa[]Isolate_Metadata, slot_ind
 			}
 		}
 
-		pool_free_unchecked(&shard.message_pool, current)
+		_shard_message_pool_free_unchecked(shard, current)
 		current = next
 	}
 	soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
@@ -388,7 +395,22 @@ _drain_mailbox :: proc(shard: ^Shard, soa_meta: #soa[]Isolate_Metadata, slot_ind
 }
 
 @(private = "package")
-_get_isolate_ptr :: proc(shard: ^Shard, type_id: Isolate_Type_Id, slot_index: Isolate_Slot_Index) -> rawptr {
+_get_isolate_ptr :: proc(
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+	loc := #caller_location,
+	_state_check := true,
+) -> rawptr {
+	when ODIN_DEBUG {
+		if _state_check {
+			assert(
+				shard.metadata[type_id][slot_index]._state != .Unallocated,
+				"reading freed isolate memory",
+				loc,
+			)
+		}
+	}
 	stride := shard.type_descriptors[type_id].stride
 	if stride == 0 {return nil}
 

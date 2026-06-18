@@ -1,0 +1,35 @@
+name: Test Architecture Hygiene
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "docs/**"
+      - ".github/workflows/test_architecture_hygiene.yml"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "docs/**"
+      - ".github/workflows/test_architecture_hygiene.yml"
+      - ".github/workflows/ci.yml"
+
+jobs:
+  hygiene:
+    name: Test architecture hygiene (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run hygiene checks
+        run: bash scripts/check_test_hygiene.sh
