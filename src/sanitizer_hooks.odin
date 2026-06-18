@@ -141,17 +141,25 @@ _sanitizer_address_poison_isolate_slot :: #force_inline proc "contextless" (
 		descriptor := shard.type_descriptors[type_id]
 		if descriptor.stride > 0 {
 			memory := shard.isolate_memory[type_id]
-			start_index := int(slot_index) * descriptor.stride
-			sanitizer.address_poison_rawptr(rawptr(&memory[start_index]), descriptor.stride)
+			// The fixture builder may fail after setting a type descriptor but before
+			// carving its backing memory. Guarding len() here prevents a nil-slice
+			// indexing panic during teardown unpoison while keeping the success path
+			// a single compare+branch.
+			if len(memory) > 0 {
+				start_index := int(slot_index) * descriptor.stride
+				sanitizer.address_poison_rawptr(rawptr(&memory[start_index]), descriptor.stride)
+			}
 		}
 
 		if descriptor.working_memory_size > 0 {
 			memory := shard.working_memory[type_id]
-			start_index := int(slot_index) * descriptor.working_memory_size
-			sanitizer.address_poison_rawptr(
-				rawptr(&memory[start_index]),
-				descriptor.working_memory_size,
-			)
+			if len(memory) > 0 {
+				start_index := int(slot_index) * descriptor.working_memory_size
+				sanitizer.address_poison_rawptr(
+					rawptr(&memory[start_index]),
+					descriptor.working_memory_size,
+				)
+			}
 		}
 	}
 }
@@ -166,17 +174,22 @@ _sanitizer_address_unpoison_isolate_slot :: #force_inline proc "contextless" (
 		descriptor := shard.type_descriptors[type_id]
 		if descriptor.stride > 0 {
 			memory := shard.isolate_memory[type_id]
-			start_index := int(slot_index) * descriptor.stride
-			sanitizer.address_unpoison_rawptr(rawptr(&memory[start_index]), descriptor.stride)
+			// See the matching guard in _sanitizer_address_poison_isolate_slot.
+			if len(memory) > 0 {
+				start_index := int(slot_index) * descriptor.stride
+				sanitizer.address_unpoison_rawptr(rawptr(&memory[start_index]), descriptor.stride)
+			}
 		}
 
 		if descriptor.working_memory_size > 0 {
 			memory := shard.working_memory[type_id]
-			start_index := int(slot_index) * descriptor.working_memory_size
-			sanitizer.address_unpoison_rawptr(
-				rawptr(&memory[start_index]),
-				descriptor.working_memory_size,
-			)
+			if len(memory) > 0 {
+				start_index := int(slot_index) * descriptor.working_memory_size
+				sanitizer.address_unpoison_rawptr(
+					rawptr(&memory[start_index]),
+					descriptor.working_memory_size,
+				)
+			}
 		}
 	}
 }

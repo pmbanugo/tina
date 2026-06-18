@@ -112,7 +112,15 @@ reactor_deinit :: proc(reactor: ^Reactor) {
 		_sanitizer_address_unpoison_io_pool_slots(&reactor.receive_pool)
 		_sanitizer_address_unpoison_io_pool_slots(&reactor.staging_pool)
 	}
-	backend_deinit(&reactor.backend)
+	// Guard against teardown of a reactor that was never initialized. If
+	// hydrate_shard fails before reactor_init_tina_owned is called, the backend
+	// is zero-initialized; some platform backends (Linux io_uring in particular)
+	// are not safe to deinit from zero state. receive_pool.slot_count is set
+	// unconditionally by reactor_init/io_slot_pool_init, so it is a reliable
+	// proxy for "reactor_init ran to completion".
+	if reactor.receive_pool.slot_count > 0 {
+		backend_deinit(&reactor.backend)
+	}
 	reactor.pending_count = 0
 	reactor.io_in_flight_count = 0
 }

@@ -508,8 +508,6 @@ test_grand_arena :: proc(t: ^testing.T) {
 	error := grand_arena_init(&arena, total_mem)
 	testing.expect_value(t, error, mem.Allocator_Error.None)
 
-	defer os_release_arena_with_guard(arena.base)
-
 	// ALLOWLIST(hydrate_shard_fixture): This test exercises the production
 	// hydrate_shard path itself; the Shard must be allocated separately so
 	// hydration can carve into it.
@@ -517,7 +515,14 @@ test_grand_arena :: proc(t: ^testing.T) {
 	defer free(shard)
 
 	carve_error := hydrate_shard(&arena, &spec, shard)
-	defer reactor_deinit(&shard.reactor)
+	// Teardown order matters for ASan: reactor pools, then all isolate slots,
+	// then the backing arena. hydrate_shard poisons free isolate slots and the
+	// reactor pools; we must unpoison them before the arena backing is released.
+	defer {
+		reactor_deinit(&shard.reactor)
+		_sanitizer_address_unpoison_shard_memory(shard)
+		os_release_arena_with_guard(arena.base)
+	}
 	testing.expect_value(t, carve_error, mem.Allocator_Error.None)
 
 	testing.expect(t, arena.region_count > 1, "Arena should have carved regions")
