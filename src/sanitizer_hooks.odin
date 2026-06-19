@@ -1,6 +1,7 @@
 package tina
 
 import "base:sanitizer"
+import "core:mem"
 
 _ :: sanitizer
 
@@ -20,6 +21,20 @@ _sanitizer_address_unpoison_raw :: #force_inline proc "contextless" (pointer: ra
 	when TINA_ASAN_POISONING {
 		if pointer != nil && size > 0 {
 			sanitizer.address_unpoison_rawptr(pointer, size)
+		}
+	}
+}
+
+// Poison the portion of a working arena that has been allocated since the last
+// reset. This makes stale pointers into logically-freed working arena
+// allocations visible to ASan. The unpoison side is handled by the ASan-aware
+// working-arena allocator wrapper, which unpoisons each freshly-allocated
+// range before returning it to the caller.
+@(private = "package")
+_sanitizer_address_poison_working_arena :: #force_inline proc "contextless" (arena: ^mem.Arena) {
+	when TINA_ASAN_POISONING {
+		if arena != nil && arena.offset > 0 {
+			_sanitizer_address_poison_raw(raw_data(arena.data), arena.offset)
 		}
 	}
 }
@@ -101,6 +116,27 @@ _sanitizer_address_unpoison_io_slot :: #force_inline proc "contextless" (
 	when TINA_ASAN_POISONING {
 		slot_pointer := rawptr(_io_slot_pool_pointer(pool, index))
 		sanitizer.address_unpoison_rawptr(slot_pointer, int(pool.slot_size))
+	}
+}
+
+// Poison a pool-backed I/O buffer that has left handler ownership and is now
+// owned by the backend/kernel until completion. The return-to-pool path
+// unpoisons the intrusive free-list word before writing it, so in-flight slots
+// can be fully poisoned and stale first-word accesses are still caught.
+@(private = "package")
+_sanitizer_address_poison_inflight_io_slot :: #force_inline proc "contextless" (
+	reactor: ^Reactor,
+	affinity: IO_Slot_Pool_Affinity,
+	index: IO_Slot_Index,
+) {
+	when TINA_ASAN_POISONING {
+		switch affinity {
+		case .Receive:
+			_sanitizer_address_poison_io_slot(&reactor.receive_pool, index)
+		case .Staging:
+			_sanitizer_address_poison_io_slot(&reactor.staging_pool, index)
+		case .None:
+		}
 	}
 }
 

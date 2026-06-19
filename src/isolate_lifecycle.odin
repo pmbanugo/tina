@@ -184,7 +184,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 
 	shard.current_isolate_turn_frame = &child_turn_frame
 	shard.current_trap_environment = &shard.trap_environment_init
-	context.allocator = mem.arena_allocator(&child_turn_frame.working_arena)
+	context.allocator = _working_arena_allocator(&child_turn_frame.working_arena)
 	context.temp_allocator = mem.arena_allocator(&child_turn_frame.scratch_arena)
 
 	transition := shard.type_descriptors[type_id].init_handler(

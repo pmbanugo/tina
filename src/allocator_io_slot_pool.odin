@@ -194,6 +194,7 @@ io_slot_pool_free_tina_owned :: #force_inline proc(pool: ^IO_Slot_Pool, index: I
 
 	slot_pointer := _io_slot_pool_pointer(pool, index)
 
+	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Index))
 	(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
 	pool.free_head = index
 	pool.free_count += 1

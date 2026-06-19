@@ -520,14 +520,29 @@ Submission_Operation :: union {
 	Submission_Op_Sendfile,
 }
 
-Submission :: struct {
+
+_Submission_Common :: struct {
 	token:            Submission_Token,
 	fixed_file_index: u16, // Index into io_uring fixed-file table (Linux only). FIXED_FILE_INDEX_NONE if unused.
 	// Resolved pointer: Isolate struct (writes) or pool slot (reads).
-    // nil for operations without data (accept, connect, close).
+	// nil for operations without data (accept, connect, close).
 	data_pointer:     [^]u8,
 	data_size:        u32, // Byte count for the data region. 0 when data_pointer is nil.
 	operation:        Submission_Operation,
+}
+
+when TINA_ASAN_POISONING {
+	Submission :: struct {
+		using _: _Submission_Common,
+		// Logical pool slot size for sanitizer poisoning. Zero means data_pointer
+		// is not a Tina-owned pool slot, or the backend chooses the buffer later
+		// (io_uring provided receive buffers).
+		sanitizer_slot_size: u32,
+	}
+} else {
+	Submission :: struct {
+		using _: _Submission_Common,
+	}
 }
 
 // --- Raw Completion (§6.6.2 §4) ---

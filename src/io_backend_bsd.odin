@@ -45,6 +45,9 @@ when !TINA_SIMULATION_MODE {
 	POSIX_WAKE_IDENT :: 69
 	POSIX_EDGE_EVENT_UDATA_FLAG :: uintptr(1) << 63
 
+
+	BACKEND_POOL_BUFFER_OWNED_AFTER_SUBMIT :: false
+
 	@(private = "file")
 	_posix_map_socket_startup_error :: #force_inline proc "contextless" (error: posix.Errno) -> Backend_Error {
 		#partial switch error {
@@ -201,6 +204,7 @@ when !TINA_SIMULATION_MODE {
 					token = submission.token,
 					extra = nil,
 				}
+				_posix_sanitizer_poison_pooled_submission_buffer(&submission)
 				immediate = false
 			} else {
 				result, immediate = _try_syscall(backend, &submission)
@@ -777,6 +781,22 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
+	_posix_sanitizer_unpoison_pooled_submission_buffer :: #force_inline proc "contextless" (submission: ^Submission) {
+		when TINA_ASAN_POISONING {
+			if submission.data_pointer == nil || submission.sanitizer_slot_size == 0 do return
+			_sanitizer_address_unpoison_raw(rawptr(submission.data_pointer), int(submission.sanitizer_slot_size))
+		}
+	}
+
+	@(private = "file")
+	_posix_sanitizer_poison_pooled_submission_buffer :: #force_inline proc "contextless" (submission: ^Submission) {
+		when TINA_ASAN_POISONING {
+			if submission.data_pointer == nil || submission.sanitizer_slot_size == 0 do return
+			_sanitizer_address_poison_raw(rawptr(submission.data_pointer), int(submission.sanitizer_slot_size))
+		}
+	}
+
+	@(private = "file")
 	_try_syscall :: proc(backend: ^Platform_Backend, submission: ^Submission) -> (Raw_Completion, bool) {
 		result := Raw_Completion {
 			token = submission.token,
@@ -785,6 +805,8 @@ when !TINA_SIMULATION_MODE {
 
 		switch op in submission.operation {
 		case Submission_Op_Read:
+			_posix_sanitizer_unpoison_pooled_submission_buffer(submission)
+			defer _posix_sanitizer_poison_pooled_submission_buffer(submission)
 			n := posix.pread(
 				posix.FD(op.fd),
 				([^]byte)(submission.data_pointer),
@@ -803,6 +825,8 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Write:
+			_posix_sanitizer_unpoison_pooled_submission_buffer(submission)
+			defer _posix_sanitizer_poison_pooled_submission_buffer(submission)
 			n := posix.pwrite(
 				posix.FD(op.fd),
 				([^]byte)(submission.data_pointer),
@@ -873,6 +897,8 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Send:
+			_posix_sanitizer_unpoison_pooled_submission_buffer(submission)
+			defer _posix_sanitizer_poison_pooled_submission_buffer(submission)
 			n := posix.send(posix.FD(op.fd_socket), rawptr(submission.data_pointer), uint(submission.data_size), {.NOSIGNAL})
 			if n < 0 {
 				errno := posix.errno()
@@ -886,6 +912,8 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Recv:
+			_posix_sanitizer_unpoison_pooled_submission_buffer(submission)
+			defer _posix_sanitizer_poison_pooled_submission_buffer(submission)
 			n := posix.recv(posix.FD(op.fd_socket), rawptr(submission.data_pointer), uint(submission.data_size), {})
 			if n < 0 {
 				errno := posix.errno()
@@ -899,6 +927,8 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Sendto:
+			_posix_sanitizer_unpoison_pooled_submission_buffer(submission)
+			defer _posix_sanitizer_poison_pooled_submission_buffer(submission)
 			sa, sa_len := _socket_address_to_sockaddr(op.address)
 			n := posix.sendto(
 				posix.FD(op.fd_socket),
@@ -920,6 +950,8 @@ when !TINA_SIMULATION_MODE {
 			return result, true
 
 		case Submission_Op_Recvfrom:
+			_posix_sanitizer_unpoison_pooled_submission_buffer(submission)
+			defer _posix_sanitizer_poison_pooled_submission_buffer(submission)
 			peer_addr: posix.sockaddr_storage
 			addr_len := posix.socklen_t(size_of(peer_addr))
 			n := posix.recvfrom(

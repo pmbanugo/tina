@@ -1184,7 +1184,7 @@ _dispatch_type_batch :: proc(
 		turn_frame.previous_temp_allocator = previous_temp_allocator
 		shard.current_isolate_turn_frame = &turn_frame
 		shard.current_trap_environment = &shard.trap_environment_inner
-		context.allocator = mem.arena_allocator(&turn_frame.working_arena)
+		context.allocator = _working_arena_allocator(&turn_frame.working_arena)
 		context.temp_allocator = mem.arena_allocator(&turn_frame.scratch_arena)
 
 		transition := type_descriptor.handler_fn(isolate_pointer, message_pointer)

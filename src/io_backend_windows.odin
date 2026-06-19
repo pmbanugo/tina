@@ -21,6 +21,7 @@ import win "core:sys/windows"
 
 when !TINA_SIMULATION_MODE {
 
+	BACKEND_POOL_BUFFER_OWNED_AFTER_SUBMIT :: true
 	MAX_WIN_OVERLAPPED :: 512
 
 	// Derivation: up to REACTOR_SUBMISSION_BATCH_COUNT completions may arrive

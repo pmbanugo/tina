@@ -104,7 +104,7 @@ test_with_turn_frame :: proc(
 	previous_temp_allocator := context.temp_allocator
 	g_current_shard_pointer = shard
 	shard.current_isolate_turn_frame = &frame
-	context.allocator = mem.arena_allocator(&frame.working_arena)
+	context.allocator = _working_arena_allocator(&frame.working_arena)
 	context.temp_allocator = mem.arena_allocator(&frame.scratch_arena)
 
 	callback(user_data)
@@ -197,7 +197,7 @@ test_with_local_turn_frame :: proc(
 	previous_temp_allocator := context.temp_allocator
 	g_current_shard_pointer = shard
 	shard.current_isolate_turn_frame = &frame
-	context.allocator = mem.arena_allocator(&frame.working_arena)
+	context.allocator = _working_arena_allocator(&frame.working_arena)
 	context.temp_allocator = mem.arena_allocator(&frame.scratch_arena)
 
 	callback(user_data)

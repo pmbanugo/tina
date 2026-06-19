@@ -549,13 +549,107 @@ ctx_timer_cancel :: #force_inline proc(handle: Timer_Handle) {
 // Memory Management APIs (§6.9 §9)
 // =================================
 
+// ASan-aware allocator wrapper for the working arena. In ASan builds every
+// allocation unpoisons the returned range so that allocations after a
+// ctx_working_arena_reset can still be used, while stale pointers into ranges
+// that were reset remain poisoned. Non-ASan builds compile to the plain
+// mem.arena_allocator.
+when TINA_ASAN_POISONING {
+	@(private = "package")
+	_working_arena_allocator_procedure_sanitizer :: proc(
+		allocator_data: rawptr,
+		mode: mem.Allocator_Mode,
+		size, alignment: int,
+		old_memory: rawptr,
+		old_size: int,
+		loc := #caller_location,
+	) -> ([]byte, mem.Allocator_Error) {
+		arena := cast(^mem.Arena)allocator_data
+
+		_alloc_unpoison_zero :: proc(
+			a: ^mem.Arena,
+			size, alignment: int,
+			zero: bool,
+			loc := #caller_location,
+		) -> ([]byte, mem.Allocator_Error) {
+			result, error := mem.arena_alloc_bytes_non_zeroed(a, size, alignment, loc)
+			if error == .None && result != nil {
+				// The arena may be backed by ASan-poisoned memory (e.g., after
+				// ctx_working_arena_reset). Unpoison before any write.
+				_sanitizer_address_unpoison_raw(raw_data(result), len(result))
+				if zero {
+					mem.zero(raw_data(result), len(result))
+				}
+			}
+			return result, error
+		}
+
+		_resize_and_unpoison :: proc(
+			arena: ^mem.Arena,
+			old_memory: rawptr,
+			old_size, size, alignment: int,
+			zero: bool,
+			loc := #caller_location,
+		) -> ([]byte, mem.Allocator_Error) {
+			if old_memory == nil do return _alloc_unpoison_zero(arena, size, alignment, zero, loc)
+
+			// Preserve mem.arena_allocator's contract: arena allocations cannot be
+			// individually freed, so resize-to-zero is not implemented.
+			if size == 0 do return nil, .Mode_Not_Implemented
+
+			if size == old_size && mem.is_aligned(old_memory, alignment) {
+				return mem.byte_slice(old_memory, old_size), .None
+			}
+
+			new_memory, error := _alloc_unpoison_zero(arena, size, alignment, zero, loc)
+			if error != .None || new_memory == nil {
+				return new_memory, error
+			}
+			copy_count := min(old_size, size)
+			if copy_count > 0 {
+				mem.copy(raw_data(new_memory), old_memory, copy_count)
+			}
+			return new_memory, .None
+		}
+
+		#partial switch mode {
+		case .Alloc:
+			return _alloc_unpoison_zero(arena, size, alignment, true, loc)
+		case .Alloc_Non_Zeroed:
+			return _alloc_unpoison_zero(arena, size, alignment, false, loc)
+		case .Resize:
+			return _resize_and_unpoison(arena, old_memory, old_size, size, alignment, true, loc)
+		case .Resize_Non_Zeroed:
+			return _resize_and_unpoison(arena, old_memory, old_size, size, alignment, false, loc)
+		case .Free:
+			return nil, .Mode_Not_Implemented
+		case .Free_All:
+			_sanitizer_address_poison_working_arena(arena)
+			mem.arena_free_all(arena)
+			return nil, .None
+		case:
+			return mem.arena_allocator_proc(arena, mode, size, alignment, old_memory, old_size, loc)
+	}
+	}
+}
+
+@(private = "package")
+_working_arena_allocator :: #force_inline proc(arena: ^mem.Arena) -> mem.Allocator {
+	when TINA_ASAN_POISONING {
+		return mem.Allocator{procedure = _working_arena_allocator_procedure_sanitizer, data = arena}
+	} else {
+		return mem.arena_allocator(arena)
+	}
+}
+
 ctx_working_arena :: #force_inline proc() -> mem.Allocator {
 	_, frame := _current_isolate_turn_frame_require_handle()
-	return mem.arena_allocator(&frame.working_arena)
+	return _working_arena_allocator(&frame.working_arena)
 }
 
 ctx_working_arena_reset :: #force_inline proc() {
 	_, frame := _current_isolate_turn_frame_require_handle()
+	_sanitizer_address_poison_working_arena(&frame.working_arena)
 	frame.working_arena.offset = 0
 }
 

@@ -587,6 +587,20 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 	// Fast-return on success
 	if error == .None {
 		reactor.io_in_flight_count += u32(reactor.pending_count)
+
+		// Completion-style backends own pooled buffers after successful submit.
+		// Readiness backends poison around their deferred syscalls instead.
+		when TINA_ASAN_POISONING && BACKEND_POOL_BUFFER_OWNED_AFTER_SUBMIT {
+			for i in 0 ..< reactor.pending_count {
+				sub := &reactor.pending_submissions[i]
+				buffer_index := submission_token_buffer_index(sub.token)
+				if buffer_index == IO_SLOT_INDEX_NONE do continue
+				operation_kind := submission_token_operation_kind(sub.token)
+				affinity := io_operation_pool_affinity(operation_kind)
+				_sanitizer_address_poison_inflight_io_slot(reactor, affinity, buffer_index)
+			}
+		}
+
 		reactor.pending_count = 0
 		return .None
 	}
@@ -1020,6 +1034,17 @@ _reactor_submission_finalize :: #force_inline proc (
 		buffer_index,
 		submission_op_kind,
 	)
+	when TINA_ASAN_POISONING {
+		if buffer_index != IO_SLOT_INDEX_NONE {
+			switch io_operation_pool_affinity(submission_op_kind) {
+			case .Receive:
+				submission_value.sanitizer_slot_size = reactor.receive_pool.slot_size
+			case .Staging:
+				submission_value.sanitizer_slot_size = reactor.staging_pool.slot_size
+			case .None:
+			}
+		}
+	}
 	reactor.pending_submissions[reactor.pending_count] = submission_value
 	reactor.pending_count += 1
 	shard.metadata[type_index][slot_index].io_fd = target_fd
