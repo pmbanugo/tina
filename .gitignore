@@ -4,10 +4,14 @@ ADR/
 adr-temp
 adr-temp2
 .DS_Store
+build/
 *.bin
 *.cast
 example_*.odin.txt
 tina_*
+http_bench
+
+!tina_trap_windows_x64.asm
 
 # Prerequisites
 *.d
