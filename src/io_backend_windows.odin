@@ -1389,10 +1389,7 @@ when !TINA_SIMULATION_MODE {
 		backend := new(Platform_Backend)
 		buffer_backing: [64 * 2]u8
 		config := Backend_Config {
-			queue_size        = DEFAULT_BACKEND_QUEUE_SIZE,
-			backing_memory_base       = &buffer_backing[0],
-			backing_memory_slot_size  = 64,
-			backing_memory_slot_count = 2,
+			queue_size = DEFAULT_BACKEND_QUEUE_SIZE,
 		}
 		backend_init(backend, config)
 		defer { backend_deinit(backend); free(backend) }
@@ -1465,6 +1462,7 @@ when !TINA_SIMULATION_MODE {
 		send_sub := [1]Submission {
 			{
 				token = send_token,
+				data_pointer = &buffer_backing[0],
 				data_size = 4,
 				operation = Submission_Op_Send{
 					fd_socket = client_fd,
@@ -1478,6 +1476,7 @@ when !TINA_SIMULATION_MODE {
 		recv_sub := [1]Submission {
 			{
 				token = recv_token,
+				data_pointer = &buffer_backing[64],
 				data_size = 64,
 				operation = Submission_Op_Recv{
 					fd_socket = server_fd,
