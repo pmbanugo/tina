@@ -68,9 +68,10 @@ transport_drain_inbound :: #force_inline proc "contextless" (shard: ^Shard, now:
 				_process_inbound_envelope(shard, source_shard, envelope)
 			}
 
-			if available > 0 {
-				spsc_ring_commit_read(ring, available)
-			}
+		if available > 0 {
+			spsc_ring_commit_read_tina_owned(ring, available)
+		}
+
 		}
 	} else {
 		if shard.sim_state.network != nil {
@@ -183,7 +184,7 @@ transport_route_envelope :: #force_inline proc "contextless" (
 
 		route_index := remote_route_index_from_shard_id(source_shard.id, destination_shard)
 		ring := source_shard.outbound_rings[route_index]
-		if spsc_ring_enqueue(ring, msg_envelope) == .Full {
+		if spsc_ring_enqueue_tina_owned(ring, msg_envelope) == .Full {
 			source_shard.counters.ring_full_drops += 1
 			return .mailbox_full
 		}

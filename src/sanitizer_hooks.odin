@@ -274,5 +274,151 @@ _sanitizer_address_unpoison_shard_memory :: proc "contextless" (shard: ^Shard) {
 		_sanitizer_address_unpoison_io_pool_slots(&shard.transfer_pool)
 		_sanitizer_address_unpoison_io_pool_slots(&shard.reactor.receive_pool)
 		_sanitizer_address_unpoison_io_pool_slots(&shard.reactor.staging_pool)
+		_sanitizer_address_unpoison_log_ring(&shard.log_ring)
+	}
+}
+
+@(private = "package")
+_sanitizer_address_poison_spsc_ring_slots :: proc "contextless" (
+	ring: ^SPSC_Ring,
+	sequence_start: u64,
+	count: u64,
+) {
+	when TINA_ASAN_POISONING {
+		if ring == nil || ring.buffer == nil || count == 0 {
+			return
+		}
+
+		slot_size := size_of(Message_Envelope)
+		for offset in 0 ..< count {
+			slot_index := (sequence_start + offset) & ring.capacity_mask
+			slot_pointer := rawptr(&ring.buffer[slot_index])
+			sanitizer.address_poison_rawptr(slot_pointer, slot_size)
+		}
+	}
+}
+
+@(private = "package")
+_sanitizer_address_unpoison_spsc_ring_slot :: #force_inline proc "contextless" (
+	ring: ^SPSC_Ring,
+	index: u64,
+) {
+	when TINA_ASAN_POISONING {
+		if ring == nil || ring.buffer == nil {
+			return
+		}
+
+		slot_index := index & ring.capacity_mask
+		slot_pointer := rawptr(&ring.buffer[slot_index])
+		sanitizer.address_unpoison_rawptr(slot_pointer, size_of(Message_Envelope))
+	}
+}
+
+@(private = "package")
+_sanitizer_address_unpoison_spsc_ring_slots :: proc "contextless" (ring: ^SPSC_Ring) {
+	when TINA_ASAN_POISONING {
+		if ring == nil || ring.buffer == nil {
+			return
+		}
+
+		for index in 0 ..< ring.capacity {
+			_sanitizer_address_unpoison_spsc_ring_slot(ring, index)
+		}
+	}
+}
+
+// Log-ring byte lifetime helpers.
+//
+// A log-ring byte is reusable while it is outside the committed live interval
+// (read_cursor, write_cursor). Poison marks reusable bytes; unpoison makes live
+// records visible to ASan. Region helpers split at the physical ring edge so
+// monotonic cursor arithmetic can address the circular buffer directly.
+
+@(private = "package")
+_sanitizer_address_poison_log_ring_region :: proc "contextless" (
+	ring: ^Log_Ring_Buffer,
+	offset: u64,
+	size: u64,
+) {
+	when TINA_ASAN_POISONING {
+		if ring == nil || len(ring.buffer) == 0 || size == 0 {
+			return
+		}
+
+		capacity := ring.capacity_mask + 1
+		start := offset & ring.capacity_mask
+
+		if start + size <= capacity {
+			sanitizer.address_poison_rawptr(rawptr(&ring.buffer[start]), int(size))
+		} else {
+			first_size := capacity - start
+			sanitizer.address_poison_rawptr(rawptr(&ring.buffer[start]), int(first_size))
+			sanitizer.address_poison_rawptr(
+				rawptr(&ring.buffer[0]),
+				int(size - first_size),
+			)
+		}
+	}
+}
+
+@(private = "package")
+_sanitizer_address_unpoison_log_ring_region :: proc "contextless" (
+	ring: ^Log_Ring_Buffer,
+	offset: u64,
+	size: u64,
+) {
+	when TINA_ASAN_POISONING {
+		if ring == nil || len(ring.buffer) == 0 || size == 0 {
+			return
+		}
+
+		capacity := ring.capacity_mask + 1
+		start := offset & ring.capacity_mask
+
+		if start + size <= capacity {
+			sanitizer.address_unpoison_rawptr(rawptr(&ring.buffer[start]), int(size))
+		} else {
+			first_size := capacity - start
+			sanitizer.address_unpoison_rawptr(rawptr(&ring.buffer[start]), int(first_size))
+			sanitizer.address_unpoison_rawptr(
+				rawptr(&ring.buffer[0]),
+				int(size - first_size),
+			)
+		}
+	}
+}
+
+// Recompute the log-ring poison state from the current cursors. Used at
+// non-signal recovery safe points after emergency_log_flush_signal advances
+// read_cursor from a signal handler.
+@(private = "package")
+_sanitizer_address_refresh_log_ring_poison :: proc "contextless" (ring: ^Log_Ring_Buffer) {
+	when TINA_ASAN_POISONING {
+		if ring == nil || len(ring.buffer) == 0 {
+			return
+		}
+
+		capacity := ring.capacity_mask + 1
+		sanitizer.address_poison_rawptr(raw_data(ring.buffer), int(capacity))
+
+		if ring.write_cursor > ring.read_cursor {
+			_sanitizer_address_unpoison_log_ring_region(
+				ring,
+				ring.read_cursor,
+				ring.write_cursor - ring.read_cursor,
+			)
+		}
+	}
+}
+
+// Unpoison the whole backing buffer before the containing allocation is freed.
+@(private = "package")
+_sanitizer_address_unpoison_log_ring :: proc "contextless" (ring: ^Log_Ring_Buffer) {
+	when TINA_ASAN_POISONING {
+		if ring == nil || len(ring.buffer) == 0 {
+			return
+		}
+
+		sanitizer.address_unpoison_rawptr(raw_data(ring.buffer), len(ring.buffer))
 	}
 }

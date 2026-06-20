@@ -165,6 +165,11 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 				os_signals_restore_thread_mask()
 			}
 
+			// The emergency signal flush may have advanced read_cursor without
+			// updating ASan shadow state. Repair the poison invariant at this
+			// non-signal recovery safe point before any further logging.
+			_sanitizer_address_refresh_log_ring_poison(&shard.log_ring)
+
 			// 1. Evaluate Shard Restart Intensity using watchdog-owned policy.
 			wall_now_ns := os_monotonic_time_ns()
 			if _check_and_record_shard_restart(runtime_state, config.system_spec, wall_now_ns) {

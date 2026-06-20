@@ -16,6 +16,7 @@ TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
 // but needs verify invariant/structural correctness holds in a non-simulated environment
 TINA_RUNTIME_ASSERTIONS :: #config(TINA_ASSERTS, true)
 TINA_ODIN_DEV :: #config(ODIN_DEV, false)
+TINA_ASAN_DEATH_TESTS :: #config(TINA_ASAN_DEATH_TESTS, false)
 
 Scheduler_Work_Count :: distinct u32
 Scheduler_Credit_Count :: distinct u32

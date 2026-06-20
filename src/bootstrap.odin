@@ -156,7 +156,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 			ring := cast(^SPSC_Ring)raw_data(raw_mem)
 			buffer_pointer := cast([^]Message_Envelope)(uintptr(raw_data(raw_mem)) +
 				size_of(SPSC_Ring))
-			spsc_ring_init(ring, u64(ring_count), buffer_pointer[:ring_count])
+			spsc_ring_init_tina_owned(ring, u64(ring_count), buffer_pointer[:ring_count])
 
 			os_apply_memory_policy(raw_mem, i32(source), spec.memory_init_mode)
 			// Wire directly into the pre-allocated configs

@@ -362,7 +362,7 @@ hydrate_shard :: proc(
 
 	grand_arena_allocator_set_name(&alloc_data, "Log_Ring_Buffer")
 	log_buf := make([]u8, spec.log_ring_size, alloc) or_return
-	log_init(&shard.log_ring, log_buf)
+	log_init_tina_owned(&shard.log_ring, log_buf)
 
 	grand_arena_allocator_set_name(&alloc_data, "Supervision_Group_Table")
 	shard.supervision_groups = make([]Supervision_Group, spec.supervision_groups_max, alloc) or_return

@@ -1,7 +1,10 @@
 package tina
 
+import "base:sanitizer"
 import "core:sync"
 import "core:testing"
+
+_ :: sanitizer
 
 SPSC_Ring :: struct #align(CACHE_LINE_SIZE) {
     // PRODUCER CACHE LINE -------------------------------------------------
@@ -95,6 +98,53 @@ spsc_ring_commit_read :: #force_inline proc "contextless" (ring: ^SPSC_Ring, cou
     sync.atomic_store_explicit(&ring.read_sequence, ring.local_read_sequence, sync.Atomic_Memory_Order.Release)
 }
 
+spsc_ring_init_tina_owned :: proc(
+    ring: ^SPSC_Ring,
+    capacity: u64,
+    buffer: []Message_Envelope,
+) {
+    spsc_ring_init(ring, capacity, buffer)
+
+    when TINA_ASAN_POISONING {
+        _sanitizer_address_poison_spsc_ring_slots(ring, 0, capacity)
+    }
+}
+
+spsc_ring_enqueue_tina_owned :: #force_inline proc "contextless" (
+    ring: ^SPSC_Ring,
+    envelope: ^Message_Envelope,
+) -> Enqueue_Result {
+    when TINA_ASAN_POISONING {
+        if ring.local_write_sequence - ring.cached_read_sequence >= ring.capacity {
+            ring.cached_read_sequence = sync.atomic_load_explicit(&ring.read_sequence, sync.Atomic_Memory_Order.Acquire)
+            if ring.local_write_sequence - ring.cached_read_sequence >= ring.capacity {
+                return .Full
+            }
+        }
+
+        index := ring.local_write_sequence & ring.capacity_mask
+        _sanitizer_address_unpoison_spsc_ring_slot(ring, index)
+        ring.buffer[index] = envelope^
+        ring.local_write_sequence += 1
+        return .Success
+    } else {
+        return spsc_ring_enqueue(ring, envelope)
+    }
+}
+
+// Slots are poisoned before read_sequence is published so a producer cannot
+// claim and write a slot ASan still considers free.
+spsc_ring_commit_read_tina_owned :: #force_inline proc "contextless" (ring: ^SPSC_Ring, count: u64) {
+    if count == 0 do return
+
+    when TINA_ASAN_POISONING {
+        _sanitizer_address_poison_spsc_ring_slots(ring, ring.local_read_sequence, count)
+    }
+
+    ring.local_read_sequence += count
+    sync.atomic_store_explicit(&ring.read_sequence, ring.local_read_sequence, sync.Atomic_Memory_Order.Release)
+}
+
 // ======
 // Tests
 // ======
@@ -128,4 +178,47 @@ test_spsc_ring_batching :: proc(t: ^testing.T) {
 
     spsc_ring_flush_producer(&ring)
     testing.expect_value(t, spsc_ring_available_to_read(&ring), 4)
+}
+
+when TINA_ASAN_POISONING {
+
+@(test)
+test_spsc_ring_tina_owned_slot_poisoning :: proc(t: ^testing.T) {
+    buffer: [4]Message_Envelope
+    ring: SPSC_Ring
+    spsc_ring_init_tina_owned(&ring, 4, buffer[:])
+
+    slot_pointer := rawptr(&buffer[0])
+    slot_size := size_of(Message_Envelope)
+
+    testing.expect(
+        t,
+        sanitizer.address_region_is_poisoned_rawptr(slot_pointer, slot_size) != nil,
+        "initially free SPSC ring slot must be poisoned",
+    )
+
+    envelope := Message_Envelope{ tag = TAG_TIMER }
+    testing.expect_value(t, spsc_ring_enqueue_tina_owned(&ring, &envelope), Enqueue_Result.Success)
+
+    testing.expect(
+        t,
+        sanitizer.address_region_is_poisoned_rawptr(slot_pointer, slot_size) == nil,
+        "enqueued SPSC ring slot must be unpoisoned",
+    )
+
+    spsc_ring_flush_producer(&ring)
+    testing.expect_value(t, spsc_ring_available_to_read(&ring), 1)
+    testing.expect(t, spsc_ring_get_read_ptr(&ring, 0) != nil)
+
+    spsc_ring_commit_read_tina_owned(&ring, 1)
+
+    testing.expect(
+        t,
+        sanitizer.address_region_is_poisoned_rawptr(slot_pointer, slot_size) != nil,
+        "committed SPSC ring slot must be re-poisoned",
+    )
+
+    _sanitizer_address_unpoison_spsc_ring_slots(&ring)
+}
+
 }

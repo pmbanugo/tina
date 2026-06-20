@@ -999,7 +999,8 @@ _dispatch_type_batch :: proc(
 	dispatch_budget := u32(work_budget_count)
 	dispatched_count: u32 = 0
 
-	if os_trap_save(&shard.trap_environment_inner) != 0 {
+	recovery_result := os_trap_save(&shard.trap_environment_inner)
+	if recovery_result != 0 {
 		when !TINA_SIMULATION_MODE {
 			// Sweep orphaned temp allocations from panic string formatting.
 			free_all(context.temp_allocator)
@@ -1031,6 +1032,15 @@ _dispatch_type_batch :: proc(
 		if next_cursor >= slot_count do next_cursor = 0
 		shard.dispatch_cursors[type_id] = next_cursor
 		shard.current_isolate_turn_frame = frame.previous_isolate_turn_frame
+	}
+
+	when TINA_ASAN_POISONING {
+		if recovery_result != 0 {
+			// An inner turn recovery may have been preceded by a signal-path
+			// emergency flush on the same thread. Restore the log-ring poison
+			// invariant before normal scheduling resumes.
+			_sanitizer_address_refresh_log_ring_poison(&shard.log_ring)
+		}
 	}
 
 	cursor := shard.dispatch_cursors[type_id]

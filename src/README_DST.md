@@ -38,6 +38,7 @@ CI keeps the normal platform and simulation suites as the portability baseline, 
 | Platform + `-sanitize:thread` | Yes | Catches data races in any test that exercises real OS threads, atomics, or cross-shard runtime paths. |
 | Platform + `-sanitize:memory` | Experimental | Linux/FreeBSD-only lane for uninitialized reads around raw OS/FFI boundaries and explicit non-zeroed allocation paths. Odin's zero-is-initialized rule makes this lower signal than ASan. |
 | Simulation + `-sanitize:memory` | Experimental | Checks the single-threaded DST backend for uninitialized reads in pure framework/application state. |
+| ASan death tests (`odin run tools/asan_death_tests`) | Yes | Odin expected-crash runner outside `odin test`. Proves stale-access detection terminates the process under ASan for every Tina-owned lifetime (pool, isolate, I/O slot, SPSC ring, log ring). |
 
 ThreadSanitizer is intentionally not part of the simulation lane today. Simulation mode is single-threaded by design, so TSan adds little signal there, and tests that deliberately corrupt checker state are not a good race-detection workload. Use TSan on non-DST tests that actually start Tina shards or exercise cross-shard communication.
 
@@ -59,9 +60,24 @@ odin test tests/ -all-packages -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FAN
 odin test tests/ -all-packages -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -sanitize:memory
 ```
 
-AddressSanitizer needs one extra Tina-specific design step to reach full value. The normal ASan runtime sees the Grand Arena as one large valid allocation; it cannot know that an isolate slot, message envelope, receive buffer, staging slot, or transfer slot is logically freed while still inside that allocation. Odin's `base:sanitizer` package exposes `address_poison*` and `address_unpoison*` procedures for this exact problem.
+AddressSanitizer uses Tina-specific ASan poisoning of every logical lifetime. The normal ASan runtime sees the Grand Arena as one large valid allocation; it cannot know that an isolate slot, message envelope, receive buffer, staging slot, transfer slot, SPSC ring slot, or log-ring byte is logically freed while still inside that allocation. Odin's `base:sanitizer` package exposes `address_poison*` and `address_unpoison*` procedures that Tina uses to instrument every pool, slot, arena, ring, and log buffer.
 
-Future allocator instrumentation should follow these rules:
+Tina-owned logical lifetimes covered by ASan poisoning include:
+
+- **Message, transfer, receive, and staging pool slots** — poisoned while free, unpoisoned on allocation.
+- **Typed isolate payloads and per-isolate working memory** — poisoned when the slot becomes `.Unallocated`, unpoisoned before handler code can access it.
+- **Working-arena sub-allocations** — poisoned on reset, unpoisoned for each fresh allocation.
+- **In-flight kernel-owned I/O buffers** — poisoned after a successful submission on completion-style backends, unpoisoned on completion.
+- **Cross-shard SPSC ring slots** — poisoned while free, unpoisoned on producer claim, and re-poisoned by the consumer before it publishes the released slot via `read_sequence`.
+- **Per-shard log-ring bytes** — poisoned while reusable, unpoisoned while they belong to a committed live record in `[read_cursor, write_cursor)`, and re-poisoned only after a successful `log_flush` advances `read_cursor`. Signal-path emergency flushes advance `read_cursor` without touching ASan shadow state; the poison invariant is repaired at the next non-signal recovery safe point.
+
+Expected-crash ASan evidence is collected by an Odin runner/tool outside the default `odin test` suite. These cases intentionally access freed/poisoned memory and are treated as passing only when ASan terminates the child process:
+
+```sh
+odin run tools/asan_death_tests
+```
+
+The instrumentation follows these design rules:
 
 1. Poison only in sanitizer builds; production and normal tests must pay zero cost.
 2. Preserve intrusive free-list metadata. For message and I/O slot pools, keep the free-list word addressable while poisoning the rest of the free slot payload, then unpoison the whole slot immediately before allocation and zeroing.
@@ -381,7 +397,7 @@ Rules:
 
 ## Sequential Verification Gate
 
-Before resuming ASan feature work, collect verification evidence from these commands run **sequentially** in the same workspace. Do not run multiple `odin test` invocations concurrently when collecting gate evidence; the runner may share build/test artifacts.
+Before making structural or sanitizer changes, collect verification evidence from these commands run **sequentially** in the same workspace. Do not run multiple `odin test` invocations concurrently when collecting gate evidence; the runner may share build/test artifacts.
 
 ```sh
 # 1. Structural hygiene (no Odin toolchain required)
@@ -395,6 +411,9 @@ odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_FAIL_ON_B
 
 # 4. Single-thread simulation suite (sanitizer-runner configuration)
 odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_FANCY=false
+
+# 5. ASan death tests (expected-crash runner)
+odin run tools/asan_death_tests
 ```
 
 ## Reproducing Failures

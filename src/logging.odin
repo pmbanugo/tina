@@ -1,7 +1,12 @@
 package tina
 
+import "base:sanitizer"
 import "core:mem"
 import "core:os"
+import "core:testing"
+
+_ :: sanitizer
+_ :: testing
 
 Log_Level :: enum u8 {
 	ERROR = 0,
@@ -76,6 +81,14 @@ log_init :: proc(ring: ^Log_Ring_Buffer, backing: []u8) {
 	ring.write_cursor = 0
 }
 
+log_init_tina_owned :: proc(ring: ^Log_Ring_Buffer, backing: []u8) {
+	log_init(ring, backing)
+
+	when TINA_ASAN_POISONING {
+		_sanitizer_address_poison_log_ring_region(ring, 0, u64(len(backing)))
+	}
+}
+
 // Writes a diagnostic log to the Shard's environment.
 // The message is raw-byte
 ctx_log_raw :: #force_inline proc(
@@ -135,6 +148,9 @@ _shard_log :: #force_inline proc "contextless" (
 	if shard.log_ring.write_cursor + record_size - shard.log_ring.read_cursor > capacity {
 		return
 	}
+
+	record_offset := shard.log_ring.write_cursor
+	_sanitizer_address_unpoison_log_ring_region(&shard.log_ring, record_offset, record_size)
 
 	header := Log_Record_Header {
 		timestamp      = timestamp,
@@ -219,6 +235,28 @@ log_level_label :: #force_inline proc "contextless" (level: Log_Level) -> string
 	return "UNKNOWN"
 }
 
+// Advances ring.read_cursor to `next_cursor` and poisons the bytes that are
+// released by that advancement. Read-cursor movement is performed first so an
+// emergency snapshot cannot observe bytes ASan already considers freed.
+@(private = "package")
+_log_flush_advance_read_cursor :: #force_inline proc "contextless" (
+	ring: ^Log_Ring_Buffer,
+	previous_cursor: u64,
+	next_cursor: u64,
+) {
+	ring.read_cursor = next_cursor
+	when TINA_ASAN_POISONING {
+		_sanitizer_address_poison_log_ring_region(
+			ring,
+			previous_cursor,
+			next_cursor - previous_cursor,
+		)
+	}
+}
+
+@(private = "package")
+LOG_FLUSH_SHOULD_WRITE_TO_STDERR_DEFAULT :: !ODIN_TEST
+
 // Step 7: Flush logs to OS stream via PIPE_BUF chunks
 log_flush :: proc(shard: ^Shard) {
 	temp_buffer: [POSIX_PIPE_BUF_SIZE]u8
@@ -267,11 +305,13 @@ log_flush :: proc(shard: ^Shard) {
 		line_bytes := line_buffer[:position]
 
 		if temp_size + len(line_bytes) > POSIX_PIPE_BUF_SIZE {
-			written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])
-			if write_error != nil || written_size < temp_size {
-				break // Retain data for next tick (Capacitor behavior)
+			when LOG_FLUSH_SHOULD_WRITE_TO_STDERR_DEFAULT {
+				written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])
+				if write_error != nil || written_size < temp_size {
+					break // Retain data for next tick (Capacitor behavior)
+				}
 			}
-			ring.read_cursor = commit_cursor
+			_log_flush_advance_read_cursor(ring, ring.read_cursor, commit_cursor)
 			temp_size = 0
 		}
 		copy(temp_buffer[temp_size:], line_bytes)
@@ -281,9 +321,92 @@ log_flush :: proc(shard: ^Shard) {
 	}
 
 	if temp_size > 0 {
-		written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])
-		if write_error == nil && written_size == temp_size {
-			ring.read_cursor = commit_cursor
+		when LOG_FLUSH_SHOULD_WRITE_TO_STDERR_DEFAULT {
+			written_size, write_error := os.write(os.stderr, temp_buffer[:temp_size])
+			if write_error == nil && written_size == temp_size {
+				_log_flush_advance_read_cursor(ring, ring.read_cursor, commit_cursor)
+			}
+		} else {
+			_log_flush_advance_read_cursor(ring, ring.read_cursor, commit_cursor)
 		}
 	}
+}
+
+when TINA_ASAN_POISONING {
+
+@(test)
+test_log_ring_byte_poisoning :: proc(t: ^testing.T) {
+	backing: [64]u8
+	ring: Log_Ring_Buffer
+	log_init_tina_owned(&ring, backing[:])
+
+	fixture := test_shard_fixture_init(
+		Test_Shard_Spec{
+			type_count  = 1,
+			slot_counts = {0},
+			strides     = {0},
+			subsystems  = {.Metadata},
+		},
+	)
+	defer test_shard_fixture_deinit(fixture)
+
+	shard := &fixture.shard
+	shard.log_ring = ring
+	shard.current_tick = 1
+
+	payload := []u8{'h', 'e', 'l', 'l', 'o'}
+
+	testing.expect(
+		t,
+		sanitizer.address_region_is_poisoned_rawptr(rawptr(&backing[32]), 1) != nil,
+		"initially reusable log-ring byte must be poisoned",
+	)
+
+	_shard_log(
+		shard,
+		ISOLATE_HANDLE_NONE,
+		Log_Level.INFO,
+		USER_LOG_TAG_BASE,
+		payload,
+	)
+
+	testing.expect(
+		t,
+		sanitizer.address_region_is_poisoned_rawptr(rawptr(&backing[0]), 32) == nil,
+		"written log-record bytes must be unpoisoned",
+	)
+	testing.expect(
+		t,
+		sanitizer.address_region_is_poisoned_rawptr(rawptr(&backing[32]), 1) != nil,
+		"adjacent reusable log-ring byte must remain poisoned",
+	)
+
+	log_flush(shard)
+
+	testing.expect(
+		t,
+		sanitizer.address_region_is_poisoned_rawptr(rawptr(&backing[0]), 1) != nil,
+		"flushed log-record bytes must be re-poisoned",
+	)
+
+	_shard_log(
+		shard,
+		ISOLATE_HANDLE_NONE,
+		Log_Level.INFO,
+		USER_LOG_TAG_BASE,
+		payload,
+	)
+
+	testing.expect(
+		t,
+		sanitizer.address_region_is_poisoned_rawptr(rawptr(&backing[32]), 32) == nil,
+		"second live log-record bytes must be unpoisoned",
+	)
+	testing.expect(
+		t,
+		sanitizer.address_region_is_poisoned_rawptr(rawptr(&backing[0]), 1) != nil,
+		"previously flushed bytes must remain poisoned after second write",
+	)
+}
+
 }
