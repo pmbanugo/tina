@@ -311,4 +311,30 @@ when TINA_ASAN_POISONING {
 			"freed IO slot payload must be poisoned",
 		)
 	}
+
+	@(test)
+	test_fully_poisoned_io_slot_can_be_allocated_tina_owned :: proc(t: ^testing.T) {
+		backing: [128]u8
+		pool: IO_Slot_Pool
+		io_slot_pool_init_tina_owned(&pool, backing[:], 64, 2)
+		defer _sanitizer_address_unpoison_io_pool_slots(&pool)
+
+		// The provided-buffer reactor path fully poisons receive slots,
+		// including the intrusive free-list word. Allocation must unpoison
+		// that word before reading the next free index.
+		_sanitizer_address_poison_io_slot(&pool, IO_Slot_Index(0))
+		_sanitizer_address_poison_io_slot(&pool, IO_Slot_Index(1))
+
+		index_zeroed, alloc_zeroed_error := io_slot_pool_alloc_tina_owned(&pool)
+		testing.expect_value(t, alloc_zeroed_error, IO_Slot_Pool_Error.None)
+
+		index_unzeroed, alloc_unzeroed_error := io_slot_pool_alloc_unzeroed_tina_owned(&pool)
+		testing.expect_value(t, alloc_unzeroed_error, IO_Slot_Pool_Error.None)
+
+		testing.expect(
+			t,
+			index_zeroed != index_unzeroed,
+			"should allocate distinct slots",
+		)
+	}
 }

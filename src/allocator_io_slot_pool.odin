@@ -164,6 +164,10 @@ io_slot_pool_alloc_tina_owned :: #force_inline proc(
 	index := pool.free_head
 	slot_pointer := _io_slot_pool_pointer(pool, index)
 
+	// Unpoison the free-list link word before reading it. The provided-buffer
+	// init path poisons entire slots (link word included), so reading the link
+	// word before unpoisoning would trigger ASan. Symmetric with the free path.
+	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Index))
 	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
 	_sanitizer_address_unpoison_io_slot(pool, index)
 	pool.free_count -= 1
@@ -182,6 +186,7 @@ io_slot_pool_alloc_unzeroed_tina_owned :: #force_inline proc(
 	}
 	index := pool.free_head
 	slot_pointer := _io_slot_pool_pointer(pool, index)
+	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Index))
 	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
 	_sanitizer_address_unpoison_io_slot(pool, index)
 	pool.free_count -= 1
