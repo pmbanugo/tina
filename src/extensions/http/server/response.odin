@@ -99,6 +99,7 @@ Header_Result :: enum u8 {
 	Staged,
 	Reserved_Name,
 	Invalid_Name,
+	Invalid_Value,
 	Header_Count_Exceeded,
 	Header_Bytes_Exceeded,
 	Already_Committed,
@@ -109,6 +110,7 @@ Response_Begin_Result :: enum u8 {
 	Begun,
 	Already_Committed,
 	Aborted,
+	Invalid_Header,
 	Header_Count_Exceeded,
 	Header_Bytes_Exceeded,
 	Egress_Buffer_Exceeded,
@@ -135,6 +137,13 @@ Body_Reservation :: struct {
 	body_size_sent_before: u64,
 	body_size_sent_commit: u64,
 }
+
+@(private = "file")
+Header_Stage_Mode :: enum u8 {
+	Set,
+	Add,
+}
+
 #assert(
 	size_of(Response_Header_Entry) == 8,
 	"Response_Header_Entry size/layout changed — expected to be exactly 8 bytes so HTTP_RESPONSE_HEADERS_MAX × 8 = 256 bytes",
@@ -210,7 +219,7 @@ response_header_set :: proc "contextless" (
 	name: []u8,
 	value: []u8,
 ) -> Header_Result {
-	return _stage_header(response, bytes_region, name, value, replace_existing = true)
+	return _stage_header(response, bytes_region, name, value, .Set)
 }
 
 response_header_add :: proc "contextless" (
@@ -219,7 +228,7 @@ response_header_add :: proc "contextless" (
 	name: []u8,
 	value: []u8,
 ) -> Header_Result {
-	return _stage_header(response, bytes_region, name, value, replace_existing = false)
+	return _stage_header(response, bytes_region, name, value, .Add)
 }
 
 // Internal staging core. Held in one place so that `header_set` and
@@ -231,18 +240,22 @@ _stage_header :: proc "contextless" (
 	bytes_region: []u8,
 	name: []u8,
 	value: []u8,
-	replace_existing: bool,
+	mode: Header_Stage_Mode,
 ) -> Header_Result {
 	if .Headers_Committed in response.flags do return .Already_Committed
 	if .Aborted in response.flags do return .Aborted
 	if len(name) == 0 do return .Invalid_Name
-
+	if !validate_token_bytes(name) do return .Invalid_Name
 	if _name_is_reserved(name) do return .Reserved_Name
+
+	for byte_value in value {
+		if !is_header_value_byte(byte_value) do return .Invalid_Value
+	}
 
 	cursor := int(response.header_bytes_used)
 	region_size := len(bytes_region)
 
-	if replace_existing {
+	if mode == .Set {
 		#no_bounds_check for index in 0 ..< response.header_count {
 			entry := response.headers[index]
 			existing_name := bytes_region[entry.name_offset:][:entry.name_size]
@@ -655,8 +668,10 @@ _response_begin_result_from_header :: #force_inline proc "contextless" (
 		return .Begun
 	case .Header_Count_Exceeded:
 		return .Header_Count_Exceeded
-	case .Header_Bytes_Exceeded, .Invalid_Name:
+	case .Header_Bytes_Exceeded:
 		return .Header_Bytes_Exceeded
+	case .Invalid_Name, .Invalid_Value:
+		return .Invalid_Header
 	case .Already_Committed:
 		return .Already_Committed
 	case .Aborted:
@@ -1533,6 +1548,63 @@ test_response_header_set_date_is_reserved :: proc(t: ^testing.T) {
 		transmute([]u8)string("Wed, 01 May 2026 12:00:00 GMT"),
 	)
 	testing.expect_value(t, ok, Header_Result.Reserved_Name)
+	testing.expect_value(t, response.header_count, 0)
+	testing.expect_value(t, response.header_bytes_used, u16(0))
+}
+
+@(test)
+test_response_header_set_rejects_invalid_name_bytes :: proc(t: ^testing.T) {
+	response: Response_State
+	response_state_reset(&response)
+	region: [256]u8
+
+	result_space := response_header_set(
+		&response,
+		region[:],
+		transmute([]u8)string("X Trace"),
+		transmute([]u8)string("abc"),
+	)
+	result_colon := response_header_set(
+		&response,
+		region[:],
+		transmute([]u8)string("X:Trace"),
+		transmute([]u8)string("abc"),
+	)
+	result_crlf := response_header_set(
+		&response,
+		region[:],
+		transmute([]u8)string("X-Trace\r\nInjected"),
+		transmute([]u8)string("abc"),
+	)
+
+	testing.expect_value(t, result_space, Header_Result.Invalid_Name)
+	testing.expect_value(t, result_colon, Header_Result.Invalid_Name)
+	testing.expect_value(t, result_crlf, Header_Result.Invalid_Name)
+	testing.expect_value(t, response.header_count, 0)
+	testing.expect_value(t, response.header_bytes_used, u16(0))
+}
+
+@(test)
+test_response_header_set_rejects_invalid_value_bytes :: proc(t: ^testing.T) {
+	response: Response_State
+	response_state_reset(&response)
+	region: [256]u8
+
+	result_crlf := response_header_set(
+		&response,
+		region[:],
+		transmute([]u8)string("X-Trace"),
+		transmute([]u8)string("abc\r\nInjected: yes"),
+	)
+	result_delete := response_header_set(
+		&response,
+		region[:],
+		transmute([]u8)string("X-Trace"),
+		[]u8{'a', 0x7F, 'b'},
+	)
+
+	testing.expect_value(t, result_crlf, Header_Result.Invalid_Value)
+	testing.expect_value(t, result_delete, Header_Result.Invalid_Value)
 	testing.expect_value(t, response.header_count, 0)
 	testing.expect_value(t, response.header_bytes_used, u16(0))
 }
