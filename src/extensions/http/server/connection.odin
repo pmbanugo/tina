@@ -311,16 +311,57 @@ _connection_process_header_bytes :: proc(
 		return _connection_begin_close(connection)
 	}
 
+	source := buffer
+	tail_bytes: []u8
+	parsed_offset_start := u16(0)
+	ingress_size_before := u16(state.ingress_size)
+	if ingress_size_before > 0 {
+		storage := state.request_frame_bytes
+		storage_size := u16(len(storage))
+		buffer_size := u16(len(buffer))
+		append_size := min(buffer_size, storage_size - ingress_size_before)
+		if append_size > 0 {
+			copy(storage[ingress_size_before:][:append_size], buffer[:append_size])
+		}
+		state.ingress_size = Ingress_Size(ingress_size_before + append_size)
+		source = state.request_frame_bytes[:state.ingress_size]
+		tail_bytes = buffer[append_size:]
+		parsed_offset_start = u16(state.ingress_parsed_offset)
+	}
+
 	parse_status, parsed_offset := parse_step(
 		&state.parser,
 		&state.request,
 		state.header_views,
-		buffer,
-		0,
+		source,
+		parsed_offset_start,
 		runtime.server.limits,
 	)
 	#partial switch parse_status {
 	case .Need_More:
+		if len(tail_bytes) > 0 {
+			limit_status := Parse_Status.Error_Header_Too_Large
+			if state.parser.phase == .Request_Line {
+				limit_status = .Error_Bad_Request
+			}
+			return _connection_send_parse_error(connection, limit_status)
+		}
+		if ingress_size_before > 0 {
+			state.ingress_parsed_offset = Ingress_Offset(parsed_offset)
+		} else {
+			if len(buffer) > len(state.request_frame_bytes) || len(buffer) > int(max(u16)) {
+				limit_status := Parse_Status.Error_Header_Too_Large
+				if state.parser.phase == .Request_Line {
+					limit_status = .Error_Bad_Request
+				}
+				return _connection_send_parse_error(connection, limit_status)
+			}
+			if len(buffer) > 0 {
+				copy(state.request_frame_bytes[:len(buffer)], buffer)
+			}
+			state.ingress_size = Ingress_Size(u16(len(buffer)))
+			state.ingress_parsed_offset = Ingress_Offset(parsed_offset)
+		}
 		if state.parser.phase == .Body_Fixed ||
 		   state.parser.phase == .Chunk_Size ||
 		   state.parser.phase == .Chunk_Data ||
@@ -341,17 +382,17 @@ _connection_process_header_bytes :: proc(
 		if _connection_should_drain(runtime) {
 			return _connection_begin_close(connection)
 		}
-		request := _connection_make_request(connection, buffer)
+		request := _connection_make_request(connection, source)
 		response := _connection_make_response(connection)
 		step := _dispatch_route(&request, &response)
 		if state.request.route_index != ROUTE_INDEX_NONE {
 			descriptor := runtime.router.descriptors[state.request.route_index]
 			if descriptor.body_mode != .None || descriptor.handler_kind == .Event {
-				_connection_retain_request_frame(connection, buffer[:parsed_offset])
+				_connection_retain_request_frame(connection, source[:parsed_offset])
 			}
 		}
-		if parsed_offset < u16(len(buffer)) {
-			if !_connection_retain_tail(connection, buffer[parsed_offset:]) {
+		if parsed_offset < u16(len(source)) || len(tail_bytes) > 0 {
+			if !_connection_retain_tail_pair(connection, source[parsed_offset:], tail_bytes) {
 				if step == .Read_Body {
 					return _connection_begin_close(connection)
 				}
@@ -1104,11 +1145,33 @@ _connection_retain_request_frame :: proc(connection: ^HTTP_Connection, frame: []
 
 @(private = "file")
 _connection_retain_tail :: proc(connection: ^HTTP_Connection, source: []u8) -> bool {
+	return _connection_retain_tail_pair(connection, source, nil)
+}
+
+@(private = "file")
+_connection_retain_tail_pair :: proc(
+	connection: ^HTTP_Connection,
+	source_first: []u8,
+	source_second: []u8,
+) -> bool {
 	state := &connection.connection_state
-	retained_size, budget_exceeded := retain_pipeline_tail(source, state.pipeline_tail_bytes)
-	if budget_exceeded {
+	retained_size := len(source_first) + len(source_second)
+	if retained_size == 0 {
+		state.pipeline_tail_size = 0
+		return true
+	}
+	if retained_size > len(state.pipeline_tail_bytes) || retained_size > int(max(u16)) {
 		state.pipeline_tail_size = 0
 		return false
+	}
+
+	write_offset := 0
+	if len(source_first) > 0 {
+		copy(state.pipeline_tail_bytes[write_offset:], source_first)
+		write_offset += len(source_first)
+	}
+	if len(source_second) > 0 {
+		copy(state.pipeline_tail_bytes[write_offset:], source_second)
 	}
 	state.pipeline_tail_size = u16(retained_size)
 	return true
@@ -2573,6 +2636,155 @@ test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T)
 		)],
 	)
 	testing.expect_value(t, retained_tail, second_request)
+}
+
+@(test)
+test_process_header_bytes_accumulates_fragmented_request_line :: proc(t: ^testing.T) {
+	router := Compiled_Router{}
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		router = router,
+	}
+
+	header_views_storage: [64]Header_View
+	request_frame_storage: [512]u8
+	response_header_storage: [1024]u8
+
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.fd = tina.FD_Handle(34)
+	connection.connection_state.state = .Recv_Headers
+	connection.connection_state.header_views = header_views_storage[:]
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	connection.connection_state.self_handle = tina.make_handle(
+		0,
+		HTTP_TYPE_OFFSET_CONNECTION,
+		0,
+		1,
+	)
+	request_state_reset(&connection.connection_state.request)
+	parser_state_reset(&connection.connection_state.parser)
+
+	fragment_first := transmute([]u8)string("GET /fragmented HT")
+	fragment_second := transmute([]u8)string("TP/1.1\r\nHost: example\r\n\r\n")
+
+	Process_Fragment_Test_State :: struct {connection: ^HTTP_Connection, input: []u8, t: ^testing.T}
+	fragment_first_state := Process_Fragment_Test_State {
+		connection = &connection,
+		input      = fragment_first,
+		t          = t,
+	}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&fragment_first_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Process_Fragment_Test_State)user_data
+			effect := _connection_process_header_bytes(test_state.connection, test_state.input)
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation().(tina.IoOp_Recv); !ok {
+				testing.expect(test_state.t, false, "first fragment should wait for more recv bytes")
+			}
+		},
+	)
+	testing.expect_value(t, int(connection.connection_state.ingress_size), len(fragment_first))
+	testing.expect_value(t, int(connection.connection_state.ingress_parsed_offset), 0)
+
+	fragment_second_state := Process_Fragment_Test_State {
+		connection = &connection,
+		input      = fragment_second,
+		t          = t,
+	}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&fragment_second_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Process_Fragment_Test_State)user_data
+			effect := _connection_process_header_bytes(test_state.connection, test_state.input)
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation().(tina.IoOp_Send); !ok {
+				testing.expect(test_state.t, false, "completed fragmented request should stage a response send")
+			}
+		},
+	)
+	testing.expect_value(t, connection.connection_state.response.status_code, HTTP_STATUS_NOT_FOUND)
+	testing.expect_value(t, connection.connection_state.parser.phase, Parse_Phase.Complete)
+}
+
+@(test)
+test_process_header_bytes_accumulates_fragmented_header_value :: proc(t: ^testing.T) {
+	router := Compiled_Router{}
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		router = router,
+	}
+
+	header_views_storage: [64]Header_View
+	request_frame_storage: [512]u8
+	response_header_storage: [1024]u8
+
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.fd = tina.FD_Handle(35)
+	connection.connection_state.state = .Recv_Headers
+	connection.connection_state.header_views = header_views_storage[:]
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	connection.connection_state.self_handle = tina.make_handle(
+		0,
+		HTTP_TYPE_OFFSET_CONNECTION,
+		0,
+		1,
+	)
+	request_state_reset(&connection.connection_state.request)
+	parser_state_reset(&connection.connection_state.parser)
+
+	fragment_first := transmute([]u8)string("GET /field HTTP/1.1\r\nHost: exam")
+	fragment_second := transmute([]u8)string("ple\r\n\r\n")
+	request_line_size := len("GET /field HTTP/1.1\r\n")
+
+	Process_Header_Fragment_Test_State :: struct {connection: ^HTTP_Connection, input: []u8, t: ^testing.T}
+	fragment_first_state := Process_Header_Fragment_Test_State {
+		connection = &connection,
+		input      = fragment_first,
+		t          = t,
+	}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&fragment_first_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Process_Header_Fragment_Test_State)user_data
+			effect := _connection_process_header_bytes(test_state.connection, test_state.input)
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation().(tina.IoOp_Recv); !ok {
+				testing.expect(test_state.t, false, "partial header value should wait for more recv bytes")
+			}
+		},
+	)
+	testing.expect_value(t, int(connection.connection_state.ingress_size), len(fragment_first))
+	testing.expect_value(t, int(connection.connection_state.ingress_parsed_offset), request_line_size)
+	testing.expect_value(t, connection.connection_state.parser.phase, Parse_Phase.Headers)
+
+	fragment_second_state := Process_Header_Fragment_Test_State {
+		connection = &connection,
+		input      = fragment_second,
+		t          = t,
+	}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&fragment_second_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Process_Header_Fragment_Test_State)user_data
+			effect := _connection_process_header_bytes(test_state.connection, test_state.input)
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation().(tina.IoOp_Send); !ok {
+				testing.expect(test_state.t, false, "completed fragmented header should stage a response send")
+			}
+		},
+	)
+	testing.expect(t, .Host in connection.connection_state.request.known_headers, "fragmented Host header should be recognized")
+	testing.expect_value(t, connection.connection_state.response.status_code, HTTP_STATUS_NOT_FOUND)
+	testing.expect_value(t, connection.connection_state.parser.phase, Parse_Phase.Complete)
 }
 
 @(test)
