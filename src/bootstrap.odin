@@ -19,12 +19,13 @@ Shard_Runtime_State :: struct #align (CACHE_LINE_SIZE) {
 	shard_pointer:            ^Shard,
 	os_thread_handle:         OS_Thread_Handle,
 	restart_window_start_ns:  u64,
-	watchdog_state:           u8,
 	restart_count:            u16,
-	_padding:                 [5]u8,
+	watchdog_state:           u8,
+	_padding:                 [CACHE_LINE_SIZE - 3 * size_of(u64) - size_of(u16) - size_of(u8)]u8,
 }
 
-#assert(size_of(Shard_Runtime_State) == CACHE_LINE_SIZE)
+#assert(size_of(Shard_Runtime_State) == CACHE_LINE_SIZE, "Shard_Runtime_State must occupy exactly one cache line")
+#assert(align_of(Shard_Runtime_State) == CACHE_LINE_SIZE, "Shard_Runtime_State alignment must match CACHE_LINE_SIZE")
 
 // Passed to each Shard thread upon creation.
 Shard_Config :: struct {

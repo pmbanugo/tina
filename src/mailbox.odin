@@ -47,7 +47,8 @@ Message :: struct {
 }
 
 // 128 bytes exactly. Fields ordered largest-to-smallest to eliminate implicit padding.
-Message_Envelope :: struct #align (128) {
+
+Message_Envelope :: struct #align (MESSAGE_ENVELOPE_SIZE) {
 	using _lifecycle: struct #raw_union {
 		source:         Isolate_Handle, // ALIVE STATE: Sender's Handle
 		next_free_slot: u32, // DEAD STATE: Intrusive pool free-list linkage
@@ -61,3 +62,7 @@ Message_Envelope :: struct #align (128) {
 	_padding:         u16,
 	payload:          [MAX_PAYLOAD_SIZE]u8, // 96 bytes
 }
+
+#assert(size_of(Message_Envelope) == MESSAGE_ENVELOPE_SIZE, "Message_Envelope must stay exactly MESSAGE_ENVELOPE_SIZE bytes")
+#assert(align_of(Message_Envelope) == MESSAGE_ENVELOPE_SIZE, "Message_Envelope alignment must match MESSAGE_ENVELOPE_SIZE")
+#assert(offset_of(Message_Envelope, payload) == 32, "Message_Envelope payload must start at byte 32 — keep fields ordered largest-to-smallest")

@@ -11,19 +11,27 @@ SPSC_Ring :: struct #align(CACHE_LINE_SIZE) {
     write_sequence:       u64, // ATOMIC: The sequence up to which data is fully written and visible
     local_write_sequence: u64, // LOCAL: The sequence of the next item to enqueue
     cached_read_sequence: u64, // LOCAL: Cached read sequence to avoid hitting the atomic
-    _padding1:            [104]u8, // 128 - (3 * 8) = 104 bytes padding to reach next cache line
+    _padding1:            [CACHE_LINE_SIZE - 3 * size_of(u64)]u8,
 
     // CONSUMER CACHE LINE -------------------------------------------------
     read_sequence:         u64, // ATOMIC: The sequence up to which data is fully consumed
     local_read_sequence:   u64, // LOCAL: The sequence of the next item to consume
     cached_write_sequence: u64, // LOCAL: Cached write sequence to avoid hitting the atomic
-    _padding2:             [104]u8, // 128 - (3 * 8) = 104 bytes padding
+    _padding2:             [CACHE_LINE_SIZE - 3 * size_of(u64)]u8,
 
     // COLD DATA. Read-only after initialization ---------------------------
     capacity:      u64,
     capacity_mask: u64,
     buffer:        [^]Message_Envelope,
 }
+
+// Producer and consumer fields must sit on separate cache lines so the
+// spatial prefetcher (Intel/AMD fetches 128-byte pairs) never pulls the
+// other thread's line into the current core. Cold data starts on a third line.
+#assert(offset_of(SPSC_Ring, read_sequence) == CACHE_LINE_SIZE, "SPSC_Ring consumer section must start on the second cache line")
+#assert(offset_of(SPSC_Ring, capacity) == 2 * CACHE_LINE_SIZE, "SPSC_Ring cold section must start on the third cache line")
+#assert(size_of(SPSC_Ring) == 3 * CACHE_LINE_SIZE, "SPSC_Ring must occupy exactly three cache lines")
+#assert(align_of(SPSC_Ring) == CACHE_LINE_SIZE, "SPSC_Ring alignment must match CACHE_LINE_SIZE")
 
 // Initializes the ring with pre-allocated memory (from process bootstrapper).
 spsc_ring_init :: proc(ring: ^SPSC_Ring, capacity: u64, buffer: []Message_Envelope) {
