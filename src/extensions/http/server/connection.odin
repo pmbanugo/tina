@@ -382,13 +382,25 @@ _connection_process_header_bytes :: proc(
 		if _connection_should_drain(runtime) {
 			return _connection_begin_close(connection)
 		}
-		request := _connection_make_request(connection, source)
+		request_frame, canonical_error := _connection_canonicalize_request_frame(
+			connection,
+			source,
+			parsed_offset,
+		)
+		if canonical_error == .Bad_Path {
+			return _connection_send_parse_error(connection, .Error_Bad_Request)
+		}
+		if canonical_error == .Frame_Too_Large {
+			return _connection_send_parse_error(connection, .Error_Header_Too_Large)
+		}
+
+		request := _connection_make_request(connection, request_frame)
 		response := _connection_make_response(connection)
 		step := _dispatch_route(&request, &response)
 		if state.request.route_index != ROUTE_INDEX_NONE {
 			descriptor := runtime.router.descriptors[state.request.route_index]
 			if descriptor.body_mode != .None || descriptor.handler_kind == .Event {
-				_connection_retain_request_frame(connection, source[:parsed_offset])
+				_connection_retain_request_frame(connection, request_frame)
 			}
 		}
 		if parsed_offset < u16(len(source)) || len(tail_bytes) > 0 {
@@ -411,6 +423,79 @@ _connection_process_header_bytes :: proc(
 	case:
 		return _connection_begin_close(connection)
 	}
+}
+
+@(private = "file")
+Request_Frame_Canonicalization_Error :: enum u8 {
+	None,
+	Bad_Path,
+	Frame_Too_Large,
+}
+
+@(private = "file")
+_connection_canonicalize_request_frame :: proc(
+	connection: ^HTTP_Connection,
+	frame: []u8,
+	frame_size: u16,
+) -> (
+	canonical_frame: []u8,
+	error: Request_Frame_Canonicalization_Error,
+) {
+	state := &connection.connection_state
+	path_offset := state.request.path_offset
+	path_size := state.request.path_size
+
+	for path_index: u16 = 0; path_index < path_size; path_index += 1 {
+		if frame[path_offset + path_index] != '%' do continue
+
+		if int(frame_size) > len(state.request_frame_bytes) {
+			when tina.TINA_RUNTIME_ASSERTIONS {
+				assert(false, "_connection_canonicalize_request_frame: parsed frame exceeds retained frame capacity")
+			}
+			return nil, .Frame_Too_Large
+		}
+		copy(state.request_frame_bytes[:frame_size], frame[:frame_size])
+
+		path_bytes := state.request_frame_bytes[path_offset:][:path_size]
+		path_size_canonical, path_error, _ := path_canonicalize_selective_in_place(path_bytes)
+		if path_error != .None {
+			return nil, .Bad_Path
+		}
+		if path_size_canonical > int(path_size) {
+			when tina.TINA_RUNTIME_ASSERTIONS {
+				assert(false, "_connection_canonicalize_request_frame: canonical path grew")
+			}
+			return nil, .Bad_Path
+		}
+
+		shift_size := path_size - u16(path_size_canonical)
+		if shift_size > 0 {
+			source_offset := path_offset + path_size
+			target_offset := path_offset + u16(path_size_canonical)
+			move_size := frame_size - source_offset
+			copy(
+				state.request_frame_bytes[target_offset:][:move_size],
+				state.request_frame_bytes[source_offset:][:move_size],
+			)
+
+			state.request.path_size = u16(path_size_canonical)
+			state.request.target_size -= shift_size
+			if state.request.query_offset != 0 {
+				state.request.query_offset -= shift_size
+			}
+			state.request.path_segment_count = PATH_SEGMENT_COUNT_NONE
+			state.parser.request_line_size -= shift_size
+
+			for header_index: u8 = 0; header_index < state.request.header_count; header_index += 1 {
+				state.header_views[header_index].name_offset -= shift_size
+				state.header_views[header_index].value_offset -= shift_size
+			}
+		}
+
+		return state.request_frame_bytes[:frame_size - shift_size], .None
+	}
+
+	return frame[:frame_size], .None
 }
 
 @(private = "package")
@@ -2636,6 +2721,237 @@ test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T)
 		)],
 	)
 	testing.expect_value(t, retained_tail, second_request)
+}
+
+@(private = "file")
+_connection_test_canonical_route_handler :: proc(request: ^Request, response: ^Response) -> Route_Step {
+	if string(path(request)) != "/admin" {
+		return respond_text(response, HTTP_STATUS_INTERNAL_SERVER_ERROR, "bad path")
+	}
+	if string(query(request)) != "x=1" {
+		return respond_text(response, HTTP_STATUS_INTERNAL_SERVER_ERROR, "bad query")
+	}
+	if string(header(request, "Host")) != "example" {
+		return respond_text(response, HTTP_STATUS_INTERNAL_SERVER_ERROR, "bad host")
+	}
+	return respond_text(response, HTTP_STATUS_OK, "ok")
+}
+
+@(test)
+test_process_header_bytes_canonicalizes_path_before_route_match :: proc(t: ^testing.T) {
+	routes := []Route{{pattern = "/admin", methods_mask = {.GET}, handler = rawptr(_connection_test_canonical_route_handler)}}
+	router, compile_error, _ := compile_router(routes)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, compile_error, Compile_Error.None)
+
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		router = router,
+	}
+
+	header_views_storage: [64]Header_View
+	request_frame_storage: [512]u8
+	response_header_storage: [1024]u8
+
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.fd = tina.FD_Handle(36)
+	connection.connection_state.state = .Recv_Headers
+	connection.connection_state.header_views = header_views_storage[:]
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	connection.connection_state.self_handle = tina.make_handle(
+		0,
+		HTTP_TYPE_OFFSET_CONNECTION,
+		0,
+		1,
+	)
+	request_state_reset(&connection.connection_state.request)
+	parser_state_reset(&connection.connection_state.parser)
+
+	request_bytes := transmute([]u8)string("GET /%61dmin?x=1 HTTP/1.1\r\nHost: example\r\n\r\n")
+	Canonical_Path_Test_State :: struct {connection: ^HTTP_Connection, input: []u8, t: ^testing.T}
+	canonical_path_test_state := Canonical_Path_Test_State {
+		connection = &connection,
+		input      = request_bytes,
+		t          = t,
+	}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&canonical_path_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Canonical_Path_Test_State)user_data
+			effect := _connection_process_header_bytes(test_state.connection, test_state.input)
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation().(tina.IoOp_Send); !ok {
+				testing.expect(test_state.t, false, "canonical path request should stage a response send")
+			}
+		},
+	)
+	testing.expect_value(t, connection.connection_state.response.status_code, HTTP_STATUS_OK)
+	testing.expect_value(t, connection.connection_state.request.path_size, u16(len("/admin")))
+	testing.expect_value(t, connection.connection_state.request.target_size, u16(len("/admin?x=1")))
+}
+
+@(test)
+test_connection_canonicalize_request_frame_preserves_encoded_slash :: proc(t: ^testing.T) {
+	request_frame_storage: [128]u8
+	frame := transmute([]u8)string("GET /a%2fb?x=1 HTTP/1.1\r\nHost: example\r\n\r\n")
+	copy(request_frame_storage[:len(frame)], frame)
+
+	connection := HTTP_Connection{}
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.request = Request_State {
+		target_offset = 4,
+		path_offset   = 4,
+		query_offset  = 11,
+		target_size   = u16(len("/a%2fb?x=1")),
+		path_size     = u16(len("/a%2fb")),
+		query_size    = u16(len("x=1")),
+	}
+
+	canonical_frame, path_error := _connection_canonicalize_request_frame(
+		&connection,
+		request_frame_storage[:len(frame)],
+		u16(len(frame)),
+	)
+	testing.expect_value(t, path_error, Request_Frame_Canonicalization_Error.None)
+	testing.expect_value(t, string(canonical_frame[4:][:len("/a%2Fb")]), "/a%2Fb")
+	testing.expect_value(t, connection.connection_state.request.path_size, u16(len("/a%2Fb")))
+	testing.expect_value(t, connection.connection_state.request.query_offset, u16(11))
+}
+
+@(test)
+test_connection_canonicalize_request_frame_shifts_empty_query_offset :: proc(t: ^testing.T) {
+	request_frame_storage: [128]u8
+	frame := transmute([]u8)string("GET /%61? HTTP/1.1\r\nHost: example\r\n\r\n")
+	copy(request_frame_storage[:len(frame)], frame)
+
+	connection := HTTP_Connection{}
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.request = Request_State {
+		target_offset = 4,
+		path_offset   = 4,
+		query_offset  = 9,
+		target_size   = u16(len("/%61?")),
+		path_size     = u16(len("/%61")),
+		query_size    = 0,
+	}
+	connection.connection_state.parser.request_line_size = u16(len("GET /%61? HTTP/1.1\r\n"))
+
+	canonical_frame, canonical_error := _connection_canonicalize_request_frame(
+		&connection,
+		request_frame_storage[:len(frame)],
+		u16(len(frame)),
+	)
+	testing.expect_value(t, canonical_error, Request_Frame_Canonicalization_Error.None)
+	testing.expect_value(t, string(canonical_frame[4:][:len("/a?")]), "/a?")
+	testing.expect_value(t, connection.connection_state.request.path_size, u16(len("/a")))
+	testing.expect_value(t, connection.connection_state.request.target_size, u16(len("/a?")))
+	testing.expect_value(t, connection.connection_state.request.query_offset, u16(7))
+	testing.expect_value(t, connection.connection_state.parser.request_line_size, u16(len("GET /a? HTTP/1.1\r\n")))
+}
+
+@(test)
+test_connection_canonicalize_request_frame_shifts_multiple_decoded_bytes :: proc(t: ^testing.T) {
+	request_frame_storage: [128]u8
+	frame := transmute([]u8)string("GET /%61%62%63 HTTP/1.1\r\nHost: example\r\n\r\n")
+	copy(request_frame_storage[:len(frame)], frame)
+
+	connection := HTTP_Connection{}
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.request = Request_State {
+		target_offset = 4,
+		path_offset   = 4,
+		target_size   = u16(len("/%61%62%63")),
+		path_size     = u16(len("/%61%62%63")),
+	}
+	connection.connection_state.parser.request_line_size = u16(len("GET /%61%62%63 HTTP/1.1\r\n"))
+
+	canonical_frame, canonical_error := _connection_canonicalize_request_frame(
+		&connection,
+		request_frame_storage[:len(frame)],
+		u16(len(frame)),
+	)
+	testing.expect_value(t, canonical_error, Request_Frame_Canonicalization_Error.None)
+	testing.expect_value(t, string(canonical_frame[4:][:len("/abc")]), "/abc")
+	testing.expect_value(t, connection.connection_state.request.path_size, u16(len("/abc")))
+	testing.expect_value(t, connection.connection_state.request.target_size, u16(len("/abc")))
+	testing.expect_value(t, connection.connection_state.request.query_offset, u16(0))
+}
+
+@(test)
+test_connection_canonicalize_request_frame_rejects_decoded_control_byte :: proc(t: ^testing.T) {
+	request_frame_storage: [128]u8
+	frame := transmute([]u8)string("GET /bad%00path HTTP/1.1\r\nHost: example\r\n\r\n")
+	copy(request_frame_storage[:len(frame)], frame)
+
+	connection := HTTP_Connection{}
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.request = Request_State {
+		target_offset = 4,
+		path_offset   = 4,
+		target_size   = u16(len("/bad%00path")),
+		path_size     = u16(len("/bad%00path")),
+	}
+
+	_, canonical_error := _connection_canonicalize_request_frame(
+		&connection,
+		request_frame_storage[:len(frame)],
+		u16(len(frame)),
+	)
+	testing.expect_value(t, canonical_error, Request_Frame_Canonicalization_Error.Bad_Path)
+}
+
+@(test)
+test_process_header_bytes_rejects_malformed_percent_path :: proc(t: ^testing.T) {
+	router := Compiled_Router{}
+	runtime := HTTP_Shard_Runtime {
+		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		router = router,
+	}
+
+	header_views_storage: [64]Header_View
+	request_frame_storage: [512]u8
+	response_header_storage: [1024]u8
+
+	connection := HTTP_Connection{}
+	connection.connection_state.shard_runtime = &runtime
+	connection.connection_state.fd = tina.FD_Handle(37)
+	connection.connection_state.state = .Recv_Headers
+	connection.connection_state.header_views = header_views_storage[:]
+	connection.connection_state.request_frame_bytes = request_frame_storage[:]
+	connection.connection_state.response_header_bytes = response_header_storage[:]
+	connection.connection_state.self_handle = tina.make_handle(
+		0,
+		HTTP_TYPE_OFFSET_CONNECTION,
+		0,
+		1,
+	)
+	request_state_reset(&connection.connection_state.request)
+	parser_state_reset(&connection.connection_state.parser)
+
+	request_bytes := transmute([]u8)string("GET /bad%GG HTTP/1.1\r\nHost: example\r\n\r\n")
+	Malformed_Path_Test_State :: struct {connection: ^HTTP_Connection, input: []u8, t: ^testing.T}
+	malformed_path_test_state := Malformed_Path_Test_State {
+		connection = &connection,
+		input      = request_bytes,
+		t          = t,
+	}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&malformed_path_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Malformed_Path_Test_State)user_data
+			effect := _connection_process_header_bytes(test_state.connection, test_state.input)
+			testing.expect_value(test_state.t, effect.kind, tina.Isolate_Transition_Kind.Wait_Io)
+			if _, ok := tina.ctx_staged_io_operation().(tina.IoOp_Send); !ok {
+				testing.expect(test_state.t, false, "malformed percent path should stage a parse-error response")
+			}
+		},
+	)
+	testing.expect_value(t, string(connection.egress_buffer[:len("HTTP/1.1 400")]), "HTTP/1.1 400")
+	testing.expect(t, .Aborted in connection.connection_state.response.flags, "malformed percent path should abort the response")
 }
 
 @(test)

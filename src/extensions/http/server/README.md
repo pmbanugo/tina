@@ -187,6 +187,7 @@ To maintain absolute structural safety and performance, the following are explic
 
 - **TLS/SSL:** Terminate TLS at your reverse proxy or load balancer. 
 - **Compression (deflate/gzip):** Rely on a CDN/proxy, or compress your response payloads in application code before passing them to the response buffer.
+- **Request chunk extensions:** Chunked request bodies support strict size/data/trailer framing only; chunk extensions are rejected rather than ignored.
 - **WebSocket Protocol**.
 - **HTTP/2**. If HTTP/3 is supported in the future, it will be added as a separate extension, not retrofitted into this HTTP/1.1 parser.
 

@@ -199,11 +199,11 @@ compile_router :: proc(
 		// literal_buffer.
 		canonical := make([]u8, len(route.pattern), context.temp_allocator)
 		copy(canonical, transmute([]u8)route.pattern)
-		canonical_size, canon_error, _ := path_canonicalize_selective_in_place(canonical)
-		if canon_error != .None {
+		pattern_size_canonical, pattern_error, _ := path_canonicalize_selective_in_place(canonical)
+		if pattern_error != .None {
 			return {}, .Pattern_Bad_Encoding, route_input_index
 		}
-		canonical = canonical[:canonical_size]
+		canonical = canonical[:pattern_size_canonical]
 
 		kind, parts, classify_error := classify_pattern(canonical, context.temp_allocator)
 		if classify_error != .None {

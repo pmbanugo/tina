@@ -238,9 +238,10 @@ Parser_State :: struct {
 	chunk_size_parsed:    u64, // partial hex value while accumulating a chunk size line
 	header_size:          u16, // total header bytes consumed (incl. CRLFs); bounded by Limits.header_size_max
 	request_line_size:    u16, // size of the request line (incl. trailing CRLF)
-	header_count:         u8, // number of headers parsed so far
-	flags:                Parser_Flags,
-	phase:                Parse_Phase,
+	header_count:            u8, // number of headers parsed so far
+	chunk_size_digit_count: u8,
+	flags:                   Parser_Flags,
+	phase:                   Parse_Phase,
 }
 
 // Initializes the parser to its pre-request baseline.
