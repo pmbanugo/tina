@@ -137,7 +137,7 @@ test_my_scenario :: proc(t: ^testing.T) {
         fd_table_slot_count = 16, fd_entry_size = size_of(FD_Entry),
         fd_handoff_entry_count = 0,
         log_ring_size = 4096, supervision_groups_max = 16,
-        scratch_arena_size = 65536,
+        scratch_memory_size = 65536,
     }
 
     // 5. Init and run

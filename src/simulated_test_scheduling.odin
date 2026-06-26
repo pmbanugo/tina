@@ -99,7 +99,7 @@ when TINA_SIMULATION_MODE {
 			fd_entry_size             = size_of(FD_Entry),
 			log_ring_size             = 4096,
 			supervision_groups_max    = 4,
-			scratch_arena_size        = 8192,
+			scratch_memory_size        = 8192,
 			default_ring_size         = 16,
 		}
 

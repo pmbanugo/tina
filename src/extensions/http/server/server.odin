@@ -495,10 +495,10 @@ install_into_system_spec :: proc(
 	working_memory_size := _compute_working_memory_size(server)
 	scratch_requirement := _compute_scratch_requirement(server)
 
-	// Raise spec.scratch_arena_size if HTTP requires more than the caller set.
+	// Raise spec.scratch_memory_size if HTTP requires more than the caller set.
 	// Never lower an explicit user value.
-	if spec.scratch_arena_size < scratch_requirement {
-		spec.scratch_arena_size = scratch_requirement
+	if spec.scratch_memory_size < scratch_requirement {
+		spec.scratch_memory_size = scratch_requirement
 	}
 
 	spec.timer_entry_count = max(
@@ -835,7 +835,7 @@ _make_base_system_spec :: proc(
 		log_ring_size             = HTTP_DEV_LOG_RING_SIZE,
 		supervision_groups_max    = HTTP_DEV_SUPERVISION_GROUPS_MAX,
 		default_ring_size         = default_ring_size,
-		// types and scratch_arena_size are filled in by install_into_system_spec.
+		// types and scratch_memory_size are filled in by install_into_system_spec.
 	}
 	return spec
 }

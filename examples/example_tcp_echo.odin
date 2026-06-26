@@ -523,7 +523,7 @@ main :: proc() {
 		timer_entry_count = 1024,
 		log_ring_size = 65536,
 		default_ring_size = 32,
-		scratch_arena_size = 65536,
+		scratch_memory_size = 65536,
 		fd_table_slot_count = 128,
 		fd_entry_size = size_of(tina.FD_Entry),
 		supervision_groups_max = 16,

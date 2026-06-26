@@ -382,8 +382,8 @@ hydrate_shard :: proc(
 
 	shard.scratch_memory = grand_arena_alloc_slice(
 		arena,
-		"Scratch_Arena",
-		spec.scratch_arena_size,
+		"Scratch_Memory",
+		spec.scratch_memory_size,
 	) or_return
 
 	// 5. Reactor
@@ -536,7 +536,7 @@ test_grand_arena :: proc(t: ^testing.T) {
 	spec := SystemSpec {
 		types                     = types[:],
 		pool_slot_count           = 10,
-		scratch_arena_size        = 1024,
+		scratch_memory_size        = 1024,
 
 		// Provide valid sizes to satisfy the subsystem initializers
 		reactor_buffer_slot_count = REACTOR_SLOTS,
@@ -607,7 +607,7 @@ test_hydrate_shard_reports_undersized_arena_make_failure :: proc(t: ^testing.T) 
 	spec := SystemSpec {
 		types                     = types[:],
 		pool_slot_count           = 10,
-		scratch_arena_size        = 1024,
+		scratch_memory_size        = 1024,
 
 		// Provide valid sizes to satisfy the subsystem initializers
 		reactor_buffer_slot_count = REACTOR_SLOTS,

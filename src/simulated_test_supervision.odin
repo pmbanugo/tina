@@ -295,7 +295,7 @@ when TINA_SIMULATION_MODE {
 			fd_entry_size             = size_of(FD_Entry),
 			log_ring_size             = 4096,
 			supervision_groups_max    = 16,
-			scratch_arena_size        = 65536,
+			scratch_memory_size        = 65536,
 		}
 
 		sim: Simulator
@@ -433,7 +433,7 @@ when TINA_SIMULATION_MODE {
 			fd_entry_size             = size_of(FD_Entry),
 			log_ring_size             = 4096,
 			supervision_groups_max    = 16,
-			scratch_arena_size        = 65536,
+			scratch_memory_size        = 65536,
 		}
 
 		sim: Simulator

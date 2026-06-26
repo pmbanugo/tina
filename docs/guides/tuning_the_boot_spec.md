@@ -116,7 +116,7 @@ ring_overrides := [1]tina.Ring_Override{
 
 ---
 
-## Scratch Arena (`scratch_arena_size`)
+## Scratch Arena (`scratch_memory_size`)
 
 **What it controls:** Shard-wide temporary memory, reset before every handler invocation. Accessed via `ctx_scratch_arena()`. Used for string formatting, parsing, intermediate computations — anything that doesn't need to survive past the current handler call.
 
@@ -217,7 +217,7 @@ spec := tina.SystemSpec{
     reactor_buffer_slot_size  = 4096,
     transfer_slot_count       = 16,         // few large transfers
     transfer_slot_size        = 4096,
-    scratch_arena_size        = 65536,
+    scratch_memory_size        = 65536,
     default_ring_size         = 256,        // heavy cross-shard routing
     fd_table_slot_count       = 4096,       // many open sockets
     shutdown_timeout_ms       = 5_000,
@@ -241,7 +241,7 @@ spec := tina.SystemSpec{
     reactor_buffer_slot_size  = 16384,      // larger reads (bulk data)
     transfer_slot_count       = 64,         // frequent large payloads
     transfer_slot_size        = 8192,
-    scratch_arena_size        = 65536,
+    scratch_memory_size        = 65536,
     default_ring_size         = 32,         // light cross-shard traffic
     fd_table_slot_count       = 64,
     shutdown_timeout_ms       = 10_000,     // workers may need time to finish
@@ -275,7 +275,7 @@ spec := tina.SystemSpec{
     reactor_buffer_slot_size  = 4096,
     transfer_slot_count       = 8,          // small! stress transfer exhaustion
     transfer_slot_size        = 4096,
-    scratch_arena_size        = 4096,       // small!
+    scratch_memory_size        = 4096,       // small!
     default_ring_size         = 16,         // minimum — stress ring-full drops
     fd_table_slot_count       = 16,
     simulation                = &sim_config,

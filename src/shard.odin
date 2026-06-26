@@ -198,8 +198,19 @@ Shard :: struct {
 	dispatchable_type_words:         []u64,
 	dispatch_ready_type_words:       []u64,
 	isolate_memory:                  [][]u8,
-	working_memory:                  [][]u8, // Base slices for working memory
-	scratch_memory:                  []u8, // Base slice for scratch arena
+	// Memory-lifetime taxonomy (see docs/concepts/memory_arenas.md):
+	//   *_memory      = backing byte slice(s) carved from the Grand Arena.
+	//   *_arena       = mem.Arena handle (data + offset) used to allocate within a *_memory.
+	//   *_memory_size = byte count sizing a *_memory region.
+	//   *_requirement_max = per-type reservation/budget, NOT a region size.
+	// Working (Gen 2): per-Isolate, persists across handler calls, dies on teardown.
+	//   Backed by working_memory; the turn exposes it as turn_frame.working_arena
+	//   and context.allocator, and persists its offset via working_arena_offset.
+	// Scratch (Gen 3): shard-wide, reset before every handler invocation.
+	//   Backed by scratch_memory; the turn exposes it as turn_frame.scratch_arena
+	//   and context.temp_allocator, and is re-initialized from offset 0 each turn.
+	working_memory:                  [][]u8, // Backing slices for per-Isolate working memory
+	scratch_memory:                  []u8, // Backing slice for the shard-wide scratch memory
 	transfer_generations:            []u16,
 	metadata:                        []#soa[]Isolate_Metadata,
 	supervision_groups:              []Supervision_Group,

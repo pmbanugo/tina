@@ -170,7 +170,7 @@ main :: proc() {
         timer_entry_count     = 256,
         log_ring_size         = 4096, // Logging Subsystem buffer size (power of 2)
         default_ring_size     = 16,
-        scratch_arena_size    = 4096,
+        scratch_memory_size    = 4096,
         fd_table_slot_count   = 16,
         fd_entry_size         = size_of(tina.FD_Entry),
         supervision_groups_max = 4,

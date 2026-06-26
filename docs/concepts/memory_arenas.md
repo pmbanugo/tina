@@ -53,6 +53,19 @@ The Grand Arena is a bump allocator: a base pointer and an offset. Each sub-allo
 
 Every byte of memory in a Shard belongs to one of three lifetime generations. This model synthesizes Ginger Bill's lifetime matrix (size vs. lifetime classification) with Ryan Fleury's three-lifetime arena model.
 
+### Naming taxonomy: `*_memory` vs `*_arena` vs `*_memory_size`
+
+The `working` and `scratch` prefixes pair with fixed suffixes that distinguish roles precisely. 
+
+| Suffix | Means | Example field |
+|---|---|---|
+| `*_memory` | Backing byte slice(s) carved from the Grand Arena | `shard.working_memory`, `shard.scratch_memory` |
+| `*_arena` | A `mem.Arena` handle (data + offset) used to allocate within a `*_memory` | `turn_frame.working_arena`, `turn_frame.scratch_arena` |
+| `*_memory_size` | Byte count sizing a `*_memory` region | `IsolateTypeDescriptor.working_memory_size`, `SystemSpec.scratch_memory_size` |
+| `*_requirement_max` | Per-type reservation/budget, NOT a region size | `IsolateTypeDescriptor.scratch_requirement_max` |
+
+The turn/quantum exposes these via `context.allocator` (working, isolate-lifetime) and `context.temp_allocator` (scratch, handler-transient), so Isolate handlers see the same lifetimes.
+
 ```
 ┌────────────────────────────────────────────────────────────────────┐
 │ GENERATION 1: SHARD-PERMANENT                                      │

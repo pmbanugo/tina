@@ -35,7 +35,7 @@ The root boot specification for the entire Tina process.
 | `fd_entry_size` | `int` | `0` | Size of each FD entry. Use `size_of(tina.FD_Entry)`. |
 | `log_ring_size` | `int` | — | **Required.** Logging Subsystem buffer capacity. Must be a power of 2. |
 | `supervision_groups_max` | `int` | `0` | Max supervision groups per Shard. |
-| `scratch_arena_size` | `int` | `0` | Scratch arena size in bytes. Must be >= the largest `IsolateTypeDescriptor.scratch_requirement_max`. |
+| `scratch_memory_size` | `int` | `0` | Scratch arena size in bytes. Must be >= the largest `IsolateTypeDescriptor.scratch_requirement_max`. |
 | `default_ring_size` | `u32` | — | **Required.** Default cross-shard messaging channel capacity. Must be a power of 2, >= 16. |
 | `ring_overrides` | `[]Ring_Override` | `nil` | Per-pair or per-shard ring size overrides. |
 | `simulation` | `^SimulationConfig` | `nil` | Simulation mode config. Only present when compiled with `TINA_SIM=true`. |
@@ -65,7 +65,7 @@ Defines the behavior, memory footprint, and lifecycle functions for a specific I
 | `stride` | `int` | — | Byte size of the Isolate struct. Use `size_of(MyIsolate)`. |
 | `soa_metadata_size` | `int` | — | Size of per-slot Isolate metadata. Use `size_of(tina.Isolate_Metadata)`. |
 | `working_memory_size` | `int` | `0` | Private working arena size per Isolate instance (bytes). |
-| `scratch_requirement_max` | `int` | `0` | Maximum scratch arena bytes this type needs. `SystemSpec.scratch_arena_size` must be >= this. |
+| `scratch_requirement_max` | `int` | `0` | Maximum scratch arena bytes this type needs. `SystemSpec.scratch_memory_size` must be >= this. |
 | `mailbox_capacity` | `u16` | `256` | Per-Isolate mailbox depth. If 0, the framework applies 256 at startup. |
 | `budget_weight` | `u16` | `1` | Scheduling weight. Higher = more messages processed per tick. If 0, the framework applies 1 at startup. |
 | `init_handler` | `Init_Handler` | — | `proc(self: rawptr, args: []u8) -> Isolate_Transition`. Called once on spawn. |
@@ -344,7 +344,7 @@ These fields must be powers of 2 (1, 2, 4, 8, 16, 32, ...):
 
 ### Arena Constraints
 
-- `scratch_arena_size` >= the largest `IsolateTypeDescriptor.scratch_requirement_max` across all types.
+- `scratch_memory_size` >= the largest `IsolateTypeDescriptor.scratch_requirement_max` across all types.
 
 ### Simulation Constraints (when `TINA_SIM=true`)
 
@@ -421,7 +421,7 @@ main :: proc() {
         log_ring_size           = 4096,
         timer_entry_count       = 64,
         default_ring_size       = 16,
-        scratch_arena_size      = 4096,
+        scratch_memory_size      = 4096,
         fd_table_slot_count     = 16,
         fd_entry_size           = size_of(tina.FD_Entry),
         supervision_groups_max  = 4,

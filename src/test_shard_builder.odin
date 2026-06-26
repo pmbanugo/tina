@@ -37,7 +37,7 @@ Test_Shard_Spec :: struct {
 	transfer_slot_size:      int,
 	handoff_entry_count:     int,
 	supervision_group_count: int,
-	scratch_arena_size:      int,
+	scratch_memory_size:      int,
 	fd_table_slot_count:     int,
 }
 
@@ -86,7 +86,7 @@ _Test_Shard_Resolved_Config :: struct {
 	transfer_slot_size:      int,
 	handoff_entry_count:     int,
 	supervision_group_count: int,
-	scratch_arena_size:      int,
+	scratch_memory_size:      int,
 }
 
 @(private)
@@ -126,8 +126,8 @@ _test_shard_resolve_config :: proc(spec: Test_Shard_Spec) -> _Test_Shard_Resolve
 	config.supervision_group_count = spec.supervision_group_count
 	if config.supervision_group_count == 0 do config.supervision_group_count = 4
 
-	config.scratch_arena_size = spec.scratch_arena_size
-	if config.scratch_arena_size == 0 do config.scratch_arena_size = 4096
+	config.scratch_memory_size = spec.scratch_memory_size
+	if config.scratch_memory_size == 0 do config.scratch_memory_size = 4096
 
 	return config
 }
@@ -221,7 +221,7 @@ _test_shard_compute_memory :: proc(spec: Test_Shard_Spec) -> int {
 	}
 
 	if .Scratch in spec.subsystems {
-		total += config.scratch_arena_size
+		total += config.scratch_memory_size
 	}
 
 	total += regions_max * CACHE_LINE_SIZE
@@ -423,7 +423,7 @@ test_shard_build :: proc(spec: Test_Shard_Spec, fixture: ^Test_Shard_Fixture) ->
 
 	// --- Scratch ---
 	if .Scratch in spec.subsystems {
-		shard.scratch_memory = grand_arena_alloc_slice(arena, "Scratch_Arena", config.scratch_arena_size) or_return
+		shard.scratch_memory = grand_arena_alloc_slice(arena, "Scratch_Memory", config.scratch_memory_size) or_return
 		fixture.initialized_subsystems += {.Scratch}
 	}
 

@@ -54,7 +54,7 @@ test_with_turn_frame :: proc(
 			working_memory_sizes = working_memory_sizes,
 			subsystems           = {.Metadata, .Timer_Wheel, .Scratch},
 			timer_entry_count    = 16,
-			scratch_arena_size   = 4096,
+			scratch_memory_size   = 4096,
 		},
 	)
 	defer test_shard_fixture_deinit(fixture)
@@ -146,7 +146,7 @@ test_with_local_turn_frame :: proc(
 			subsystems           = {.Metadata, .Dispatchable, .Message_Pool, .Timer_Wheel, .Scratch},
 			message_pool_slots   = 8,
 			timer_entry_count    = 16,
-			scratch_arena_size   = 4096,
+			scratch_memory_size   = 4096,
 		},
 	)
 	defer test_shard_fixture_deinit(fixture)

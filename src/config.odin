@@ -238,7 +238,7 @@ SystemSpec :: struct {
 	fd_entry_size:             int,
 	log_ring_size:             int,
 	supervision_groups_max:    int,
-	scratch_arena_size:        int,
+	scratch_memory_size:        int,
 	shard_count:               u8,
 	default_ring_size:         u32,
 	ring_overrides:            []Ring_Override,
@@ -378,10 +378,10 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 	}
 
 	// ADR Check 10: Scratch arena adequacy
-	if spec.scratch_arena_size < scratch_max {
+	if spec.scratch_memory_size < scratch_max {
 		fmt.eprintfln(
-			"[FATAL] scratch_arena_size (%v) is smaller than max requirement (%v)",
-			spec.scratch_arena_size,
+			"[FATAL] scratch_memory_size (%v) is smaller than max requirement (%v)",
+			spec.scratch_memory_size,
 			scratch_max,
 		)
 		return .ValueOutOfBounds
@@ -819,7 +819,7 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.fd_table_slot_count * spec.fd_entry_size
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)
-	total += spec.scratch_arena_size
+	total += spec.scratch_memory_size
 	total += regions_max * size_of(SubRegion)
 
 	types_count := len(spec.types)
@@ -868,7 +868,7 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 		shard_count             = 1,
 		types                   = types[:],
 		shard_specs             = shard_specs[:],
-		scratch_arena_size      = 2048, // Intentionally too small
+		scratch_memory_size      = 2048, // Intentionally too small
 		pool_slot_count         = 1024,
 		log_ring_size           = 65536,
 		timer_entry_count       = 64,
@@ -882,7 +882,7 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	error := validate_system_spec(&spec)
 	testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
 
-	spec.scratch_arena_size = 4096 // Exactly enough
+	spec.scratch_memory_size = 4096 // Exactly enough
 	error = validate_system_spec(&spec)
 	testing.expect_value(t, error, SystemSpecError.None)
 
@@ -932,7 +932,7 @@ test_system_spec_validation_rejects_non_dense_type_ids :: proc(t: ^testing.T) {
 		shard_count             = 1,
 		types                   = types[:],
 		shard_specs             = shard_specs[:],
-		scratch_arena_size      = 1,
+		scratch_memory_size      = 1,
 		pool_slot_count         = 16,
 		log_ring_size           = 16,
 		timer_entry_count       = 16,
@@ -970,7 +970,7 @@ test_system_spec_validation_rejects_supervision_group_overflow :: proc(t: ^testi
 		shard_count             = 1,
 		types                   = types[:],
 		shard_specs             = shard_specs[:],
-		scratch_arena_size      = 1,
+		scratch_memory_size      = 1,
 		pool_slot_count         = 16,
 		log_ring_size           = 16,
 		timer_entry_count       = 16,

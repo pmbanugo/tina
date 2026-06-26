@@ -15,7 +15,7 @@ when TINA_SIMULATION_MODE {
 		fd_table_slot_count:       int,
 		log_ring_size:             int,
 		supervision_groups_max:    int,
-		scratch_arena_size:        int,
+		scratch_memory_size:        int,
 		default_ring_size:                 u32,
 		diagnostic_record_count_per_shard: int,
 	}
@@ -34,7 +34,7 @@ when TINA_SIMULATION_MODE {
 		fd_table_slot_count = 16,
 		log_ring_size = 4096,
 		supervision_groups_max = 4,
-		scratch_arena_size = 8192,
+		scratch_memory_size = 8192,
 		default_ring_size = 16,
 		diagnostic_record_count_per_shard = 64,
 	}
@@ -83,7 +83,7 @@ when TINA_SIMULATION_MODE {
 		if options.fd_table_slot_count != 0 do opts.fd_table_slot_count = options.fd_table_slot_count
 		if options.log_ring_size != 0 do opts.log_ring_size = options.log_ring_size
 		if options.supervision_groups_max != 0 do opts.supervision_groups_max = options.supervision_groups_max
-		if options.scratch_arena_size != 0 do opts.scratch_arena_size = options.scratch_arena_size
+		if options.scratch_memory_size != 0 do opts.scratch_memory_size = options.scratch_memory_size
 		if options.default_ring_size != 0 do opts.default_ring_size = options.default_ring_size
 		if options.diagnostic_record_count_per_shard != 0 do opts.diagnostic_record_count_per_shard = options.diagnostic_record_count_per_shard
 
@@ -110,7 +110,7 @@ when TINA_SIMULATION_MODE {
 			fd_entry_size = size_of(FD_Entry),
 			log_ring_size = opts.log_ring_size,
 			supervision_groups_max = opts.supervision_groups_max,
-			scratch_arena_size = opts.scratch_arena_size,
+			scratch_memory_size = opts.scratch_memory_size,
 			default_ring_size = opts.default_ring_size,
 		}
 	}
