@@ -124,9 +124,9 @@ run_child :: proc(case_name: string) {
 
 @(private = "file")
 _death_message_pool_use_after_free :: proc() {
-	backing: [MESSAGE_ENVELOPE_SIZE * 2]u8
+	backing: [2]Message_Envelope
 	pool: Message_Pool
-	pool_init_tina_owned(&pool, backing[:], MESSAGE_ENVELOPE_SIZE)
+	pool_init_tina_owned(&pool, backing[:])
 
 	index, _ := pool_alloc_system_tina_owned(&pool)
 	message := pool_get_ptr_unchecked(&pool, index)
@@ -147,8 +147,8 @@ _death_io_slot_use_after_free :: proc() {
 	io_slot_pool_free_tina_owned(&pool, index)
 
 	// ASan must intercept this write to freed poisoned memory (past the
-	// intrusive free-list word that remains addressable).
-	intrinsics.volatile_store(&slot[size_of(IO_Slot_Index)], 0xAB)
+	// intrusive free-list link that remains addressable).
+	intrinsics.volatile_store(&slot[size_of(IO_Slot_Link)], 0xAB)
 }
 
 @(private = "file")

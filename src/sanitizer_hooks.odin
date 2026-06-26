@@ -50,9 +50,9 @@ _sanitizer_address_poison_free_slot_payload :: #force_inline proc "contextless" 
 			return
 		}
 
-		payload_pointer := rawptr(uintptr(slot_pointer) + uintptr(free_word_size))
-		payload_size := slot_size - free_word_size
-		sanitizer.address_poison_rawptr(payload_pointer, payload_size)
+		slot_bytes := mem.byte_slice(slot_pointer, slot_size)
+		payload := slot_bytes[free_word_size:]
+		sanitizer.address_poison_rawptr(raw_data(payload), len(payload))
 	}
 }
 
@@ -62,10 +62,10 @@ _sanitizer_address_poison_message_slot_payload :: #force_inline proc "contextles
 	index: u32,
 ) {
 	when TINA_ASAN_POISONING {
-		slot_pointer := rawptr(&pool.buffer[index << pool.slot_shift])
+		slot_pointer := rawptr(&pool.backing[index])
 		_sanitizer_address_poison_free_slot_payload(
 			slot_pointer,
-			int(pool.slot_size),
+			size_of(Message_Envelope),
 			size_of(u32),
 		)
 	}
@@ -77,8 +77,8 @@ _sanitizer_address_unpoison_message_slot :: #force_inline proc "contextless" (
 	index: u32,
 ) {
 	when TINA_ASAN_POISONING {
-		slot_pointer := rawptr(&pool.buffer[index << pool.slot_shift])
-		sanitizer.address_unpoison_rawptr(slot_pointer, int(pool.slot_size))
+		slot_pointer := rawptr(&pool.backing[index])
+		sanitizer.address_unpoison_rawptr(slot_pointer, size_of(Message_Envelope))
 	}
 }
 
@@ -92,7 +92,7 @@ _sanitizer_address_poison_io_slot_payload :: #force_inline proc "contextless" (
 		_sanitizer_address_poison_free_slot_payload(
 			slot_pointer,
 			int(pool.slot_size),
-			size_of(IO_Slot_Index),
+			size_of(IO_Slot_Link),
 		)
 	}
 }
@@ -167,6 +167,74 @@ _sanitizer_address_unpoison_io_pool_slots :: proc "contextless" (pool: ^IO_Slot_
 	}
 }
 
+@(private = "file")
+_sanitizer_address_get_isolate_memory_row_if_backed :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+) -> []u8 {
+	when TINA_ASAN_POISONING {
+		if shard == nil {
+			return {}
+		}
+
+		type_index := int(type_id)
+		if type_index >= len(shard.type_descriptors) || type_index >= len(shard.isolate_memory) {
+			return {}
+		}
+
+		descriptor := shard.type_descriptors[type_index]
+		if descriptor.slot_count <= 0 || descriptor.stride <= 0 || int(slot_index) >= descriptor.slot_count {
+			return {}
+		}
+
+		memory := shard.isolate_memory[type_index]
+		if descriptor.stride > len(memory) / descriptor.slot_count {
+			return {}
+		}
+
+		start_index := int(slot_index) * descriptor.stride
+		return memory[start_index:start_index + descriptor.stride]
+	}
+
+	return {}
+}
+
+@(private = "file")
+_sanitizer_address_get_isolate_working_memory_row_if_backed :: #force_inline proc "contextless" (
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+) -> []u8 {
+	when TINA_ASAN_POISONING {
+		if shard == nil {
+			return {}
+		}
+
+		type_index := int(type_id)
+		if type_index >= len(shard.type_descriptors) || type_index >= len(shard.working_memory) {
+			return {}
+		}
+
+		descriptor := shard.type_descriptors[type_index]
+		if descriptor.slot_count <= 0 ||
+		   descriptor.working_memory_size <= 0 ||
+		   int(slot_index) >= descriptor.slot_count {
+			return {}
+		}
+
+		memory := shard.working_memory[type_index]
+		if descriptor.working_memory_size > len(memory) / descriptor.slot_count {
+			return {}
+		}
+
+		start_index := int(slot_index) * descriptor.working_memory_size
+		return memory[start_index:start_index + descriptor.working_memory_size]
+	}
+
+	return {}
+}
+
 @(private = "package")
 _sanitizer_address_poison_isolate_slot :: #force_inline proc "contextless" (
 	shard: ^Shard,
@@ -174,28 +242,17 @@ _sanitizer_address_poison_isolate_slot :: #force_inline proc "contextless" (
 	slot_index: Isolate_Slot_Index,
 ) {
 	when TINA_ASAN_POISONING {
-		descriptor := shard.type_descriptors[type_id]
-		if descriptor.stride > 0 {
-			memory := shard.isolate_memory[type_id]
-			// The fixture builder may fail after setting a type descriptor but before
-			// carving its backing memory. Guarding len() here prevents a nil-slice
-			// indexing panic during teardown unpoison while keeping the success path
-			// a single compare+branch.
-			if len(memory) > 0 {
-				start_index := int(slot_index) * descriptor.stride
-				sanitizer.address_poison_rawptr(rawptr(&memory[start_index]), descriptor.stride)
-			}
+		// The fixture builder may fail after setting a type descriptor but before
+		// carving its backing memory. These ASan hooks therefore use a cleanup-only
+		// optional row accessor; normal row accessors assert on broken geometry.
+		memory := _sanitizer_address_get_isolate_memory_row_if_backed(shard, type_id, slot_index)
+		if len(memory) > 0 {
+			sanitizer.address_poison_rawptr(raw_data(memory), len(memory))
 		}
 
-		if descriptor.working_memory_size > 0 {
-			memory := shard.working_memory[type_id]
-			if len(memory) > 0 {
-				start_index := int(slot_index) * descriptor.working_memory_size
-				sanitizer.address_poison_rawptr(
-					rawptr(&memory[start_index]),
-					descriptor.working_memory_size,
-				)
-			}
+		working_memory := _sanitizer_address_get_isolate_working_memory_row_if_backed(shard, type_id, slot_index)
+		if len(working_memory) > 0 {
+			sanitizer.address_poison_rawptr(raw_data(working_memory), len(working_memory))
 		}
 	}
 }
@@ -207,25 +264,14 @@ _sanitizer_address_unpoison_isolate_slot :: #force_inline proc "contextless" (
 	slot_index: Isolate_Slot_Index,
 ) {
 	when TINA_ASAN_POISONING {
-		descriptor := shard.type_descriptors[type_id]
-		if descriptor.stride > 0 {
-			memory := shard.isolate_memory[type_id]
-			// See the matching guard in _sanitizer_address_poison_isolate_slot.
-			if len(memory) > 0 {
-				start_index := int(slot_index) * descriptor.stride
-				sanitizer.address_unpoison_rawptr(rawptr(&memory[start_index]), descriptor.stride)
-			}
+		memory := _sanitizer_address_get_isolate_memory_row_if_backed(shard, type_id, slot_index)
+		if len(memory) > 0 {
+			sanitizer.address_unpoison_rawptr(raw_data(memory), len(memory))
 		}
 
-		if descriptor.working_memory_size > 0 {
-			memory := shard.working_memory[type_id]
-			if len(memory) > 0 {
-				start_index := int(slot_index) * descriptor.working_memory_size
-				sanitizer.address_unpoison_rawptr(
-					rawptr(&memory[start_index]),
-					descriptor.working_memory_size,
-				)
-			}
+		working_memory := _sanitizer_address_get_isolate_working_memory_row_if_backed(shard, type_id, slot_index)
+		if len(working_memory) > 0 {
+			sanitizer.address_unpoison_rawptr(raw_data(working_memory), len(working_memory))
 		}
 	}
 }

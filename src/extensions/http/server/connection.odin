@@ -83,9 +83,10 @@ _connection_init_working_memory_regions :: proc(
 		int(runtime.server.limits.header_count_max) * size_of(Header_View),
 	)
 	if len(header_view_storage) > 0 {
-		state.header_views = (cast([^]Header_View)raw_data(header_view_storage))[:int(
-			runtime.server.limits.header_count_max,
-		)]
+		state.header_views = mem.slice_ptr(
+			cast(^Header_View)raw_data(header_view_storage),
+			int(runtime.server.limits.header_count_max),
+		)
 	}
 
 	state.route_state_bytes = _connection_working_region_take(

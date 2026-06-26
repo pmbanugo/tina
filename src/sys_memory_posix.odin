@@ -21,13 +21,15 @@ os_reserve_arena_with_guard :: proc "contextless" (size: uint) -> (data:[]u8, er
 		-1,
 		0,
 	)
-	if addr == posix.MAP_FAILED || addr == nil do return nil, .Out_Of_Memory
+	if addr == posix.MAP_FAILED || addr == nil do return {}, .Out_Of_Memory
 
-	// Guard page at the tail
-	guard_addr := rawptr(uintptr(addr) + uintptr(aligned_size))
-	posix.mprotect(guard_addr, page_sz, {}) // PROT_NONE
+	usable_size := int(aligned_size)
+	memory := mem.byte_slice(addr, int(total_size))
 
-	return (cast([^]u8)addr)[:aligned_size], nil
+	guard_addr := raw_data(memory[usable_size:])
+	posix.mprotect(guard_addr, page_sz, {})
+
+	return mem.byte_slice(addr, usable_size), .None
 }
 
 // Releases the memory including the guard page

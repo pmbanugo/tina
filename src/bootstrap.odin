@@ -1,6 +1,7 @@
 package tina
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:sync"
 import "core:sys/info"
@@ -153,11 +154,12 @@ tina_start :: proc(spec: ^SystemSpec) {
 				os.exit(1)
 			}
 
-			// Map the struct to the start, and the buffer right after it
 			ring := cast(^SPSC_Ring)raw_data(raw_mem)
-			buffer_pointer := cast([^]Message_Envelope)(uintptr(raw_data(raw_mem)) +
-				size_of(SPSC_Ring))
-			spsc_ring_init_tina_owned(ring, u64(ring_count), buffer_pointer[:ring_count])
+			buffer := mem.slice_ptr(
+				cast(^Message_Envelope)&raw_mem[size_of(SPSC_Ring)],
+				int(ring_count),
+			)
+			spsc_ring_init_tina_owned(ring, u64(ring_count), buffer)
 
 			os_apply_memory_policy(raw_mem, i32(source), spec.memory_init_mode)
 			// Wire directly into the pre-allocated configs
@@ -183,9 +185,11 @@ tina_start :: proc(spec: ^SystemSpec) {
 		}
 
 		channel := cast(^Shard_Control_Channel)raw_data(raw_mem)
-		cell_pointer := cast([^]Shard_Control_Channel_Cell)(uintptr(raw_data(raw_mem)) +
-			size_of(Shard_Control_Channel))
-		shard_control_channel_init(channel, control_source_count, cell_pointer[:control_source_count])
+		cells := mem.slice_ptr(
+			cast(^Shard_Control_Channel_Cell)&raw_mem[size_of(Shard_Control_Channel)],
+			control_source_count,
+		)
+		shard_control_channel_init(channel, control_source_count, cells)
 
 		// The target scheduler is the single consumer and drains this channel every tick.
 		os_apply_memory_policy(raw_mem, i32(target), spec.memory_init_mode)

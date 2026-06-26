@@ -993,11 +993,20 @@ _compute_source_pointer :: #force_inline proc(
 	payload_size: u32,
 ) -> ([^]u8, IO_Error) {
 	stride := shard.type_descriptors[type_index].stride
-	if int(payload_offset) + int(payload_size) > stride {
+	payload_start := int(payload_offset)
+	payload_end := payload_start + int(payload_size)
+	if payload_end > stride {
 		return nil, IO_ERR_BOUNDS_VIOLATION
 	}
 	isolate_pointer := _get_isolate_ptr(shard, type_index, slot_index)
-	return cast([^]u8)(uintptr(isolate_pointer) + uintptr(payload_offset)), IO_ERR_NONE
+	if isolate_pointer == nil {
+		if payload_start == 0 && payload_size == 0 {
+			return nil, IO_ERR_NONE
+		}
+		return nil, IO_ERR_BOUNDS_VIOLATION
+	}
+	isolate_bytes := (cast([^]u8)isolate_pointer)[:stride]
+	return raw_data(isolate_bytes[payload_start:]), IO_ERR_NONE
 }
 
 @(private = "file")

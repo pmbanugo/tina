@@ -194,10 +194,10 @@ _write_ring_data :: #force_inline proc "contextless" (
 	} else {
 		// Wraps the buffer edge: perform two distinct copies
 		first_chunk := capacity - start
-		mem.copy(&ring.buffer[start], raw_data(data), int(first_chunk))
+		first_count := int(first_chunk)
+		mem.copy(&ring.buffer[start], raw_data(data), first_count)
 
-		src_offset := rawptr(uintptr(raw_data(data)) + uintptr(first_chunk))
-		mem.copy(&ring.buffer[0], src_offset, int(size - first_chunk))
+		mem.copy(&ring.buffer[0], raw_data(data[first_count:]), int(size - first_chunk))
 	}
 }
 
@@ -220,10 +220,10 @@ _read_ring_data :: #force_inline proc "contextless" (
 	} else {
 		// Wraps the buffer edge: perform two distinct copies
 		first_chunk := capacity - start
-		mem.copy(raw_data(data), &ring.buffer[start], int(first_chunk))
+		first_count := int(first_chunk)
+		mem.copy(raw_data(data), &ring.buffer[start], first_count)
 
-		dst_offset := rawptr(uintptr(raw_data(data)) + uintptr(first_chunk))
-		mem.copy(dst_offset, &ring.buffer[0], int(size - first_chunk))
+		mem.copy(raw_data(data[first_count:]), &ring.buffer[0], int(size - first_chunk))
 	}
 }
 

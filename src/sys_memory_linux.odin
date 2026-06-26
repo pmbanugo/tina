@@ -21,13 +21,15 @@ os_reserve_arena_with_guard :: proc "contextless" (size: uint) -> (data:[]u8, er
 		{.READ, .WRITE},
 		{.PRIVATE, .ANONYMOUS},
 	)
-	if errno != .NONE do return nil, .Out_Of_Memory
+	if errno != .NONE do return {}, .Out_Of_Memory
 
-	// Guard page at the tail - PROT_NONE (empty protection set)
-	guard_addr := rawptr(uintptr(addr) + uintptr(aligned_size))
+	usable_size := int(aligned_size)
+	memory := mem.byte_slice(addr, int(total_size))
+
+	guard_addr := raw_data(memory[usable_size:])
 	linux.mprotect(guard_addr, page_sz, {})
 
-	return (cast([^]u8)addr)[:aligned_size], nil
+	return mem.byte_slice(addr, usable_size), .None
 }
 
 // Releases the memory including the guard page

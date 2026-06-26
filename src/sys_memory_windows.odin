@@ -17,17 +17,17 @@ os_reserve_arena_with_guard :: proc "contextless" (size: uint) -> (data:[]u8, er
 
 	// Reserve the whole chunk including guard page
 	addr := win.VirtualAlloc(nil, total_size, win.MEM_RESERVE, win.PAGE_NOACCESS)
-	if addr == nil do return nil, .Out_Of_Memory
+	if addr == nil do return {}, .Out_Of_Memory
 
 	// Commit the usable portion
 	commit_addr := win.VirtualAlloc(addr, aligned_size, win.MEM_COMMIT, win.PAGE_READWRITE)
 	if commit_addr == nil {
 		win.VirtualFree(addr, 0, win.MEM_RELEASE)
-		return nil, .Out_Of_Memory
+		return {}, .Out_Of_Memory
 	}
 
 	// The tail page remains MEM_RESERVE (uncommitted/no-access), serving as the guard page
-	return (cast([^]u8)addr)[:aligned_size], nil
+	return mem.byte_slice(addr, int(aligned_size)), .None
 }
 
 // Releases the memory including the guard page

@@ -241,8 +241,8 @@ test_shard_build :: proc(spec: Test_Shard_Spec, fixture: ^Test_Shard_Fixture) ->
 	regions_max := 32
 
 	tracker_size := regions_max * size_of(SubRegion)
-	tracker_pointer := grand_arena_alloc_named(arena, "Arena_Regions_Tracker", tracker_size) or_return
-	arena.regions = (cast([^]SubRegion)tracker_pointer)[:regions_max]
+	tracker_memory := grand_arena_alloc_named(arena, "Arena_Regions_Tracker", tracker_size) or_return
+	arena.regions = mem.slice_ptr(cast(^SubRegion)raw_data(tracker_memory), regions_max)
 	arena.regions[0] = SubRegion{name = "Arena_Regions_Tracker", qualifier = -1, offset = 0, size = tracker_size}
 	arena.region_count = 1
 
@@ -337,7 +337,8 @@ test_shard_build :: proc(spec: Test_Shard_Spec, fixture: ^Test_Shard_Fixture) ->
 	// --- Message Pool ---
 	if .Message_Pool in spec.subsystems {
 		msg_pool_buf := grand_arena_alloc_slice(arena, "Message_Pool", config.message_pool_slots * MESSAGE_ENVELOPE_SIZE) or_return
-		pool_init_tina_owned(&shard.message_pool, msg_pool_buf, MESSAGE_ENVELOPE_SIZE)
+		msg_pool_backing := mem.slice_ptr(cast(^Message_Envelope)raw_data(msg_pool_buf), config.message_pool_slots)
+		pool_init_tina_owned(&shard.message_pool, msg_pool_backing)
 		shard.handoff_retry_head = POOL_NONE_INDEX
 		shard.handoff_retry_tail = POOL_NONE_INDEX
 		shard.handoff_retry_count = 0

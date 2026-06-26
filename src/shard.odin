@@ -1161,16 +1161,14 @@ _dispatch_type_batch :: proc(
 
 		mem.arena_init(&turn_frame.scratch_arena, shard.scratch_memory)
 
-		working_stride := type_descriptor.working_memory_size
-		if working_stride > 0 {
-			start_index := int(slot_index) * working_stride
-			working_slice := shard.working_memory[type_id][start_index:start_index +
-			working_stride]
+		working_slice, working_slice_ok := _get_isolate_working_memory_row_if_present(shard, type_id, slot_index)
+		if working_slice_ok {
 			turn_frame.working_arena = mem.Arena {
 				data   = working_slice,
 				offset = int(working_arena_offsets[slot_index]),
 			}
 		} else {
+			assert(type_descriptor.working_memory_size == 0, "working memory row unavailable")
 			turn_frame.working_arena = {}
 		}
 
@@ -1204,7 +1202,7 @@ _dispatch_type_batch :: proc(
 		context.temp_allocator = turn_frame.previous_temp_allocator
 		shard.current_trap_environment = nil
 
-		if working_stride > 0 {
+		if working_slice_ok {
 			working_arena_offsets[slot_index] = u32(turn_frame.working_arena.offset)
 		}
 

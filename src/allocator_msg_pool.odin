@@ -1,15 +1,12 @@
 package tina
 
-import "core:math/bits"
 import "core:mem"
 import "core:testing"
 
 POOL_NONE_INDEX :: 0xFFFF_FFFF
 
 Message_Pool :: struct {
-	buffer:         []u8,
-	slot_size:      u32,
-	slot_shift:     u32, // Power-of-2 exponent for bit-shifting
+	backing:        []Message_Envelope,
 	slot_count:     u32,
 	free_count:     u32,
 	reserved_count: u32,
@@ -29,21 +26,11 @@ Pool_Error :: enum u8 {
 
 pool_init :: proc(
 	p: ^Message_Pool,
-	backing: []u8,
-	slot_size: u32,
+	backing: []Message_Envelope,
 	reserved_pct: f32 = 0.01,
 ) {
-	assert(slot_size >= 4, "slot_size must be >= 4 bytes for intrusive free list")
-	assert((slot_size & (slot_size - 1)) == 0, "slot_size must be a power of 2")
-
-	p.buffer = backing
-	p.slot_size = slot_size
-
-	// slot_size is structurally guaranteed by assert to be a power of 2
-	p.slot_shift = u32(bits.trailing_zeros(slot_size))
-
-	// Total capacity via bit-shift division
-	p.slot_count = u32(len(backing)) >> p.slot_shift
+	p.backing = backing
+	p.slot_count = u32(len(backing))
 	p.free_count = 0
 	p.free_head = POOL_NONE_INDEX
 
@@ -55,7 +42,7 @@ pool_init :: proc(
 
 	// Intrusive push. Slot 0 at the head for sequential cache warmth.
 	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
-		slot_pointer := cast(^Message_Envelope)&p.buffer[u32(i) << p.slot_shift]
+		slot_pointer := &p.backing[i]
 		slot_pointer.next_free_slot = p.free_head
 		p.free_head = u32(i)
 		p.free_count += 1
@@ -65,10 +52,10 @@ pool_init :: proc(
 @(private = "file")
 _pool_alloc_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool) -> u32 {
 	slot_index := p.free_head
-	slot_pointer := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
+	slot_pointer := &p.backing[slot_index]
 	p.free_head = slot_pointer.next_free_slot
 	p.free_count -= 1
-	mem.zero(slot_pointer, int(p.slot_size))
+	mem.zero(slot_pointer, size_of(Message_Envelope))
 	return slot_index
 }
 
@@ -94,7 +81,7 @@ pool_free :: proc(p: ^Message_Pool, index: u32) {
 // Must remain contextless (no assert/fmt/make/default-allocator calls).
 // intended use in hot path and guaranteed safety
 pool_free_unchecked :: #force_inline proc "contextless" (p: ^Message_Pool, index: u32) {
-	slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+	slot_pointer := &p.backing[index]
 	slot_pointer.next_free_slot = p.free_head
 	p.free_head = index
 	p.free_count += 1
@@ -106,7 +93,7 @@ pool_reset :: proc "contextless" (p: ^Message_Pool) {
 	p.free_head = POOL_NONE_INDEX
 	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
 		index := u32(i)
-		slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+		slot_pointer := &p.backing[index]
 		slot_pointer.next_free_slot = p.free_head
 		p.free_head = index
 	}
@@ -115,11 +102,10 @@ pool_reset :: proc "contextless" (p: ^Message_Pool) {
 @(private = "package")
 pool_init_tina_owned :: proc(
 	p: ^Message_Pool,
-	backing: []u8,
-	slot_size: u32,
+	backing: []Message_Envelope,
 	reserved_pct: f32 = 0.01,
 ) {
-	pool_init(p, backing, slot_size, reserved_pct)
+	pool_init(p, backing, reserved_pct)
 	for index in 0 ..< p.slot_count {
 		_sanitizer_address_poison_message_slot_payload(p, index)
 	}
@@ -140,17 +126,17 @@ pool_alloc_system_tina_owned :: #force_inline proc "contextless" (p: ^Message_Po
 @(private = "package")
 pool_alloc_unchecked_tina_owned :: #force_inline proc "contextless" (p: ^Message_Pool) -> u32 {
 	slot_index := p.free_head
-	slot_pointer := cast(^Message_Envelope)&p.buffer[slot_index << p.slot_shift]
+	slot_pointer := &p.backing[slot_index]
 	p.free_head = slot_pointer.next_free_slot
 	_sanitizer_address_unpoison_message_slot(p, slot_index)
 	p.free_count -= 1
-	mem.zero(slot_pointer, int(p.slot_size))
+	mem.zero(slot_pointer, size_of(Message_Envelope))
 	return slot_index
 }
 
 @(private = "package")
 pool_free_unchecked_tina_owned :: #force_inline proc "contextless" (p: ^Message_Pool, index: u32) {
-	slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+	slot_pointer := &p.backing[index]
 	slot_pointer.next_free_slot = p.free_head
 	p.free_head = index
 	p.free_count += 1
@@ -164,7 +150,7 @@ pool_reset_tina_owned :: proc "contextless" (p: ^Message_Pool) {
 	for i := int(p.slot_count) - 1; i >= 0; i -= 1 {
 		index := u32(i)
 		_sanitizer_address_unpoison_message_slot(p, index)
-		slot_pointer := cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+		slot_pointer := &p.backing[index]
 		slot_pointer.next_free_slot = p.free_head
 		p.free_head = index
 		_sanitizer_address_poison_message_slot_payload(p, index)
@@ -184,7 +170,7 @@ pool_get_ptr_unchecked :: #force_inline proc "contextless" (
 	p: ^Message_Pool,
 	index: u32,
 ) -> ^Message_Envelope {
-	return cast(^Message_Envelope)&p.buffer[index << p.slot_shift]
+	return &p.backing[index]
 }
 
 pool_stats :: proc(p: ^Message_Pool) -> Pool_Stats {
@@ -198,13 +184,12 @@ pool_stats :: proc(p: ^Message_Pool) -> Pool_Stats {
 // === TESTS ===
 @(test)
 test_message_pool :: proc(t: ^testing.T) {
-	backing: [1280]u8
+	backing: [10]Message_Envelope
 	pool: Message_Pool
-	pool_init(&pool, backing[:], 128)
+	pool_init(&pool, backing[:])
 
 	stats := pool_stats(&pool)
 	testing.expect_value(t, stats.slot_count, 10)
-	testing.expect_value(t, pool.slot_shift, 7) // log2(128) == 7
 	testing.expect_value(t, pool.reserved_count, 1)
 
 	testing.expect_value(t, stats.free_count, 10)
@@ -252,9 +237,9 @@ test_message_pool :: proc(t: ^testing.T) {
 
 @(test)
 test_message_pool_small_pool_keeps_system_reserve :: proc(t: ^testing.T) {
-	backing: [MESSAGE_ENVELOPE_SIZE * 2]u8
+	backing: [2]Message_Envelope
 	pool: Message_Pool
-	pool_init(&pool, backing[:], MESSAGE_ENVELOPE_SIZE)
+	pool_init(&pool, backing[:])
 
 	testing.expect_value(t, pool.slot_count, u32(2))
 	testing.expect_value(t, pool.reserved_count, u32(1))

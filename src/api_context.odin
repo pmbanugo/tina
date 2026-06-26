@@ -780,13 +780,13 @@ ctx_staged_io_payload_offset :: #force_inline proc() -> u16 {
 
 // Computes the byte offset of a data slice within an Isolate struct, with bounds validation.
 payload_offset_of :: #force_inline proc(self: ^$T, data: []u8) -> u16 {
-	base := uintptr(self)
-	data_start := uintptr(raw_data(data))
-	offset := data_start - base
+	base := cast(^u8)self
+	data_start := cast(^u8)raw_data(data)
+	offset := mem.ptr_sub(data_start, base)
 	when TINA_RUNTIME_ASSERTIONS {
-		assert(data_start >= base, "data must point within Isolate struct")
+		assert(offset >= 0, "data must point within Isolate struct")
 		assert(
-			offset + uintptr(len(data)) <= uintptr(size_of(T)),
+			offset + len(data) <= size_of(T),
 			"data must not exceed Isolate struct bounds",
 		)
 	}

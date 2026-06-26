@@ -53,31 +53,44 @@ grand_arena_init :: proc "contextless" (
 	return .None
 }
 
-grand_arena_alloc_named :: proc "contextless" (
+grand_arena_alloc_named :: proc(
 	arena: ^Grand_Arena,
 	name: string,
 	size: int,
 	alignment: int = CACHE_LINE_SIZE,
 	qualifier: int = -1,
 ) -> (
-	rawptr,
+	[]u8,
 	mem.Allocator_Error,
 ) {
+	assert(size >= 0, "size must be non-negative")
+
 	if size == 0 {
-		return nil, .None
+		return {}, .None
 	}
 
-	// Bitwise align-forward (works because alignment is a power of 2)
-	actual_offset := (arena.offset + alignment - 1) & ~(alignment - 1)
-	align_offset := actual_offset - arena.offset
-	total_alloc := size + align_offset
+	assert(alignment > 0 && (alignment & (alignment - 1)) == 0, "alignment must be a power of two")
 
-	if arena.offset + total_alloc > arena.total_size {
-		return nil, .Out_Of_Memory
+	// Align the absolute address, not only the byte offset. OS-backed arenas are
+	// page-aligned, but test/simulation arenas may be ordinary []u8 allocations.
+	base_address := uintptr(raw_data(arena.base))
+	current_address := base_address + uintptr(arena.offset)
+	if current_address < base_address {
+		return {}, .Out_Of_Memory
+	}
+	alignment_mask := uintptr(alignment - 1)
+	aligned_address := (current_address + alignment_mask) & ~alignment_mask
+	if aligned_address < current_address {
+		return {}, .Out_Of_Memory
+	}
+	actual_offset := int(aligned_address - base_address)
+
+	if actual_offset > arena.total_size || size > arena.total_size - actual_offset {
+		return {}, .Out_Of_Memory
 	}
 
-	ptr := rawptr(uintptr(raw_data(arena.base)) + uintptr(actual_offset))
-	arena.offset += total_alloc
+	memory := arena.base[actual_offset:actual_offset + size]
+	arena.offset = actual_offset + size
 
 	// Only record if the tracking array has been allocated
 	if arena.regions != nil && arena.region_count < len(arena.regions) {
@@ -90,10 +103,10 @@ grand_arena_alloc_named :: proc "contextless" (
 		arena.region_count += 1
 	}
 
-	return ptr, .None
+	return memory, .None
 }
 
-grand_arena_alloc_slice :: #force_inline proc "contextless" (
+grand_arena_alloc_slice :: #force_inline proc(
 	arena: ^Grand_Arena,
 	name: string,
 	size: int,
@@ -102,8 +115,7 @@ grand_arena_alloc_slice :: #force_inline proc "contextless" (
 	result: []u8,
 	error: mem.Allocator_Error,
 ) {
-	ptr := grand_arena_alloc_named(arena, name, size, qualifier = qualifier) or_return
-	return (cast([^]u8)ptr)[:size], .None
+	return grand_arena_alloc_named(arena, name, size, qualifier = qualifier)
 }
 
 // Custom Allocator Wrapper for Grand_Arena
@@ -151,7 +163,7 @@ grand_arena_allocator_proc :: proc(
 		// But tiny metadata slices (Slice Headers, dispatch_cursors, dispatch_credit_counts, isolate_free_heads)
 		// should be tightly packed.
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
-		ptr, error := grand_arena_alloc_named(
+		memory, error := grand_arena_alloc_named(
 			data.arena,
 			data.current_name,
 			size,
@@ -159,16 +171,16 @@ grand_arena_allocator_proc :: proc(
 			data.current_qualifier,
 		)
 		if error != .None do return nil, error
-		return (cast([^]byte)ptr)[:size], .None
+		return memory, .None
 	case .Resize:
-		if old_size >= size do return (cast([^]byte)old_memory)[:size], .None
+		if old_size >= size do return mem.byte_slice(old_memory, size), .None
 		return nil, .Mode_Not_Implemented
 	case .Free, .Free_All:
 		return nil, .None // Silently ignore, arenas free all at once structurally
 	case .Alloc_Non_Zeroed:
 		// Arena bumps a pointer; non-zeroed is identical to zeroed allocation
 		actual_alignment := max(alignment, CACHE_LINE_SIZE)
-		ptr, error := grand_arena_alloc_named(
+		memory, error := grand_arena_alloc_named(
 			data.arena,
 			data.current_name,
 			size,
@@ -176,7 +188,7 @@ grand_arena_allocator_proc :: proc(
 			data.current_qualifier,
 		)
 		if error != .None do return nil, error
-		return (cast([^]byte)ptr)[:size], .None
+		return memory, .None
 	case .Query_Features, .Query_Info, .Resize_Non_Zeroed:
 		return nil, .Mode_Not_Implemented
 	}
@@ -197,13 +209,13 @@ hydrate_shard :: proc(
 	// 1. Allocate the tracking array FOR the arena, FROM the arena!
 	regions_max := compute_max_sub_regions(spec)
 	tracker_size := regions_max * size_of(SubRegion)
-	tracker_pointer := grand_arena_alloc_named(
+	tracker_memory := grand_arena_alloc_named(
 		arena,
 		"Arena_Regions_Tracker",
 		tracker_size,
 	) or_return
 
-	arena.regions = (cast([^]SubRegion)tracker_pointer)[:regions_max]
+	arena.regions = mem.slice_ptr(cast(^SubRegion)raw_data(tracker_memory), regions_max)
 	arena.regions[0] = SubRegion {
 		name      = "Arena_Regions_Tracker",
 		qualifier = -1,
@@ -308,7 +320,8 @@ hydrate_shard :: proc(
 		"Message_Pool",
 		spec.pool_slot_count * MESSAGE_ENVELOPE_SIZE,
 	) or_return
-	pool_init_tina_owned(&shard.message_pool, msg_pool_buf, MESSAGE_ENVELOPE_SIZE)
+	msg_pool_backing := mem.slice_ptr(cast(^Message_Envelope)raw_data(msg_pool_buf), spec.pool_slot_count)
+	pool_init_tina_owned(&shard.message_pool, msg_pool_backing)
 	shard.handoff_retry_head = POOL_NONE_INDEX
 	shard.handoff_retry_tail = POOL_NONE_INDEX
 	shard.handoff_retry_count = 0
@@ -466,6 +479,43 @@ arena_print_layout :: proc(arena: ^Grand_Arena) {
 // ALLOWLIST_FILE(hydrate_shard_fixture): The tests below exercise the real
 // hydrate_shard production path. They are approved hydrate-shard fixtures,
 // not partial hardcoded Shard fixtures.
+@(test)
+test_grand_arena_alloc_named_aligns_absolute_address :: proc(t: ^testing.T) {
+	MESSAGE_ALIGNMENT :: align_of(Message_Envelope)
+	backing_memory: [size_of(Message_Envelope) + MESSAGE_ALIGNMENT * 2]u8
+
+	misaligned_offset := -1
+	for offset in 1 ..< MESSAGE_ALIGNMENT {
+		candidate_memory := backing_memory[offset:]
+		if uintptr(raw_data(candidate_memory)) % uintptr(MESSAGE_ALIGNMENT) != 0 {
+			misaligned_offset = offset
+			break
+		}
+	}
+
+	testing.expect(t, misaligned_offset >= 0, "test must find a misaligned arena base")
+	if misaligned_offset < 0 do return
+
+	arena_memory := backing_memory[misaligned_offset:]
+	arena := Grand_Arena{}
+	init_error := grand_arena_init_from_memory(&arena, arena_memory, len(arena_memory))
+	testing.expect_value(t, init_error, mem.Allocator_Error.None)
+
+	memory, allocation_error := grand_arena_alloc_named(
+		&arena,
+		"Message_Pool",
+		size_of(Message_Envelope),
+		MESSAGE_ALIGNMENT,
+	)
+	testing.expect_value(t, allocation_error, mem.Allocator_Error.None)
+	testing.expect_value(t, len(memory), size_of(Message_Envelope))
+	testing.expect(
+		t,
+		uintptr(raw_data(memory)) % uintptr(MESSAGE_ALIGNMENT) == 0,
+		"arena allocation must align the absolute address",
+	)
+}
+
 @(test)
 test_grand_arena :: proc(t: ^testing.T) {
 	types := [1]IsolateTypeDescriptor {

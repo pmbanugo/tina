@@ -22,12 +22,8 @@ when TINA_ASAN_POISONING {
 		type_id: Isolate_Type_Id,
 		slot_index: Isolate_Slot_Index,
 	) -> rawptr {
-		descriptor := shard.type_descriptors[type_id]
-		if descriptor.stride == 0 {
-			return nil
-		}
-		start_index := int(slot_index) * descriptor.stride
-		return rawptr(&shard.isolate_memory[type_id][start_index])
+		memory := _get_isolate_memory_row(shard, type_id, slot_index)
+		return raw_data(memory)
 	}
 
 	@(private = "file")
@@ -36,12 +32,9 @@ when TINA_ASAN_POISONING {
 		type_id: Isolate_Type_Id,
 		slot_index: Isolate_Slot_Index,
 	) -> rawptr {
-		descriptor := shard.type_descriptors[type_id]
-		if descriptor.working_memory_size == 0 {
-			return nil
-		}
-		start_index := int(slot_index) * descriptor.working_memory_size
-		return rawptr(&shard.working_memory[type_id][start_index])
+		memory, memory_ok := _get_isolate_working_memory_row_if_present(shard, type_id, slot_index)
+		assert(memory_ok, "fixture working row must exist")
+		return raw_data(memory)
 	}
 
 	@(test)
@@ -297,17 +290,18 @@ when TINA_ASAN_POISONING {
 		_sanitizer_address_poison_io_slot(&pool, index)
 		io_slot_pool_free_tina_owned(&pool, index)
 
+		slot_bytes := mem.byte_slice(pointer, 64)
+		link_bytes := slot_bytes[:size_of(IO_Slot_Link)]
+		payload_bytes := slot_bytes[size_of(IO_Slot_Link):]
+
 		testing.expect(
 			t,
-			sanitizer.address_region_is_poisoned_rawptr(pointer, size_of(IO_Slot_Index)) == nil,
-			"free-list word must remain addressable after freeing a fully poisoned slot",
+			sanitizer.address_region_is_poisoned_rawptr(raw_data(link_bytes), len(link_bytes)) == nil,
+			"free-list link must remain addressable after freeing a fully poisoned slot",
 		)
 		testing.expect(
 			t,
-			sanitizer.address_region_is_poisoned_rawptr(
-				rawptr(uintptr(pointer) + uintptr(size_of(IO_Slot_Index))),
-				64 - size_of(IO_Slot_Index),
-			) != nil,
+			sanitizer.address_region_is_poisoned_rawptr(raw_data(payload_bytes), len(payload_bytes)) != nil,
 			"freed IO slot payload must be poisoned",
 		)
 	}

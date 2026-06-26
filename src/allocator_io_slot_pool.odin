@@ -4,6 +4,10 @@ import "core:math/bits"
 import "core:mem"
 import "core:testing"
 
+IO_Slot_Link :: struct {
+	next_free: IO_Slot_Index,
+}
+
 IO_Slot_Pool :: struct {
 	backing_memory:     []u8,
 	slot_size:  u32, // bytes per slot
@@ -40,7 +44,7 @@ io_slot_pool_init :: proc(
 		return
 	}
 
-	assert(slot_size >= 2, "slot_size must be >= 2 for intrusive free list")
+	assert(slot_size >= size_of(IO_Slot_Link), "slot_size must fit IO_Slot_Link")
 	assert((slot_size & (slot_size - 1)) == 0, "slot_size must be a power of 2")
 	assert(len(backing_memory) >= int(slot_count) * int(slot_size), "backing memory too small")
 
@@ -56,7 +60,8 @@ io_slot_pool_init :: proc(
 
 	for i := int(slot_count) - 1; i >= 0; i -= 1 {
 		slot_pointer := _io_slot_pool_pointer(pool, IO_Slot_Index(i))
-		(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
+		slot_link := cast(^IO_Slot_Link)slot_pointer
+		slot_link.next_free = pool.free_head
 		pool.free_head = IO_Slot_Index(i)
 		pool.free_count += 1
 	}
@@ -69,8 +74,9 @@ io_slot_pool_alloc :: #force_inline proc(pool: ^IO_Slot_Pool) -> (IO_Slot_Index,
 
 	index := pool.free_head
 	slot_pointer := _io_slot_pool_pointer(pool, index)
+	slot_link := cast(^IO_Slot_Link)slot_pointer
 
-	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
+	pool.free_head = slot_link.next_free
 	pool.free_count -= 1
 
 	mem.zero(slot_pointer, int(pool.slot_size))
@@ -86,7 +92,8 @@ io_slot_pool_alloc_unzeroed :: #force_inline proc(
 	}
 	index := pool.free_head
 	slot_pointer := _io_slot_pool_pointer(pool, index)
-	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
+	slot_link := cast(^IO_Slot_Link)slot_pointer
+	pool.free_head = slot_link.next_free
 	pool.free_count -= 1
 	// No mem.zero — caller guarantees the region will be fully written before read.
 	return index, .None
@@ -96,8 +103,9 @@ io_slot_pool_free :: #force_inline proc(pool: ^IO_Slot_Pool, index: IO_Slot_Inde
 	assert(u16(index) < pool.slot_count, "IO_Slot Pool index out of bounds")
 
 	slot_pointer := _io_slot_pool_pointer(pool, index)
+	slot_link := cast(^IO_Slot_Link)slot_pointer
 
-	(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
+	slot_link.next_free = pool.free_head
 	pool.free_head = index
 	pool.free_count += 1
 }
@@ -135,7 +143,8 @@ io_slot_pool_reset :: #force_inline proc(pool: ^IO_Slot_Pool) {
 	pool.free_head = IO_SLOT_INDEX_NONE
 	for i := int(pool.slot_count) - 1; i >= 0; i -= 1 {
 		slot_pointer := _io_slot_pool_pointer(pool, IO_Slot_Index(i))
-		(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
+		slot_link := cast(^IO_Slot_Link)slot_pointer
+		slot_link.next_free = pool.free_head
 		pool.free_head = IO_Slot_Index(i)
 	}
 }
@@ -167,8 +176,9 @@ io_slot_pool_alloc_tina_owned :: #force_inline proc(
 	// Unpoison the free-list link word before reading it. The provided-buffer
 	// init path poisons entire slots (link word included), so reading the link
 	// word before unpoisoning would trigger ASan. Symmetric with the free path.
-	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Index))
-	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
+	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Link))
+	slot_link := cast(^IO_Slot_Link)slot_pointer
+	pool.free_head = slot_link.next_free
 	_sanitizer_address_unpoison_io_slot(pool, index)
 	pool.free_count -= 1
 
@@ -186,8 +196,9 @@ io_slot_pool_alloc_unzeroed_tina_owned :: #force_inline proc(
 	}
 	index := pool.free_head
 	slot_pointer := _io_slot_pool_pointer(pool, index)
-	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Index))
-	pool.free_head = (cast(^IO_Slot_Index)slot_pointer)^
+	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Link))
+	slot_link := cast(^IO_Slot_Link)slot_pointer
+	pool.free_head = slot_link.next_free
 	_sanitizer_address_unpoison_io_slot(pool, index)
 	pool.free_count -= 1
 	return index, .None
@@ -198,9 +209,10 @@ io_slot_pool_free_tina_owned :: #force_inline proc(pool: ^IO_Slot_Pool, index: I
 	assert(u16(index) < pool.slot_count, "IO_Slot Pool index out of bounds")
 
 	slot_pointer := _io_slot_pool_pointer(pool, index)
+	slot_link := cast(^IO_Slot_Link)slot_pointer
 
-	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Index))
-	(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
+	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Link))
+	slot_link.next_free = pool.free_head
 	pool.free_head = index
 	pool.free_count += 1
 	_sanitizer_address_poison_io_slot_payload(pool, index)
@@ -214,7 +226,8 @@ io_slot_pool_reset_tina_owned :: #force_inline proc(pool: ^IO_Slot_Pool) {
 		slot_index := IO_Slot_Index(i)
 		_sanitizer_address_unpoison_io_slot(pool, slot_index)
 		slot_pointer := _io_slot_pool_pointer(pool, slot_index)
-		(cast(^IO_Slot_Index)slot_pointer)^ = pool.free_head
+		slot_link := cast(^IO_Slot_Link)slot_pointer
+		slot_link.next_free = pool.free_head
 		pool.free_head = slot_index
 		_sanitizer_address_poison_io_slot_payload(pool, slot_index)
 	}

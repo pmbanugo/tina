@@ -90,12 +90,11 @@ test_with_turn_frame :: proc(
 	}
 	mem.arena_init(&frame.scratch_arena, shard.scratch_memory)
 
-	working_stride := shard.type_descriptors[self_type_id].working_memory_size
-	if working_stride > 0 {
-		start_index := int(self_slot_index) * working_stride
-		working_slice := shard.working_memory[self_type_id][start_index:start_index + working_stride]
+	working_slice, working_slice_ok := _get_isolate_working_memory_row_if_present(shard, self_type_id, self_slot_index)
+	if working_slice_ok {
 		mem.arena_init(&frame.working_arena, working_slice)
 	} else {
+		assert(shard.type_descriptors[self_type_id].working_memory_size == 0, "working memory row unavailable")
 		frame.working_arena = {}
 	}
 
@@ -183,12 +182,11 @@ test_with_local_turn_frame :: proc(
 	}
 	mem.arena_init(&frame.scratch_arena, shard.scratch_memory)
 
-	working_stride := shard.type_descriptors[target_type_id].working_memory_size
-	if working_stride > 0 {
-		start_index := int(target_slot_index) * working_stride
-		working_slice := shard.working_memory[target_type_id][start_index:start_index + working_stride]
+	working_slice, working_slice_ok := _get_isolate_working_memory_row_if_present(shard, target_type_id, target_slot_index)
+	if working_slice_ok {
 		mem.arena_init(&frame.working_arena, working_slice)
 	} else {
+		assert(shard.type_descriptors[target_type_id].working_memory_size == 0, "working memory row unavailable")
 		frame.working_arena = {}
 	}
 

@@ -119,11 +119,14 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 		offset = parent_frame != nil ? parent_frame.scratch_arena.offset : 0,
 	}
 
-	working_stride := shard.type_descriptors[type_id].working_memory_size
-	if working_stride > 0 {
-		start_index := int(slot_index) * working_stride
-		working_slice := shard.working_memory[type_id][start_index:start_index + working_stride]
+	working_slice, working_slice_ok := _get_isolate_working_memory_row_if_present(shard, type_id, child_slot_index)
+	if working_slice_ok {
 		mem.arena_init(&child_turn_frame.working_arena, working_slice)
+	} else {
+		assert(
+			shard.type_descriptors[type_id].working_memory_size == 0,
+			"working memory row unavailable",
+		)
 	}
 
 	// 4. Execute init_handler
@@ -198,7 +201,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 	context.temp_allocator = child_turn_frame.previous_temp_allocator
 	shard.current_trap_environment = previous_trap_environment
 
-	if working_stride > 0 {
+	if working_slice_ok {
 		soa_meta[slot_index].working_arena_offset = u32(child_turn_frame.working_arena.offset)
 	}
 
@@ -395,6 +398,55 @@ _drain_mailbox :: proc(shard: ^Shard, soa_meta: #soa[]Isolate_Metadata, slot_ind
 }
 
 @(private = "package")
+_get_isolate_memory_row :: #force_inline proc(
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+) -> []u8 {
+	assert(int(type_id) < len(shard.type_descriptors), "type_id out of bounds")
+	descriptor := shard.type_descriptors[type_id]
+	assert(descriptor.id == type_id, "type descriptor id mismatch")
+	assert(descriptor.slot_count >= 0, "slot_count must be non-negative")
+	assert(descriptor.stride > 0, "isolate type has no memory row")
+	assert(int(slot_index) < descriptor.slot_count, "slot_index out of bounds")
+	assert(int(type_id) < len(shard.isolate_memory), "isolate memory type_id out of bounds")
+
+	memory := shard.isolate_memory[type_id]
+	assert(descriptor.stride <= len(memory) / descriptor.slot_count, "isolate memory backing too small")
+
+	start_index := int(slot_index) * descriptor.stride
+	return memory[start_index:start_index + descriptor.stride]
+}
+
+@(private = "package")
+_get_isolate_working_memory_row_if_present :: #force_inline proc(
+	shard: ^Shard,
+	type_id: Isolate_Type_Id,
+	slot_index: Isolate_Slot_Index,
+) -> ([]u8, bool) {
+	assert(int(type_id) < len(shard.type_descriptors), "type_id out of bounds")
+	descriptor := shard.type_descriptors[type_id]
+	assert(descriptor.id == type_id, "type descriptor id mismatch")
+	assert(descriptor.slot_count >= 0, "slot_count must be non-negative")
+	assert(int(slot_index) < descriptor.slot_count, "slot_index out of bounds")
+
+	if descriptor.working_memory_size == 0 {
+		return {}, false
+	}
+	assert(descriptor.working_memory_size > 0, "working_memory_size must be non-negative")
+	assert(int(type_id) < len(shard.working_memory), "working memory type_id out of bounds")
+
+	memory := shard.working_memory[type_id]
+	assert(
+		descriptor.working_memory_size <= len(memory) / descriptor.slot_count,
+		"working memory backing too small",
+	)
+
+	start_index := int(slot_index) * descriptor.working_memory_size
+	return memory[start_index:start_index + descriptor.working_memory_size], true
+}
+
+@(private = "package")
 _get_isolate_ptr :: proc(
 	shard: ^Shard,
 	type_id: Isolate_Type_Id,
@@ -414,8 +466,7 @@ _get_isolate_ptr :: proc(
 	stride := shard.type_descriptors[type_id].stride
 	if stride == 0 {return nil}
 
-	assert(int(type_id) < len(shard.isolate_memory), "type_id out of bounds")
-	assert(int(slot_index) * stride < len(shard.isolate_memory[type_id]), "slot_index out of bounds")
+	memory := _get_isolate_memory_row(shard, type_id, slot_index)
 
-	return rawptr(&shard.isolate_memory[type_id][int(slot_index) * stride])
+	return raw_data(memory)
 }
