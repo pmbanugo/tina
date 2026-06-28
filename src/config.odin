@@ -12,7 +12,7 @@ MIN_RING_SIZE :: 16
 MAX_TYPE_DESCRIPTOR_ID :: 254 // 8-bit type_id, 255 (0xFF) is reserved for Supervision Groups
 CACHE_LINE_SIZE :: 128
 TINA_SIMULATION_MODE :: #config(TINA_SIM, false)
-// TINA_DEBUG_ASSERTS used to enable runtime asserts for cases that are fixed behaviour (runtime inputs don't change behaviour)
+// TINA_RUNTIME_ASSERTIONS used to enable runtime asserts for cases that are fixed behaviour (runtime inputs don't change behaviour)
 // but needs verify invariant/structural correctness holds in a non-simulated environment
 TINA_RUNTIME_ASSERTIONS :: #config(TINA_ASSERTS, true)
 TINA_ODIN_DEV :: #config(ODIN_DEV, false)

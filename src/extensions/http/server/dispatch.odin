@@ -213,7 +213,7 @@ import "core:testing"
 @(test)
 test_dispatch_unknown_method_missing_path_returns_not_implemented :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET}}}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
@@ -287,7 +287,7 @@ _dispatch_test_expect_event_handler :: proc(
 @(test)
 test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET}, handler = rawptr(_dispatch_test_ok_handler)}}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
@@ -329,7 +329,7 @@ test_dispatch_connection_close_marks_response_for_close_after_send :: proc(t: ^t
 @(test)
 test_dispatch_none_body_route_closes_after_response_when_body_present :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.POST}, handler = rawptr(_dispatch_test_ok_handler)}}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
@@ -384,7 +384,7 @@ test_dispatch_streamed_route_final_response_before_body_closes_after_send :: pro
 			body_size_max = 16,
 		},
 	}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
@@ -434,7 +434,7 @@ test_dispatch_streamed_route_cannot_park_before_consuming_body :: proc(t: ^testi
 			body_size_max = 16,
 		},
 	}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
@@ -462,7 +462,7 @@ test_dispatch_streamed_route_cannot_park_before_consuming_body :: proc(t: ^testi
 @(test)
 test_dispatch_options_asterisk_implicit_response :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET}}}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 

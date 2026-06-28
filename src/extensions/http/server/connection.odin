@@ -21,8 +21,8 @@ _http_connection_init :: proc(self: rawptr, args: []u8) -> tina.Isolate_Transiti
 	}
 
 	frame_size :=
-		int(runtime.server.limits.request_line_size_max) +
-		int(runtime.server.limits.header_size_max)
+		int(runtime.server.parse_budget.request_line_size_max) +
+		int(runtime.server.parse_budget.header_size_max)
 	connection.connection_state.shard_runtime = runtime
 	connection.connection_state.deadline_timer_handle = tina.ctx_timer_acquire()
 	when tina.TINA_RUNTIME_ASSERTIONS {
@@ -43,8 +43,8 @@ _http_connection_init :: proc(self: rawptr, args: []u8) -> tina.Isolate_Transiti
 		tina.ctx_submit_io(
 			tina.IoOp_Recv {
 				fd = init_args.client_fd,
-				buffer_size_max = u32(runtime.server.limits.request_line_size_max) +
-				u32(runtime.server.limits.header_size_max),
+				buffer_size_max = u32(runtime.server.parse_budget.request_line_size_max) +
+				u32(runtime.server.parse_budget.header_size_max),
 			},
 		),
 	)
@@ -74,18 +74,29 @@ _connection_init_working_memory_regions :: proc(
 	state.pipeline_tail_bytes = _connection_working_region_take(
 		working_bytes,
 		&working_offset,
-		int(runtime.server.limits.pipeline_size_max),
+		int(runtime.server.memory_budget.pipeline_size_max),
 	)
 
 	header_view_storage := _connection_working_region_take(
 		working_bytes,
 		&working_offset,
-		int(runtime.server.limits.header_count_max) * size_of(Header_View),
+		int(runtime.server.memory_budget.header_count_max) * size_of(Header_View),
 	)
 	if len(header_view_storage) > 0 {
 		state.header_views = mem.slice_ptr(
 			cast(^Header_View)raw_data(header_view_storage),
-			int(runtime.server.limits.header_count_max),
+			int(runtime.server.memory_budget.header_count_max),
+		)
+	}
+
+	// Debug/test-only structural invariant: both budgets derive from the same
+	// `Limits.header_count_max`, so the working-memory layout matches the
+	// parser cap by construction. Defaults are checked at compile time in
+	// `limits.odin`; operator values are validated at install.
+	when ODIN_DEBUG || ODIN_TEST {
+		assert(
+			len(state.header_views) == int(runtime.server.parse_budget.header_count_max),
+			"_connection_init_working_memory_regions: header_views region under-provisioned relative to Parse_Budget.header_count_max — working-memory layout drift",
 		)
 	}
 
@@ -98,14 +109,14 @@ _connection_init_working_memory_regions :: proc(
 	request_arena_bytes := _connection_working_region_take(
 		working_bytes,
 		&working_offset,
-		int(runtime.server.limits.request_arena_size),
+		int(runtime.server.memory_budget.request_arena_size),
 	)
 	mem.arena_init(&state.request_arena_region, request_arena_bytes)
 
 	state.response_header_bytes = _connection_working_region_take(
 		working_bytes,
 		&working_offset,
-		int(runtime.server.limits.response_header_bytes_max),
+		int(runtime.server.memory_budget.response_header_bytes_max),
 	)
 }
 
@@ -336,7 +347,7 @@ _connection_process_header_bytes :: proc(
 		state.header_views,
 		source,
 		parsed_offset_start,
-		runtime.server.limits,
+		runtime.server.parse_budget,
 	)
 	#partial switch parse_status {
 	case .Need_More:
@@ -1397,7 +1408,7 @@ _connection_process_body_bytes :: proc(
 				&state.buffered_body_size,
 				&state.request_body_size_received,
 				descriptor.body_size_max,
-				runtime.server.limits,
+				runtime.server.parse_budget,
 				buffered = false,
 			)
 
@@ -1477,7 +1488,7 @@ _connection_process_body_bytes :: proc(
 				&state.buffered_body_size,
 				&state.request_body_size_received,
 				descriptor.body_size_max,
-				runtime.server.limits,
+				runtime.server.parse_budget,
 				buffered = true,
 			)
 
@@ -1555,8 +1566,8 @@ _connection_complete_close :: proc(connection: ^HTTP_Connection) {
 @(private = "file")
 _recv_buffer_size_max :: proc(runtime: ^HTTP_Shard_Runtime) -> u32 {
 	return(
-		u32(runtime.server.limits.request_line_size_max) +
-		u32(runtime.server.limits.header_size_max) \
+		u32(runtime.server.parse_budget.request_line_size_max) +
+		u32(runtime.server.parse_budget.header_size_max) \
 	)
 }
 
@@ -1582,7 +1593,7 @@ test_idle_peer_close_unlinks_idle_before_fd_close :: proc(t: ^testing.T) {
 	idle_slot_positions[0] = u16(IDLE_ARRAY_INDEX_NONE)
 
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		active_slot_indices   = active_slot_indices[:],
 		active_connections    = active_connections[:],
 		active_slot_positions = active_slot_positions[:],
@@ -1755,14 +1766,14 @@ test_stale_notification_on_keep_alive_connection_is_dropped :: proc(t: ^testing.
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		router = router,
 	}
 	connection := HTTP_Connection{}
@@ -1886,14 +1897,14 @@ test_pending_application_message_is_preserved_until_expectation :: proc(t: ^test
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		router = router,
 	}
 	connection := HTTP_Connection{}
@@ -1987,14 +1998,14 @@ test_pending_application_message_first_wins_when_multiple_arrive :: proc(t: ^tes
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		router = router,
 	}
 	connection := HTTP_Connection{}
@@ -2091,7 +2102,7 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
@@ -2099,7 +2110,7 @@ test_shutdown_in_application_expectation_delivers_server_drain :: proc(t: ^testi
 				timeout_ms_send = 1,
 			},
 			graceful_drain_ms = 1,
-		},
+		),
 		router = router,
 	}
 
@@ -2159,7 +2170,7 @@ test_shutdown_while_reading_headers_closes_immediately :: proc(t: ^testing.T) {
 	idle_slot_positions[0] = u16(IDLE_ARRAY_INDEX_NONE)
 
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{graceful_drain_ms = 1},
+		server = _test_server_runtime(graceful_drain_ms = 1),
 		connection_slot_count = 1,
 		idle_slot_indices = idle_slot_indices[:],
 		idle_slot_handles = idle_slot_handles[:],
@@ -2250,14 +2261,14 @@ test_dispatch_step_flush_non_final_dispatches_send_ready_without_io :: proc(t: ^
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		router = router,
 		free_count = 8,
 		keepalive_reserve = 0,
@@ -2311,14 +2322,14 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		router = router,
 		free_count = 8,
 		keepalive_reserve = 0,
@@ -2354,14 +2365,14 @@ test_dispatch_step_flush_final_skips_send_ready_without_io :: proc(t: ^testing.T
 @(test)
 test_send_complete_with_sendfile_plan_transitions_to_sendfile_io :: proc(t: ^testing.T) {
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		free_count = 8,
 		keepalive_reserve = 0,
 	}
@@ -2402,14 +2413,14 @@ test_send_complete_with_sendfile_plan_transitions_to_sendfile_io :: proc(t: ^tes
 @(test)
 test_stage_canned_response_arms_send_timeout :: proc(t: ^testing.T) {
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 25,
 			},
-		},
+		),
 	}
 
 	connection := HTTP_Connection{}
@@ -2462,14 +2473,14 @@ test_drive_body_read_restarts_send_from_unsent_offset :: proc(t: ^testing.T) {
 		},
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 25,
 			},
-		},
+		),
 		router = Compiled_Router {
 			descriptors = router_descriptors[:],
 		},
@@ -2545,14 +2556,14 @@ test_send_complete_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		router = router,
 	}
 
@@ -2609,14 +2620,14 @@ test_sendfile_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
 		descriptors = router_descriptors[:],
 	}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime {
+		server = _test_server_runtime(
 			timeouts = Timeouts {
 				timeout_ms_idle = 1,
 				timeout_ms_header = 1,
 				timeout_ms_body = 1,
 				timeout_ms_send = 1,
 			},
-		},
+		),
 		router = router,
 	}
 
@@ -2662,7 +2673,7 @@ test_sendfile_error_dispatches_peer_closed_then_closes :: proc(t: ^testing.T) {
 test_process_header_bytes_retains_tail_for_simple_request :: proc(t: ^testing.T) {
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		router = router,
 	}
 
@@ -2741,12 +2752,12 @@ _connection_test_canonical_route_handler :: proc(request: ^Request, response: ^R
 @(test)
 test_process_header_bytes_canonicalizes_path_before_route_match :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/admin", methods_mask = {.GET}, handler = rawptr(_connection_test_canonical_route_handler)}}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		router = router,
 	}
 
@@ -2908,7 +2919,7 @@ test_connection_canonicalize_request_frame_rejects_decoded_control_byte :: proc(
 test_process_header_bytes_rejects_malformed_percent_path :: proc(t: ^testing.T) {
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		router = router,
 	}
 
@@ -2959,7 +2970,7 @@ test_process_header_bytes_rejects_malformed_percent_path :: proc(t: ^testing.T) 
 test_process_header_bytes_accumulates_fragmented_request_line :: proc(t: ^testing.T) {
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		router = router,
 	}
 
@@ -3032,7 +3043,7 @@ test_process_header_bytes_accumulates_fragmented_request_line :: proc(t: ^testin
 test_process_header_bytes_accumulates_fragmented_header_value :: proc(t: ^testing.T) {
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		router = router,
 	}
 
@@ -3110,7 +3121,7 @@ test_process_header_bytes_closes_when_core_shutdown_started_before_http_runtime_
 ) {
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		router = router,
 	}
 
@@ -3180,7 +3191,7 @@ test_finalize_flushed_response_processes_pipeline_tail_before_recv :: proc(t: ^t
 
 	router := Compiled_Router{}
 	runtime := HTTP_Shard_Runtime {
-		server = Server_Runtime{limits = DEFAULT_LIMITS, timeouts = DEFAULT_TIMEOUTS},
+		server = DEFAULT_SERVER_RUNTIME,
 		router = router,
 		free_count = 4,
 		keepalive_reserve = 0,

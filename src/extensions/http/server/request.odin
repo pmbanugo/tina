@@ -47,6 +47,15 @@ Request_Flags :: distinct bit_set[Request_Flag;u8]
 @(private = "package")
 PATH_SEGMENT_COUNT_NONE :: u8(0xFF)
 
+// Sentinel meaning "the request path exceeded Match_Budget.path_segment_count_max".
+// Distinct from NONE (0xFF): the match path caches this so the per-request
+// over-limit decision is made exactly once.
+//  0xFE is safe because path_segment_count_max
+// is asserted to be < 0xFF at install time, so a legitimate count can never
+// collide with this sentinel.
+@(private = "package")
+PATH_SEGMENT_COUNT_OVER_LIMIT :: u8(0xFE)
+
 @(private = "package")
 Request_State :: struct {
 	header_bloom:       u64,
@@ -626,7 +635,7 @@ test_param_extracts_named_segment :: proc(t: ^testing.T) {
 		methods_mask = {.GET},
 		body_mode    = .None,
 	}}
-	router, compile_error, _ := compile_router(routes)
+	router, compile_error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, compile_error, Compile_Error.None)
 	defer compiled_router_destroy(&router)
 

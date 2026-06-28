@@ -76,18 +76,47 @@ Server :: struct {
 }
 
 // Baked, immutable runtime configuration derived at install time.
-// This intentionally excludes user-facing route tables and other boot-only input.
+// This intentionally excludes user-facing route tables and other boot-only
+// input. `Limits` is *not* carried here: install decomposes it once into
+// domain-specific budgets (parse, route, match, memory) so the runtime
+// never holds the flat config shape.
 @(private = "package")
 Server_Runtime :: struct {
 	address:                tina.Socket_Address,
 	backlog:                u32,
 	ingress_mode:           Ingress_Mode,
-	limits:                 Limits,
+	parse_budget:           Parse_Budget,
+	memory_budget:          Memory_Budget,
+	match_budget:            Match_Budget,
+	route_budget:            Route_Budget,
 	timeouts:               Timeouts,
 	keepalive_reserve_slots: u16,
 	graceful_drain_ms:      u32,
 	buffered_body_size_max: u32,
 	route_state_size_max:   u16,
+}
+
+@(private = "package")
+DEFAULT_SERVER_RUNTIME :: Server_Runtime {
+	parse_budget  = DEFAULT_PARSE_BUDGET,
+	memory_budget = DEFAULT_MEMORY_BUDGET,
+	match_budget  = DEFAULT_MATCH_BUDGET,
+	route_budget  = DEFAULT_ROUTE_BUDGET,
+	timeouts      = DEFAULT_TIMEOUTS,
+}
+
+// Test scaffolding helper: produce a `Server_Runtime` with the default budgets
+// baked in and only the test-specific overrides (timeouts, graceful_drain_ms)
+// modifiable.
+@(private = "package")
+_test_server_runtime :: proc(
+	timeouts: Timeouts = DEFAULT_TIMEOUTS,
+	graceful_drain_ms: u32 = 0,
+) -> Server_Runtime {
+	runtime := DEFAULT_SERVER_RUNTIME
+	runtime.timeouts = timeouts
+	runtime.graceful_drain_ms = graceful_drain_ms
+	return runtime
 }
 
 // Per-request opaque token stamped at request_start. Exposed to handlers via
@@ -451,15 +480,34 @@ install_into_system_spec :: proc(
 	}
 
 	// Boot-time runtime guards (HTTP_LIBRARY_SYSTEM_INTEGRATION.md §3.6).
-	limits := server.limits
+	parse_budget, parse_error := parse_budget_from(server.limits)
+	route_budget, route_error := route_budget_from(server.limits)
+	match_budget, match_error := match_budget_from(server.limits)
+	memory_budget, memory_error := memory_budget_from(server.limits)
+
 	assert(
-		u32(limits.request_line_size_max) + u32(limits.header_size_max) <= 65_535,
-		"limits: request_line_size_max + header_size_max exceeds u16 frame width",
+		parse_error == .None,
+		fmt.tprintf("install_into_system_spec: invalid parse budget: %v", parse_error),
 	)
 	assert(
-		u32(limits.pipeline_size_max) <= 65_535,
-		"limits: pipeline_size_max exceeds u16 width",
+		route_error == .None,
+		fmt.tprintf("install_into_system_spec: invalid route budget: %v", route_error),
 	)
+	assert(
+		match_error == .None,
+		fmt.tprintf("install_into_system_spec: invalid match budget: %v", match_error),
+	)
+	assert(
+		memory_error == .None,
+		fmt.tprintf("install_into_system_spec: invalid memory budget: %v", memory_error),
+	)
+
+	// Timeout normalization already happened in `_normalize_server_defaults`.
+	// Re-assert the couple of timeout invariants the codebase has long relied
+	// on (header timeout shorter than idle — defensive against a client that
+	// connects but sends nothing).
+	assert(server.timeouts.timeout_ms_header < server.timeouts.timeout_ms_idle,
+		"install_into_system_spec: timeout_ms_header must be < timeout_ms_idle")
 
 	assert(
 		len(server.app.routes) <= 254,
@@ -477,8 +525,9 @@ install_into_system_spec :: proc(
 	)
 
 	// Compile the route table once at boot and keep it alive for the lifetime
-	// of the system spec.
-	router_value, router_error, router_error_index := compile_router(server.app.routes, context.allocator)
+	// of the system spec. `route_budget` is required here so the compile pass
+	// cannot silently regress to enforcing no ceilings.
+	router_value, router_error, router_error_index := compile_router(server.app.routes, route_budget, context.allocator)
 	assert(
 		router_error == .None,
 		fmt.tprintf("install_into_system_spec: route compilation failed at index %d with %v", router_error_index, router_error),
@@ -487,13 +536,15 @@ install_into_system_spec :: proc(
 	router_storage[0] = router_value
 	router := &router_storage[0]
 	server_runtime_storage := make([]Server_Runtime, 1, context.allocator)
-	server_runtime_storage[0] = _bake_server_runtime(server)
+	server_runtime_storage[0] = _make_server_runtime(
+		server, parse_budget, memory_budget, match_budget, route_budget,
+	)
 	server_runtime := &server_runtime_storage[0]
 	coordinator_mode_enabled := topology.coordinator_mode_enabled
 
 	// --- Derive memory budgets ---
-	working_memory_size := _compute_working_memory_size(server)
-	scratch_requirement := _compute_scratch_requirement(server)
+	working_memory_size := _compute_working_memory_size(server_runtime)
+	scratch_requirement := _compute_scratch_requirement(memory_budget)
 
 	// Raise spec.scratch_memory_size if HTTP requires more than the caller set.
 	// Never lower an explicit user value.
@@ -856,38 +907,50 @@ _derive_timer_entry_count :: proc "contextless" (
 	return int(entry_count)
 }
 
-// Compute the per-Connection working_memory_size from limits + route metadata.
-// Math is exact and boot-computable — under-provisioning is caught here, not
-// at parse time. See HTTP_LIBRARY_MEMORY_LAYOUT.md §2.5.
+// Compute the per-Connection working_memory_size from the baked runtime.
 @(private = "package")
-_compute_working_memory_size :: proc(server: ^Server) -> int {
-	server_runtime := _bake_server_runtime(server)
-	limits := server_runtime.limits
+_compute_working_memory_size :: proc(server_runtime: ^Server_Runtime) -> int {
+	memory := server_runtime.memory_budget
+	parse_budget := server_runtime.parse_budget
 
-	// Pre-compute u32 sums to keep arithmetic in one width and avoid surprise
-	// promotions deep inside the formula.
-	frame_size := int(limits.request_line_size_max) + int(limits.header_size_max)
-	header_table_size := int(limits.header_count_max) * size_of(Header_View)
 
-	total :=
+	frame_size := int(parse_budget.request_line_size_max) + int(parse_budget.header_size_max)
+	header_table_size := int(memory.header_count_max) * size_of(Header_View)
+
+	total_size :=
 		_align_up(frame_size) +
 		_align_up(int(server_runtime.buffered_body_size_max)) +
-		_align_up(int(limits.pipeline_size_max)) +
+		_align_up(int(memory.pipeline_size_max)) +
 		_align_up(header_table_size) +
 		_align_up(int(server_runtime.route_state_size_max)) +
-		int(limits.request_arena_size) +
-		_align_up(int(limits.response_header_bytes_max))
+		int(memory.request_arena_size) +
+		_align_up(int(memory.response_header_bytes_max))
 
-	return total
+	return total_size
 }
 
+// Make the immutable runtime from the operator-supplied `Server` config and
+// the already-validated budgets. The caller (`install_into_system_spec`) is
+// the single place where `Limits → budget` derivation occurs: it calls the
+// constructors, asserts `Limits_Error.None`, and passes the budgets here.
+// `Server_Runtime` therefore never holds the flat `Limits` shape — each plane
+// sees only its own typed budget.
 @(private = "package")
-_bake_server_runtime :: proc(server: ^Server) -> Server_Runtime {
+_make_server_runtime :: proc(
+	server: ^Server,
+	parse_budget: Parse_Budget,
+	memory_budget: Memory_Budget,
+	match_budget: Match_Budget,
+	route_budget: Route_Budget,
+) -> Server_Runtime {
 	return Server_Runtime {
 		address                = server.address,
 		backlog                = server.backlog,
 		ingress_mode           = server.ingress_mode,
-		limits                 = server.limits,
+		parse_budget           = parse_budget,
+		memory_budget          = memory_budget,
+		match_budget           = match_budget,
+		route_budget           = route_budget,
 		timeouts               = server.timeouts,
 		keepalive_reserve_slots = server.keepalive.reserve_slots,
 		graceful_drain_ms      = server.graceful_drain_ms,
@@ -897,8 +960,8 @@ _bake_server_runtime :: proc(server: ^Server) -> Server_Runtime {
 }
 
 @(private = "package")
-_compute_scratch_requirement :: proc(server: ^Server) -> int {
-	return HTTP_INTERNAL_SCRATCH_NEED + int(server.limits.handler_scratch_max)
+_compute_scratch_requirement :: proc(memory_budget: Memory_Budget) -> int {
+	return HTTP_INTERNAL_SCRATCH_NEED + int(memory_budget.handler_scratch_max)
 }
 
 // The listener's working memory holds the shared HTTP_Shard_Runtime plus the
@@ -1149,8 +1212,15 @@ test_compute_working_memory_size_bounded :: proc(t: ^testing.T) {
 		app     = &app,
 		limits  = DEFAULT_LIMITS,
 	}
+	server_runtime := _make_server_runtime(
+		&server,
+		DEFAULT_PARSE_BUDGET,
+		DEFAULT_MEMORY_BUDGET,
+		DEFAULT_MATCH_BUDGET,
+		DEFAULT_ROUTE_BUDGET,
+	)
 
-	working_memory_size := _compute_working_memory_size(&server)
+	working_memory_size := _compute_working_memory_size(&server_runtime)
 
 	// Floor: must include at least the request frame region + request arena.
 	min_expected :=
@@ -1170,8 +1240,15 @@ test_compute_working_memory_size_alignment :: proc(t: ^testing.T) {
 		app     = &app,
 		limits  = DEFAULT_LIMITS,
 	}
+	server_runtime := _make_server_runtime(
+		&server,
+		DEFAULT_PARSE_BUDGET,
+		DEFAULT_MEMORY_BUDGET,
+		DEFAULT_MATCH_BUDGET,
+		DEFAULT_ROUTE_BUDGET,
+	)
 
-	working_memory_size := _compute_working_memory_size(&server)
+	working_memory_size := _compute_working_memory_size(&server_runtime)
 	testing.expect(
 		t,
 		working_memory_size % align_of(uintptr) == 0,
@@ -1461,4 +1538,101 @@ test_install_into_system_spec_is_position_independent :: proc(t: ^testing.T) {
 	testing.expect_value(t, spec.types[expected_connection_id].stride, size_of(HTTP_Connection))
 	testing.expect_value(t, spec.types[expected_connection_id].slot_count, 257)
 	testing.expect_value(t, root.child_count_dynamic_max, u16(257))
+}
+
+
+// ─── Install-time budget contract tests ─────────────────────────────────────
+//
+// Install asserts the four budget constructors (`parse_budget_from`,
+// `route_budget_from`, `match_budget_from`, `memory_budget_from`) all return
+// `.None`. Because Odin's `assert` aborts the runtime when triggered, the
+// per-constructor unit tests in `limits.odin` are where each contract is
+// exercised on a value-by-value basis. Here we exercise the *composition* —
+// that valid `Limits` flow through `install_into_system_spec` end-to-end and
+// the compile_router step approves the operator route table.
+
+@(test)
+test_install_accepts_default_limits_and_routes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+
+	app := App {
+		routes = []Route {
+			{pattern = "/health", methods_mask = {.GET}},
+			{pattern = "/:p/:q", methods_mask = {.GET}},
+		},
+	}
+	server := Server {
+		address = tina.ipv4(127, 0, 0, 1, 8080),
+		app     = &app,
+	}
+	spec := install_development_defaults(&server)
+	testing.expect_value(t, spec.shard_count, u8(1))
+	testing.expect(t, len(spec.types) == 2, "single-shard dev install registers 2 HTTP types")
+}
+
+@(test)
+test_install_rejects_param_count_exceeds_limit :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+
+	// Routes declare 9 params; default param_count_max = 8. Compile_router
+	// rejects, and install surfaces the Compile_Error via its assert.
+	app := App {
+		routes = []Route {
+			{pattern = "/:a/:b/:c/:d/:e/:f/:g/:h/:i", methods_mask = {.GET}},
+		},
+	}
+	server := Server {
+		address = tina.ipv4(127, 0, 0, 1, 8080),
+		app     = &app,
+	}
+
+	// Compile outside install to recover the specific error variant — install
+	// would assert-fail with the message but not expose the enum value.
+	route_budget, _ := route_budget_from(DEFAULT_LIMITS)
+	_, error, _ := compile_router(app.routes, route_budget)
+	testing.expect_value(t, error, Compile_Error.Param_Count_Exceeds_Limit)
+}
+
+@(test)
+test_install_rejects_segment_count_exceeds_limit :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+
+	// 17-segment route exceeds default path_segment_count_max (16).
+	routes := []Route {
+		{pattern = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q", methods_mask = {.GET}},
+	}
+	route_budget, _ := route_budget_from(DEFAULT_LIMITS)
+	_, error, _ := compile_router(routes, route_budget)
+	testing.expect_value(t, error, Compile_Error.Segment_Count_Exceeds_Limit)
+}
+
+@(test)
+test_install_rejects_invalid_limits_via_constructor :: proc(t: ^testing.T) {
+	// Install derives budgets and asserts `Limits_Error.None` on each. Use the
+	// constructors directly to surface the specific Limits_Error variant
+	// (install's combined assert message would aggregate but not expose them).
+	zeroed := DEFAULT_LIMITS
+	zeroed.param_count_max = 0
+	_, error := route_budget_from(zeroed)
+	testing.expect_value(t, error, Limits_Error.Zero_Limit)
+
+	zeroed = DEFAULT_LIMITS
+	zeroed.header_count_max = 0xFF
+	_, error = parse_budget_from(zeroed)
+	testing.expect_value(t, error, Limits_Error.Header_Count_Width)
+
+	zeroed = DEFAULT_LIMITS
+	zeroed.path_segment_count_max = 6
+	zeroed.param_count_max = 7
+	_, error = route_budget_from(zeroed)
+	testing.expect_value(t, error, Limits_Error.Param_Exceeds_Segments)
+
+	zeroed = DEFAULT_LIMITS
+	zeroed.request_line_size_max = 40_000
+	zeroed.header_size_max = 40_000
+	_, error = parse_budget_from(zeroed)
+	testing.expect_value(t, error, Limits_Error.Frame_Width_Exceeded)
 }

@@ -213,7 +213,7 @@ init_args_of :: #force_inline proc(args: ^$T) -> (payload: [MAX_INIT_ARGS_SIZE]u
 }
 
 // Debug-checked cast from rawptr to a typed Isolate pointer.
-// Validates at runtime (under TINA_DEBUG_ASSERTS) that the registered stride
+// Validates at runtime (under TINA_RUNTIME_ASSERTIONS) that the registered stride
 // matches the target type, catching wrong-type casts before they corrupt memory.
 self_as :: #force_inline proc($T: typeid, self_raw: rawptr, caller_location := #caller_location) -> ^T {
 	when TINA_RUNTIME_ASSERTIONS {

@@ -59,6 +59,11 @@ Compiled_Router :: struct {
 	route_parts:                  []Route_Part,
 	descriptors:                  []Route_Descriptor,
 
+	// Match-time path-segment ceiling baked at compile time from
+	// `Route_Budget.path_segment_count_max`. The match data plane never
+	// re-reads `Limits`, it reads this field instead.
+	match_budget:                 Match_Budget,
+
 	// Bucket counts segregating entries[] by kind. Sum equals len(entries).
 	static_count:                 u16,
 	parametric_count:             u16,
@@ -91,7 +96,8 @@ Compile_Error :: enum u8 {
 	Pattern_Bad_Encoding, // canonicalization rejected the pattern
 	Wildcard_Not_Terminal, // `*` segment appears before the end
 	Empty_Param_Name, // `:` followed by `/` or end-of-pattern
-	Too_Many_Parts, // pattern has > 255 segments
+	Param_Count_Exceeds_Limit, // pattern declares more `:param` segments than the operator-configured Route_Budget allows
+	Segment_Count_Exceeds_Limit, // pattern declares more path segments than the operator-configured Route_Budget allows
 	Duplicate_Route, // same canonical pattern + same method registered twice
 	Param_Name_Conflict, // same path + kind aggregated, but different param names
 	Asterisk_Wrong_Method, // `*` registered for a method other than OPTIONS
@@ -128,9 +134,17 @@ Route_Part_IR :: struct {
 // router (and its backing buffers) are allocated from the supplied allocator
 // and remain valid until that allocator is destroyed. On error, no allocations
 // outlive the call.
+//
+// `route_budget` is a *required* parameter (not defaulted): the route-table
+// compile pass enforces operator-configured ceilings (param count, segment
+// count) against this budget. Requiring it makes a future change to compile
+// without a budget a compile-time error rather than a silent regression.
+// The same operator value is folded into the compiled router's
+// `Match_Budget` so the match data plane never re-reads `Limits`.
 @(private = "package")
 compile_router :: proc(
 	routes: []Route,
+	route_budget: Route_Budget,
 	allocator := context.allocator,
 ) -> (
 	router: Compiled_Router,
@@ -205,10 +219,10 @@ compile_router :: proc(
 		}
 		canonical = canonical[:pattern_size_canonical]
 
-		kind, parts, classify_error := classify_pattern(canonical, context.temp_allocator)
-		if classify_error != .None {
-			return {}, classify_error, route_input_index
-		}
+kind, parts, classify_error := classify_pattern(canonical, route_budget, context.temp_allocator)
+	if classify_error != .None {
+		return {}, classify_error, route_input_index
+	}
 
 		// Expand each method bit into its own IR entry — one descriptor and
 		// one per-method dispatch slot per concrete method. The aggregator
@@ -434,6 +448,9 @@ compile_router :: proc(
 		literal_buffer               = literal_buffer,
 		route_parts                  = route_parts_final,
 		descriptors                  = descriptors_final,
+		match_budget                 = Match_Budget {
+			path_segment_count_max = route_budget.path_segment_count_max,
+		},
 		static_count                 = static_count,
 		parametric_count             = parametric_count,
 		wildcard_count               = wildcard_count,
@@ -467,6 +484,7 @@ compiled_router_destroy :: proc(router: ^Compiled_Router, allocator := context.a
 @(private = "file")
 classify_pattern :: proc(
 	pattern: []u8,
+	route_budget: Route_Budget,
 	allocator := context.temp_allocator,
 ) -> (
 	kind: Route_Kind,
@@ -481,6 +499,7 @@ classify_pattern :: proc(
 
 	any_param := false
 	any_wildcard := false
+	param_count := 0
 	wildcard_seen_at: int = -1
 
 	read_index := 1 // skip leading `/`
@@ -523,6 +542,7 @@ classify_pattern :: proc(
 				return .Static, nil, .Empty_Param_Name
 			}
 			any_param = true
+			param_count += 1
 			append(
 				&parts_dynamic,
 				Route_Part_IR {
@@ -549,8 +569,17 @@ classify_pattern :: proc(
 	   wildcard_seen_at != int(parts_dynamic[len(parts_dynamic) - 1].pattern_offset) {
 		return .Static, nil, .Wildcard_Not_Terminal
 	}
-	if len(parts_dynamic) > 255 {
-		return .Static, nil, .Too_Many_Parts
+
+	// Configurable ceilings fire first — these encode the operator's stated
+	// budget and produce the precise, named diagnosis. The constructor
+	// `route_budget_from` already guarantees path_segment_count_max < 0xFF and
+	// param_count_max <= path_segment_count_max, so a check against a sub-255
+	// ceiling is the *only* reachable width contract.
+	if param_count > int(route_budget.param_count_max) {
+		return .Static, nil, .Param_Count_Exceeds_Limit
+	}
+	if len(parts_dynamic) > int(route_budget.path_segment_count_max) {
+		return .Static, nil, .Segment_Count_Exceeds_Limit
 	}
 
 	parts = parts_dynamic[:]
@@ -673,7 +702,17 @@ match_route_parametric_or_wildcard :: proc(
 		return Match_Result{outcome = .Not_Found}
 	}
 
-	segment_count := ensure_path_segment_count(request, path_bytes)
+	segment_count := ensure_path_segment_count(
+		request,
+		path_bytes,
+		router.match_budget.path_segment_count_max,
+	)
+
+	// Operator-configured ceiling: oversized request paths are rejected
+	// outright, including wildcard fallthrough.
+	if segment_count == PATH_SEGMENT_COUNT_OVER_LIMIT {
+		return Match_Result{outcome = .Not_Found}
+	}
 
 	// Parametric bucket — exact segment count match required.
 	parametric_begin := int(router.static_count)
@@ -785,9 +824,23 @@ match_route_parts :: proc(
 
 // Computes (or returns the cached) number of path segments. A segment is a
 // non-empty run between `/` separators. Root path `/` has 0 segments.
-// Saturates at 254 so it never collides with `PATH_SEGMENT_COUNT_NONE`.
+//
+// `path_segment_count_max` is the operator-configured Match_Budget ceiling.
+// Request paths that exceed it return (and cache) `PATH_SEGMENT_COUNT_OVER_LIMIT`
+// so the per-request over-limit decision is made exactly once. The match path
+// short-circuits on this sentinel and reports `.Not_Found`, refusing wildcard
+// fallthrough — the documented contract of "Max path segments for parametric
+// matching".
+//
+// Because `match_budget_from` asserts `path_segment_count_max < 0xFF` at
+// install time, a legitimate count can never collide with either sentinel
+// (NONE=0xFF, OVER_LIMIT=0xFE).
 @(private = "package")
-ensure_path_segment_count :: proc(request: ^Request_State, path_bytes: []u8) -> u8 {
+ensure_path_segment_count :: proc(
+	request: ^Request_State,
+	path_bytes: []u8,
+	path_segment_count_max: u8,
+) -> u8 {
 	if request.path_segment_count != PATH_SEGMENT_COUNT_NONE {
 		return request.path_segment_count
 	}
@@ -804,6 +857,12 @@ ensure_path_segment_count :: proc(request: ^Request_State, path_bytes: []u8) -> 
 			continue
 		}
 		count += 1
+		// Short-circuit the moment we cross the operator ceiling — no point
+		// counting segments we will refuse to match anyway.
+		if count > int(path_segment_count_max) {
+			request.path_segment_count = PATH_SEGMENT_COUNT_OVER_LIMIT
+			return request.path_segment_count
+		}
 		for read_index < path_size && path_bytes[read_index] != '/' {
 			read_index += 1
 		}
@@ -905,7 +964,7 @@ test_route_index_sentinel :: proc(t: ^testing.T) {
 
 @(test)
 test_compile_empty :: proc(t: ^testing.T) {
-	router, error, _ := compile_router({})
+	router, error, _ := compile_router({}, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 0)
 	testing.expect_value(t, router.options_asterisk_route_index, ROUTE_INDEX_NONE)
@@ -919,7 +978,7 @@ test_compile_static_routes_packed :: proc(t: ^testing.T) {
 		{pattern = "/users", methods_mask = {.GET, .POST}},
 		{pattern = "/users/me", methods_mask = {.GET}},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 3)
@@ -937,7 +996,7 @@ test_compile_aggregates_methods_into_one_entry :: proc(t: ^testing.T) {
 		{pattern = "/users", methods_mask = {.GET}},
 		{pattern = "/users", methods_mask = {.POST}},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 1)
@@ -961,7 +1020,7 @@ test_compile_explicit_head_overrides_get_fallback :: proc(t: ^testing.T) {
 		{pattern = "/x", methods_mask = {.GET}, handler = rawptr(uintptr(0xAAAA))},
 		{pattern = "/x", methods_mask = {.HEAD}, handler = rawptr(uintptr(0xBBBB))},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -979,7 +1038,7 @@ test_compile_duplicate_route_rejected :: proc(t: ^testing.T) {
 		{pattern = "/dup", methods_mask = {.GET}},
 		{pattern = "/dup", methods_mask = {.GET}},
 	}
-	_, error, _ := compile_router(routes)
+	_, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, error, Compile_Error.Duplicate_Route)
 }
 
@@ -990,14 +1049,14 @@ test_compile_canonicalization_collision :: proc(t: ^testing.T) {
 		{pattern = "/admin", methods_mask = {.GET}},
 		{pattern = "/%61dmin", methods_mask = {.GET}},
 	}
-	_, error, _ := compile_router(routes)
+	_, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, error, Compile_Error.Duplicate_Route)
 }
 
 @(test)
 test_compile_parametric_classified :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users/:id", methods_mask = {.GET}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, router.parametric_count, 1)
@@ -1008,7 +1067,7 @@ test_compile_parametric_classified :: proc(t: ^testing.T) {
 @(test)
 test_compile_wildcard_classified :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/static/*", methods_mask = {.GET}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, router.wildcard_count, 1)
@@ -1018,14 +1077,14 @@ test_compile_wildcard_classified :: proc(t: ^testing.T) {
 @(test)
 test_compile_wildcard_must_be_terminal :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/*/foo", methods_mask = {.GET}}}
-	_, error, _ := compile_router(routes)
+	_, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, error, Compile_Error.Wildcard_Not_Terminal)
 }
 
 @(test)
 test_compile_empty_param_name_rejected :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users/:", methods_mask = {.GET}}}
-	_, error, _ := compile_router(routes)
+	_, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, error, Compile_Error.Empty_Param_Name)
 }
 
@@ -1034,7 +1093,7 @@ test_compile_options_asterisk_split_out :: proc(t: ^testing.T) {
 	routes := []Route {
 		{pattern = "*", methods_mask = {.OPTIONS}, handler = rawptr(uintptr(0xCAFE))},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, len(router.entries), 0)
@@ -1049,7 +1108,7 @@ test_compile_options_asterisk_split_out :: proc(t: ^testing.T) {
 @(test)
 test_compile_options_asterisk_allow_built :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/health", methods_mask = {.GET}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 	testing.expect_value(t, router.options_asterisk_route_index, ROUTE_INDEX_NONE)
@@ -1060,7 +1119,7 @@ test_compile_options_asterisk_allow_built :: proc(t: ^testing.T) {
 @(test)
 test_compile_asterisk_for_non_options_rejected :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "*", methods_mask = {.GET}}}
-	_, error, _ := compile_router(routes)
+	_, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, error, Compile_Error.Asterisk_Wrong_Method)
 }
 
@@ -1072,7 +1131,7 @@ test_compile_param_name_conflict_rejected :: proc(t: ^testing.T) {
 		{pattern = "/users/:id", methods_mask = {.GET}},
 		{pattern = "/users/:name", methods_mask = {.POST}},
 	}
-	_, error, _ := compile_router(routes)
+	_, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	testing.expect_value(t, error, Compile_Error.Param_Name_Conflict)
 }
 
@@ -1083,7 +1142,7 @@ test_match_static_hit :: proc(t: ^testing.T) {
 		{pattern = "/users", methods_mask = {.GET}},
 		{pattern = "/users/me", methods_mask = {.GET}},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1102,7 +1161,7 @@ test_match_static_hit :: proc(t: ^testing.T) {
 @(test)
 test_match_static_miss_falls_through_to_not_found :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users", methods_mask = {.GET}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1117,7 +1176,7 @@ test_match_static_miss_falls_through_to_not_found :: proc(t: ^testing.T) {
 @(test)
 test_match_method_not_allowed_emits_correct_mask :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1136,7 +1195,7 @@ test_match_method_not_allowed_emits_correct_mask :: proc(t: ^testing.T) {
 @(test)
 test_match_unknown_method_known_path_still_reports_method_not_allowed :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1155,7 +1214,7 @@ test_match_unknown_method_known_path_still_reports_method_not_allowed :: proc(t:
 @(test)
 test_match_unknown_method_missing_path_stays_not_found :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET, .POST}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1171,7 +1230,7 @@ test_match_unknown_method_missing_path_stays_not_found :: proc(t: ^testing.T) {
 @(test)
 test_match_head_resolves_to_get_handler :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/x", methods_mask = {.GET}, handler = rawptr(uintptr(0x1111))}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1195,7 +1254,7 @@ test_match_static_beats_parametric :: proc(t: ^testing.T) {
 		{pattern = "/users/:id", methods_mask = {.GET}, handler = rawptr(uintptr(0xAA))},
 		{pattern = "/users/me", methods_mask = {.GET}, handler = rawptr(uintptr(0xBB))},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1213,7 +1272,7 @@ test_match_parametric_route :: proc(t: ^testing.T) {
 	routes := []Route {
 		{pattern = "/users/:id", methods_mask = {.GET}, handler = rawptr(uintptr(0xAA))},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1229,7 +1288,7 @@ test_match_parametric_route :: proc(t: ^testing.T) {
 @(test)
 test_match_parametric_segment_count_mismatch :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/users/:id", methods_mask = {.GET}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1244,7 +1303,7 @@ test_match_parametric_segment_count_mismatch :: proc(t: ^testing.T) {
 @(test)
 test_match_wildcard_consumes_suffix :: proc(t: ^testing.T) {
 	routes := []Route{{pattern = "/static/*", methods_mask = {.GET}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1262,7 +1321,7 @@ test_match_parametric_beats_wildcard :: proc(t: ^testing.T) {
 		{pattern = "/files/*", methods_mask = {.GET}, handler = rawptr(uintptr(0xAAA1))},
 		{pattern = "/files/:name", methods_mask = {.GET}, handler = rawptr(uintptr(0xBBB2))},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1285,7 +1344,7 @@ test_match_parametric_beats_wildcard :: proc(t: ^testing.T) {
 test_match_2F_does_not_split_segments_at_runtime :: proc(t: ^testing.T) {
 	// Path `/a%2Fb` must match parametric `/:p` (one segment), not `/:a/:b`.
 	routes := []Route{{pattern = "/:p", methods_mask = {.GET}}}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1301,12 +1360,12 @@ test_match_2F_does_not_split_segments_at_runtime :: proc(t: ^testing.T) {
 test_ensure_path_segment_count_caches :: proc(t: ^testing.T) {
 	request: Request_State
 	request_state_reset(&request)
-	count_first := ensure_path_segment_count(&request, transmute([]u8)string("/a/b/c"))
+	count_first := ensure_path_segment_count(&request, transmute([]u8)string("/a/b/c"), DEFAULT_MATCH_BUDGET.path_segment_count_max)
 	testing.expect_value(t, count_first, 3)
 
 	// Re-call should be cache-hit; mutating the path bytes underneath should
 	// not change the cached count.
-	count_second := ensure_path_segment_count(&request, transmute([]u8)string("/x/y"))
+	count_second := ensure_path_segment_count(&request, transmute([]u8)string("/x/y"), DEFAULT_MATCH_BUDGET.path_segment_count_max)
 	testing.expect_value(t, count_second, 3)
 }
 
@@ -1314,7 +1373,7 @@ test_ensure_path_segment_count_caches :: proc(t: ^testing.T) {
 test_ensure_path_segment_count_root :: proc(t: ^testing.T) {
 	request: Request_State
 	request_state_reset(&request)
-	count := ensure_path_segment_count(&request, transmute([]u8)string("/"))
+	count := ensure_path_segment_count(&request, transmute([]u8)string("/"), DEFAULT_MATCH_BUDGET.path_segment_count_max)
 	testing.expect_value(t, count, 0)
 }
 
@@ -1363,7 +1422,7 @@ test_dozens_of_paths_resolve_correctly :: proc(t: ^testing.T) {
 			handler = rawptr(uintptr(9)),
 		},
 	}
-	router, error, _ := compile_router(routes)
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
 	defer compiled_router_destroy(&router)
 	testing.expect_value(t, error, Compile_Error.None)
 
@@ -1423,4 +1482,140 @@ test_dozens_of_paths_resolve_correctly :: proc(t: ^testing.T) {
 			}
 		}
 	}
+}
+
+
+// ─── Compile-time Route_Budget enforcement ─────────────────────────────────
+
+// Test helper: build a canonical `/a/b/c/...` pattern string with exactly
+// `seg_count` single-letter literal segments. No trailing slash — every
+// segment is non-empty, so the canonicalizer and `classify_pattern` see
+// exactly `seg_count` segments. The result is allocated from
+// `context.temp_allocator`; callers reset the temp allocator at end of test
+// via `defer free_all(context.temp_allocator)`, so the pattern lifetime ends
+// exactly when the test ends.
+@(private = "file")
+build_pattern_segments :: proc(seg_count: int) -> string {
+	pattern := make([]u8, 1 + seg_count * 2 - 1, context.temp_allocator)
+	pattern[0] = '/'
+	pattern[1] = 'a'
+	for i in 1..<seg_count {
+		pattern[2 * i] = '/'
+		pattern[2 * i + 1] = u8('a' + (i % 26))
+	}
+	return string(pattern)
+}
+
+@(test)
+test_compile_param_count_exceeds_limit :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+	// 9 params against a budget of 8 — the configurable ceiling fires before
+	// the u8-width backstop (which would only trip at >255 parts).
+	tight := DEFAULT_ROUTE_BUDGET
+	routes := []Route{{pattern = "/:a/:b/:c/:d/:e/:f/:g/:h/:i", methods_mask = {.GET}}}
+	_, error, error_index := compile_router(routes, tight)
+	testing.expect_value(t, error, Compile_Error.Param_Count_Exceeds_Limit)
+	testing.expect_value(t, error_index, 0)
+}
+
+@(test)
+test_compile_param_count_at_boundary_succeeds :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+	// Exactly param_count_max (8) param segments is the legal edge.
+	routes := []Route{{pattern = "/:a/:b/:c/:d/:e/:f/:g/:h", methods_mask = {.GET}}}
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, error, Compile_Error.None)
+}
+
+@(test)
+test_compile_segment_count_exceeds_limit :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+	// 17 literal segments against a budget of 16 — the configurable ceiling
+	// fires. Build the pattern with literals only so the param check does not
+	// mask it.
+	pattern := build_pattern_segments(seg_count = 17)
+	routes := []Route{{pattern = pattern, methods_mask = {.GET}}}
+	_, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	testing.expect_value(t, error, Compile_Error.Segment_Count_Exceeds_Limit)
+}
+
+@(test)
+test_compile_segment_count_at_boundary_succeeds :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+	// Exactly path_segment_count_max (16) literal segments is the legal edge.
+	pattern := build_pattern_segments(seg_count = 16)
+	routes := []Route{{pattern = pattern, methods_mask = {.GET}}}
+	router, error, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	defer compiled_router_destroy(&router)
+	testing.expect_value(t, error, Compile_Error.None)
+}
+
+// ─── Match-time Match_Budget enforcement ───────────────────────────────────
+
+@(test)
+test_ensure_path_segment_count_over_limit_caches_sentinel :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+	request: Request_State
+	request_state_reset(&request)
+	count := ensure_path_segment_count(
+		&request,
+		transmute([]u8)string("/a/b/c/d"),
+		path_segment_count_max = 3,
+	)
+	testing.expect_value(t, count, PATH_SEGMENT_COUNT_OVER_LIMIT)
+	testing.expect_value(t, request.path_segment_count, PATH_SEGMENT_COUNT_OVER_LIMIT)
+
+	// Subsequent call must return the cached sentinel — the "never recomputed"
+	// invariant for the cached field holds even on the over-limit path.
+	count_again := ensure_path_segment_count(
+		&request,
+		transmute([]u8)string("/short"),
+		path_segment_count_max = 3,
+	)
+	testing.expect_value(t, count_again, PATH_SEGMENT_COUNT_OVER_LIMIT)
+}
+
+@(test)
+test_match_route_parametric_rejects_over_limit_path :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+	// A 9-segment request path against a router compiled with
+	// path_segment_count_max = 16 must NOT match a parametric `/:p`
+	// route. Use a long (>16) request path so the over-limit branch fires
+	// and short-circuits to Not_Found (no wildcard fallthrough).
+	routes := []Route{{pattern = "/:p", methods_mask = {.GET}}}
+	router, _, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	defer compiled_router_destroy(&router)
+
+	// 17 segments — exceeds the default path_segment_count_max (16).
+	path_bytes := transmute([]u8)build_pattern_segments(seg_count = 17)
+	request: Request_State
+	request_state_reset(&request)
+	result := match_route(&router, &request, path_bytes)
+	testing.expect_value(t, result.outcome, Match_Outcome.Not_Found)
+	testing.expect_value(t, request.path_segment_count, PATH_SEGMENT_COUNT_OVER_LIMIT)
+}
+
+@(test)
+test_match_route_parametric_unders_limit_still_routes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+	// Sanity: a 1-segment path against `/:p` (under every ceiling) still
+	// matches. Guards against the over-limit branch incorrectly rejecting legal input.
+	routes := []Route{{pattern = "/:p", methods_mask = {.GET}}}
+	router, _, _ := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	defer compiled_router_destroy(&router)
+
+	request: Request_State
+	request_state_reset(&request)
+	result := match_route(&router, &request, transmute([]u8)string("/hello"))
+	testing.expect_value(t, result.outcome, Match_Outcome.Found)
+	testing.expect(t, request.path_segment_count != PATH_SEGMENT_COUNT_OVER_LIMIT, "legal path must not carry the over-limit sentinel")
+	testing.expect(t, request.path_segment_count != PATH_SEGMENT_COUNT_NONE, "matched path must have its segment count computed")
 }

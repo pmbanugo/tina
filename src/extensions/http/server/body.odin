@@ -66,7 +66,7 @@ drain_request_body :: proc "contextless" (
 	destination_size: ^u32,
 	body_size_received: ^u64,
 	body_size_max: u32,
-	limits: Limits,
+	parse_budget: Parse_Budget,
 	buffered: bool,
 ) -> Body_Drain_Result {
 	result: Body_Drain_Result
@@ -189,7 +189,7 @@ drain_request_body :: proc "contextless" (
 
 			line_end := bytes.index_byte(view, '\r')
 			if line_end < 0 {
-				if int(parser.header_size) + len(view) > int(limits.header_size_max) {
+				if int(parser.header_size) + len(view) > int(parse_budget.header_size_max) {
 					result.protocol_error = true
 					return result
 				}
@@ -208,11 +208,11 @@ drain_request_body :: proc "contextless" (
 			}
 
 			line_size := line_end + 2
-			if int(parser.header_size) + line_size > int(limits.header_size_max) {
+			if int(parser.header_size) + line_size > int(parse_budget.header_size_max) {
 				result.protocol_error = true
 				return result
 			}
-			if int(parser.header_count) >= int(limits.header_count_max) {
+			if int(parser.header_count) >= int(parse_budget.header_count_max) {
 				result.protocol_error = true
 				return result
 			}
@@ -358,7 +358,7 @@ test_drain_request_body_fixed_buffered :: proc(t: ^testing.T) {
 		&destination_size,
 		&body_size_received,
 		5,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		true,
 	)
 
@@ -385,7 +385,7 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, size_line.protocol_error, false)
@@ -399,7 +399,7 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, payload.protocol_error, false)
@@ -413,7 +413,7 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, chunk_data_end.protocol_error, false)
@@ -426,7 +426,7 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, zero_line.protocol_error, false)
@@ -439,7 +439,7 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, trailers_end.protocol_error, false)
@@ -462,7 +462,7 @@ test_drain_request_body_chunked_rejects_chunk_extension :: proc(t: ^testing.T) {
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, result.protocol_error, true)
@@ -486,7 +486,7 @@ test_drain_request_body_chunked_rejects_size_line_whitespace :: proc(t: ^testing
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, result_space.protocol_error, true)
@@ -498,7 +498,7 @@ test_drain_request_body_chunked_rejects_size_line_whitespace :: proc(t: ^testing
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, result_tab.protocol_error, true)
@@ -519,7 +519,7 @@ test_drain_request_body_chunked_rejects_junk_after_size_whitespace :: proc(t: ^t
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, result.protocol_error, true)
@@ -540,7 +540,7 @@ test_drain_request_body_chunked_size_line_survives_cr_fragmentation :: proc(t: ^
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, fragment_first.protocol_error, false)
@@ -556,7 +556,7 @@ test_drain_request_body_chunked_size_line_survives_cr_fragmentation :: proc(t: ^
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, fragment_second.protocol_error, false)
@@ -581,7 +581,7 @@ test_drain_request_body_chunked_rejects_empty_size_line :: proc(t: ^testing.T) {
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, result.protocol_error, true)
@@ -602,7 +602,7 @@ test_drain_request_body_chunked_rejects_more_than_u64_hex_digits :: proc(t: ^tes
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, fragment_first.protocol_error, false)
@@ -616,7 +616,7 @@ test_drain_request_body_chunked_rejects_more_than_u64_hex_digits :: proc(t: ^tes
 		&destination_size,
 		&body_size_received,
 		16,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, fragment_second.protocol_error, true)
@@ -637,7 +637,7 @@ test_drain_request_body_chunked_rejects_chunk_size_over_body_budget :: proc(t: ^
 		&destination_size,
 		&body_size_received,
 		5,
-		DEFAULT_LIMITS,
+		DEFAULT_PARSE_BUDGET,
 		false,
 	)
 	testing.expect_value(t, result.body_too_large, true)

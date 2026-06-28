@@ -236,7 +236,7 @@ Parser_State :: struct {
 	body_size_remaining:  u64, // Content-Length remaining; tracked from header parse onward
 	chunk_size_remaining: u64, // bytes left inside the current chunk's data section
 	chunk_size_parsed:    u64, // partial hex value while accumulating a chunk size line
-	header_size:          u16, // total header bytes consumed (incl. CRLFs); bounded by Limits.header_size_max
+	header_size:          u16, // total header bytes consumed (incl. CRLFs); bounded by Parse_Budget.header_size_max
 	request_line_size:    u16, // size of the request line (incl. trailing CRLF)
 	header_count:            u8, // number of headers parsed so far
 	chunk_size_digit_count: u8,
@@ -406,7 +406,7 @@ parse_request_line :: #force_inline proc "contextless" (
 	request: ^Request_State,
 	buffer: []u8,
 	parsed_offset: u16,
-	limits: Limits,
+	budget: Parse_Budget,
 ) -> (
 	Parse_Status,
 	u16,
@@ -423,7 +423,7 @@ parse_request_line :: #force_inline proc "contextless" (
 		return .Error_Bad_Request, parsed_offset
 	}
 
-	cr_offset, limit_exceeded := find_newline_offset(view, 0, limits.request_line_size_max)
+	cr_offset, limit_exceeded := find_newline_offset(view, 0, budget.request_line_size_max)
 	if limit_exceeded {
 		// A request line that exceeds the configured cap is treated as a
 		// malformed request rather than 414 — request-target overrun is
@@ -528,7 +528,7 @@ parse_one_header :: proc "contextless" (
 	headers: []Header_View,
 	buffer: []u8,
 	parsed_offset: u16,
-	limits: Limits,
+	budget: Parse_Budget,
 ) -> (
 	Parse_Status,
 	u16,
@@ -552,7 +552,7 @@ parse_one_header :: proc "contextless" (
 	// §5.2 to neutralize smuggling via line-folding ambiguity.
 	#no_bounds_check if view[0] == ' ' || view[0] == '\t' do return .Error_Bad_Request, parsed_offset
 
-	remaining_budget := limits.header_size_max - state.header_size
+	remaining_budget := budget.header_size_max - state.header_size
 	cr_offset, limit_exceeded := find_newline_offset(view, 0, remaining_budget)
 	if limit_exceeded do return .Error_Header_Too_Large, parsed_offset
 	if cr_offset < 0 do return .Need_More, parsed_offset
@@ -563,7 +563,7 @@ parse_one_header :: proc "contextless" (
 	line := view[:cr_offset]
 
 	// Bound header_count before we touch any storage.
-	if int(state.header_count) >= int(limits.header_count_max) ||
+	if int(state.header_count) >= int(budget.header_count_max) ||
 	   int(state.header_count) >= len(headers) {
 		return .Error_Header_Too_Large, parsed_offset
 	}
@@ -686,7 +686,7 @@ parse_step :: #force_inline proc "contextless" (
 	headers: []Header_View,
 	buffer: []u8,
 	parsed_offset: u16,
-	limits: Limits,
+	budget: Parse_Budget,
 ) -> (
 	Parse_Status,
 	u16,
@@ -700,7 +700,7 @@ parse_step :: #force_inline proc "contextless" (
 				request,
 				buffer,
 				current_offset,
-				limits,
+				budget,
 			)
 			current_offset = new_offset
 			#partial switch result {
@@ -721,7 +721,7 @@ parse_step :: #force_inline proc "contextless" (
 					headers,
 					buffer,
 					current_offset,
-					limits,
+					budget,
 				)
 				current_offset = new_offset
 				#partial switch result {
@@ -1118,13 +1118,13 @@ Parse_Harness :: struct {
 	request:       Request_State,
 	headers:       [64]Header_View,
 	parsed_offset: u16,
-	limits:        Limits,
+	budget:        Parse_Budget,
 }
 
 @(private = "file")
 parse_harness_make :: proc() -> Parse_Harness {
 	harness := Parse_Harness {
-		limits = DEFAULT_LIMITS,
+		budget = DEFAULT_PARSE_BUDGET,
 	}
 	request_state_reset(&harness.request)
 	parser_state_reset(&harness.state)
@@ -1141,7 +1141,7 @@ parse_harness_run :: proc(harness: ^Parse_Harness, buffer: []u8) -> Parse_Status
 		harness.headers[:],
 		buffer,
 		harness.parsed_offset,
-		harness.limits,
+		harness.budget,
 	)
 	harness.parsed_offset = new_offset
 	return status
@@ -1164,7 +1164,7 @@ parse_harness_run_byte_by_byte :: proc(
 			harness.headers[:],
 			buffer[:index],
 			harness.parsed_offset,
-			harness.limits,
+			harness.budget,
 		)
 		harness.parsed_offset = new_offset
 		if status != .Need_More {
@@ -1576,7 +1576,7 @@ test_parse_step_smuggling_431_header_too_large :: proc(t: ^testing.T) {
 	// Construct headers that exceed `header_size_max` while remaining
 	// individually well-formed. Use a tightened limit for a fast test.
 	harness := parse_harness_make()
-	harness.limits.header_size_max = 64
+	harness.budget.header_size_max = 64
 
 	// Build a single oversize header value.
 	buf: [256]u8
@@ -1599,7 +1599,7 @@ test_parse_step_smuggling_431_header_too_large :: proc(t: ^testing.T) {
 @(test)
 test_parse_step_smuggling_request_line_too_long :: proc(t: ^testing.T) {
 	harness := parse_harness_make()
-	harness.limits.request_line_size_max = 32
+	harness.budget.request_line_size_max = 32
 
 	// Path long enough to overrun request_line_size_max with no CR in budget.
 	buf: [128]u8
@@ -1623,7 +1623,7 @@ test_parse_step_smuggling_request_line_too_long :: proc(t: ^testing.T) {
 test_parse_step_smuggling_too_many_headers :: proc(t: ^testing.T) {
 	// Cap header_count_max well below what we feed.
 	harness := parse_harness_make()
-	harness.limits.header_count_max = 3
+	harness.budget.header_count_max = 3
 
 	request_bytes := transmute([]u8)string(
 		"GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n",

@@ -168,7 +168,7 @@ Not `ctx_`-prefixed but part of the public API.
 
 | Call | Signature | Returns | Description |
 |------|-----------|---------|-------------|
-| `self_as` | `self_as($T, self_raw: rawptr) -> ^T` | `^T` | Debug-checked cast from `rawptr` to typed Isolate pointer. When `TINA_DEBUG_ASSERTS` is true, validates stride matches `size_of(T)`. |
+| `self_as` | `self_as($T, self_raw: rawptr) -> ^T` | `^T` | Debug-checked cast from `rawptr` to typed Isolate pointer. When `TINA_RUNTIME_ASSERTIONS` is true, validates stride matches `size_of(T)`. |
 | `payload_as` | `payload_as($T, payload: []u8) -> ^T` | `^T` | Cast message payload bytes to a typed pointer. Asserts `size_of(T) <= len(payload)`. |
 | `bytes_of` | `bytes_of(ptr: ^$T) -> []u8` | `[]u8` | Cast a typed struct pointer to a byte slice for sending. |
 
