@@ -23,6 +23,9 @@ os_reserve_arena_with_guard :: proc "contextless" (size: uint) -> (data:[]u8, er
 	)
 	if addr == posix.MAP_FAILED || addr == nil do return {}, .Out_Of_Memory
 
+	assert_contextless(cast(uintptr)addr & (CACHE_LINE_SIZE - 1) == 0,
+		"os_reserve_arena_with_guard: mmap returned non-CACHE_LINE_SIZE aligned memory")
+
 	usable_size := int(aligned_size)
 	memory := mem.byte_slice(addr, int(total_size))
 

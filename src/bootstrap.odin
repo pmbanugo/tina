@@ -15,18 +15,25 @@ MAX_SHARDS :: 256
 
 OS_Thread_Handle :: distinct uintptr
 
-// Shared control-plane state scanned by the watchdog and mutated by the shard thread.
-Shard_Runtime_State :: struct #align (CACHE_LINE_SIZE) {
+// Single-writer health report a shard publishes about itself for the watchdog
+// to read. The owning shard thread is the ONLY writer; the watchdog and the
+// bootstrap thread treat it as untrusted health INPUT and never write here.
+// It lives as the first cache line of the shard's own guard-paged Grand Arena,
+// so a peer shard cannot reach it via a contiguous overrun.
+// A shard corrupting its own report is tolerated: thewatchdog cross-checks
+// liveness via the heartbeat and treats the report as a hint.
+// Watchdog-to-shard commands travel the separate Control_Signal channel.
+Shard_Health_Report :: struct #align (CACHE_LINE_SIZE) {
 	shard_pointer:            ^Shard,
 	os_thread_handle:         OS_Thread_Handle,
 	restart_window_start_ns:  u64,
 	restart_count:            u16,
-	watchdog_state:           u8,
+	reported_state:           u8,
 	_padding:                 [CACHE_LINE_SIZE - 3 * size_of(u64) - size_of(u16) - size_of(u8)]u8,
 }
 
-#assert(size_of(Shard_Runtime_State) == CACHE_LINE_SIZE, "Shard_Runtime_State must occupy exactly one cache line")
-#assert(align_of(Shard_Runtime_State) == CACHE_LINE_SIZE, "Shard_Runtime_State alignment must match CACHE_LINE_SIZE")
+#assert(size_of(Shard_Health_Report) == CACHE_LINE_SIZE, "Shard_Health_Report must occupy exactly one cache line")
+#assert(align_of(Shard_Health_Report) == CACHE_LINE_SIZE, "Shard_Health_Report alignment must match CACHE_LINE_SIZE")
 
 // Passed to each Shard thread upon creation.
 Shard_Config :: struct {
@@ -39,7 +46,7 @@ Shard_Config :: struct {
 	system_spec:       ^SystemSpec,
 	shard_spec:        ^ShardSpec,
 	barrier:           ^sync.Barrier,
-	runtime_state:     ^Shard_Runtime_State,
+	health_report:     ^Shard_Health_Report,
 	total_memory_size: int,
 	shard_id:          Shard_Id,
 	target_core:       u8,
@@ -103,14 +110,15 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 	// 5. Initialize coordination structures
 	shard_configs := make([]Shard_Config, spec.shard_count)
-	shard_runtime_states := make([]Shard_Runtime_State, spec.shard_count)
 	remote_shard_count := int(spec.shard_count) - 1
 
 	barrier := new(sync.Barrier)
 	sync.barrier_init(barrier, int(spec.shard_count)) // Main thread does NOT wait on this
 
-	// 3. Reserve Grand Arena VA for each Shard WITH guard pages
-	shard_memory_size := compute_shard_memory_total(spec)
+	// 3. Reserve Grand Arena VA for each Shard with guard pages. The first cache
+	// line of each arena backs that shard's Shard_Health_Report, so the report
+	// inherits the arena's per-shard isolation for free with no separate mapping.
+	shard_memory_size := compute_shard_memory_total(spec) + CACHE_LINE_SIZE
 	total_system_memory_size := int(spec.shard_count) * shard_memory_size
 
 	for i in 0 ..< spec.shard_count {
@@ -127,7 +135,9 @@ tina_start :: proc(spec: ^SystemSpec) {
 			config.shard_spec = &spec.shard_specs[i]
 		}
 		config.barrier = barrier
-		config.runtime_state = &shard_runtime_states[i]
+		// The report occupies the first cache line; the shard carves its general
+		// arena from the bytes after it (see shard_thread_entry).
+		config.health_report = cast(^Shard_Health_Report)raw_data(arena_mem)
 		config.total_memory_size = shard_memory_size
 		config.shard_id = Shard_Id(i)
 		config.target_core = u8(i) // Mapped directly to shard_id by default
@@ -277,7 +287,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 		failed_shard_index := -1
 		failed_state := Shard_State.Init
 		for index in 0 ..< spec.shard_count {
-			state := load_watchdog_state_acquire(&shard_runtime_states[index])
+			state := load_reported_state_acquire(shard_configs[index].health_report)
 			if state == .Running {
 				continue
 			}
@@ -302,7 +312,7 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 		if time.stopwatch_duration(stopwatch) > timeout_duration {
 			for index in 0 ..< spec.shard_count {
-				state := load_watchdog_state(&shard_runtime_states[index])
+				state := load_reported_state(shard_configs[index].health_report)
 				fmt.eprintfln(
 					"[FATAL] Shard %d failed to initialize within %v (state: %s)",
 					index,
@@ -317,21 +327,21 @@ tina_start :: proc(spec: ^SystemSpec) {
 
 	watchdog_shards := make([]^Shard, spec.shard_count)
 	defer delete(watchdog_shards)
-	watchdog_runtime_states := make([]^Shard_Runtime_State, spec.shard_count)
-	defer delete(watchdog_runtime_states)
+	watchdog_health_reports := make([]^Shard_Health_Report, spec.shard_count)
+	defer delete(watchdog_health_reports)
 	for index in 0 ..< spec.shard_count {
-		runtime_state := &shard_runtime_states[index]
-		state := load_watchdog_state_acquire(runtime_state)
-		if state != .Running || runtime_state.shard_pointer == nil {
+		report := shard_configs[index].health_report
+		state := load_reported_state_acquire(report)
+		if state != .Running || report.shard_pointer == nil {
 			fmt.eprintfln("[FATAL] Shard %d reached watchdog startup without a published shard pointer", index)
 			os.exit(1)
 		}
-		watchdog_shards[index] = runtime_state.shard_pointer
-		watchdog_runtime_states[index] = runtime_state
+		watchdog_shards[index] = report.shard_pointer
+		watchdog_health_reports[index] = report
 	}
 	watchdog_view := Watchdog_View {
 		shards = watchdog_shards,
-		runtime_states = watchdog_runtime_states,
+		health_reports = watchdog_health_reports,
 	}
 
 	// ========================================================================

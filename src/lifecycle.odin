@@ -14,25 +14,22 @@ Process_Phase :: enum u8 {
 // Modified by the main/watchdog thread, read asynchronously by Shards (e.g. during exit).
 g_process_phase: Process_Phase = .Bootstrap
 
+// The shard's lifecycle state. The owning shard is the sole writer; the
+// watchdog and bootstrap thread only read it (as untrusted health input).
+// Watchdog-to-shard commands use the Control_Signal channel, not this state.
+// Both the shard and the watchdog reach the state through the canonical
+// Shard_Health_Report, so there is one source of truth.
+// Shard-side callers pass shard.health_report.
 @(private = "package")
-load_watchdog_state :: proc {
-	_load_watchdog_state_runtime,
-	_load_watchdog_state_shard,
+load_reported_state :: #force_inline proc "contextless" (report: ^Shard_Health_Report) -> Shard_State {
+	return cast(Shard_State)sync.atomic_load_explicit(&report.reported_state, .Relaxed)
 }
 
+// Acquire load pairs with the shard's Release store of .Running, publishing the
+// shard_pointer / os_thread_handle the shard wrote into its report beforehand.
 @(private = "package")
-_load_watchdog_state_runtime :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
-	return cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Relaxed)
-}
-
-@(private = "package")
-_load_watchdog_state_shard :: #force_inline proc "contextless" (shard: ^Shard) -> Shard_State {
-	return cast(Shard_State)sync.atomic_load_explicit(shard.watchdog_state_pointer, .Relaxed)
-}
-
-@(private = "package")
-load_watchdog_state_acquire :: #force_inline proc "contextless" (runtime_state: ^Shard_Runtime_State) -> Shard_State {
-	return cast(Shard_State)sync.atomic_load_explicit(&runtime_state.watchdog_state, .Acquire)
+load_reported_state_acquire :: #force_inline proc "contextless" (report: ^Shard_Health_Report) -> Shard_State {
+	return cast(Shard_State)sync.atomic_load_explicit(&report.reported_state, .Acquire)
 }
 
 shard_state_label :: #force_inline proc "contextless" (state: Shard_State) -> string {
@@ -48,17 +45,11 @@ shard_state_label :: #force_inline proc "contextless" (state: Shard_State) -> st
 }
 
 @(private = "package")
-store_watchdog_state :: proc {
-	_store_watchdog_state_runtime,
-	_store_watchdog_state_shard,
-}
-
-@(private = "package")
-_store_watchdog_state_runtime :: #force_inline proc "contextless" (
-	runtime_state: ^Shard_Runtime_State,
+store_reported_state :: #force_inline proc "contextless" (
+	report: ^Shard_Health_Report,
 	state: Shard_State,
 ) {
-	sync.atomic_store_explicit(&runtime_state.watchdog_state, u8(state), .Release)
+	sync.atomic_store_explicit(&report.reported_state, u8(state), .Release)
 }
 
 @(private = "package")
@@ -72,11 +63,6 @@ store_shard_control_signal :: #force_inline proc "contextless" (
 	signal: Control_Signal,
 ) {
 	sync.atomic_store_explicit(cast(^u8)&shard.control_signal, u8(signal), .Relaxed)
-}
-
-@(private = "package")
-_store_watchdog_state_shard :: #force_inline proc "contextless" (shard: ^Shard, state: Shard_State) {
-	sync.atomic_store_explicit(shard.watchdog_state_pointer, u8(state), .Release)
 }
 
 // Atomically read the current process phase.

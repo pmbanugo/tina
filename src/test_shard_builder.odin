@@ -47,7 +47,7 @@ Test_Shard_Spec :: struct {
 Test_Shard_Fixture :: struct {
 	arena:                  Grand_Arena,
 	shard:                  Shard,
-	watchdog_state:         u8,
+	health_report:          Shard_Health_Report,
 	// Ownership record for subsystems that completed initialization. Deinit
 	// uses this to avoid tearing down subsystems that were never initialized.
 	initialized_subsystems: Test_Shard_Subsystems,
@@ -454,8 +454,8 @@ test_shard_fixture_init :: proc(spec: Test_Shard_Spec) -> ^Test_Shard_Fixture {
 
 	fixture.shard.id = 0
 	fixture.shard.shard_count = 1
-	fixture.watchdog_state = u8(Shard_State.Running)
-	fixture.shard.watchdog_state_pointer = &fixture.watchdog_state
+	fixture.health_report.reported_state = u8(Shard_State.Running)
+	fixture.shard.health_report = &fixture.health_report
 
 	return fixture
 }

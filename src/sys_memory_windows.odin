@@ -26,6 +26,9 @@ os_reserve_arena_with_guard :: proc "contextless" (size: uint) -> (data:[]u8, er
 		return {}, .Out_Of_Memory
 	}
 
+	assert_contextless(cast(uintptr)addr & (CACHE_LINE_SIZE - 1) == 0,
+		"os_reserve_arena_with_guard: VirtualAlloc returned non-CACHE_LINE_SIZE aligned memory")
+
 	// The tail page remains MEM_RESERVE (uncommitted/no-access), serving as the guard page
 	return mem.byte_slice(addr, int(aligned_size)), .None
 }

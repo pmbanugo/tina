@@ -1035,7 +1035,7 @@ ctx_read_io_slot :: #force_inline proc(slot_index: IO_Slot_Index, size: u32) -> 
 
 ctx_is_shutting_down :: #force_inline proc() -> bool {
 	shard, _ := _current_isolate_turn_frame()
-	return load_watchdog_state(shard) == .Shutting_Down
+	return load_reported_state(shard.health_report) == .Shutting_Down
 }
 
 ctx_supervision_group_id :: #force_inline proc() -> Supervision_Group_Id {

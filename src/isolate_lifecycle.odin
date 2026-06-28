@@ -195,7 +195,7 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 		local_spec.args_payload[:local_spec.args_size],
 	)
 	child_turn_frame.phase = .Scheduler_Commit
-	child_shutdown_pending := load_watchdog_state(shard) == .Shutting_Down
+	child_shutdown_pending := load_reported_state(shard.health_report) == .Shutting_Down
 
 	context.allocator = child_turn_frame.previous_allocator
 	context.temp_allocator = child_turn_frame.previous_temp_allocator

@@ -61,7 +61,7 @@ test_with_turn_frame :: proc(
 
 	shard := &fixture.shard
 	if config.shutting_down {
-		fixture.watchdog_state = u8(Shard_State.Shutting_Down)
+		fixture.health_report.reported_state = u8(Shard_State.Shutting_Down)
 	}
 
 	shard.timer_resolution_ns = config.timer_resolution_ns

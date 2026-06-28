@@ -32,6 +32,10 @@ SPSC_Ring :: struct #align(CACHE_LINE_SIZE) {
 #assert(offset_of(SPSC_Ring, capacity) == 2 * CACHE_LINE_SIZE, "SPSC_Ring cold section must start on the third cache line")
 #assert(size_of(SPSC_Ring) == 3 * CACHE_LINE_SIZE, "SPSC_Ring must occupy exactly three cache lines")
 #assert(align_of(SPSC_Ring) == CACHE_LINE_SIZE, "SPSC_Ring alignment must match CACHE_LINE_SIZE")
+#assert(
+	size_of(SPSC_Ring) % align_of(Message_Envelope) == 0,
+	"SPSC_Ring header size must be a multiple of Message_Envelope alignment so the inner ring buffer stays aligned without manual padding",
+)
 
 // Initializes the ring with pre-allocated memory (from process bootstrapper).
 spsc_ring_init :: proc(ring: ^SPSC_Ring, capacity: u64, buffer: []Message_Envelope) {

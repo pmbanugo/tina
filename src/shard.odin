@@ -76,6 +76,7 @@ Control_Signal :: enum u8 {
 	None     = 0,
 	Shutdown = 1,
 	Kill     = 2,
+	Recover  = 3, // Leave quarantine and rebuild. Only sent to a quarantined shard.
 }
 
 
@@ -240,7 +241,7 @@ Shard :: struct {
 	liveness_broadcast_state:        Shard_State,
 	peer_alive_mask:                 Shard_Mask, // Tracks up to 256 peers. Bit N = 1 if Shard N is alive
 	control_signal:                  Control_Signal, // Atomic, mutually exclusive signals from watchdog
-	watchdog_state_pointer:          ^u8, // Points to external watchdog state (config or simulator backing)
+	health_report:                   ^Shard_Health_Report, // The shard's canonical single-writer report (arena head in production, fixture/sim backing in tests)
 
 	// --- Cold / Massive Storage ---
 	timer_wheel:                     Timer_Wheel,
@@ -313,7 +314,7 @@ _handle_shard_control_signal :: proc(shard: ^Shard) {
 		return
 	case .Shutdown:
 		store_shard_control_signal(shard, .None)
-		store_watchdog_state(shard, .Shutting_Down)
+		store_reported_state(shard.health_report, .Shutting_Down)
 
 		for type_descriptor in shard.type_descriptors {
 			_wake_type_for_shutdown(shard, type_descriptor.id, u32(type_descriptor.slot_count))
@@ -322,6 +323,11 @@ _handle_shard_control_signal :: proc(shard: ^Shard) {
 		_fd_handoff_close_all_entries(shard, true)
 	case .Kill:
 		os_trap_restore(&shard.trap_environment_outer, RECOVERY_SOFT_KILL)
+	case .Recover:
+		// Recovery is consumed by the dormant quarantine loop, not here. A
+		// .Recover seen on the running path is stale (the watchdog only sends
+		// it to a quarantined shard); clear it defensively.
+		store_shard_control_signal(shard, .None)
 	}
 }
 

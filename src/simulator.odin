@@ -15,7 +15,7 @@ when TINA_SIMULATION_MODE {
 		spec:                    ^SystemSpec,
 		allocator:               mem.Allocator,
 		shards:                  []Shard, // Allocated as a flat array
-		watchdog_states:         []u8, // Backing for Shard.watchdog_state_pointer (bypasses watchdog)
+		health_reports:          []Shard_Health_Report, // Backing for Shard.health_report (bypasses the watchdog)
 		shard_arena_bytes:       [][]u8,
 		control_channels:        []Shard_Control_Channel,
 		control_channel_cells:   [][]Shard_Control_Channel_Cell,
@@ -56,7 +56,7 @@ when TINA_SIMULATION_MODE {
 		sim.allocator = allocator
 		sim.shards, error = make([]Shard, spec.shard_count, allocator)
 		if error != .None do return error
-		sim.watchdog_states, error = make([]u8, spec.shard_count, allocator)
+		sim.health_reports, error = make([]Shard_Health_Report, spec.shard_count, allocator)
 		if error != .None do return error
 		sim.shard_arena_bytes, error = make([][]u8, spec.shard_count, allocator)
 		if error != .None do return error
@@ -182,9 +182,9 @@ when TINA_SIMULATION_MODE {
 
 			sim.shard_count_initialized += 1
 
-			// Wire up watchdog_state_pointer before tree building (ctx_spawn reads it)
-			sim.watchdog_states[i] = u8(Shard_State.Running)
-			shard.watchdog_state_pointer = &sim.watchdog_states[i]
+			// Wire up the health report before tree building (ctx_spawn reads it)
+			sim.health_reports[i].reported_state = u8(Shard_State.Running)
+			shard.health_report = &sim.health_reports[i]
 
 			// Initialize Supervision Tree
 			alloc_data := Grand_Arena_Allocator_Data {
@@ -355,7 +355,7 @@ when TINA_SIMULATION_MODE {
 		delete(sim.control_channel_cells, sim.allocator)
 		delete(sim.control_channels, sim.allocator)
 		delete(sim.shard_index_order, sim.allocator)
-		delete(sim.watchdog_states, sim.allocator)
+		delete(sim.health_reports, sim.allocator)
 		delete(sim.shards, sim.allocator)
 
 		if sim.sim_io_world != nil {

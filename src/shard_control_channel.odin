@@ -37,6 +37,10 @@ Shard_Control_Channel :: struct #align(CACHE_LINE_SIZE) {
 // line with the source_count/cells fields read only by the consumer.
 #assert(offset_of(Shard_Control_Channel, source_count) == CACHE_LINE_SIZE, "Shard_Control_Channel cold section must start on the second cache line")
 #assert(size_of(Shard_Control_Channel) == 2 * CACHE_LINE_SIZE, "Shard_Control_Channel must occupy exactly two cache lines")
+#assert(
+	size_of(Shard_Control_Channel) % align_of(Shard_Control_Channel_Cell) == 0,
+	"Shard_Control_Channel header size must be a multiple of Shard_Control_Channel_Cell alignment so the inner cells array stays aligned without manual padding",
+)
 
 #assert(size_of(Shard_Control_Event) == size_of(u64))
 #assert(size_of(Shard_Control_Channel_Cell) == size_of(u64))

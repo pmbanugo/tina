@@ -19,7 +19,7 @@ Watchdog_Tracker :: struct {
 
 Watchdog_View :: struct {
 	shards:         []^Shard,
-	runtime_states: []^Shard_Runtime_State,
+	health_reports: []^Shard_Health_Report,
 }
 
 watchdog_loop :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
@@ -51,17 +51,18 @@ watchdog_loop :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
 		case .Recover_Quarantine:
 			_write_stderr(transmute([]u8)string("[WATCHDOG] Recovering quarantined Shards.\n"))
 			for i in 0 ..< spec.shard_count {
-				runtime_state := view.runtime_states[i]
-				state := load_watchdog_state(runtime_state)
+				report := view.health_reports[i]
+				state := load_reported_state(report)
 				if state == .Quarantined {
+					// command the shard to leave quarantine. The
+					// shard owns its reported_state and restart accounting and
+					// resets them itself when it consumes the .Recover signal.
 					tracker.stall_count[i] = 0
-					runtime_state.restart_count = 0
-					runtime_state.restart_window_start_ns = os_monotonic_time_ns()
-					store_watchdog_state(runtime_state, .Running)
+					store_shard_control_signal(view.shards[i], .Recover)
 					buf: [64]u8
 					position := _sig_append_str(buf[:], 0, "[WATCHDOG] Shard ")
 					position = _sig_append_u64(buf[:], position, u64(i))
-					position = _sig_append_str(buf[:], position, " recovered from quarantine.\n")
+					position = _sig_append_str(buf[:], position, " signalled to recover from quarantine.\n")
 					_write_stderr(buf[:position])
 				}
 			}
@@ -72,8 +73,8 @@ watchdog_loop :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
 		case .None:
 			// Timeout (EAGAIN) — No OS signal received. Do periodic heartbeat work.
 			for i in 0 ..< spec.shard_count {
-				runtime_state := view.runtime_states[i]
-				state := load_watchdog_state(runtime_state)
+				report := view.health_reports[i]
+				state := load_reported_state(report)
 				if state != .Running do continue
 
 				shard := view.shards[i]
@@ -98,7 +99,7 @@ watchdog_loop :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
 						position = _sig_append_u64(buf[:], position, u64(i))
 						position = _sig_append_str(buf[:], position, " hard-stalled. Phase 2 (Forced SIGUSR1) dispatched.\n")
 						_write_stderr(buf[:position])
-						os_signal_thread(runtime_state.os_thread_handle, posix.Signal.SIGUSR1)
+						os_signal_thread(report.os_thread_handle, posix.Signal.SIGUSR1)
 						tracker.stall_count[i] = 0
 					}
 				} else {
@@ -117,8 +118,8 @@ _execute_graceful_shutdown :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
 
 	// Notify all running shards via control signal
 	for i in 0 ..< spec.shard_count {
-		runtime_state := view.runtime_states[i]
-		state := load_watchdog_state(runtime_state)
+		report := view.health_reports[i]
+		state := load_reported_state(report)
 		if state == .Running {
 			store_shard_control_signal(view.shards[i], .Shutdown)
 		}
@@ -148,7 +149,7 @@ _execute_graceful_shutdown :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
 		// Check if all shards have cleanly terminated
 		all_terminated := true
 		for i in 0 ..< spec.shard_count {
-			state := load_watchdog_state(view.runtime_states[i])
+			state := load_reported_state(view.health_reports[i])
 			if state != .Terminated && state != .Quarantined {
 				all_terminated = false
 				break
@@ -162,8 +163,8 @@ _execute_graceful_shutdown :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
 
 		// Heartbeat monitoring during drain (§5.2 — watchdog remains active)
 		for i in 0 ..< spec.shard_count {
-			runtime_state := view.runtime_states[i]
-			state := load_watchdog_state(runtime_state)
+			report := view.health_reports[i]
+			state := load_reported_state(report)
 			if state != .Shutting_Down do continue
 
 			shard := view.shards[i]
@@ -178,7 +179,7 @@ _execute_graceful_shutdown :: proc(view: ^Watchdog_View, spec: ^SystemSpec) {
 						position = _sig_append_str(buf[:], position, " stalled during shutdown drain. Sending SIGUSR1.\n")
 						_write_stderr(buf[:position])
 					}
-					os_signal_thread(runtime_state.os_thread_handle, posix.Signal.SIGUSR1)
+					os_signal_thread(report.os_thread_handle, posix.Signal.SIGUSR1)
 					tracker.stall_count[i] = 0
 				}
 			} else {
@@ -205,7 +206,7 @@ _execute_phase3_force_kill :: proc(view: ^Watchdog_View, spec: ^SystemSpec) -> !
 	// Step 1: Log diagnostic
 	alive_count := 0
 	for i in 0 ..< spec.shard_count {
-		state := load_watchdog_state(view.runtime_states[i])
+		state := load_reported_state(view.health_reports[i])
 		if state != .Terminated && state != .Quarantined {
 			alive_count += 1
 		}
