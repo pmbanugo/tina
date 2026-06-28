@@ -8,7 +8,7 @@
     #   github:odin-lang/Odin/dev-2026-06
     #   github:odin-lang/Odin/master
     odin-src = {
-      url = "github:odin-lang/Odin/dev-2026-05";
+      url = "github:odin-lang/Odin/dev-2026-06";
       flake = false;
     };
   };
@@ -16,7 +16,7 @@
   outputs =
     { nixpkgs, odin-src, ... }:
     let
-      odinVersion = "dev-2026-05";
+      odinVersion = "dev-2026-06";
 
       systems = [
         "x86_64-linux"
