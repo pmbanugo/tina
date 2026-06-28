@@ -1,6 +1,7 @@
 package http_server
 
 import "core:bytes"
+import "core:math/bits"
 import "core:testing"
 import tina "../../.."
 
@@ -162,22 +163,46 @@ validate_token_bytes :: proc "contextless" (bytes_array: []u8) -> bool {
 
 // ─── Integer Decoders ──────────────────────────────────────────────────
 
-// Parses a base-10 Content-Length value.
-// Precondition: digit_bytes must contain ONLY validated '0'..'9' characters.
-// Returns (parsed_size, true) on success, (0, false) on empty input
-// or conservative range reject.
+// Parses a base-10 unsigned size value. Rejects empty input, non-digit bytes,
+// and values that do not fit in a u64.
 @(private = "package")
-parse_decimal_size :: proc "contextless" (digit_bytes: []u8) -> (u64, bool) {
-	if len(digit_bytes) == 0 do return 0, false
-	if len(digit_bytes) > 19 do return 0, false
+parse_decimal_size :: proc "contextless" (decimal_bytes: []u8) -> (u64, bool) {
+	if len(decimal_bytes) == 0 do return 0, false
+	if len(decimal_bytes) > 20 do return 0, false
 
 	parsed_size: u64 = 0
-	for character in digit_bytes {
-		digit_value := u64(character - '0')
-		parsed_size = (parsed_size * 10) + digit_value
+
+	// The largest 19-digit decimal (9_999_999_999_999_999_999) fits in u64,
+	// so the common path needs no overflow checks.
+	if len(decimal_bytes) < 20 {
+		for character in decimal_bytes {
+			digit := character - '0'
+			if digit > 9 do return 0, false
+			parsed_size = (parsed_size * 10) + u64(digit)
+		}
+		return parsed_size, true
 	}
 
-	return parsed_size, true
+	// Exactly 20 digits can overflow; parse the first 19 unchecked, then check
+	// the final digit with carry-aware arithmetic.
+	#no_bounds_check first_nineteen := decimal_bytes[:19]
+	for character in first_nineteen {
+		digit := character - '0'
+		if digit > 9 do return 0, false
+		parsed_size = (parsed_size * 10) + u64(digit)
+	}
+
+	#no_bounds_check last_character := decimal_bytes[19]
+	last_digit := last_character - '0'
+	if last_digit > 9 do return 0, false
+
+	product_hi, product_lo := bits.mul_u64(parsed_size, 10)
+	if product_hi != 0 do return 0, false
+
+	sum, carry := bits.add_u64(product_lo, u64(last_digit), 0)
+	if carry != 0 do return 0, false
+
+	return sum, true
 }
 
 // Hexadecimal digit to integer conversion.
@@ -899,13 +924,45 @@ test_decimal_size_parsing :: proc(t: ^testing.T) {
 	parsed_size, success = parse_decimal_size(transmute([]u8)string("4096"))
 	testing.expect(t, success && parsed_size == 4096)
 
-	// Largest safe 19-digit number
+	// Largest 19-digit number fits comfortably in u64.
 	parsed_size, success = parse_decimal_size(transmute([]u8)string("9999999999999999999"))
 	testing.expect(t, success && parsed_size == 9_999_999_999_999_999_999)
 
-	// 20 digits should trigger fast-guard overflow block
-	_, success = parse_decimal_size(transmute([]u8)string("18446744073709551615"))
-	testing.expect(t, !success, "20-digit string must fail fast-guard")
+	// Maximum u64 value is a 20-digit decimal and must parse exactly.
+	parsed_size, success = parse_decimal_size(transmute([]u8)string("18446744073709551615"))
+	testing.expect(t, success && parsed_size == max(u64), "max(u64) decimal must parse exactly")
+
+	// One past max(u64) must overflow and be rejected.
+	_, success = parse_decimal_size(transmute([]u8)string("18446744073709551616"))
+	testing.expect(t, !success, "max(u64) + 1 decimal must overflow")
+
+	// More than 20 digits can never fit in u64.
+	_, success = parse_decimal_size(transmute([]u8)string("100000000000000000000"))
+	testing.expect(t, !success, "21-digit decimal must be rejected")
+}
+
+@(test)
+test_decimal_size_rejects_invalid_syntax :: proc(t: ^testing.T) {
+	// Any byte outside '0'..'9' must be rejected; these are all valid HTTP
+	// header-value bytes but are not valid Content-Length syntax.
+	invalid_cases := [?]string {
+		"",
+		"abc",
+		"1x",
+		"x1",
+		"+1",
+		"-1",
+		"1.5",
+		"1,000",
+		"1\t2",
+		" 1",
+		"1 ",
+	}
+
+	for case_text in invalid_cases {
+		_, ok := parse_decimal_size(transmute([]u8)case_text)
+		testing.expectf(t, !ok, "parse_decimal_size(%q) must be rejected", case_text)
+	}
 }
 
 @(test)
@@ -1453,6 +1510,36 @@ test_parse_step_smuggling_400_bad_request :: proc(t: ^testing.T) {
 		{
 			"duplicate transfer-encoding",
 			"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"content-length non-numeric",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"content-length negative sign",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"content-length plus sign",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: +1\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"content-length mixed alphanumeric",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1x\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"content-length decimal overflow",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 18446744073709551616\r\n\r\n",
+			.Error_Bad_Request,
+		},
+		{
+			"content-length with internal whitespace",
+			"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1 2\r\n\r\n",
 			.Error_Bad_Request,
 		},
 		{
