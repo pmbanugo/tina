@@ -244,7 +244,7 @@ _sanitizer_address_poison_isolate_slot :: #force_inline proc "contextless" (
 	when TINA_ASAN_POISONING {
 		// The fixture builder may fail after setting a type descriptor but before
 		// carving its backing memory. These ASan hooks therefore use a cleanup-only
-		// optional row accessor; normal row accessors assert on broken geometry.
+		// optional row accessor. normal row accessors assert on broken geometry.
 		memory := _sanitizer_address_get_isolate_memory_row_if_backed(shard, type_id, slot_index)
 		if len(memory) > 0 {
 			sanitizer.address_poison_rawptr(raw_data(memory), len(memory))
