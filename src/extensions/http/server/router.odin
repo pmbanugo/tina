@@ -179,11 +179,11 @@ compile_router :: proc(
 		append(
 			&descriptors_dynamic,
 			Route_Descriptor {
-				handler       = route.handler,
-				handler_kind  = route.handler_kind,
+				handler = route.handler,
+				handler_kind = route.handler_kind,
 				body_size_max = route.body_size_max,
-				body_mode     = route.body_mode,
-				state_size    = route.state_size,
+				body_mode = route.body_mode,
+				state_size = route.state_size,
 			},
 		)
 		options_asterisk_route_index = descriptor_index
@@ -213,7 +213,11 @@ compile_router :: proc(
 		}
 		canonical = canonical[:pattern_size_canonical]
 
-		kind, parts, classify_error := classify_pattern(canonical, route_budget, context.temp_allocator)
+		kind, parts, classify_error := classify_pattern(
+			canonical,
+			route_budget,
+			context.temp_allocator,
+		)
 		if classify_error != .None {
 			return {}, classify_error, route_input_index
 		}
@@ -378,8 +382,8 @@ compile_router :: proc(
 				)
 				route_part.name_size = ir_part.size
 			case .Wildcard:
-				// terminal segment; no offsets recorded — match consumes the
-				// remaining suffix unconditionally
+			// terminal segment. no offsets recorded — match consumes the
+			// remaining suffix unconditionally
 			}
 			route_parts_final[parts_cursor] = route_part
 			parts_cursor += 1
@@ -406,19 +410,17 @@ compile_router :: proc(
 	}
 
 	router = Compiled_Router {
-		entries                      = entries_final,
-		literal_buffer               = literal_buffer,
-		route_parts                  = route_parts_final,
-		descriptors                  = descriptors_final,
-		match_budget                 = Match_Budget {
-			path_segment_count_max = route_budget.path_segment_count_max,
-		},
-		static_count                 = static_count,
-		parametric_count             = parametric_count,
-		wildcard_count               = wildcard_count,
-		global_methods_mask          = global_methods_mask,
+		entries = entries_final,
+		literal_buffer = literal_buffer,
+		route_parts = route_parts_final,
+		descriptors = descriptors_final,
+		match_budget = Match_Budget{path_segment_count_max = route_budget.path_segment_count_max},
+		static_count = static_count,
+		parametric_count = parametric_count,
+		wildcard_count = wildcard_count,
+		global_methods_mask = global_methods_mask,
 		options_asterisk_route_index = options_asterisk_route_index,
-		options_asterisk_allow       = options_allow,
+		options_asterisk_allow = options_allow,
 	}
 	return router, .None, -1
 }
@@ -639,14 +641,20 @@ match_route :: proc(
 		if !slice.equal(path_bytes, pattern_bytes) do continue
 
 		if !method_known {
-			return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+			return Match_Result {
+				outcome = .Method_Not_Allowed,
+				methods_mask = router.entries[entry_index].methods_mask,
+			}
 		}
 
 		route_index := router.entries[entry_index].route_index_by_method[method]
 		if route_index != ROUTE_INDEX_NONE {
 			return Match_Result{outcome = .Found, route_index = route_index}
 		}
-		return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+		return Match_Result {
+			outcome = .Method_Not_Allowed,
+			methods_mask = router.entries[entry_index].methods_mask,
+		}
 	}
 
 	return match_route_parametric_or_wildcard(router, request, path_bytes, method, method_known)
@@ -687,17 +695,23 @@ match_route_parametric_or_wildcard :: proc(
 			router.entries[entry_index].part_count,
 			path_bytes,
 			false,
-		) { continue }
+		) {continue}
 
 		if !method_known {
-			return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+			return Match_Result {
+				outcome = .Method_Not_Allowed,
+				methods_mask = router.entries[entry_index].methods_mask,
+			}
 		}
 
 		route_index := router.entries[entry_index].route_index_by_method[method]
 		if route_index != ROUTE_INDEX_NONE {
 			return Match_Result{outcome = .Found, route_index = route_index}
 		}
-		return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+		return Match_Result {
+			outcome = .Method_Not_Allowed,
+			methods_mask = router.entries[entry_index].methods_mask,
+		}
 	}
 
 	// Wildcard bucket — entry.segment_count is the minimum, suffix consumed
@@ -712,17 +726,23 @@ match_route_parametric_or_wildcard :: proc(
 			router.entries[entry_index].part_count,
 			path_bytes,
 			true,
-		) { continue }
+		) {continue}
 
 		if !method_known {
-			return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+			return Match_Result {
+				outcome = .Method_Not_Allowed,
+				methods_mask = router.entries[entry_index].methods_mask,
+			}
 		}
 
 		route_index := router.entries[entry_index].route_index_by_method[method]
 		if route_index != ROUTE_INDEX_NONE {
 			return Match_Result{outcome = .Found, route_index = route_index}
 		}
-		return Match_Result{outcome = .Method_Not_Allowed, methods_mask = router.entries[entry_index].methods_mask}
+		return Match_Result {
+			outcome = .Method_Not_Allowed,
+			methods_mask = router.entries[entry_index].methods_mask,
+		}
 	}
 
 	return Match_Result{outcome = .Not_Found}
@@ -846,7 +866,7 @@ ensure_path_segment_count :: proc(
 ALLOW_METHOD_ORDER :: [?]Method{.GET, .HEAD, .POST, .PUT, .PATCH, .DELETE, .OPTIONS, .TRACE}
 
 @(private = "file", rodata)
-METHOD_TOKEN_STRINGS := [Method]string{
+METHOD_TOKEN_STRINGS := [Method]string {
 	.GET     = "GET",
 	.POST    = "POST",
 	.PUT     = "PUT",
@@ -1347,12 +1367,20 @@ test_match_2F_does_not_split_segments_at_runtime :: proc(t: ^testing.T) {
 test_ensure_path_segment_count_caches :: proc(t: ^testing.T) {
 	request: Request_State
 	request_state_reset(&request)
-	count_first := ensure_path_segment_count(&request, transmute([]u8)string("/a/b/c"), DEFAULT_MATCH_BUDGET.path_segment_count_max)
+	count_first := ensure_path_segment_count(
+		&request,
+		transmute([]u8)string("/a/b/c"),
+		DEFAULT_MATCH_BUDGET.path_segment_count_max,
+	)
 	testing.expect_value(t, count_first, 3)
 
 	// Re-call should be cache-hit; mutating the path bytes underneath should
 	// not change the cached count.
-	count_second := ensure_path_segment_count(&request, transmute([]u8)string("/x/y"), DEFAULT_MATCH_BUDGET.path_segment_count_max)
+	count_second := ensure_path_segment_count(
+		&request,
+		transmute([]u8)string("/x/y"),
+		DEFAULT_MATCH_BUDGET.path_segment_count_max,
+	)
 	testing.expect_value(t, count_second, 3)
 }
 
@@ -1360,7 +1388,11 @@ test_ensure_path_segment_count_caches :: proc(t: ^testing.T) {
 test_ensure_path_segment_count_root :: proc(t: ^testing.T) {
 	request: Request_State
 	request_state_reset(&request)
-	count := ensure_path_segment_count(&request, transmute([]u8)string("/"), DEFAULT_MATCH_BUDGET.path_segment_count_max)
+	count := ensure_path_segment_count(
+		&request,
+		transmute([]u8)string("/"),
+		DEFAULT_MATCH_BUDGET.path_segment_count_max,
+	)
 	testing.expect_value(t, count, 0)
 }
 
@@ -1486,7 +1518,7 @@ build_pattern_segments :: proc(seg_count: int) -> string {
 	pattern := make([]u8, 1 + seg_count * 2 - 1, context.temp_allocator)
 	pattern[0] = '/'
 	pattern[1] = 'a'
-	for i in 1..<seg_count {
+	for i in 1 ..< seg_count {
 		pattern[2 * i] = '/'
 		pattern[2 * i + 1] = u8('a' + (i % 26))
 	}
@@ -1603,8 +1635,16 @@ test_match_route_parametric_unders_limit_still_routes :: proc(t: ^testing.T) {
 	request_state_reset(&request)
 	result := match_route(&router, &request, transmute([]u8)string("/hello"))
 	testing.expect_value(t, result.outcome, Match_Outcome.Found)
-	testing.expect(t, request.path_segment_count != PATH_SEGMENT_COUNT_OVER_LIMIT, "legal path must not carry the over-limit sentinel")
-	testing.expect(t, request.path_segment_count != PATH_SEGMENT_COUNT_NONE, "matched path must have its segment count computed")
+	testing.expect(
+		t,
+		request.path_segment_count != PATH_SEGMENT_COUNT_OVER_LIMIT,
+		"legal path must not carry the over-limit sentinel",
+	)
+	testing.expect(
+		t,
+		request.path_segment_count != PATH_SEGMENT_COUNT_NONE,
+		"matched path must have its segment count computed",
+	)
 }
 
 @(test)
