@@ -684,9 +684,8 @@ _response_begin_result_from_header :: #force_inline proc "contextless" (
 status :: #force_inline proc (response: ^Response, code: HTTP_Status) {
 	state := _response_state(response)
 	when tina.TINA_RUNTIME_ASSERTIONS {
-		if .Headers_Committed in state.flags {
-			assert(false, "status: cannot change status after headers are committed")
-		}
+		assert(.Headers_Committed not_in state.flags, "status: cannot change status after headers are committed")
+		assert(u16(code) >= 100 && u16(code) <= 599, "HTTP status code must be in 100..599")
 	}
 	state.status_code = code
 	state.body_policy = _body_policy_from_status(code, response.connection.connection_state.request.method)
