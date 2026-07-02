@@ -1125,6 +1125,11 @@ _dispatch_step :: proc(
 	step: Route_Step,
 ) -> tina.Isolate_Transition {
 	state := &connection.connection_state
+	when tina.TINA_RUNTIME_ASSERTIONS {
+		if .Fixed_Length_Body_Violation in state.response.flags {
+			assert(false, "_dispatch_step: fixed-length response body violates declared Content-Length")
+		}
+	}
 	if step != .Expect_Application &&
 	   step != .Flush &&
 	   step != .Flush_Final &&

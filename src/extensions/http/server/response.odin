@@ -82,6 +82,7 @@ Response_Flag :: enum u8 {
 	Aborted, // Response surface poisoned (double-response, library failure).
 	In_Drain, // Server is draining; no new keep-alive after current response.
 	Interim_100_Sent, // 100 Continue staged or flushed; duplicate sends are no-ops.
+	Fixed_Length_Body_Violation, // Declared Content-Length contract was broken.
 }
 
 @(private = "package")
@@ -882,15 +883,38 @@ continue_100 :: proc(response: ^Response) {
 	state.flags += {.Interim_100_Sent}
 }
 
-write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
+write_bytes :: proc(response: ^Response, data: []u8) -> u16 {
 	state := _response_state(response)
+	data_size := len(data)
 	if state.body_policy != .Send {
-		accepted_size := u16(min(len(data), int(max(u16))))
+		accepted_size := u16(min(data_size, int(max(u16))))
 		state.body_size_sent += u64(accepted_size)
 		return accepted_size
 	}
-	if state.mode == .Closed || len(data) == 0 {
+	if state.mode == .Closed || data_size == 0 {
 		return 0
+	}
+	// Fixed-length streaming is a byte-for-byte contract: never stage bytes
+	// beyond the already-advertised Content-Length.
+	if state.mode == .Fixed_Length {
+		if state.body_size_sent > state.body_size_total {
+			state.flags += {.Aborted, .Close_After_Send, .Fixed_Length_Body_Violation}
+			state.mode = .Closed
+			when tina.TINA_RUNTIME_ASSERTIONS {
+				assert(false, "write_bytes: fixed-length body size already exceeds declared Content-Length")
+			}
+			return 0
+		}
+
+		body_size_remaining := state.body_size_total - state.body_size_sent
+		if u64(data_size) > body_size_remaining {
+			state.flags += {.Aborted, .Close_After_Send, .Fixed_Length_Body_Violation}
+			state.mode = .Closed
+			when tina.TINA_RUNTIME_ASSERTIONS {
+				assert(false, "write_bytes: fixed-length write exceeds declared Content-Length")
+			}
+			return 0
+		}
 	}
 
 	cursor := int(state.egress_size)
@@ -903,7 +927,7 @@ write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 			return 0
 		}
 		free := u16(remaining - HTTP_CHUNKED_FRAMING_RESERVE)
-		want := u16(min(len(data), int(max(u16))))
+		want := u16(min(data_size, int(max(u16))))
 		admitted := admit_chunk_payload(free, want)
 		if admitted == 0 {
 			state.flags += {.Backpressured}
@@ -933,19 +957,19 @@ write_bytes :: proc "contextless" (response: ^Response, data: []u8) -> u16 {
 
 		state.egress_size = Egress_Size(next_cursor)
 		state.body_size_sent += u64(admitted)
-		if int(admitted) < len(data) {
+		if int(admitted) < data_size {
 			state.flags += {.Backpressured}
 		}
 		return admitted
 	}
 
-	copy_size := min(len(data), remaining)
+	copy_size := min(data_size, remaining)
 	if copy_size > 0 {
 		copy(response.connection.egress_buffer[cursor:], data[:copy_size])
 		state.egress_size = Egress_Size(cursor + copy_size)
 		state.body_size_sent += u64(copy_size)
 	}
-	if copy_size < len(data) {
+	if copy_size < data_size {
 		state.flags += {.Backpressured}
 	}
 	return u16(copy_size)
@@ -1111,11 +1135,29 @@ _response_prepare_flush :: proc(response: ^Response, final: bool) -> bool {
 	if !_response_commit_headers(response) {
 		return false
 	}
+	if .Fixed_Length_Body_Violation in state.flags {
+		when tina.TINA_RUNTIME_ASSERTIONS {
+			assert(false, "flush: fixed-length body size violates declared Content-Length")
+		}
+		return false
+	}
 
 	if final {
+		if state.mode == .Fixed_Length && state.body_policy == .Send {
+			fixed_length_complete := state.body_size_sent == state.body_size_total
+			if !fixed_length_complete {
+				state.flags += {.Aborted, .Close_After_Send, .Fixed_Length_Body_Violation}
+				state.mode = .Closed
+				when tina.TINA_RUNTIME_ASSERTIONS {
+					assert(false, "flush(final): fixed-length body size must match declared Content-Length")
+				}
+				return false
+			}
+		}
 		if state.mode == .Chunked {
 			if !_response_append_chunked_terminator(state, response.connection.egress_buffer[:]) {
 				state.flags += {.Aborted, .Close_After_Send}
+				state.mode = .Closed
 				return false
 			}
 		}
@@ -1982,6 +2024,106 @@ test_begin_stream_commits_headers_and_write_bytes_frames_chunk :: proc(t: ^testi
 			testing.expect_value(test_state.t, wire_chunk, "5\r\nhello\r\n")
 		},
 	)
+}
+
+@(test)
+test_begin_fixed_stream_write_bytes_completes_exact_length :: proc(t: ^testing.T) {
+	fixture: HTTP_Test_Fixture
+	http_test_fixture_init(&fixture)
+	Fixed_Stream_Exact_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+	fixed_stream_exact_test_state := Fixed_Stream_Exact_Test_State {fixture = &fixture, t = t}
+	tina.test_with_turn_frame(
+		tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+		rawptr(&fixed_stream_exact_test_state),
+		proc(user_data: rawptr) {
+			test_state := cast(^Fixed_Stream_Exact_Test_State)user_data
+			response := http_test_fixture_response(test_state.fixture)
+			begin_result := begin_fixed_stream(&response, HTTP_STATUS_OK, "text/plain", 5)
+			testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
+			state := _response_state(&response)
+			head_size := state.egress_size
+			committed_head := string(test_state.fixture.connection.egress_buffer[:head_size])
+			testing.expect(test_state.t, strings.index(committed_head, "\r\nContent-Length: 5\r\n") >= 0)
+
+			accepted := write_bytes(&response, transmute([]u8)string("hello"))
+			testing.expect_value(test_state.t, accepted, u16(5))
+			ok := _response_prepare_flush(&response, true)
+			testing.expect(test_state.t, ok)
+			testing.expect_value(test_state.t, state.mode, Response_Mode.Closed)
+			testing.expect_value(test_state.t, state.body_size_sent, u64(5))
+			wire_body := string(test_state.fixture.connection.egress_buffer[head_size:state.egress_size])
+			testing.expect_value(test_state.t, wire_body, "hello")
+		},
+	)
+}
+
+@(test)
+test_fixed_stream_write_bytes_rejects_overflow_without_staging :: proc(t: ^testing.T) {
+	when tina.TINA_RUNTIME_ASSERTIONS {
+		_ = t
+	} else {
+		fixture: HTTP_Test_Fixture
+		http_test_fixture_init(&fixture)
+		Fixed_Stream_Overflow_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+		fixed_stream_overflow_test_state := Fixed_Stream_Overflow_Test_State {fixture = &fixture, t = t}
+		tina.test_with_turn_frame(
+			tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+			rawptr(&fixed_stream_overflow_test_state),
+			proc(user_data: rawptr) {
+				test_state := cast(^Fixed_Stream_Overflow_Test_State)user_data
+				response := http_test_fixture_response(test_state.fixture)
+				begin_result := begin_fixed_stream(&response, HTTP_STATUS_OK, "text/plain", 5)
+				testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
+				state := _response_state(&response)
+				egress_size_before := state.egress_size
+				body_size_sent_before := state.body_size_sent
+
+				accepted := write_bytes(&response, transmute([]u8)string("excess"))
+				testing.expect_value(test_state.t, accepted, u16(0))
+				testing.expect_value(test_state.t, state.egress_size, egress_size_before)
+				testing.expect_value(test_state.t, state.body_size_sent, body_size_sent_before)
+				testing.expect(test_state.t, .Aborted in state.flags)
+				testing.expect(test_state.t, .Close_After_Send in state.flags)
+				testing.expect(test_state.t, .Fixed_Length_Body_Violation in state.flags)
+				testing.expect_value(test_state.t, state.mode, Response_Mode.Closed)
+				wire := string(test_state.fixture.connection.egress_buffer[:state.egress_size])
+				testing.expect(test_state.t, strings.index(wire, "excess") < 0)
+			},
+		)
+	}
+}
+
+@(test)
+test_fixed_stream_final_flush_rejects_underflow :: proc(t: ^testing.T) {
+	when tina.TINA_RUNTIME_ASSERTIONS {
+		_ = t
+	} else {
+		fixture: HTTP_Test_Fixture
+		http_test_fixture_init(&fixture)
+		Fixed_Stream_Underflow_Test_State :: struct {fixture: ^HTTP_Test_Fixture, t: ^testing.T}
+		fixed_stream_underflow_test_state := Fixed_Stream_Underflow_Test_State {fixture = &fixture, t = t}
+		tina.test_with_turn_frame(
+			tina.Test_Turn_Frame_Config {self_handle = fixture.connection.connection_state.self_handle, timer_resolution_ns = 1},
+			rawptr(&fixed_stream_underflow_test_state),
+			proc(user_data: rawptr) {
+				test_state := cast(^Fixed_Stream_Underflow_Test_State)user_data
+				response := http_test_fixture_response(test_state.fixture)
+				begin_result := begin_fixed_stream(&response, HTTP_STATUS_OK, "text/plain", 5)
+				testing.expect_value(test_state.t, begin_result, Response_Begin_Result.Begun)
+
+				accepted := write_bytes(&response, transmute([]u8)string("abc"))
+				testing.expect_value(test_state.t, accepted, u16(3))
+				state := _response_state(&response)
+				ok := _response_prepare_flush(&response, true)
+				testing.expect(test_state.t, !ok)
+				testing.expect_value(test_state.t, state.body_size_sent, u64(3))
+				testing.expect(test_state.t, .Aborted in state.flags)
+				testing.expect(test_state.t, .Close_After_Send in state.flags)
+				testing.expect(test_state.t, .Fixed_Length_Body_Violation in state.flags)
+				testing.expect_value(test_state.t, state.mode, Response_Mode.Closed)
+			},
+		)
+	}
 }
 
 @(test)
