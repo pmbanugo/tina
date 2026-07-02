@@ -510,8 +510,8 @@ install_into_system_spec :: proc(
 		"install_into_system_spec: timeout_ms_header must be < timeout_ms_idle")
 
 	assert(
-		len(server.app.routes) <= 254,
-		"too many routes (Route_Index reserves 0xFF as ROUTE_INDEX_NONE; 254 is the conservative cap)",
+		len(server.app.routes) <= 255,
+		"too many routes",
 	)
 	assert(
 		spec.timer_resolution_ns <= 1_000_000_000,
