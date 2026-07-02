@@ -90,7 +90,7 @@ Match_Result :: struct {
 @(private = "package")
 Compile_Error :: enum u8 {
 	None,
-	Too_Many_Routes, // > 254 user routes
+	Too_Many_Routes,
 	Empty_Pattern,
 	Pattern_Not_Rooted, // pattern does not start with `/`
 	Pattern_Bad_Encoding, // canonicalization rejected the pattern
@@ -104,23 +104,7 @@ Compile_Error :: enum u8 {
 	Empty_Methods_Mask, // route registered with no methods
 }
 
-// Intermediate per-route record built during compilation. Carries the
-// canonical pattern bytes (allocated from temp storage for the lifetime of the
-// compile pass) and the classified route kind/parts. Discarded once
-// `Compiled_Router` has been emitted.
-@(private = "file")
-Route_Compile_IR :: struct {
-	canonical_pattern: []u8,
-	parts:             []Route_Part_IR,
-	method:            Method,
-	body_size_max:     u32,
-	state_size:        u16,
-	body_mode:         Route_Body_Mode,
-	kind:              Route_Kind,
-	descriptor_index:  Route_Index,
-}
-
-// Sidecar parts use canonical-pattern-relative offsets during the IR phase;
+// Sidecar parts use canonical-pattern-relative offsets during the compile pass;
 // they are rebased onto `literal_buffer` at emit time.
 @(private = "file")
 Route_Part_IR :: struct {
@@ -151,26 +135,14 @@ compile_router :: proc(
 	error: Compile_Error,
 	error_index: int,
 ) {
-	// Persistent (output) memory comes from `allocator`. All compile-time
-	// working storage (descriptors_dynamic, ir_list, IR string copies,
-	// aggregates, classify_pattern's parts buffer) is parked on
-	// `context.temp_allocator` and freed wholesale when the caller resets it.
 	output_allocator := allocator
 
-	if len(routes) > 254 {
+	if len(routes) > 255 {
 		return {}, .Too_Many_Routes, len(routes) - 1
 	}
 
-	// Phase 1: build descriptors (one per registered Route × method).
-	descriptors_dynamic := make([dynamic]Route_Descriptor, 0, len(routes), context.temp_allocator)
-
-	// Phase 2: classify, canonicalize, and collect IR for normal routes.
-	// `OPTIONS *` is split out and stored on the router directly.
-	ir_list := make([dynamic]Route_Compile_IR, 0, len(routes), context.temp_allocator)
-
-	options_asterisk_route_index := ROUTE_INDEX_NONE
-	global_methods_mask: Method_Mask
-
+	// Phase 1: validate input shapes, find the asterisk route.
+	asterisk_input_index: int = -1
 	for route, route_input_index in routes {
 		if route.methods_mask == {} {
 			return {}, .Empty_Methods_Mask, route_input_index
@@ -181,95 +153,44 @@ compile_router :: proc(
 
 		is_asterisk_pattern := len(route.pattern) == 1 && route.pattern[0] == '*'
 		if is_asterisk_pattern {
-			// `*` is only legal for OPTIONS — DR-10.
 			if route.methods_mask != {.OPTIONS} {
 				return {}, .Asterisk_Wrong_Method, route_input_index
 			}
-			if options_asterisk_route_index != ROUTE_INDEX_NONE {
+			if asterisk_input_index >= 0 {
 				return {}, .Duplicate_Route, route_input_index
 			}
-			descriptor_index := Route_Index(len(descriptors_dynamic))
-			append(
-				&descriptors_dynamic,
-				Route_Descriptor {
-					handler = route.handler,
-					handler_kind = route.handler_kind,
-					body_size_max = route.body_size_max,
-					body_mode = route.body_mode,
-					state_size = route.state_size,
-				},
-			)
-			options_asterisk_route_index = descriptor_index
-			global_methods_mask += {.OPTIONS}
+			asterisk_input_index = route_input_index
 			continue
 		}
 
 		if route.pattern[0] != '/' {
 			return {}, .Pattern_Not_Rooted, route_input_index
 		}
-
-		// Make a mutable copy and canonicalize in place. Canonical pattern
-		// bytes live in temp memory until they are packed into the final
-		// literal_buffer.
-		canonical := make([]u8, len(route.pattern), context.temp_allocator)
-		copy(canonical, transmute([]u8)route.pattern)
-		pattern_size_canonical, pattern_error, _ := path_canonicalize_selective_in_place(canonical)
-		if pattern_error != .None {
-			return {}, .Pattern_Bad_Encoding, route_input_index
-		}
-		canonical = canonical[:pattern_size_canonical]
-
-kind, parts, classify_error := classify_pattern(canonical, route_budget, context.temp_allocator)
-	if classify_error != .None {
-		return {}, classify_error, route_input_index
 	}
 
-		// Expand each method bit into its own IR entry — one descriptor and
-		// one per-method dispatch slot per concrete method. The aggregator
-		// later coalesces all methods for the same canonical pattern into a
-		// single Route_Entry.
-		for method in Method {
-			if method not_in route.methods_mask do continue
+	descriptors_dynamic := make([dynamic]Route_Descriptor, 0, len(routes), context.temp_allocator)
 
-			pattern_copy := make([]u8, len(canonical), context.temp_allocator)
-			copy(pattern_copy, canonical)
+	options_asterisk_route_index := ROUTE_INDEX_NONE
+	global_methods_mask: Method_Mask
 
-			parts_copy := make([]Route_Part_IR, len(parts), context.temp_allocator)
-			copy(parts_copy, parts)
-
-			descriptor_index := Route_Index(len(descriptors_dynamic))
-			append(
-				&descriptors_dynamic,
-				Route_Descriptor {
-					handler = route.handler,
-					handler_kind = route.handler_kind,
-					body_size_max = route.body_size_max,
-					body_mode = route.body_mode,
-					state_size = route.state_size,
-				},
-			)
-
-			append(
-				&ir_list,
-				Route_Compile_IR {
-					canonical_pattern = pattern_copy,
-					parts = parts_copy,
-					method = method,
-					body_size_max = route.body_size_max,
-					state_size = route.state_size,
-					body_mode = route.body_mode,
-					kind = kind,
-					descriptor_index = descriptor_index,
-				},
-			)
-			global_methods_mask += {method}
-		}
+	if asterisk_input_index >= 0 {
+		route := routes[asterisk_input_index]
+		descriptor_index := Route_Index(len(descriptors_dynamic))
+		append(
+			&descriptors_dynamic,
+			Route_Descriptor {
+				handler       = route.handler,
+				handler_kind  = route.handler_kind,
+				body_size_max = route.body_size_max,
+				body_mode     = route.body_mode,
+				state_size    = route.state_size,
+			},
+		)
+		options_asterisk_route_index = descriptor_index
+		global_methods_mask += {.OPTIONS}
 	}
 
-	// Phase 3: aggregate IR by (kind, canonical_pattern). The first IR seen
-	// for a given pattern owns the part schema; later IRs only assign their
-	// method into the existing aggregate's `route_index_by_method` slot.
-
+	// Phase 2: aggregate routes by (kind, canonical pattern).
 	Aggregate :: struct {
 		kind:          Route_Kind,
 		pattern_bytes: []u8,
@@ -279,22 +200,48 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 		slots:         [len(Method)]Route_Index,
 	}
 
-	aggregates := make([dynamic]Aggregate, 0, len(ir_list), context.temp_allocator)
+	aggregates := make([dynamic]Aggregate, 0, len(routes), context.temp_allocator)
 
-	for &ir, ir_index in ir_list {
-		// Find an aggregate whose runtime MATCH shape is identical (same
-		// kind, same per-segment kinds, same literal segment bytes). Param
-		// names are not part of match shape — they are checked separately
-		// after a shape match is found.
+	for route, route_input_index in routes {
+		if route_input_index == asterisk_input_index do continue
+
+		canonical := make([]u8, len(route.pattern), context.temp_allocator)
+		copy(canonical, transmute([]u8)route.pattern)
+		pattern_size_canonical, pattern_error, _ := path_canonicalize_selective_in_place(canonical)
+		if pattern_error != .None {
+			return {}, .Pattern_Bad_Encoding, route_input_index
+		}
+		canonical = canonical[:pattern_size_canonical]
+
+		kind, parts, classify_error := classify_pattern(canonical, route_budget, context.temp_allocator)
+		if classify_error != .None {
+			return {}, classify_error, route_input_index
+		}
+
+		descriptor_index := Route_Index(len(descriptors_dynamic))
+		append(
+			&descriptors_dynamic,
+			Route_Descriptor {
+				handler = route.handler,
+				handler_kind = route.handler_kind,
+				body_size_max = route.body_size_max,
+				body_mode = route.body_mode,
+				state_size = route.state_size,
+			},
+		)
+
+		// Find an aggregate whose runtime match shape is identical — same
+		// kind, same per-segment kinds, same literal segment bytes. Param
+		// names are checked separately after a shape match is found.
 		aggregate_index := -1
 		for &candidate, candidate_index in aggregates {
 			if route_match_shapes_equal(
 				candidate.kind,
 				candidate.parts,
 				candidate.pattern_bytes,
-				ir.kind,
-				ir.parts,
-				ir.canonical_pattern,
+				kind,
+				parts,
+				canonical,
 			) {
 				aggregate_index = candidate_index
 				break
@@ -302,19 +249,32 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 		}
 
 		if aggregate_index < 0 {
+			pattern_copy := make([]u8, len(canonical), context.temp_allocator)
+			copy(pattern_copy, canonical)
+
+			parts_copy: []Route_Part_IR
+			if kind != .Static {
+				parts_copy = make([]Route_Part_IR, len(parts), context.temp_allocator)
+				copy(parts_copy, parts)
+			}
+
 			slots: [len(Method)]Route_Index
 			for &slot in slots do slot = ROUTE_INDEX_NONE
 
-			slots[ir.method] = ir.descriptor_index
+			for method in Method {
+				if method not_in route.methods_mask do continue
+				slots[method] = descriptor_index
+				global_methods_mask += {method}
+			}
 
 			append(
 				&aggregates,
 				Aggregate {
-					kind = ir.kind,
-					pattern_bytes = ir.canonical_pattern,
-					parts = ir.parts,
-					segment_count = part_count_to_segment_count(ir.kind, ir.parts),
-					methods_mask = {ir.method},
+					kind = kind,
+					pattern_bytes = pattern_copy,
+					parts = parts_copy,
+					segment_count = part_count_to_segment_count(kind, parts_copy),
+					methods_mask = route.methods_mask,
 					slots = slots,
 				},
 			)
@@ -322,28 +282,36 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 		}
 
 		aggregate := &aggregates[aggregate_index]
-		if aggregate.slots[ir.method] != ROUTE_INDEX_NONE {
-			return {}, .Duplicate_Route, ir_index
+
+		// Preserve the original error precedence: a duplicate method on the
+		// same shape is diagnosed before a param-name disagreement.
+		for method in Method {
+			if method not_in route.methods_mask do continue
+			if aggregate.slots[method] != ROUTE_INDEX_NONE {
+				return {}, .Duplicate_Route, route_input_index
+			}
 		}
 
 		// Match shape collapses these into one entry — the shared
-		// `Route_Part` sidecar can therefore record only one set of param
-		// names. Reject if the names disagree.
+		// Route_Part sidecar can only record one set of param names.
 		if !route_parts_param_names_equal(
 			aggregate.parts,
-			ir.parts,
+			parts,
 			aggregate.pattern_bytes,
-			ir.canonical_pattern,
+			canonical,
 		) {
-			return {}, .Param_Name_Conflict, ir_index
+			return {}, .Param_Name_Conflict, route_input_index
 		}
 
-		aggregate.slots[ir.method] = ir.descriptor_index
-		aggregate.methods_mask += {ir.method}
+		for method in Method {
+			if method not_in route.methods_mask do continue
+			aggregate.slots[method] = descriptor_index
+			aggregate.methods_mask += {method}
+			global_methods_mask += {method}
+		}
 	}
 
-	// Phase 4: HEAD → GET fallback applied per aggregate, AFTER explicit HEAD
-	// registrations have claimed their slot. Explicit HEAD always wins.
+	// Phase 3: HEAD → GET fallback. Explicit HEAD wins.
 	for &aggregate in aggregates {
 		if .HEAD in aggregate.methods_mask do continue
 		if .GET not_in aggregate.methods_mask do continue
@@ -352,7 +320,7 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 	}
 	if .GET in global_methods_mask do global_methods_mask += {.HEAD}
 
-	// Phase 5: pre-calculate emitted sizes.
+	// Pre-calculate emitted sizes.
 	static_count: u16 = 0
 	parametric_count: u16 = 0
 	wildcard_count: u16 = 0
@@ -372,7 +340,7 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 		route_parts_total += u16(len(aggregate.parts))
 	}
 
-	// Phase 6: allocate final immutable storage on the supplied allocator.
+	// Allocate final storage on the supplied allocator.
 	descriptors_final := make([]Route_Descriptor, len(descriptors_dynamic), output_allocator)
 	copy(descriptors_final, descriptors_dynamic[:])
 
@@ -380,8 +348,8 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 	route_parts_final := make([]Route_Part, route_parts_total, output_allocator)
 	entries_final := make_soa(#soa[]Route_Entry, len(aggregates), output_allocator)
 
-	// Phase 7: emit aggregates into the SoA in bucketed order so the static
-	// path is a tight prefix scan with no kind branch.
+	// Emit aggregates in bucketed order so the static path is a tight
+	// prefix scan with no kind branch.
 	emit_indices := [3]u16{0, static_count, static_count + parametric_count}
 	literal_cursor: u32 = 0
 	parts_cursor: u16 = 0
@@ -391,12 +359,9 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 		entry_index := emit_indices[bucket_index]
 		emit_indices[bucket_index] += 1
 
-		// Pack the canonical pattern bytes once for this aggregate.
 		pattern_offset := Literal_Offset(literal_cursor)
 		copy(literal_buffer[literal_cursor:], aggregate.pattern_bytes)
 
-		// Rebase the IR parts onto the now-packed pattern in literal_buffer
-		// and copy them into the route_parts sidecar.
 		first_part_index := parts_cursor
 		for ir_part in aggregate.parts {
 			route_part: Route_Part
@@ -413,8 +378,8 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 				)
 				route_part.name_size = ir_part.size
 			case .Wildcard:
-			// terminal segment; no offsets recorded — match consumes the
-			// remaining suffix unconditionally
+				// terminal segment; no offsets recorded — match consumes the
+				// remaining suffix unconditionally
 			}
 			route_parts_final[parts_cursor] = route_part
 			parts_cursor += 1
@@ -434,10 +399,7 @@ kind, parts, classify_error := classify_pattern(canonical, route_budget, context
 		literal_cursor += u32(len(aggregate.pattern_bytes))
 	}
 
-	// Phase 8: build the canned `OPTIONS *` Allow value if the user did not
-	// register an explicit handler. The value is immutable for the lifetime
-	// of the router; the actual response is produced through the normal
-	// response writer so Date, Connection, and framing policy stay correct.
+	// Build OPTIONS * Allow value if no explicit handler was registered.
 	options_allow: []u8
 	if options_asterisk_route_index == ROUTE_INDEX_NONE {
 		options_allow = build_options_asterisk_allow(global_methods_mask, output_allocator)
@@ -1136,6 +1098,31 @@ test_compile_param_name_conflict_rejected :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_compile_duplicate_route_error_index_is_input_index :: proc(t: ^testing.T) {
+	routes := []Route {
+		{pattern = "/first", methods_mask = {.GET}},
+		{pattern = "/second", methods_mask = {.GET}},
+		{pattern = "/second", methods_mask = {.GET}},
+	}
+	_, error, error_index := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	testing.expect_value(t, error, Compile_Error.Duplicate_Route)
+	testing.expect_value(t, error_index, 2)
+}
+
+@(test)
+test_compile_param_name_conflict_error_index_is_input_index :: proc(t: ^testing.T) {
+	routes := []Route {
+		{pattern = "/first", methods_mask = {.GET}},
+		{pattern = "/second", methods_mask = {.GET}},
+		{pattern = "/users/:id", methods_mask = {.GET}},
+		{pattern = "/users/:name", methods_mask = {.POST}},
+	}
+	_, error, error_index := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	testing.expect_value(t, error, Compile_Error.Param_Name_Conflict)
+	testing.expect_value(t, error_index, 3)
+}
+
+@(test)
 test_match_static_hit :: proc(t: ^testing.T) {
 	routes := []Route {
 		{pattern = "/", methods_mask = {.GET}},
@@ -1618,4 +1605,55 @@ test_match_route_parametric_unders_limit_still_routes :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.outcome, Match_Outcome.Found)
 	testing.expect(t, request.path_segment_count != PATH_SEGMENT_COUNT_OVER_LIMIT, "legal path must not carry the over-limit sentinel")
 	testing.expect(t, request.path_segment_count != PATH_SEGMENT_COUNT_NONE, "matched path must have its segment count computed")
+}
+
+@(test)
+test_compile_many_all_method_routes_no_descriptor_overflow :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	context.allocator = context.temp_allocator
+
+	ROUTE_COUNT :: 33
+	ALL_METHODS :: Method_Mask {
+		Method.GET,
+		Method.POST,
+		Method.PUT,
+		Method.DELETE,
+		Method.PATCH,
+		Method.HEAD,
+		Method.OPTIONS,
+		Method.TRACE,
+	}
+
+	pattern_buf: [8]u8
+	routes := make([]Route, ROUTE_COUNT, context.temp_allocator)
+	for i in 0 ..< ROUTE_COUNT {
+		pattern := fmt.bprintf(pattern_buf[:], "/r%d", i)
+		routes[i] = Route {
+			handler      = rawptr(uintptr(0x1000 + uintptr(i))),
+			handler_kind = .Request,
+			pattern      = strings.clone(pattern, context.temp_allocator),
+			methods_mask = ALL_METHODS,
+		}
+	}
+
+	router, error, error_index := compile_router(routes, DEFAULT_ROUTE_BUDGET)
+	defer compiled_router_destroy(&router)
+
+	testing.expect_value(t, error, Compile_Error.None)
+	testing.expect_value(t, error_index, -1)
+	testing.expect_value(t, len(router.descriptors), ROUTE_COUNT)
+
+	for i in 0 ..< ROUTE_COUNT {
+		request: Request_State
+		request_state_reset(&request)
+		request.method = .GET
+		path_bytes := transmute([]u8)routes[i].pattern
+		result := match_route(&router, &request, path_bytes)
+		testing.expect_value(t, result.outcome, Match_Outcome.Found)
+		testing.expect_value(
+			t,
+			router.descriptors[result.route_index].handler,
+			rawptr(uintptr(0x1000 + uintptr(i))),
+		)
+	}
 }

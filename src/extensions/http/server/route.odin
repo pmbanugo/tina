@@ -395,10 +395,10 @@ any :: proc {
 @(private = "package")
 Route_Descriptor :: struct {
 	handler:       rawptr,
-	handler_kind:  Route_Handler_Kind,
 	body_size_max: u32,
-	body_mode:     Route_Body_Mode,
 	state_size:    u16,
+	handler_kind:  Route_Handler_Kind,
+	body_mode:     Route_Body_Mode,
 }
 
 @(private = "file")
