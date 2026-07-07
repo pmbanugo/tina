@@ -165,18 +165,38 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		submissions: []Submission,
 	) -> Backend_Error {
-		// All-or-error: pre-check overlapped entry capacity.
+		// All-or-error: pre-check overlapped entry capacity. Close is synchronous
+		// and completes through backend.completed, so it must not consume an
+		// OVERLAPPED entry or be rejected because the async entry pool is full.
+		async_submission_count: i32 = 0
+		for sub in submissions {
+			if _, is_close := sub.operation.(Submission_Op_Close); !is_close {
+				async_submission_count += 1
+			}
+		}
+
 		available: i32 = 0
 		for i in 0 ..< MAX_WIN_OVERLAPPED {
 			if !backend.entries[i].active {
 				available += 1
 			}
 		}
-		if available < i32(len(submissions)) {
+		if available < async_submission_count {
 			return .Queue_Full
 		}
 
 		for &sub in submissions {
+			if op, is_close := sub.operation.(Submission_Op_Close); is_close {
+				result: i32 = 0
+				if win.closesocket(win.SOCKET(uintptr(op.fd))) == win.SOCKET_ERROR {
+					if win.CloseHandle(win.HANDLE(uintptr(op.fd))) == win.FALSE {
+						result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+					}
+				}
+				_win_push_completion(backend, sub.token, result, nil)
+				continue
+			}
+
 			entry_index := _win_alloc_entry(backend)
 			if entry_index < 0 {
 				return .Queue_Full
@@ -314,20 +334,9 @@ when !TINA_SIMULATION_MODE {
 				}
 
 			case Submission_Op_Close:
-				// Close is synchronous — no overlapped needed.
-				result: i32 = 0
-				flags: win.DWORD
-				if win.GetHandleInformation(win.HANDLE(uintptr(op.fd)), &flags) {
-					if win.closesocket(win.SOCKET(uintptr(op.fd))) == win.SOCKET_ERROR {
-						if win.CloseHandle(win.HANDLE(uintptr(op.fd))) == win.FALSE {
-							result = i32(IO_ERR_RESOURCE_EXHAUSTED)
-						}
-					}
-				} else {
-					result = i32(IO_ERR_RESOURCE_EXHAUSTED)
-				}
-				_win_push_completion(backend, sub.token, result, nil)
+				assert(false, "Close submissions complete synchronously before Win_Overlapped_Entry allocation")
 				entry.active = false
+				continue
 
 			case Submission_Op_Send:
 				wsa_buf := win.WSABUF {
@@ -999,7 +1008,8 @@ when !TINA_SIMULATION_MODE {
 		case Submission_Op_Connect:
 			return win.HANDLE(uintptr(op.fd_socket))
 		case Submission_Op_Close:
-			return win.HANDLE(uintptr(op.fd))
+			assert(false, "Close submissions do not have IOCP entry handles")
+			return win.INVALID_HANDLE_VALUE
 		case Submission_Op_Send:
 			return win.HANDLE(uintptr(op.fd_socket))
 		case Submission_Op_Recv:
