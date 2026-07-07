@@ -11,6 +11,7 @@ Parse_Phase :: enum u8 {
 	Headers,
 	Body_Fixed,
 	Chunk_Size,
+	Chunk_Ext,
 	Chunk_Data,
 	Chunk_Data_CRLF,
 	Trailers,
@@ -769,7 +770,7 @@ parse_step :: #force_inline proc "contextless" (
 				}
 			}
 
-		case .Body_Fixed, .Chunk_Size, .Chunk_Data, .Chunk_Data_CRLF, .Trailers, .Complete:
+		case .Body_Fixed, .Chunk_Size, .Chunk_Ext, .Chunk_Data, .Chunk_Data_CRLF, .Trailers, .Complete:
 			// Body phases are owned by body.odin (Phase 3). For Phase 2,
 			// returning Need_More keeps parse_step idempotent if a caller
 			// re-enters after Headers_Done without owning body parsing.

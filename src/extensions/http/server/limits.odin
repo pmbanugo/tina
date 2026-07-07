@@ -11,6 +11,7 @@ Limits :: struct {
 	handler_scratch_max:       u32, // App max scratch use per callback.
 	header_size_max:           u16, // Max total request header bytes.
 	request_line_size_max:     u16, // Max bytes for the request line (method + target + version).
+	chunk_ext_size_max:        u16, // Max bytes in a single chunk extension line (between chunk-size and CRLF).
 	pipeline_size_max:         u16, // Max bytes retained for the pipelined next-request tail.
 	response_header_bytes_max: u16, // Max bytes the response header staging region (Working Memory) holds (DR-1).
 	header_count_max:          u8, // Max number of individual request headers (255 cap; >255 is an attack).
@@ -37,6 +38,7 @@ Timeouts :: struct {
 Parse_Budget :: struct {
 	header_size_max:       u16, // Max total request header bytes.
 	request_line_size_max: u16, // Max bytes for the request line (method + target + version).
+	chunk_ext_size_max:    u16, // Max bytes in a single chunk extension line.
 	header_count_max:      u8, // Max number of individual request headers the parser accepts.
 }
 
@@ -88,6 +90,7 @@ Limits_Error :: enum u8 {
 parse_budget_from :: proc "contextless" (limits: Limits) -> (Parse_Budget, Limits_Error) {
 	if limits.header_size_max == 0 ||
 	   limits.request_line_size_max == 0 ||
+	   limits.chunk_ext_size_max == 0 ||
 	   limits.header_count_max == 0 {
 		return {}, .Zero_Limit
 	}
@@ -100,6 +103,7 @@ parse_budget_from :: proc "contextless" (limits: Limits) -> (Parse_Budget, Limit
 	return Parse_Budget {
 		header_size_max       = limits.header_size_max,
 		request_line_size_max = limits.request_line_size_max,
+		chunk_ext_size_max    = limits.chunk_ext_size_max,
 		header_count_max      = limits.header_count_max,
 	}, .None
 }
@@ -166,6 +170,7 @@ DEFAULT_LIMITS :: Limits {
 	request_arena_size        = 4096, // 4 KB — sufficient for typical per-request state.
 	handler_scratch_max       = 2048, // 2 KB — percent decode, temp formatting.
 	request_line_size_max     = 2048, // 2 KB — long URIs with query strings.
+	chunk_ext_size_max        = 4096, // 4 KB — one chunk extension line; protects from oversized-extension DoS.
 	pipeline_size_max         = 8192, // 8 KB — one full extra pipelined request frame.
 	header_count_max          = 64, // Practical ceiling; most requests use < 20.
 	response_header_bytes_max = 1024, // 1 KB — typical response headers + retries (DR-1).
@@ -184,6 +189,7 @@ DEFAULT_TIMEOUTS :: Timeouts {
 DEFAULT_PARSE_BUDGET :: Parse_Budget {
 	header_size_max       = DEFAULT_LIMITS.header_size_max,
 	request_line_size_max = DEFAULT_LIMITS.request_line_size_max,
+	chunk_ext_size_max    = DEFAULT_LIMITS.chunk_ext_size_max,
 	header_count_max      = DEFAULT_LIMITS.header_count_max,
 }
 
@@ -209,6 +215,7 @@ DEFAULT_MEMORY_BUDGET :: Memory_Budget {
 
 #assert(DEFAULT_LIMITS.header_size_max > 0)
 #assert(DEFAULT_LIMITS.request_line_size_max > 0)
+#assert(DEFAULT_LIMITS.chunk_ext_size_max > 0)
 #assert(DEFAULT_LIMITS.header_count_max > 0 && DEFAULT_LIMITS.header_count_max < 255)
 #assert(u32(DEFAULT_LIMITS.request_line_size_max) + u32(DEFAULT_LIMITS.header_size_max) <= 65_535)
 #assert(DEFAULT_LIMITS.path_segment_count_max > 0 && DEFAULT_LIMITS.path_segment_count_max < 255)
@@ -223,6 +230,7 @@ DEFAULT_MEMORY_BUDGET :: Memory_Budget {
 // to the debug-only structural check in `_connection_init_working_memory_regions`.
 #assert(DEFAULT_PARSE_BUDGET.header_size_max == DEFAULT_LIMITS.header_size_max)
 #assert(DEFAULT_PARSE_BUDGET.request_line_size_max == DEFAULT_LIMITS.request_line_size_max)
+#assert(DEFAULT_PARSE_BUDGET.chunk_ext_size_max == DEFAULT_LIMITS.chunk_ext_size_max)
 #assert(DEFAULT_PARSE_BUDGET.header_count_max == DEFAULT_LIMITS.header_count_max)
 #assert(DEFAULT_ROUTE_BUDGET.path_segment_count_max == DEFAULT_LIMITS.path_segment_count_max)
 #assert(DEFAULT_ROUTE_BUDGET.param_count_max == DEFAULT_LIMITS.param_count_max)
@@ -246,6 +254,7 @@ test_default_limits_non_zero :: proc(t: ^testing.T) {
 	testing.expect(t, limits.request_arena_size > 0, "request_arena_size must be > 0")
 	testing.expect(t, limits.handler_scratch_max > 0, "handler_scratch_max must be > 0")
 	testing.expect(t, limits.request_line_size_max > 0, "request_line_size_max must be > 0")
+	testing.expect(t, limits.chunk_ext_size_max > 0, "chunk_ext_size_max must be > 0")
 	testing.expect(t, limits.pipeline_size_max > 0, "pipeline_size_max must be > 0")
 	testing.expect(t, limits.header_count_max > 0, "header_count_max must be > 0")
 	testing.expect(t, limits.response_header_bytes_max > 0, "response_header_bytes_max must be > 0")
@@ -340,6 +349,11 @@ test_parse_budget_from_rejects_zero :: proc(t: ^testing.T) {
 
 	zeroed = DEFAULT_LIMITS
 	zeroed.request_line_size_max = 0
+	_, error = parse_budget_from(zeroed)
+	testing.expect_value(t, error, Limits_Error.Zero_Limit)
+
+	zeroed = DEFAULT_LIMITS
+	zeroed.chunk_ext_size_max = 0
 	_, error = parse_budget_from(zeroed)
 	testing.expect_value(t, error, Limits_Error.Zero_Limit)
 }

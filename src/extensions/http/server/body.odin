@@ -100,35 +100,81 @@ drain_request_body :: proc "contextless" (
 				continue
 			}
 
-			if byte_value != '\r' || digit_count == 0 {
-				result.protocol_error = true
+			if byte_value == '\r' {
+				if digit_count == 0 {
+					result.protocol_error = true
+					return result
+				}
+				if index + 1 >= len(network) {
+					parser.chunk_size_parsed = parsed_size
+					parser.chunk_size_digit_count = digit_count
+					result.consumed_size = index
+					result.need_more = true
+					return result
+				}
+				if network[index + 1] != '\n' {
+					result.protocol_error = true
+					return result
+				}
+				if body_size_received^ > u64(body_size_max) ||
+				   parsed_size > u64(body_size_max) - body_size_received^ {
+					result.body_too_large = true
+					return result
+				}
+				parser.chunk_size_remaining = parsed_size
+				parser.chunk_size_parsed = 0
+				parser.chunk_size_digit_count = 0
+				parser.phase = .Trailers if parsed_size == 0 else .Chunk_Data
+				result.consumed_size = index + 2
 				return result
 			}
-			if index + 1 >= len(network) {
-				parser.chunk_size_parsed = parsed_size
-				parser.chunk_size_digit_count = digit_count
-				result.consumed_size = index
-				result.need_more = true
+
+			if (byte_value == ';' || byte_value == ' ' || byte_value == '\t') && digit_count > 0 {
+				parser.chunk_size_remaining = parsed_size
+				parser.chunk_size_parsed = 0
+				parser.chunk_size_digit_count = 0
+				parser.phase = .Chunk_Ext
+				result.consumed_size = index + 1
 				return result
 			}
-			if network[index + 1] != '\n' {
-				result.protocol_error = true
-				return result
-			}
-			if body_size_received^ > u64(body_size_max) ||
-			   parsed_size > u64(body_size_max) - body_size_received^ {
-				result.body_too_large = true
-				return result
-			}
-			parser.chunk_size_remaining = parsed_size
-			parser.chunk_size_parsed = 0
-			parser.chunk_size_digit_count = 0
-			parser.phase = .Trailers if parsed_size == 0 else .Chunk_Data
-			result.consumed_size = index + 2
+
+			result.protocol_error = true
 			return result
 		}
 		parser.chunk_size_parsed = parsed_size
 		parser.chunk_size_digit_count = digit_count
+		result.consumed_size = len(network)
+		result.need_more = true
+		return result
+
+	case .Chunk_Ext:
+		for index in 0 ..< len(network) {
+			byte_value := network[index]
+			if byte_value == '\r' {
+				if index + 1 >= len(network) {
+					result.consumed_size = index
+					result.need_more = true
+					return result
+				}
+				if network[index + 1] != '\n' {
+					result.protocol_error = true
+					return result
+				}
+				parser.chunk_size_parsed = 0
+				parser.phase = .Trailers if parser.chunk_size_remaining == 0 else .Chunk_Data
+				result.consumed_size = index + 2
+				return result
+			}
+			if byte_value < 0x20 && byte_value != '\t' {
+				result.protocol_error = true
+				return result
+			}
+			parser.chunk_size_parsed += 1
+			if parser.chunk_size_parsed > u64(parse_budget.chunk_ext_size_max) {
+				result.protocol_error = true
+				return result
+			}
+		}
 		result.consumed_size = len(network)
 		result.need_more = true
 		return result
@@ -448,14 +494,14 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 }
 
 @(test)
-test_drain_request_body_chunked_rejects_chunk_extension :: proc(t: ^testing.T) {
+test_drain_request_body_chunked_accepts_chunk_extension :: proc(t: ^testing.T) {
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
 	body_size_received: u64
 	destination_size: u32
 
-	result := drain_request_body(
+	size := drain_request_body(
 		&parser,
 		transmute([]u8)string("4;foo=bar\r\n"),
 		nil,
@@ -465,12 +511,29 @@ test_drain_request_body_chunked_rejects_chunk_extension :: proc(t: ^testing.T) {
 		DEFAULT_PARSE_BUDGET,
 		false,
 	)
-	testing.expect_value(t, result.protocol_error, true)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4;"))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext := drain_request_body(
+		&parser,
+		transmute([]u8)string("foo=bar\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, false)
+	testing.expect_value(t, ext.consumed_size, len("foo=bar\r\n"))
+	testing.expect_value(t, parser.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
 }
 
 @(test)
-test_drain_request_body_chunked_rejects_size_line_whitespace :: proc(t: ^testing.T) {
-	parser := Parser_State {
+test_drain_request_body_chunked_accepts_size_line_trailing_whitespace :: proc(t: ^testing.T) {
+	parser_space := Parser_State {
 		phase = .Chunk_Size,
 	}
 	parser_tab := Parser_State {
@@ -479,9 +542,9 @@ test_drain_request_body_chunked_rejects_size_line_whitespace :: proc(t: ^testing
 	body_size_received: u64
 	destination_size: u32
 
-	result_space := drain_request_body(
-		&parser,
-		transmute([]u8)string("4 \r\n"),
+	space_first := drain_request_body(
+		&parser_space,
+		transmute([]u8)string("4 "),
 		nil,
 		&destination_size,
 		&body_size_received,
@@ -489,11 +552,13 @@ test_drain_request_body_chunked_rejects_size_line_whitespace :: proc(t: ^testing
 		DEFAULT_PARSE_BUDGET,
 		false,
 	)
-	testing.expect_value(t, result_space.protocol_error, true)
+	testing.expect_value(t, space_first.protocol_error, false)
+	testing.expect_value(t, space_first.consumed_size, len("4 "))
+	testing.expect_value(t, parser_space.phase, Parse_Phase.Chunk_Ext)
 
-	result_tab := drain_request_body(
-		&parser_tab,
-		transmute([]u8)string("4\t\r\n"),
+	space_second := drain_request_body(
+		&parser_space,
+		transmute([]u8)string("\r\n"),
 		nil,
 		&destination_size,
 		&body_size_received,
@@ -501,18 +566,329 @@ test_drain_request_body_chunked_rejects_size_line_whitespace :: proc(t: ^testing
 		DEFAULT_PARSE_BUDGET,
 		false,
 	)
-	testing.expect_value(t, result_tab.protocol_error, true)
+	testing.expect_value(t, space_second.protocol_error, false)
+	testing.expect_value(t, space_second.consumed_size, len("\r\n"))
+	testing.expect_value(t, parser_space.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser_space.phase, Parse_Phase.Chunk_Data)
+
+	tab_first := drain_request_body(
+		&parser_tab,
+		transmute([]u8)string("4\t"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, tab_first.protocol_error, false)
+	testing.expect_value(t, tab_first.consumed_size, len("4\t"))
+	testing.expect_value(t, parser_tab.phase, Parse_Phase.Chunk_Ext)
+
+	tab_second := drain_request_body(
+		&parser_tab,
+		transmute([]u8)string("\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, tab_second.protocol_error, false)
+	testing.expect_value(t, tab_second.consumed_size, len("\r\n"))
+	testing.expect_value(t, parser_tab.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser_tab.phase, Parse_Phase.Chunk_Data)
 }
 
 @(test)
-test_drain_request_body_chunked_rejects_junk_after_size_whitespace :: proc(t: ^testing.T) {
+test_drain_request_body_chunked_accepts_extension_with_bws :: proc(t: ^testing.T) {
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
 	body_size_received: u64
 	destination_size: u32
 
-	result := drain_request_body(
+	size := drain_request_body(
+		&parser,
+		transmute([]u8)string("4 ; foo=bar\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4 "))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext := drain_request_body(
+		&parser,
+		transmute([]u8)string("; foo=bar\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, false)
+	testing.expect_value(t, ext.consumed_size, len("; foo=bar\r\n"))
+	testing.expect_value(t, parser.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
+}
+
+@(test)
+test_drain_request_body_chunked_accepts_multiple_extensions :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size := drain_request_body(
+		&parser,
+		transmute([]u8)string("4;foo=bar;baz=qux\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4;"))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext := drain_request_body(
+		&parser,
+		transmute([]u8)string("foo=bar;baz=qux\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, false)
+	testing.expect_value(t, ext.consumed_size, len("foo=bar;baz=qux\r\n"))
+	testing.expect_value(t, parser.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
+}
+
+@(test)
+test_drain_request_body_chunked_accepts_zero_chunk_with_extension :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size := drain_request_body(
+		&parser,
+		transmute([]u8)string("0;reason=done\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("0;"))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext := drain_request_body(
+		&parser,
+		transmute([]u8)string("reason=done\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, false)
+	testing.expect_value(t, ext.consumed_size, len("reason=done\r\n"))
+	testing.expect_value(t, parser.chunk_size_remaining, u64(0))
+	testing.expect_value(t, parser.phase, Parse_Phase.Trailers)
+}
+
+@(test)
+test_drain_request_body_chunked_accepts_extension_quoted_string :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size := drain_request_body(
+		&parser,
+		transmute([]u8)string("4;foo=\"hello world\"\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4;"))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext := drain_request_body(
+		&parser,
+		transmute([]u8)string("foo=\"hello world\"\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, false)
+	testing.expect_value(t, ext.consumed_size, len("foo=\"hello world\"\r\n"))
+	testing.expect_value(t, parser.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
+}
+
+@(test)
+test_drain_request_body_chunked_rejects_extension_ctl :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size := drain_request_body(
+		&parser,
+		transmute([]u8)string("4;"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4;"))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext := drain_request_body(
+		&parser,
+		transmute([]u8)string("\x01foo\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, true)
+}
+
+@(test)
+test_drain_request_body_chunked_rejects_extension_budget_overflow :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size := drain_request_body(
+		&parser,
+		transmute([]u8)string("4;"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4;"))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	extension: [4097]u8
+	for i in 0 ..< len(extension) {
+		extension[i] = 'a'
+	}
+	ext := drain_request_body(
+		&parser,
+		extension[:],
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, true)
+}
+
+@(test)
+test_drain_request_body_chunked_extension_survives_cr_fragmentation :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size := drain_request_body(
+		&parser,
+		transmute([]u8)string("4;foo\r"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4;"))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext_fragment := drain_request_body(
+		&parser,
+		transmute([]u8)string("foo\r"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext_fragment.protocol_error, false)
+	testing.expect_value(t, ext_fragment.consumed_size, len("foo"))
+	testing.expect_value(t, ext_fragment.need_more, true)
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext_end := drain_request_body(
+		&parser,
+		transmute([]u8)string("\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext_end.protocol_error, false)
+	testing.expect_value(t, ext_end.consumed_size, len("\r\n"))
+	testing.expect_value(t, parser.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
+}
+
+@(test)
+test_drain_request_body_chunked_accepts_size_line_extension_without_semicolon :: proc(t: ^testing.T) {
+	parser := Parser_State {
+		phase = .Chunk_Size,
+	}
+	body_size_received: u64
+	destination_size: u32
+
+	size := drain_request_body(
 		&parser,
 		transmute([]u8)string("4 invalid\r\n"),
 		nil,
@@ -522,7 +898,24 @@ test_drain_request_body_chunked_rejects_junk_after_size_whitespace :: proc(t: ^t
 		DEFAULT_PARSE_BUDGET,
 		false,
 	)
-	testing.expect_value(t, result.protocol_error, true)
+	testing.expect_value(t, size.protocol_error, false)
+	testing.expect_value(t, size.consumed_size, len("4 "))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
+
+	ext := drain_request_body(
+		&parser,
+		transmute([]u8)string("invalid\r\n"),
+		nil,
+		&destination_size,
+		&body_size_received,
+		16,
+		DEFAULT_PARSE_BUDGET,
+		false,
+	)
+	testing.expect_value(t, ext.protocol_error, false)
+	testing.expect_value(t, ext.consumed_size, len("invalid\r\n"))
+	testing.expect_value(t, parser.chunk_size_remaining, u64(4))
+	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
 }
 
 @(test)
