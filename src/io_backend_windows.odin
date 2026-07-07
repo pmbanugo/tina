@@ -187,13 +187,7 @@ when !TINA_SIMULATION_MODE {
 
 		for &sub in submissions {
 			if op, is_close := sub.operation.(Submission_Op_Close); is_close {
-				result: i32 = 0
-				if win.closesocket(win.SOCKET(uintptr(op.fd))) == win.SOCKET_ERROR {
-					if win.CloseHandle(win.HANDLE(uintptr(op.fd))) == win.FALSE {
-						result = i32(IO_ERR_RESOURCE_EXHAUSTED)
-					}
-				}
-				_win_push_completion(backend, sub.token, result, nil)
+				_win_push_completion(backend, sub.token, _win_close_fd_result(op.fd), nil)
 				continue
 			}
 
@@ -1025,6 +1019,29 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
+	_win_close_fd_result :: proc "contextless" (fd: OS_FD) -> i32 {
+		if win.closesocket(win.SOCKET(uintptr(fd))) != win.SOCKET_ERROR {
+			return 0
+		}
+
+		socket_error := win.WSAGetLastError()
+		handle := win.HANDLE(uintptr(fd))
+		flags: win.DWORD
+		if win.GetHandleInformation(handle, &flags) == win.FALSE {
+			if socket_error != win.WSAENOTSOCK {
+				return -i32(socket_error)
+			}
+			return -i32(win.ERROR_INVALID_HANDLE)
+		}
+
+		if win.CloseHandle(handle) == win.FALSE {
+			return -i32(win.GetLastError())
+		}
+
+		return 0
+	}
+
+	@(private = "file")
 	_win_push_completion :: proc(
 		backend: ^Platform_Backend,
 		token: Submission_Token,
@@ -1589,18 +1606,22 @@ when !TINA_SIMULATION_MODE {
 		backend_init(backend, config)
 		defer { backend_deinit(backend); free(backend) }
 
-		// Submit close of an invalid FD — both closesocket and CloseHandle should fail
+		// Submit close of an invalid FD — it must complete with a negative result
+		// without using CloseHandle as a probe for random garbage handles.
 		token := submission_token_pack(
 			0, 0, 0, 0, IO_SLOT_INDEX_NONE, .Close_Complete,
 		)
 		submissions := [1]Submission {
 			{token = token, operation = Submission_Op_Close{fd = OS_FD(uintptr(0xDEADBEEF))}},
 		}
-		backend_submit(backend, submissions[:])
+		sub_error := backend_submit(backend, submissions[:])
+		if !testing.expect_value(t, sub_error, Backend_Error.None) do return
+		if !testing.expect_value(t, backend.completed_count, u16(1)) do return
+		testing.expect_value(t, backend.completed_read, u16(0))
 
 		completions: [4]Raw_Completion
 		count, _ := backend_collect(backend, completions[:], 0)
-		testing.expect(t, count >= 1, "close should produce a completion")
+		if !testing.expect(t, count >= 1, "close should produce a completion") do return
 		testing.expect(t, completions[0].result < 0, "close of invalid FD should yield negative result")
 	}
 
