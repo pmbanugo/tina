@@ -1406,12 +1406,13 @@ _connection_process_body_bytes :: proc(
 				return _connection_drive_body_read(connection)
 			}
 
-			result := drain_request_body(
+			result: Body_Drain_Result
+			result, state.buffered_body_size, state.request_body_size_received = drain_request_body(
 				&state.parser,
 				remaining_source,
 				state.buffered_body_bytes,
-				&state.buffered_body_size,
-				&state.request_body_size_received,
+				state.buffered_body_size,
+				state.request_body_size_received,
 				descriptor.body_size_max,
 				runtime.server.parse_budget,
 				buffered = false,
@@ -1486,12 +1487,13 @@ _connection_process_body_bytes :: proc(
 		}
 	} else {
 		for {
-			result := drain_request_body(
+			result: Body_Drain_Result
+			result, state.buffered_body_size, state.request_body_size_received = drain_request_body(
 				&state.parser,
 				remaining_source,
 				state.buffered_body_bytes,
-				&state.buffered_body_size,
-				&state.request_body_size_received,
+				state.buffered_body_size,
+				state.request_body_size_received,
 				descriptor.body_size_max,
 				runtime.server.parse_budget,
 				buffered = true,

@@ -63,12 +63,12 @@ drain_request_body :: proc "contextless" (
 	parser: ^Parser_State,
 	network: []u8,
 	destination: []u8,
-	destination_size: ^u32,
-	body_size_received: ^u64,
+	destination_size: u32,
+	body_size_received: u64,
 	body_size_max: u32,
 	parse_budget: Parse_Budget,
 	buffered: bool,
-) -> Body_Drain_Result {
+) -> (Body_Drain_Result, u32, u64) {
 	result: Body_Drain_Result
 
 	#partial switch parser.phase {
@@ -93,7 +93,7 @@ drain_request_body :: proc "contextless" (
 			if is_hex_digit_byte(byte_value) {
 				if digit_count >= CHUNK_SIZE_DIGIT_COUNT_MAXIMUM || (parsed_size >> 60) != 0 {
 					result.protocol_error = true
-					return result
+					return result, destination_size, body_size_received
 				}
 				parsed_size = (parsed_size << 4) | hex_digit_value(byte_value)
 				digit_count += 1
@@ -103,30 +103,30 @@ drain_request_body :: proc "contextless" (
 			if byte_value == '\r' {
 				if digit_count == 0 {
 					result.protocol_error = true
-					return result
+					return result, destination_size, body_size_received
 				}
 				if index + 1 >= len(network) {
 					parser.chunk_size_parsed = parsed_size
 					parser.chunk_size_digit_count = digit_count
 					result.consumed_size = index
 					result.need_more = true
-					return result
+					return result, destination_size, body_size_received
 				}
 				if network[index + 1] != '\n' {
 					result.protocol_error = true
-					return result
+					return result, destination_size, body_size_received
 				}
-				if body_size_received^ > u64(body_size_max) ||
-				   parsed_size > u64(body_size_max) - body_size_received^ {
+				if body_size_received > u64(body_size_max) ||
+				   parsed_size > u64(body_size_max) - body_size_received {
 					result.body_too_large = true
-					return result
+					return result, destination_size, body_size_received
 				}
 				parser.chunk_size_remaining = parsed_size
 				parser.chunk_size_parsed = 0
 				parser.chunk_size_digit_count = 0
 				parser.phase = .Trailers if parsed_size == 0 else .Chunk_Data
 				result.consumed_size = index + 2
-				return result
+				return result, destination_size, body_size_received
 			}
 
 			if (byte_value == ';' || byte_value == ' ' || byte_value == '\t') && digit_count > 0 {
@@ -135,17 +135,17 @@ drain_request_body :: proc "contextless" (
 				parser.chunk_size_digit_count = 0
 				parser.phase = .Chunk_Ext
 				result.consumed_size = index + 1
-				return result
+				return result, destination_size, body_size_received
 			}
 
 			result.protocol_error = true
-			return result
+			return result, destination_size, body_size_received
 		}
 		parser.chunk_size_parsed = parsed_size
 		parser.chunk_size_digit_count = digit_count
 		result.consumed_size = len(network)
 		result.need_more = true
-		return result
+		return result, destination_size, body_size_received
 
 	case .Chunk_Ext:
 		for index in 0 ..< len(network) {
@@ -154,30 +154,30 @@ drain_request_body :: proc "contextless" (
 				if index + 1 >= len(network) {
 					result.consumed_size = index
 					result.need_more = true
-					return result
+					return result, destination_size, body_size_received
 				}
 				if network[index + 1] != '\n' {
 					result.protocol_error = true
-					return result
+					return result, destination_size, body_size_received
 				}
 				parser.chunk_size_parsed = 0
 				parser.phase = .Trailers if parser.chunk_size_remaining == 0 else .Chunk_Data
 				result.consumed_size = index + 2
-				return result
+				return result, destination_size, body_size_received
 			}
 			if byte_value < 0x20 && byte_value != '\t' {
 				result.protocol_error = true
-				return result
+				return result, destination_size, body_size_received
 			}
 			parser.chunk_size_parsed += 1
 			if parser.chunk_size_parsed > u64(parse_budget.chunk_ext_size_max) {
 				result.protocol_error = true
-				return result
+				return result, destination_size, body_size_received
 			}
 		}
 		result.consumed_size = len(network)
 		result.need_more = true
-		return result
+		return result, destination_size, body_size_received
 
 	case .Chunk_Data:
 		return _drain_body_payload(
@@ -194,23 +194,23 @@ drain_request_body :: proc "contextless" (
 	case .Chunk_Data_CRLF:
 		if len(network) == 0 {
 			result.need_more = true
-			return result
+			return result, destination_size, body_size_received
 		}
 		if network[0] != '\r' {
 			result.protocol_error = true
-			return result
+			return result, destination_size, body_size_received
 		}
 		if len(network) == 1 {
 			result.need_more = true
-			return result
+			return result, destination_size, body_size_received
 		}
 		if network[1] != '\n' {
 			result.protocol_error = true
-			return result
+			return result, destination_size, body_size_received
 		}
 		parser.phase = .Chunk_Size
 		result.consumed_size = 2
-		return result
+		return result, destination_size, body_size_received
 
 	case .Trailers:
 		cursor := 0
@@ -218,49 +218,49 @@ drain_request_body :: proc "contextless" (
 			if cursor >= len(network) {
 				result.consumed_size = cursor
 				result.need_more = true
-				return result
+				return result, destination_size, body_size_received
 			}
 			view := network[cursor:]
 			if len(view) == 1 && view[0] == '\r' {
 				result.consumed_size = cursor
 				result.need_more = true
-				return result
+				return result, destination_size, body_size_received
 			}
 			if len(view) >= 2 && view[0] == '\r' && view[1] == '\n' {
 				parser.phase = .Complete
 				result.consumed_size = cursor + 2
 				result.done = true
-				return result
+				return result, destination_size, body_size_received
 			}
 
 			line_end := bytes.index_byte(view, '\r')
 			if line_end < 0 {
 				if int(parser.header_size) + len(view) > int(parse_budget.header_size_max) {
 					result.protocol_error = true
-					return result
+					return result, destination_size, body_size_received
 				}
 				result.consumed_size = cursor
 				result.need_more = true
-				return result
+				return result, destination_size, body_size_received
 			}
 			if line_end + 1 >= len(view) {
 				result.consumed_size = cursor
 				result.need_more = true
-				return result
+				return result, destination_size, body_size_received
 			}
 			if view[line_end + 1] != '\n' {
 				result.protocol_error = true
-				return result
+				return result, destination_size, body_size_received
 			}
 
 			line_size := line_end + 2
 			if int(parser.header_size) + line_size > int(parse_budget.header_size_max) {
 				result.protocol_error = true
-				return result
+				return result, destination_size, body_size_received
 			}
 			if int(parser.header_count) >= int(parse_budget.header_count_max) {
 				result.protocol_error = true
-				return result
+				return result, destination_size, body_size_received
 			}
 			parser.header_size += u16(line_size)
 			parser.header_count += 1
@@ -269,11 +269,11 @@ drain_request_body :: proc "contextless" (
 
 	case .Complete:
 		result.done = true
-		return result
+		return result, destination_size, body_size_received
 
 	case:
 		result.protocol_error = true
-		return result
+		return result, destination_size, body_size_received
 	}
 }
 
@@ -282,45 +282,47 @@ _drain_body_payload :: proc "contextless" (
 	parser: ^Parser_State,
 	network: []u8,
 	destination: []u8,
-	destination_size: ^u32,
-	body_size_received: ^u64,
+	destination_size: u32,
+	body_size_received: u64,
 	body_size_max: u32,
 	buffered: bool,
 	fixed_length: bool,
-) -> Body_Drain_Result {
+) -> (Body_Drain_Result, u32, u64) {
 	result: Body_Drain_Result
+	new_destination_size := destination_size
+	new_body_size_received := body_size_received
 	remaining_size := parser.body_size_remaining if fixed_length else parser.chunk_size_remaining
 	if remaining_size == 0 {
 		parser.phase = .Complete if fixed_length else .Chunk_Data_CRLF
 		result.done = fixed_length
-		return result
+		return result, new_destination_size, new_body_size_received
 	}
 
 	available_size := min(len(network), int(remaining_size))
 	if available_size == 0 {
 		result.need_more = true
-		return result
+		return result, new_destination_size, new_body_size_received
 	}
 
-	next_body_size_received := body_size_received^ + u64(available_size)
+	next_body_size_received := new_body_size_received + u64(available_size)
 	if next_body_size_received > u64(body_size_max) {
 		result.body_too_large = true
-		return result
+		return result, new_destination_size, new_body_size_received
 	}
 
 	if buffered {
-		next_destination_size := int(destination_size^) + available_size
+		next_destination_size := int(new_destination_size) + available_size
 		if next_destination_size > len(destination) {
 			result.body_too_large = true
-			return result
+			return result, new_destination_size, new_body_size_received
 		}
-		copy(destination[int(destination_size^):][:available_size], network[:available_size])
-		destination_size^ = u32(next_destination_size)
+		copy(destination[int(new_destination_size):][:available_size], network[:available_size])
+		new_destination_size = u32(next_destination_size)
 	} else {
 		result.data_size = available_size
 	}
 
-	body_size_received^ = next_body_size_received
+	new_body_size_received = next_body_size_received
 	result.consumed_size = available_size
 
 	if fixed_length {
@@ -329,14 +331,14 @@ _drain_body_payload :: proc "contextless" (
 			parser.phase = .Complete
 			result.done = true
 		}
-		return result
+		return result, new_destination_size, new_body_size_received
 	}
 
 	parser.chunk_size_remaining -= u64(available_size)
 	if parser.chunk_size_remaining == 0 {
 		parser.phase = .Chunk_Data_CRLF
 	}
-	return result
+	return result, new_destination_size, new_body_size_received
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -395,14 +397,16 @@ test_drain_request_body_fixed_buffered :: proc(t: ^testing.T) {
 	}
 	destination := make([]u8, 8)
 	defer mem.delete(destination)
+	result: Body_Drain_Result
 	destination_size: u32
 	body_size_received: u64
-	result := drain_request_body(
+
+	result, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("hello"),
 		destination,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		5,
 		DEFAULT_PARSE_BUDGET,
 		true,
@@ -421,15 +425,20 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size_line: Body_Drain_Result
+	payload: Body_Drain_Result
+	chunk_data_end: Body_Drain_Result
+	zero_line: Body_Drain_Result
+	trailers_end: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size_line := drain_request_body(
+	size_line, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -438,12 +447,12 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 	testing.expect_value(t, size_line.consumed_size, 3)
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data)
 
-	payload := drain_request_body(
+	payload, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("Wiki"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -452,12 +461,12 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 	testing.expect_value(t, payload.data_size, 4)
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Data_CRLF)
 
-	chunk_data_end := drain_request_body(
+	chunk_data_end, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -465,12 +474,12 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 	testing.expect_value(t, chunk_data_end.protocol_error, false)
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Size)
 
-	zero_line := drain_request_body(
+	zero_line, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("0\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -478,12 +487,12 @@ test_drain_request_body_chunked_streamed_emits_payload_then_trailer_completion :
 	testing.expect_value(t, zero_line.protocol_error, false)
 	testing.expect_value(t, parser.phase, Parse_Phase.Trailers)
 
-	trailers_end := drain_request_body(
+	trailers_end, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -498,15 +507,17 @@ test_drain_request_body_chunked_accepts_chunk_extension :: proc(t: ^testing.T) {
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4;foo=bar\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -515,12 +526,12 @@ test_drain_request_body_chunked_accepts_chunk_extension :: proc(t: ^testing.T) {
 	testing.expect_value(t, size.consumed_size, len("4;"))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("foo=bar\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -539,15 +550,19 @@ test_drain_request_body_chunked_accepts_size_line_trailing_whitespace :: proc(t:
 	parser_tab := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	space_first: Body_Drain_Result
+	space_second: Body_Drain_Result
+	tab_first: Body_Drain_Result
+	tab_second: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	space_first := drain_request_body(
+	space_first, destination_size, body_size_received = drain_request_body(
 		&parser_space,
 		transmute([]u8)string("4 "),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -556,12 +571,12 @@ test_drain_request_body_chunked_accepts_size_line_trailing_whitespace :: proc(t:
 	testing.expect_value(t, space_first.consumed_size, len("4 "))
 	testing.expect_value(t, parser_space.phase, Parse_Phase.Chunk_Ext)
 
-	space_second := drain_request_body(
+	space_second, destination_size, body_size_received = drain_request_body(
 		&parser_space,
 		transmute([]u8)string("\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -571,12 +586,12 @@ test_drain_request_body_chunked_accepts_size_line_trailing_whitespace :: proc(t:
 	testing.expect_value(t, parser_space.chunk_size_remaining, u64(4))
 	testing.expect_value(t, parser_space.phase, Parse_Phase.Chunk_Data)
 
-	tab_first := drain_request_body(
+	tab_first, destination_size, body_size_received = drain_request_body(
 		&parser_tab,
 		transmute([]u8)string("4\t"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -585,12 +600,12 @@ test_drain_request_body_chunked_accepts_size_line_trailing_whitespace :: proc(t:
 	testing.expect_value(t, tab_first.consumed_size, len("4\t"))
 	testing.expect_value(t, parser_tab.phase, Parse_Phase.Chunk_Ext)
 
-	tab_second := drain_request_body(
+	tab_second, destination_size, body_size_received = drain_request_body(
 		&parser_tab,
 		transmute([]u8)string("\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -606,15 +621,17 @@ test_drain_request_body_chunked_accepts_extension_with_bws :: proc(t: ^testing.T
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4 ; foo=bar\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -623,12 +640,12 @@ test_drain_request_body_chunked_accepts_extension_with_bws :: proc(t: ^testing.T
 	testing.expect_value(t, size.consumed_size, len("4 "))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("; foo=bar\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -644,15 +661,17 @@ test_drain_request_body_chunked_accepts_multiple_extensions :: proc(t: ^testing.
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4;foo=bar;baz=qux\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -661,12 +680,12 @@ test_drain_request_body_chunked_accepts_multiple_extensions :: proc(t: ^testing.
 	testing.expect_value(t, size.consumed_size, len("4;"))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("foo=bar;baz=qux\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -682,15 +701,17 @@ test_drain_request_body_chunked_accepts_zero_chunk_with_extension :: proc(t: ^te
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("0;reason=done\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -699,12 +720,12 @@ test_drain_request_body_chunked_accepts_zero_chunk_with_extension :: proc(t: ^te
 	testing.expect_value(t, size.consumed_size, len("0;"))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("reason=done\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -720,15 +741,17 @@ test_drain_request_body_chunked_accepts_extension_quoted_string :: proc(t: ^test
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4;foo=\"hello world\"\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -737,12 +760,12 @@ test_drain_request_body_chunked_accepts_extension_quoted_string :: proc(t: ^test
 	testing.expect_value(t, size.consumed_size, len("4;"))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("foo=\"hello world\"\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -758,15 +781,17 @@ test_drain_request_body_chunked_rejects_extension_ctl :: proc(t: ^testing.T) {
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4;"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -775,12 +800,12 @@ test_drain_request_body_chunked_rejects_extension_ctl :: proc(t: ^testing.T) {
 	testing.expect_value(t, size.consumed_size, len("4;"))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("\x01foo\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -793,15 +818,17 @@ test_drain_request_body_chunked_rejects_extension_budget_overflow :: proc(t: ^te
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4;"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -814,12 +841,12 @@ test_drain_request_body_chunked_rejects_extension_budget_overflow :: proc(t: ^te
 	for i in 0 ..< len(extension) {
 		extension[i] = 'a'
 	}
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		extension[:],
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -832,15 +859,18 @@ test_drain_request_body_chunked_extension_survives_cr_fragmentation :: proc(t: ^
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext_fragment: Body_Drain_Result
+	ext_end: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4;foo\r"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -849,12 +879,12 @@ test_drain_request_body_chunked_extension_survives_cr_fragmentation :: proc(t: ^
 	testing.expect_value(t, size.consumed_size, len("4;"))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext_fragment := drain_request_body(
+	ext_fragment, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("foo\r"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -864,12 +894,12 @@ test_drain_request_body_chunked_extension_survives_cr_fragmentation :: proc(t: ^
 	testing.expect_value(t, ext_fragment.need_more, true)
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext_end := drain_request_body(
+	ext_end, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -885,15 +915,17 @@ test_drain_request_body_chunked_accepts_size_line_extension_without_semicolon ::
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	size: Body_Drain_Result
+	ext: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	size := drain_request_body(
+	size, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4 invalid\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -902,12 +934,12 @@ test_drain_request_body_chunked_accepts_size_line_extension_without_semicolon ::
 	testing.expect_value(t, size.consumed_size, len("4 "))
 	testing.expect_value(t, parser.phase, Parse_Phase.Chunk_Ext)
 
-	ext := drain_request_body(
+	ext, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("invalid\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -923,15 +955,17 @@ test_drain_request_body_chunked_size_line_survives_cr_fragmentation :: proc(t: ^
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	fragment_first: Body_Drain_Result
+	fragment_second: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	fragment_first := drain_request_body(
+	fragment_first, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("4\r"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -942,12 +976,12 @@ test_drain_request_body_chunked_size_line_survives_cr_fragmentation :: proc(t: ^
 	testing.expect_value(t, parser.chunk_size_parsed, u64(4))
 	testing.expect_value(t, parser.chunk_size_digit_count, u8(1))
 
-	fragment_second := drain_request_body(
+	fragment_second, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -964,15 +998,16 @@ test_drain_request_body_chunked_rejects_empty_size_line :: proc(t: ^testing.T) {
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	result: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	result := drain_request_body(
+	result, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -985,15 +1020,17 @@ test_drain_request_body_chunked_rejects_more_than_u64_hex_digits :: proc(t: ^tes
 	parser := Parser_State {
 		phase = .Chunk_Size,
 	}
-	body_size_received: u64
+	fragment_first: Body_Drain_Result
+	fragment_second: Body_Drain_Result
 	destination_size: u32
+	body_size_received: u64
 
-	fragment_first := drain_request_body(
+	fragment_first, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("0000000000000000"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -1002,12 +1039,12 @@ test_drain_request_body_chunked_rejects_more_than_u64_hex_digits :: proc(t: ^tes
 	testing.expect_value(t, fragment_first.need_more, true)
 	testing.expect_value(t, parser.chunk_size_digit_count, CHUNK_SIZE_DIGIT_COUNT_MAXIMUM)
 
-	fragment_second := drain_request_body(
+	fragment_second, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("0\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		16,
 		DEFAULT_PARSE_BUDGET,
 		false,
@@ -1022,13 +1059,14 @@ test_drain_request_body_chunked_rejects_chunk_size_over_body_budget :: proc(t: ^
 	}
 	body_size_received := u64(3)
 	destination_size: u32
+	result: Body_Drain_Result
 
-	result := drain_request_body(
+	result, destination_size, body_size_received = drain_request_body(
 		&parser,
 		transmute([]u8)string("3\r\n"),
 		nil,
-		&destination_size,
-		&body_size_received,
+		destination_size,
+		body_size_received,
 		5,
 		DEFAULT_PARSE_BUDGET,
 		false,

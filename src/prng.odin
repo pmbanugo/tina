@@ -22,18 +22,18 @@ prng_init :: proc "contextless" (p: ^Prng, seed: u64) {
 	local_seed := seed
 
 	// Inline SplitMix64 step
-	sm64_next :: #force_inline proc "contextless" (s: ^u64) -> u64 {
-		s^ += 0x9E3779B97F4A7C15
-		z := s^
+	sm64_next :: #force_inline proc "contextless" (s: u64) -> (u64, u64) {
+		next := s + 0x9E3779B97F4A7C15
+		z := next
 		z = (z ~ (z >> 30)) * 0xBF58476D1CE4E5B9
 		z = (z ~ (z >> 27)) * 0x94D049BB133111EB
-		return z ~ (z >> 31)
+		return z ~ (z >> 31), next
 	}
 
-	p.state[0] = sm64_next(&local_seed)
-	p.state[1] = sm64_next(&local_seed)
-	p.state[2] = sm64_next(&local_seed)
-	p.state[3] = sm64_next(&local_seed)
+	p.state[0], local_seed = sm64_next(local_seed)
+	p.state[1], local_seed = sm64_next(local_seed)
+	p.state[2], local_seed = sm64_next(local_seed)
+	p.state[3], local_seed = sm64_next(local_seed)
 
 	// Extremely unlikely all zero; ensure non-zero state to prevent generator death
 	if (p.state[0] | p.state[1] | p.state[2] | p.state[3]) == 0 {

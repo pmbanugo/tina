@@ -327,15 +327,15 @@ shard_build_supervision_tree :: proc(
 	Build_Result,
 	mem.Allocator_Error,
 ) {
-	group_index_next: u16 = 0
-	return _build_group(
+	build_result, build_error, _ := _build_group(
 		shard,
 		root_spec,
 		SUPERVISION_GROUP_ID_NONE,
-		&group_index_next,
+		0,
 		alloc,
 		arena_alloc_data,
 	)
+	return build_result, build_error
 }
 
 @(private = "package")
@@ -343,15 +343,16 @@ _build_group :: proc(
 	shard: ^Shard,
 	group_spec: ^Group_Spec,
 	parent_id: Supervision_Group_Id,
-	group_index_next: ^u16,
+	group_index_next: u16,
 	alloc: mem.Allocator,
 	arena_alloc_data: ^Grand_Arena_Allocator_Data,
 ) -> (
 	Build_Result,
 	mem.Allocator_Error,
+	u16,
 ) {
-	group_index := group_index_next^
-	group_index_next^ += 1
+	group_index := group_index_next
+	current_next := group_index_next + 1
 
 	group := &shard.supervision_groups[group_index]
 	group.group_id = Supervision_Group_Id(group_index)
@@ -374,7 +375,7 @@ _build_group :: proc(
 			int(group_index),
 		)
 		group.children_handles, allocation_error = make([]Isolate_Handle, child_capacity_count, alloc)
-		if allocation_error != .None do return .Ok, allocation_error
+		if allocation_error != .None do return .Ok, allocation_error, current_next
 	}
 
 	if group_spec.child_count_dynamic_max > 0 && len(group.dynamic_specs) == 0 {
@@ -388,7 +389,7 @@ _build_group :: proc(
 			group_spec.child_count_dynamic_max,
 			alloc,
 		)
-		if allocation_error != .None do return .Ok, allocation_error
+		if allocation_error != .None do return .Ok, allocation_error, current_next
 	}
 
 	_assert_group_layout(group)
@@ -406,31 +407,33 @@ _build_group :: proc(
 			// static child spawn in a tight loop without any state change is pure churn.
 			if !_spawn_static_child_at(shard, group, u16(i)) {
 				_escalate(shard, group)
-				return .Escalated, .None
+				return .Escalated, .None, current_next
 			}
 
 		case Group_Spec:
-			subgroup_id := Supervision_Group_Id(group_index_next^)
+			subgroup_id := Supervision_Group_Id(current_next)
 			group.children_handles[i] = _supervision_subgroup_handle_make(shard.id, subgroup_id)
 
-			build_result, build_error := _build_group(
+			build_result: Build_Result
+			build_error: mem.Allocator_Error
+			build_result, build_error, current_next = _build_group(
 				shard,
 				&s,
 				Supervision_Group_Id(group_index),
-				group_index_next,
+				current_next,
 				alloc,
 				arena_alloc_data,
 			)
 			if build_error != .None {
-				return .Ok, build_error
+				return .Ok, build_error, current_next
 			}
 			if build_result == .Escalated {
-				return .Escalated, .None
+				return .Escalated, .None, current_next
 			}
 		}
 	}
 
-	return .Ok, .None
+	return .Ok, .None, current_next
 }
 
 @(private = "package")
