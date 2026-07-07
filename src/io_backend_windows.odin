@@ -170,7 +170,17 @@ when !TINA_SIMULATION_MODE {
 		// OVERLAPPED entry or be rejected because the async entry pool is full.
 		async_submission_count: i32 = 0
 		for sub in submissions {
-			if _, is_close := sub.operation.(Submission_Op_Close); !is_close {
+			switch _ in sub.operation {
+			case Submission_Op_Close:
+			case Submission_Op_Read,
+			     Submission_Op_Write,
+			     Submission_Op_Accept,
+			     Submission_Op_Connect,
+			     Submission_Op_Send,
+			     Submission_Op_Recv,
+			     Submission_Op_Sendto,
+			     Submission_Op_Recvfrom,
+			     Submission_Op_Sendfile:
 				async_submission_count += 1
 			}
 		}
@@ -186,9 +196,19 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		for &sub in submissions {
-			if op, is_close := sub.operation.(Submission_Op_Close); is_close {
+			switch op in sub.operation {
+			case Submission_Op_Close:
 				_win_push_completion(backend, sub.token, _win_close_fd_result(op.fd), nil)
 				continue
+			case Submission_Op_Read,
+			     Submission_Op_Write,
+			     Submission_Op_Accept,
+			     Submission_Op_Connect,
+			     Submission_Op_Send,
+			     Submission_Op_Recv,
+			     Submission_Op_Sendto,
+			     Submission_Op_Recvfrom,
+			     Submission_Op_Sendfile:
 			}
 
 			entry_index := _win_alloc_entry(backend)
