@@ -314,13 +314,17 @@ when !TINA_SIMULATION_MODE {
 				}
 
 			case Submission_Op_Close:
-				// Close is synchronous — no overlapped needed
+				// Close is synchronous — no overlapped needed.
 				result: i32 = 0
-				if win.closesocket(win.SOCKET(uintptr(op.fd))) == win.SOCKET_ERROR {
-					// Try as a regular handle
-					if win.CloseHandle(win.HANDLE(uintptr(op.fd))) == win.FALSE {
-						result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+				flags: win.DWORD
+				if win.GetHandleInformation(win.HANDLE(uintptr(op.fd)), &flags) {
+					if win.closesocket(win.SOCKET(uintptr(op.fd))) == win.SOCKET_ERROR {
+						if win.CloseHandle(win.HANDLE(uintptr(op.fd))) == win.FALSE {
+							result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+						}
 					}
+				} else {
+					result = i32(IO_ERR_RESOURCE_EXHAUSTED)
 				}
 				_win_push_completion(backend, sub.token, result, nil)
 				entry.active = false
@@ -898,6 +902,10 @@ when !TINA_SIMULATION_MODE {
 
 	@(private = "package")
 	_backend_control_close :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
+		flags: win.DWORD
+		if !win.GetHandleInformation(win.HANDLE(uintptr(fd)), &flags) {
+			return .Invalid_Argument
+		}
 		if win.closesocket(win.SOCKET(uintptr(fd))) == win.SOCKET_ERROR {
 			if !win.CloseHandle(win.HANDLE(uintptr(fd))) {
 				return .System_Error
