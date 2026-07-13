@@ -18,6 +18,9 @@ package tina
 
 import "core:testing"
 import win "core:sys/windows"
+import "base:sanitizer"
+
+_ :: sanitizer
 
 when !TINA_SIMULATION_MODE {
 
@@ -33,6 +36,14 @@ when !TINA_SIMULATION_MODE {
 	// TODO: Consider exposing via Backend_Config if workloads require larger bursts.
 	MAX_WIN_COMPLETED :: REACTOR_SUBMISSION_BATCH_COUNT + REACTOR_COMPLETION_BATCH_COUNT
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_WIN_OVERLAPPED)
+
+	@(private = "package")
+	_backend_boot_scratch_size :: #force_inline proc "contextless" (
+		receive_slot_count: int,
+		fd_slot_count: int,
+	) -> int {
+		return 0
+	}
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_WIN_COMPLETED)
 
 	@(private = "file")
@@ -84,14 +95,31 @@ when !TINA_SIMULATION_MODE {
 		peer_address:     win.SOCKADDR_STORAGE_LH,
 		peer_address_len: win.INT,
 	}
+	Win_Overlapped_State :: enum u8 {
+		Free,
+		Prepared,
+		In_Flight,
+	}
 
-	Win_Overlapped_Entry :: struct {
+	// The entry payload has one free-slot lifetime, while OVERLAPPED and op_data
+	// gain a narrower kernel-owned lifetime after an operation becomes pending.
+	Win_Overlapped_Entry_Payload :: struct {
 		overlapped: win.OVERLAPPED,
 		token:      Submission_Token,
 		operation:  Submission_Operation,
 		op_data:    Win_Op_Data,
-		active:     bool,
 	}
+
+	Win_Overlapped_Entry :: struct {
+		using payload: Win_Overlapped_Entry_Payload,
+		state:         Win_Overlapped_State,
+	}
+	#assert(offset_of(Win_Overlapped_Entry, payload) == 0)
+	#assert(offset_of(Win_Overlapped_Entry_Payload, overlapped) == 0)
+	#assert(size_of(Win_Overlapped_Entry_Payload) % ASAN_POISON_GRANULE_SIZE == 0)
+	#assert(offset_of(Win_Overlapped_Entry, state) >= size_of(Win_Overlapped_Entry_Payload))
+	#assert(offset_of(Win_Overlapped_Entry_Payload, op_data) % ASAN_POISON_GRANULE_SIZE == 0)
+	#assert(size_of(Win_Op_Data) % ASAN_POISON_GRANULE_SIZE == 0)
 
 	// Layout guards: catch silent struct bloat or union mis-sizing at compile time.
 	#assert(size_of(Win_Op_Data) == size_of(Win_Recvfrom_Data), "Win_Op_Data must be sized by the larger variant (Recvfrom)")
@@ -107,9 +135,12 @@ when !TINA_SIMULATION_MODE {
 		completed:       [MAX_WIN_COMPLETED]Raw_Completion,
 		completed_count: u16,
 		completed_read:  u16,
-		accept_ex:       win.LPFN_ACCEPTEX,
-		connect_ex:      win.LPFN_CONNECTEX,
-		transmit_file:   LPFN_TRANSMITFILE,
+		accept_ex_ipv4:       win.LPFN_ACCEPTEX,
+		accept_ex_ipv6:       win.LPFN_ACCEPTEX,
+		connect_ex_ipv4:      win.LPFN_CONNECTEX,
+		connect_ex_ipv6:      win.LPFN_CONNECTEX,
+		transmit_file_ipv4:   LPFN_TRANSMITFILE,
+		transmit_file_ipv6:   LPFN_TRANSMITFILE,
 	}
 
 	// ============================================================================
@@ -128,25 +159,28 @@ when !TINA_SIMULATION_MODE {
 		backend.iocp = iocp
 		backend.completed_count = 0
 		backend.completed_read = 0
+		backend.accept_ex_ipv4 = nil
+		backend.accept_ex_ipv6 = nil
+		backend.connect_ex_ipv4 = nil
+		backend.connect_ex_ipv6 = nil
+		backend.transmit_file_ipv4 = nil
+		backend.transmit_file_ipv6 = nil
 
 		for i in 0 ..< MAX_WIN_OVERLAPPED {
-			backend.entries[i].active = false
+			backend.entries[i].state = .Free
 		}
 
-		// Load AcceptEx and ConnectEx function pointers via a dummy socket
-		dummy := win.WSASocketW(
-			win.AF_INET,
-			win.SOCK_STREAM,
-			win.IPPROTO_TCP,
-			nil,
-			0,
-			win.WSA_FLAG_OVERLAPPED,
-		)
-		if dummy != win.INVALID_SOCKET {
-			_win_load_socket_fn(dummy, win.WSAID_ACCEPTEX, &backend.accept_ex)
-			_win_load_socket_fn(dummy, win.WSAID_CONNECTEX, &backend.connect_ex)
-			_win_load_socket_fn(dummy, WSAID_TRANSMITFILE, &backend.transmit_file)
-			win.closesocket(dummy)
+		// Extension pointers are provider-specific. Load each address-family
+		// provider once at boot rather than issuing WSAIoctl on the data path.
+		_win_load_extension_functions(backend, win.AF_INET)
+		_win_load_extension_functions(backend, win.AF_INET6)
+		when TINA_ASAN_POISONING {
+			for i in 0 ..< MAX_WIN_OVERLAPPED {
+				_sanitizer_address_poison_raw(
+					rawptr(&backend.entries[i].payload),
+					size_of(backend.entries[i].payload),
+				)
+			}
 		}
 
 		return .None
@@ -154,6 +188,15 @@ when !TINA_SIMULATION_MODE {
 
 	@(private = "package")
 	_backend_deinit :: proc(backend: ^Platform_Backend) {
+		for i in 0 ..< MAX_WIN_OVERLAPPED {
+			assert(backend.entries[i].state == .Free, "Windows backend teardown requires every entry release")
+			when TINA_ASAN_POISONING {
+				_sanitizer_address_unpoison_raw(
+					rawptr(&backend.entries[i].payload),
+					size_of(backend.entries[i].payload),
+				)
+			}
+		}
 		if backend.iocp != nil {
 			win.CloseHandle(backend.iocp)
 			backend.iocp = nil
@@ -161,10 +204,26 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
+	_backend_quiesce_after_collect_fault :: proc(
+		backend: ^Platform_Backend,
+	) -> Backend_Quiesce_Result {
+		// Closing IOCP does not prove that Windows has stopped touching each
+		// OVERLAPPED and its buffers. Recovery is process-fatal while any such
+		// ownership remains; reclaiming arena memory would permit corruption.
+		for &entry in backend.entries {
+			if entry.state == .In_Flight {
+				return .Unproven
+			}
+		}
+		_backend_deinit(backend)
+		return .Quiesced
+	}
+
+	@(private = "package")
 	_backend_submit :: proc(
 		backend: ^Platform_Backend,
 		submissions: []Submission,
-	) -> Backend_Error {
+	) -> Backend_Submit_Result {
 		// All-or-error: pre-check overlapped entry capacity. Close is synchronous
 		// and completes through backend.completed, so it must not consume an
 		// OVERLAPPED entry or be rejected because the async entry pool is full.
@@ -187,18 +246,23 @@ when !TINA_SIMULATION_MODE {
 
 		available: i32 = 0
 		for i in 0 ..< MAX_WIN_OVERLAPPED {
-			if !backend.entries[i].active {
+			if backend.entries[i].state == .Free {
 				available += 1
 			}
 		}
 		if available < async_submission_count {
-			return .Queue_Full
+			return backend_submit_rejected(.Queue_Full)
+		}
+		// Every operation can complete immediately once ownership transfers.
+		// Reserve that worst case before issuing the first kernel operation.
+		if int(MAX_WIN_COMPLETED - backend.completed_count) < len(submissions) {
+			return backend_submit_rejected(.Queue_Full)
 		}
 
 		for &sub in submissions {
 			switch op in sub.operation {
 			case Submission_Op_Close:
-				_win_push_completion(backend, sub.token, _win_close_fd_result(op.fd), nil)
+				_win_store_completion_assert(backend, sub.token, _win_close_fd_result(op.fd), nil)
 				continue
 			case Submission_Op_Read,
 			     Submission_Op_Write,
@@ -212,11 +276,10 @@ when !TINA_SIMULATION_MODE {
 			}
 
 			entry_index := _win_alloc_entry(backend)
-			if entry_index < 0 {
-				return .Queue_Full
-			}
+			assert(entry_index >= 0, "Windows entry preflight must guarantee allocation")
 
 			entry := &backend.entries[entry_index]
+			assert(entry.state == .Prepared, "allocated Windows entry must be prepared")
 			entry.token = sub.token
 			entry.operation = sub.operation
 			entry.overlapped = {}
@@ -235,10 +298,11 @@ when !TINA_SIMULATION_MODE {
 				if ok == win.FALSE {
 					error := win.GetLastError()
 					if error == win.ERROR_IO_PENDING {
+						_win_mark_entry_in_flight(entry)
 						continue
 					}
 					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
+					_win_release_entry(entry)
 					continue
 				}
 				// Synchronous success with FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
@@ -257,99 +321,30 @@ when !TINA_SIMULATION_MODE {
 				if ok == win.FALSE {
 					error := win.GetLastError()
 					if error == win.ERROR_IO_PENDING {
+						_win_mark_entry_in_flight(entry)
 						continue
 					}
 					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
+					_win_release_entry(entry)
 					continue
 				}
 				_win_push_sync_completion(backend, entry)
 
 			case Submission_Op_Accept:
-				// Create the accept socket
-				client_sock := win.WSASocketW(
-					win.AF_INET,
-					win.SOCK_STREAM,
-					win.IPPROTO_TCP,
-					nil,
-					0,
-					win.WSA_FLAG_OVERLAPPED,
-				)
-				if client_sock == win.INVALID_SOCKET {
-					_win_push_error_completion(backend, sub.token, i32(win.WSAGetLastError()))
-					entry.active = false
-					continue
-				}
-				entry.op_data.accept.client_fd = OS_FD(client_sock)
-
-				received: win.DWORD
-				ok := win.TRUE
-				if backend.accept_ex != nil {
-					ok = backend.accept_ex(
-						win.SOCKET(uintptr(op.listen_fd)),
-						client_sock,
-						&entry.op_data.accept.buf,
-						0,
-						size_of(win.sockaddr_in6) + 16,
-						size_of(win.sockaddr_in6) + 16,
-						&received,
-						&entry.overlapped,
-					)
-				} else {
-					_win_push_completion(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED), nil)
-					win.closesocket(client_sock)
-					entry.op_data.accept.client_fd = OS_FD_INVALID
-					entry.active = false
-					continue
-				}
-
-				if ok == win.FALSE {
-					error := win.GetLastError()
-					if error == win.ERROR_IO_PENDING {
-						continue
-					}
-					win.closesocket(client_sock)
-					entry.op_data.accept.client_fd = OS_FD_INVALID
-					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
-					continue
-				}
+				is_pending := _win_submit_accept(backend, entry, &sub)
+				if !is_pending do continue
+				assert(entry.state == .Prepared, "pending AcceptEx must retain its prepared entry")
+				_win_mark_entry_in_flight(entry)
 
 			case Submission_Op_Connect:
-				// ConnectEx requires the socket to be bound first
-				_win_bind_for_connect(op.fd_socket, op.address)
-
-				sockaddr, socklen := _win_socket_address_to_sockaddr(op.address)
-				ok := win.TRUE
-				if backend.connect_ex != nil {
-					ok = backend.connect_ex(
-						win.SOCKET(uintptr(op.fd_socket)),
-						&sockaddr,
-						socklen,
-						nil,
-						0,
-						nil,
-						&entry.overlapped,
-					)
-				} else {
-					_win_push_completion(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED), nil)
-					entry.active = false
-					continue
-				}
-
-				if ok == win.FALSE {
-					error := win.GetLastError()
-					if error == win.ERROR_IO_PENDING {
-						continue
-					}
-					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
-					continue
-				}
+				is_pending := _win_submit_connect(backend, entry, &sub)
+				if !is_pending do continue
+				assert(entry.state == .Prepared, "pending ConnectEx must retain its prepared entry")
+				_win_mark_entry_in_flight(entry)
 
 			case Submission_Op_Close:
 				assert(false, "Close submissions complete synchronously before Win_Overlapped_Entry allocation")
-				entry.active = false
+				_win_release_entry(entry)
 				continue
 
 			case Submission_Op_Send:
@@ -369,10 +364,11 @@ when !TINA_SIMULATION_MODE {
 				if rc == win.SOCKET_ERROR {
 					error := win.WSAGetLastError()
 					if _win_is_pending(error) {
+						_win_mark_entry_in_flight(entry)
 						continue
 					}
 					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
+					_win_release_entry(entry)
 					continue
 				}
 				_win_push_sync_completion(backend, entry)
@@ -395,10 +391,11 @@ when !TINA_SIMULATION_MODE {
 				if rc == win.SOCKET_ERROR {
 					error := win.WSAGetLastError()
 					if _win_is_pending(error) {
+						_win_mark_entry_in_flight(entry)
 						continue
 					}
 					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
+					_win_release_entry(entry)
 					continue
 				}
 				_win_push_sync_completion(backend, entry)
@@ -423,10 +420,11 @@ when !TINA_SIMULATION_MODE {
 				if rc == win.SOCKET_ERROR {
 					error := win.WSAGetLastError()
 					if _win_is_pending(error) {
+						_win_mark_entry_in_flight(entry)
 						continue
 					}
 					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
+					_win_release_entry(entry)
 					continue
 				}
 				_win_push_sync_completion(backend, entry)
@@ -453,15 +451,16 @@ when !TINA_SIMULATION_MODE {
 				if rc == win.SOCKET_ERROR {
 					error := win.WSAGetLastError()
 					if _win_is_pending(error) {
+						_win_mark_entry_in_flight(entry)
 						continue
 					}
 					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
+					_win_release_entry(entry)
 					continue
 				}
 				// Synchronous success — peer address is already in entry.op_data.recvfrom
 				bytes := i32(uintptr(entry.overlapped.InternalHigh))
-				_win_push_completion(
+				_win_store_completion_assert(
 					backend,
 					entry.token,
 					bytes,
@@ -469,12 +468,12 @@ when !TINA_SIMULATION_MODE {
 						peer_address = _win_sockaddr_to_socket_address(&entry.op_data.recvfrom.peer_address),
 					},
 				)
-				entry.active = false
+				_win_release_entry(entry)
 
 			case Submission_Op_Sendfile:
 				if op.size == 0 {
-					_win_push_completion(backend, sub.token, 0, nil)
-					entry.active = false
+					_win_store_completion_assert(backend, sub.token, 0, nil)
+					_win_release_entry(entry)
 					continue
 				}
 
@@ -486,13 +485,25 @@ when !TINA_SIMULATION_MODE {
 				entry.overlapped.Offset = win.DWORD(op.source_offset & 0xFFFFFFFF)
 				entry.overlapped.OffsetHigh = win.DWORD(op.source_offset >> 32)
 
-				if backend.transmit_file == nil {
-					_win_push_error_completion(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED))
-					entry.active = false
+				transmit_file: LPFN_TRANSMITFILE
+				socket_family := _win_socket_family(op.fd_socket)
+				if socket_family == win.AF_INET {
+					transmit_file = backend.transmit_file_ipv4
+				} else if socket_family == win.AF_INET6 {
+					transmit_file = backend.transmit_file_ipv6
+				}
+				if transmit_file == nil {
+					_win_store_completion_assert(
+						backend,
+						sub.token,
+						i32(IO_ERR_RESOURCE_EXHAUSTED),
+						nil,
+					)
+					_win_release_entry(entry)
 					continue
 				}
 
-				ok := backend.transmit_file(
+				ok := transmit_file(
 					win.SOCKET(uintptr(op.fd_socket)),
 					win.HANDLE(uintptr(op.fd_file)),
 					win.DWORD(nbytes_to_send),
@@ -504,17 +515,18 @@ when !TINA_SIMULATION_MODE {
 				if ok == win.FALSE {
 					error := win.GetLastError()
 					if error == win.ERROR_IO_PENDING {
+						_win_mark_entry_in_flight(entry)
 						continue
 					}
 					_win_push_error_completion(backend, sub.token, i32(error))
-					entry.active = false
+					_win_release_entry(entry)
 					continue
 				}
 				_win_push_sync_completion(backend, entry)
 			}
 		}
 
-		return .None
+		return backend_submit_accepted()
 	}
 
 	@(private = "package")
@@ -522,16 +534,13 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		completions: []Raw_Completion,
 		timeout_ns: i64,
-	) -> (
-		u32,
-		Backend_Error,
-	) {
+	) -> Backend_Collect_Result {
 		count: u32 = 0
 
 		// 1. Drain immediate completions
 		for backend.completed_read < backend.completed_count {
 			if count >= u32(len(completions)) {
-				return count, .None
+				return Backend_Collect_Result{completion_count = count}
 			}
 			completions[count] = backend.completed[backend.completed_read]
 			backend.completed_read += 1
@@ -544,7 +553,7 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		if count >= u32(len(completions)) {
-			return count, .None
+			return Backend_Collect_Result{completion_count = count}
 		}
 
 		// 2. Harvest from IOCP
@@ -570,9 +579,9 @@ when !TINA_SIMULATION_MODE {
 		) {
 			error := win.GetLastError()
 			if error == win.WAIT_TIMEOUT || error == win.WAIT_IO_COMPLETION {
-				return count, .None
+				return Backend_Collect_Result{completion_count = count}
 			}
-			return count, .System_Error
+			return Backend_Collect_Result{completion_count = count, fault = .System_Error}
 		}
 
 		for i in 0 ..< entries_removed {
@@ -582,34 +591,30 @@ when !TINA_SIMULATION_MODE {
 				continue
 			}
 
-			entry := _win_entry_from_overlapped(backend, event.lpOverlapped)
-			if entry == nil {
-				continue
-			}
+			entry := _win_entry_from_overlapped(event.lpOverlapped)
+			assert(entry.state == .In_Flight, "IOCP completion must reference an in-flight entry")
+			_win_reclaim_entry(entry)
 
 			raw: Raw_Completion
 			raw.token = entry.token
 			raw.extra = nil
 
-			// Extract result from OVERLAPPED
+			// Query the owning API so cancellation, connection, handle, and
+			// permission failures remain distinguishable negative OS codes.
 			bytes_transferred := i32(event.dwNumberOfBytesTransferred)
+			raw.result = _win_overlapped_result(entry, event.dwNumberOfBytesTransferred)
 
-			if entry.overlapped.Internal != nil {
-				// Error — translate NTSTATUS to a negative error code
-				raw.result = i32(IO_ERR_RESOURCE_EXHAUSTED)
-			} else {
-				raw.result = bytes_transferred
+			if raw.result >= 0 {
 
 				// Handle operation-specific completion data
 				switch _ in entry.operation {
 				case Submission_Op_Accept:
 					when TINA_RUNTIME_ASSERTIONS { _, da_ok := entry.operation.(Submission_Op_Accept); assert(da_ok, "Win_Op_Data.accept variant read on non-Accept entry — raw union would return corrupt client_fd/sockaddr from overlapping Recvfrom memory") }
 					op := entry.operation.(Submission_Op_Accept)
-					if bytes_transferred >= 0 {
-						accept_fd := entry.op_data.accept.client_fd
-						// Associate accepted socket with IOCP at creation time
-						_win_associate_with_iocp(backend, win.HANDLE(uintptr(accept_fd)))
+					accept_fd := entry.op_data.accept.client_fd
+					assert(accept_fd != OS_FD_INVALID, "completed accept entry must own a client socket")
 
+					if bytes_transferred >= 0 {
 						// Inherit listen socket properties on the accepted socket
 						listen_sock := win.SOCKET(uintptr(op.listen_fd))
 						win.setsockopt(
@@ -642,6 +647,14 @@ when !TINA_SIMULATION_MODE {
 							client_fd      = accept_fd,
 							client_address = client_address,
 						}
+
+						// The socket ownership transfers to the completion.
+						entry.op_data.accept.client_fd = OS_FD_INVALID
+					} else {
+						// Error path: close the pre-created socket. The entry release
+						// below will finish cleanup.
+						win.closesocket(win.SOCKET(uintptr(accept_fd)))
+						entry.op_data.accept.client_fd = OS_FD_INVALID
 					}
 
 				case Submission_Op_Connect:
@@ -679,18 +692,19 @@ when !TINA_SIMULATION_MODE {
 				}
 			}
 
-			entry.active = false
+			_win_release_entry(entry)
 
 			// Deliver to output slice, or buffer internally if output is full
 			if count < u32(len(completions)) {
 				completions[count] = raw
 				count += 1
 			} else {
-				_win_push_completion(backend, raw.token, raw.result, raw.extra)
+				store_result := _win_push_completion(backend, raw.token, raw.result, raw.extra)
+				assert(store_result == .Stored, "IOCP overflow capacity preflight is insufficient")
 			}
 		}
 
-		return count, .None
+		return Backend_Collect_Result{completion_count = count}
 	}
 
 	@(private = "package")
@@ -700,7 +714,7 @@ when !TINA_SIMULATION_MODE {
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
 		for i in 0 ..< MAX_WIN_OVERLAPPED {
 			entry := &backend.entries[i]
-			if entry.active && entry.token == token {
+			if entry.state == .In_Flight && entry.token == token {
 				// Find the handle for CancelIoEx
 				handle := _win_entry_handle(entry)
 				if handle != win.INVALID_HANDLE_VALUE {
@@ -762,8 +776,13 @@ when !TINA_SIMULATION_MODE {
 			return OS_FD_INVALID, _win_map_socket_startup_error(win.WSAGetLastError())
 		}
 
-		// Associate with IOCP at creation time — before any I/O submission
-		_win_associate_with_iocp(backend, win.HANDLE(sock))
+		// Associate with IOCP at creation time — before any I/O submission.
+		// If association fails, the socket cannot be used safely with this backend.
+		associate_error := _win_associate_with_iocp(backend, win.HANDLE(sock))
+		if associate_error != .None {
+			win.closesocket(sock)
+			return OS_FD_INVALID, associate_error
+		}
 
 		return OS_FD(sock), .None
 	}
@@ -946,26 +965,15 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_register_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) {
+	_backend_register_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) -> Backend_Fixed_File_Update_Result {
 		// No-op: IOCP has no fixed-file table.
+		return .Optimization_Disabled
 	}
 
 	@(private = "package")
-	_backend_unregister_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16) {
+	_backend_unregister_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16) -> Backend_Fixed_File_Update_Result {
 		// No-op: IOCP has no fixed-file table.
-	}
-
-	@(private = "package")
-	_backend_recv_uses_provided_buffers :: #force_inline proc "contextless" (backend: ^Platform_Backend) -> bool {
-		return false
-	}
-
-	@(private = "package")
-	_backend_replenish_recv_buffer :: #force_inline proc "contextless" (
-		backend: ^Platform_Backend,
-		buffer_index: IO_Slot_Index,
-	) {
-		// No provided buffer ring on Windows — receive pool free-list manages slots.
+		return .Optimization_Disabled
 	}
 
 	@(test)
@@ -982,14 +990,176 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	// ============================================================================
+	// Accept/Connect Submit Helpers
+	// ============================================================================
+
+	// Create the accept socket and start AcceptEx. Pending operations retain the
+	// prepared entry; every synchronous result releases it before returning.
+	@(private = "file")
+	_win_submit_accept :: proc(
+		backend: ^Platform_Backend,
+		entry: ^Win_Overlapped_Entry,
+		sub: ^Submission,
+	) -> bool {
+		op := sub.operation.(Submission_Op_Accept)
+		entry.op_data.accept.client_fd = OS_FD_INVALID
+		address_family := _win_socket_family(op.listen_fd)
+		accept_ex: win.LPFN_ACCEPTEX
+		if address_family == win.AF_INET {
+			accept_ex = backend.accept_ex_ipv4
+		} else if address_family == win.AF_INET6 {
+			accept_ex = backend.accept_ex_ipv6
+		}
+
+		client_sock := win.WSASocketW(
+			address_family,
+			win.SOCK_STREAM,
+			win.IPPROTO_TCP,
+			nil,
+			0,
+			win.WSA_FLAG_OVERLAPPED,
+		)
+		if client_sock == win.INVALID_SOCKET {
+			_win_push_error_completion(backend, sub.token, i32(win.WSAGetLastError()))
+			_win_release_entry(entry)
+			return false
+		}
+		entry.op_data.accept.client_fd = OS_FD(client_sock)
+
+		associate_error := _win_associate_with_iocp(backend, win.HANDLE(client_sock))
+		if associate_error != .None {
+			win.closesocket(client_sock)
+			entry.op_data.accept.client_fd = OS_FD_INVALID
+			_win_push_error_completion(backend, sub.token, i32(associate_error))
+			_win_release_entry(entry)
+			return false
+		}
+
+		if accept_ex == nil {
+			_win_store_completion_assert(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED), nil)
+			win.closesocket(client_sock)
+			entry.op_data.accept.client_fd = OS_FD_INVALID
+			_win_release_entry(entry)
+			return false
+		}
+
+		received: win.DWORD
+		ok := accept_ex(
+			win.SOCKET(uintptr(op.listen_fd)),
+			client_sock,
+			&entry.op_data.accept.buf,
+			0,
+			size_of(win.sockaddr_in6) + 16,
+			size_of(win.sockaddr_in6) + 16,
+			&received,
+			&entry.overlapped,
+		)
+
+		if ok == win.FALSE {
+			error := win.GetLastError()
+			if error == win.ERROR_IO_PENDING {
+				return true
+			}
+			win.closesocket(client_sock)
+			entry.op_data.accept.client_fd = OS_FD_INVALID
+			_win_push_error_completion(backend, sub.token, i32(error))
+			_win_release_entry(entry)
+			return false
+		}
+
+		_win_complete_accept_success(backend, entry)
+		return false
+	}
+
+	// Bind the socket for ConnectEx if needed, then start ConnectEx.
+	@(private = "file")
+	_win_submit_connect :: proc(
+		backend: ^Platform_Backend,
+		entry: ^Win_Overlapped_Entry,
+		sub: ^Submission,
+	) -> bool {
+		op := sub.operation.(Submission_Op_Connect)
+		connect_ex := backend.connect_ex_ipv4
+		#partial switch _ in op.address {
+		case Socket_Address_Inet6:
+			connect_ex = backend.connect_ex_ipv6
+		}
+
+		// ConnectEx requires the socket to be bound first
+		_win_bind_for_connect(op.fd_socket, op.address)
+
+		sockaddr, socklen := _win_socket_address_to_sockaddr(op.address)
+		if connect_ex == nil {
+			_win_store_completion_assert(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED), nil)
+			_win_release_entry(entry)
+			return false
+		}
+
+		ok := connect_ex(
+			win.SOCKET(uintptr(op.fd_socket)),
+			&sockaddr,
+			socklen,
+			nil,
+			0,
+			nil,
+			&entry.overlapped,
+		)
+
+		if ok == win.FALSE {
+			error := win.GetLastError()
+			if error == win.ERROR_IO_PENDING {
+				return true
+			}
+			_win_push_error_completion(backend, sub.token, i32(error))
+			_win_release_entry(entry)
+			return false
+		}
+
+		_win_complete_connect_success(backend, entry)
+		return false
+	}
+
+	// Release an overlapped entry and any resources it owns. For accept entries,
+	// close the client socket if it was not transferred to a completion.
+	@(private = "file")
+	_win_release_entry :: proc(entry: ^Win_Overlapped_Entry) {
+		assert(entry.state == .Prepared, "only a prepared Windows entry can be released")
+
+		switch _ in entry.operation {
+		case Submission_Op_Accept:
+			if entry.op_data.accept.client_fd != OS_FD_INVALID {
+				win.closesocket(win.SOCKET(uintptr(entry.op_data.accept.client_fd)))
+				entry.op_data.accept.client_fd = OS_FD_INVALID
+			}
+		case Submission_Op_Read,
+		     Submission_Op_Write,
+		     Submission_Op_Connect,
+		     Submission_Op_Close,
+		     Submission_Op_Send,
+		     Submission_Op_Recv,
+		     Submission_Op_Sendto,
+		     Submission_Op_Recvfrom,
+		     Submission_Op_Sendfile:
+			// No platform resources to release beyond the entry itself.
+		}
+
+		entry.state = .Free
+		_sanitizer_address_poison_raw(rawptr(&entry.payload), size_of(entry.payload))
+	}
+
+	// ============================================================================
 	// Internal Helpers
 	// ============================================================================
 
 	@(private = "file")
 	_win_alloc_entry :: proc(backend: ^Platform_Backend) -> i32 {
 		for i in 0 ..< MAX_WIN_OVERLAPPED {
-			if !backend.entries[i].active {
-				backend.entries[i].active = true
+			if backend.entries[i].state == .Free {
+				_sanitizer_address_unpoison_raw(
+					rawptr(&backend.entries[i].payload),
+					size_of(backend.entries[i].payload),
+				)
+				backend.entries[i].state = .Prepared
 				return i32(i)
 			}
 		}
@@ -997,17 +1167,26 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
+	_win_mark_entry_in_flight :: #force_inline proc "contextless" (entry: ^Win_Overlapped_Entry) {
+		_sanitizer_address_poison_raw(rawptr(&entry.overlapped), size_of(entry.overlapped))
+		// Freezing the raw union for every operation keeps one ownership rule;
+		// AcceptEx and WSARecvFrom are the variants the kernel actually writes.
+		_sanitizer_address_poison_raw(rawptr(&entry.op_data), size_of(entry.op_data))
+		entry.state = .In_Flight
+	}
+
+	@(private = "file")
+	_win_reclaim_entry :: #force_inline proc "contextless" (entry: ^Win_Overlapped_Entry) {
+		_sanitizer_address_unpoison_raw(rawptr(&entry.overlapped), size_of(entry.overlapped))
+		_sanitizer_address_unpoison_raw(rawptr(&entry.op_data), size_of(entry.op_data))
+		entry.state = .Prepared
+	}
+
+	@(private = "file")
 	_win_entry_from_overlapped :: proc(
-		backend: ^Platform_Backend,
 		overlapped: ^win.OVERLAPPED,
 	) -> ^Win_Overlapped_Entry {
-		// Scan entries for matching overlapped address
-		for i in 0 ..< MAX_WIN_OVERLAPPED {
-			if &backend.entries[i].overlapped == overlapped {
-				return &backend.entries[i]
-			}
-		}
-		return nil
+		return cast(^Win_Overlapped_Entry)overlapped
 	}
 
 	@(private = "file")
@@ -1039,6 +1218,61 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
+	_win_overlapped_result :: proc(
+		entry: ^Win_Overlapped_Entry,
+		bytes_transferred_event: win.DWORD,
+	) -> i32 {
+		bytes_transferred := bytes_transferred_event
+		switch op in entry.operation {
+		case Submission_Op_Read:
+			handle := win.HANDLE(uintptr(op.fd))
+			if win.GetOverlappedResult(
+				handle,
+				&entry.overlapped,
+				&bytes_transferred,
+				win.FALSE,
+			) != win.FALSE {
+				return i32(bytes_transferred)
+			}
+			return -i32(win.GetLastError())
+		case Submission_Op_Write:
+			handle := win.HANDLE(uintptr(op.fd))
+			if win.GetOverlappedResult(
+				handle,
+				&entry.overlapped,
+				&bytes_transferred,
+				win.FALSE,
+			) != win.FALSE {
+				return i32(bytes_transferred)
+			}
+			return -i32(win.GetLastError())
+		case Submission_Op_Accept,
+		     Submission_Op_Connect,
+		     Submission_Op_Send,
+		     Submission_Op_Recv,
+		     Submission_Op_Sendto,
+		     Submission_Op_Recvfrom,
+		     Submission_Op_Sendfile:
+			flags: win.DWORD
+			socket := win.SOCKET(uintptr(_win_entry_handle(entry)))
+			if win.WSAGetOverlappedResult(
+				socket,
+				&entry.overlapped,
+				&bytes_transferred,
+				win.FALSE,
+				&flags,
+			) != win.FALSE {
+				return i32(bytes_transferred)
+			}
+			return -i32(win.WSAGetLastError())
+		case Submission_Op_Close:
+			assert(false, "close submissions never own an OVERLAPPED entry")
+			return i32(IO_ERR_BACKEND_FAILURE)
+		}
+		return i32(IO_ERR_BACKEND_FAILURE)
+	}
+
+	@(private = "file")
 	_win_close_fd_result :: proc "contextless" (fd: OS_FD) -> i32 {
 		if win.closesocket(win.SOCKET(uintptr(fd))) != win.SOCKET_ERROR {
 			return 0
@@ -1067,14 +1301,27 @@ when !TINA_SIMULATION_MODE {
 		token: Submission_Token,
 		result: i32,
 		extra: Completion_Extra,
-	) {
+	) -> Backend_Completion_Store_Result {
 		if backend.completed_count < MAX_WIN_COMPLETED {
 			c := &backend.completed[backend.completed_count]
 			c.token = token
 			c.result = result
 			c.extra = extra
 			backend.completed_count += 1
+			return .Stored
 		}
+		return .Capacity_Exhausted
+	}
+
+	@(private = "file")
+	_win_store_completion_assert :: proc(
+		backend: ^Platform_Backend,
+		token: Submission_Token,
+		result: i32,
+		extra: Completion_Extra,
+	) {
+		store_result := _win_push_completion(backend, token, result, extra)
+		assert(store_result == .Stored, "immediate completion capacity was preflighted")
 	}
 
 	@(private = "file")
@@ -1083,24 +1330,84 @@ when !TINA_SIMULATION_MODE {
 		token: Submission_Token,
 		error: i32,
 	) {
-		_win_push_completion(backend, token, -error, nil)
+		result := _win_push_completion(backend, token, -error, nil)
+		assert(result == .Stored, "immediate error completion capacity was preflighted")
 	}
 
 	@(private = "file")
 	_win_push_sync_completion :: proc(backend: ^Platform_Backend, entry: ^Win_Overlapped_Entry) {
 		bytes := i32(uintptr(entry.overlapped.InternalHigh))
-		_win_push_completion(backend, entry.token, bytes, nil)
-		entry.active = false
+		result := _win_push_completion(backend, entry.token, bytes, nil)
+		assert(result == .Stored, "immediate completion capacity was preflighted")
+		_win_release_entry(entry)
+	}
+
+	// Synchronous AcceptEx success. The accepted socket was already associated
+	// with IOCP in _win_submit_accept before AcceptEx was issued, so no
+	// re-association is needed here. The invariant is: associate once at
+	// creation time, never again.
+	@(private = "file")
+	_win_complete_accept_success :: proc(backend: ^Platform_Backend, entry: ^Win_Overlapped_Entry) {
+		op := entry.operation.(Submission_Op_Accept)
+		accept_fd := entry.op_data.accept.client_fd
+		listen_socket := win.SOCKET(uintptr(op.listen_fd))
+		win.setsockopt(
+			win.SOCKET(uintptr(accept_fd)), win.SOL_SOCKET, win.SO_UPDATE_ACCEPT_CONTEXT,
+			(^win.CHAR)(&listen_socket), size_of(listen_socket),
+		)
+		local_address, remote_address: ^win.sockaddr
+		local_size, remote_size: win.INT
+		win.GetAcceptExSockaddrs(
+			&entry.op_data.accept.buf, 0, size_of(win.sockaddr_in6) + 16,
+			size_of(win.sockaddr_in6) + 16, &local_address, &local_size,
+			&remote_address, &remote_size,
+		)
+		result := _win_push_completion(backend, entry.token, 0, Completion_Extra_Accept {
+			client_fd = accept_fd,
+			client_address = _win_sockaddr_to_socket_address((^win.SOCKADDR_STORAGE_LH)(remote_address)),
+		})
+		assert(result == .Stored, "immediate accept completion capacity was preflighted")
+		entry.op_data.accept.client_fd = OS_FD_INVALID
+		_win_release_entry(entry)
+	}
+
+	@(private = "file")
+	_win_complete_connect_success :: proc(backend: ^Platform_Backend, entry: ^Win_Overlapped_Entry) {
+		op := entry.operation.(Submission_Op_Connect)
+		win.setsockopt(
+			win.SOCKET(uintptr(op.fd_socket)), win.SOL_SOCKET,
+			win.SO_UPDATE_CONNECT_CONTEXT, nil, 0,
+		)
+		result := _win_push_completion(backend, entry.token, 0, nil)
+		assert(result == .Stored, "immediate connect completion capacity was preflighted")
+		_win_release_entry(entry)
 	}
 
 	// Associate a handle with IOCP and enable skip-on-success.
 	// Called exactly once per FD at creation time (control_socket or accept completion).
 	// Invariant: never called on an already-associated handle.
+	//
+	// Returns an error if either association or skip-on-success mode fails.
+	// Skip-on-success is a semantic requirement of this backend: synchronous
+	// completion paths in _backend_submit push the completion immediately, so
+	// an IOCP completion for the same operation must not arrive later.
 	@(private = "file")
-	_win_associate_with_iocp :: proc(backend: ^Platform_Backend, handle: win.HANDLE) {
-		win.CreateIoCompletionPort(handle, backend.iocp, 0, 0)
+	_win_associate_with_iocp :: proc(backend: ^Platform_Backend, handle: win.HANDLE) -> Backend_Error {
+		if backend.iocp == nil {
+			return .System_Error
+		}
+
+		port := win.CreateIoCompletionPort(handle, backend.iocp, 0, 0)
+		if port == nil {
+			return .System_Error
+		}
+
 		cmode: u8 = win.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | win.FILE_SKIP_SET_EVENT_ON_HANDLE
-		win.SetFileCompletionNotificationModes(handle, cmode)
+		if win.SetFileCompletionNotificationModes(handle, cmode) == win.FALSE {
+			return .System_Error
+		}
+
+		return .None
 	}
 
 	@(private = "file")
@@ -1137,6 +1444,43 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		win.bind(win.SOCKET(uintptr(fd)), &bind_addr, bind_len)
+	}
+
+	@(private = "file")
+	_win_load_extension_functions :: proc(backend: ^Platform_Backend, address_family: i32) {
+		dummy := win.WSASocketW(
+			address_family,
+			win.SOCK_STREAM,
+			win.IPPROTO_TCP,
+			nil,
+			0,
+			win.WSA_FLAG_OVERLAPPED,
+		)
+		if dummy == win.INVALID_SOCKET {
+			return
+		}
+		defer win.closesocket(dummy)
+
+		if address_family == win.AF_INET {
+			_win_load_socket_fn(dummy, win.WSAID_ACCEPTEX, &backend.accept_ex_ipv4)
+			_win_load_socket_fn(dummy, win.WSAID_CONNECTEX, &backend.connect_ex_ipv4)
+			_win_load_socket_fn(dummy, WSAID_TRANSMITFILE, &backend.transmit_file_ipv4)
+		} else if address_family == win.AF_INET6 {
+			_win_load_socket_fn(dummy, win.WSAID_ACCEPTEX, &backend.accept_ex_ipv6)
+			_win_load_socket_fn(dummy, win.WSAID_CONNECTEX, &backend.connect_ex_ipv6)
+			_win_load_socket_fn(dummy, WSAID_TRANSMITFILE, &backend.transmit_file_ipv6)
+		}
+	}
+
+	@(private = "file")
+	_win_socket_family :: proc "contextless" (fd: OS_FD) -> i32 {
+		address: win.SOCKADDR_STORAGE_LH
+		address_size := win.c_int(size_of(address))
+		result := win.getsockname(win.SOCKET(uintptr(fd)), &address, &address_size)
+		if result == win.SOCKET_ERROR {
+			return 0
+		}
+		return i32(address.ss_family)
 	}
 
 	@(private = "file")
@@ -1286,12 +1630,13 @@ when !TINA_SIMULATION_MODE {
 			{token = token, operation = Submission_Op_Close{fd = fd}},
 		}
 		sub_error := backend_submit(backend, submissions[:])
-		testing.expect_value(t, sub_error, Backend_Error.None)
+		testing.expect_value(t, sub_error.status, Backend_Submit_Status.Accepted)
 
 		// Collect the close completion
 		completions: [4]Raw_Completion
-		count, collect_error := backend_collect(backend, completions[:], 0)
-		testing.expect_value(t, collect_error, Backend_Error.None)
+		collect_result := backend_collect(backend, completions[:], 0)
+		count := collect_result.completion_count
+		testing.expect_value(t, collect_result.fault, Backend_Collect_Fault.None)
 		testing.expect(t, count >= 1, "close should produce a completion")
 		testing.expect_value(t, completions[0].token, token)
 		testing.expect(t, completions[0].result >= 0, "close of valid socket should succeed")
@@ -1347,8 +1692,8 @@ when !TINA_SIMULATION_MODE {
 		connect_found := false
 
 		for _ in 0 ..< 20 {
-			count, _ := backend_collect(backend, completions[collected:], 50_000_000) // 50ms
-			collected += count
+			collect_result := backend_collect(backend, completions[collected:], 50_000_000) // 50ms
+			collected += collect_result.completion_count
 			// Check what we have
 			for i in 0 ..< collected {
 				if completions[i].token == accept_token do accept_found = true
@@ -1419,8 +1764,8 @@ when !TINA_SIMULATION_MODE {
 		completions: [4]Raw_Completion
 		collected: u32 = 0
 		for _ in 0 ..< 10 {
-			count, _ := backend_collect(backend, completions[collected:], 50_000_000)
-			collected += count
+			collect_result := backend_collect(backend, completions[collected:], 50_000_000)
+			collected += collect_result.completion_count
 			if collected >= 1 do break
 		}
 
@@ -1492,8 +1837,8 @@ when !TINA_SIMULATION_MODE {
 		collected: u32 = 0
 		server_fd := OS_FD_INVALID
 		for _ in 0 ..< 20 {
-			count, _ := backend_collect(backend, completions[collected:], 50_000_000)
-			collected += count
+			collect_result := backend_collect(backend, completions[collected:], 50_000_000)
+			collected += collect_result.completion_count
 			accept_done := false
 			connect_done := false
 			for i in 0 ..< collected {
@@ -1548,8 +1893,8 @@ when !TINA_SIMULATION_MODE {
 		recv_done := false
 		recv_byte_count: i32 = 0
 		for _ in 0 ..< 20 {
-			count, _ := backend_collect(backend, completions[collected:], 50_000_000)
-			collected += count
+			collect_result := backend_collect(backend, completions[collected:], 50_000_000)
+			collected += collect_result.completion_count
 			for i in 0 ..< collected {
 				if completions[i].token == send_token do send_done = true
 				if completions[i].token == recv_token {
@@ -1596,14 +1941,16 @@ when !TINA_SIMULATION_MODE {
 
 		// Collect with a 1-slot output slice — only 1 should be returned
 		completions_small: [1]Raw_Completion
-		count_first, err_first := backend_collect(backend, completions_small[:], 0)
-		testing.expect_value(t, err_first, Backend_Error.None)
+		result_first := backend_collect(backend, completions_small[:], 0)
+		count_first := result_first.completion_count
+		testing.expect_value(t, result_first.fault, Backend_Collect_Fault.None)
 		testing.expect_value(t, count_first, 1)
 
 		// Collect again — the remaining 2 should come from the internal buffer
 		completions_rest: [4]Raw_Completion
-		count_rest, err_rest := backend_collect(backend, completions_rest[:], 0)
-		testing.expect_value(t, err_rest, Backend_Error.None)
+		result_rest := backend_collect(backend, completions_rest[:], 0)
+		count_rest := result_rest.completion_count
+		testing.expect_value(t, result_rest.fault, Backend_Collect_Fault.None)
 		testing.expect_value(t, count_rest, 2)
 
 		// Verify all 3 tokens were delivered (order may vary)
@@ -1635,14 +1982,69 @@ when !TINA_SIMULATION_MODE {
 			{token = token, operation = Submission_Op_Close{fd = OS_FD(uintptr(0xDEADBEEF))}},
 		}
 		sub_error := backend_submit(backend, submissions[:])
-		if !testing.expect_value(t, sub_error, Backend_Error.None) do return
+		if !testing.expect_value(t, sub_error.status, Backend_Submit_Status.Accepted) do return
 		if !testing.expect_value(t, backend.completed_count, u16(1)) do return
 		testing.expect_value(t, backend.completed_read, u16(0))
 
 		completions: [4]Raw_Completion
-		count, _ := backend_collect(backend, completions[:], 0)
+		count := backend_collect(backend, completions[:], 0).completion_count
 		if !testing.expect(t, count >= 1, "close should produce a completion") do return
 		testing.expect(t, completions[0].result < 0, "close of invalid FD should yield negative result")
+	}
+
+	when TINA_ASAN_POISONING {
+		@(test)
+		test_windows_overlapped_entry_lifetime_is_poisoned :: proc(t: ^testing.T) {
+			backend: Platform_Backend
+			entry := &backend.entries[0]
+			entry.state = .Free
+			_sanitizer_address_poison_raw(rawptr(&entry.payload), size_of(entry.payload))
+
+			entry_index := _win_alloc_entry(&backend)
+			testing.expect_value(t, entry_index, i32(0))
+			entry.token = Submission_Token(1)
+			entry.operation = Submission_Op_Read{}
+			entry.overlapped = {}
+			testing.expect(
+				t,
+				sanitizer.address_region_is_poisoned_rawptr(
+					rawptr(&entry.payload),
+					size_of(entry.payload),
+				) == nil,
+				"prepared Windows entry payload must be addressable",
+			)
+
+			_win_mark_entry_in_flight(entry)
+			testing.expect(
+				t,
+				sanitizer.address_region_is_poisoned_rawptr(
+					rawptr(&entry.overlapped),
+					size_of(entry.overlapped),
+				) != nil,
+				"kernel-owned OVERLAPPED must be poisoned",
+			)
+			testing.expect_value(t, entry.state, Win_Overlapped_State.In_Flight)
+
+			_win_reclaim_entry(entry)
+			testing.expect(
+				t,
+				sanitizer.address_region_is_poisoned_rawptr(
+					rawptr(&entry.overlapped),
+					size_of(entry.overlapped),
+				) == nil,
+				"completed OVERLAPPED must be addressable before result decoding",
+			)
+			_win_release_entry(entry)
+			testing.expect(
+				t,
+				sanitizer.address_region_is_poisoned_rawptr(
+					rawptr(&entry.payload),
+					size_of(entry.payload),
+				) != nil,
+				"free Windows entry payload must be poisoned",
+			)
+			_sanitizer_address_unpoison_raw(rawptr(&entry.payload), size_of(entry.payload))
+		}
 	}
 
 } // when !TINA_SIM

@@ -11,21 +11,31 @@ RECOVERY_TIER_3 :: 1
 RECOVERY_WATCHDOG :: 2
 RECOVERY_ROOT_ESCALATE :: 3
 RECOVERY_SOFT_KILL :: 4
+RECOVERY_BACKEND_COLLECT :: 5
 
 @(private = "package")
 recovery_reason_label :: #force_inline proc "contextless" (reason: i32) -> string {
 	@(static, rodata)
-	labels := [5]string {
+	labels := [6]string {
 		"None",
 		"Signal (SIGSEGV/BUS/FPE)",
 		"Watchdog (SIGUSR1)",
 		"Root Escalate",
 		"Soft Kill",
+		"I/O Backend Collect Fault",
 	}
 	if reason >= 0 && reason < i32(len(labels)) {
 		return labels[reason]
 	}
 	return "Unknown"
+}
+
+@(private = "file")
+_scheduler_service_io :: proc(shard: ^Shard) {
+	fault := reactor_service_nonblocking(&shard.reactor, shard)
+	if fault != .None {
+		os_trap_restore(&shard.trap_environment_outer, RECOVERY_BACKEND_COLLECT)
+	}
 }
 
 @(thread_local)
@@ -101,6 +111,9 @@ Isolate_Metadata :: struct {
 	io_sequence:          u8,
 }
 
+// Lock the measured layout so control-state growth is an explicit decision.
+#assert(size_of(Isolate_Metadata) == 68)
+
 Shard_Counters :: struct {
 	stale_delivery_drops:              u64,
 	ring_full_drops:                   u64,
@@ -116,7 +129,7 @@ Shard_Counters :: struct {
 	// interrupted WAITING_FOR_IO Isolates. A mismatch would indicate
 	// a stale completion was lost (buffer leak) or double-counted.
 	// Might require tracking a separate "io_wakes" counter to compare against.
-	io_recv_no_buffers_count:          u64,
+	io_backend_fault_count:            u64,
 	staging_slot_leaks:                u64, // leak signal.
 	transfer_exhaustions:              u64,
 	transfer_stale_reads:              u64,
@@ -933,9 +946,7 @@ _slot_set_io_submit_failure :: #force_inline proc "contextless" (
 	_dispatchable_refresh_slot(shard, type_id, slot_index)
 }
 
-// Returns a buffer slot to its owning pool based on the operation's pool
-// affinity. For receive-pool buffers, handles provided buffer ring
-// replenishment when active on Linux.
+// Returns a buffer slot to its owning pool based on the operation's affinity.
 @(private = "package")
 _io_slot_return_to_pool :: #force_inline proc(
 	reactor: ^Reactor,
@@ -945,14 +956,7 @@ _io_slot_return_to_pool :: #force_inline proc(
 	if slot_index == IO_SLOT_INDEX_NONE do return
 	switch affinity {
 	case .Receive:
-		if backend_recv_uses_provided_buffers(&reactor.backend) {
-			when TINA_ASAN_POISONING {
-				_sanitizer_address_poison_io_slot(&reactor.receive_pool, slot_index)
-			}
-			backend_replenish_recv_buffer(&reactor.backend, slot_index)
-		} else {
-			_reactor_receive_pool_free(reactor, slot_index)
-		}
+		_reactor_receive_pool_free(reactor, slot_index)
 	case .Staging:
 		_reactor_staging_pool_free(reactor, slot_index)
 	case .None:
@@ -1294,7 +1298,7 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 	for turn_work_budget_count > 0 && scanned_type_count < type_count {
 		if dispatch_since_io_service_count >= io_service_interval_count {
 			if shard.counters.io_awaiting_count > 0 {
-				reactor_service_nonblocking(&shard.reactor, shard)
+				_scheduler_service_io(shard)
 			}
 			dispatch_since_io_service_count = 0
 		}
@@ -1346,7 +1350,7 @@ _scheduler_run_dispatch_turn :: proc(shard: ^Shard) {
 
 		if dispatch_since_io_service_count >= io_service_interval_count {
 			if shard.counters.io_awaiting_count > 0 {
-				reactor_service_nonblocking(&shard.reactor, shard)
+				_scheduler_service_io(shard)
 			}
 			dispatch_since_io_service_count = 0
 		}
@@ -1382,7 +1386,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// Step 2: Initial nonblocking I/O service point
 	// ========================================================================
 	if shard.counters.io_awaiting_count > 0 {
-		reactor_service_nonblocking(&shard.reactor, shard)
+		_scheduler_service_io(shard)
 	}
 
 	// ========================================================================
@@ -1396,7 +1400,7 @@ scheduler_tick :: proc(shard: ^Shard) {
 	// ========================================================================
 	reactor_flush_submissions(&shard.reactor, shard)
 	if reactor_has_io_work(&shard.reactor) {
-		reactor_service_nonblocking(&shard.reactor, shard)
+		_scheduler_service_io(shard)
 	}
 	_fd_handoff_retry_scan(shard)
 	_fd_handoff_timeout_scan(shard, now)
@@ -2340,6 +2344,121 @@ _fd_handoff_timeout_scan :: proc(shard: ^Shard, now: u64) {
 
 // --- Mass Teardown & Recovery ---
 
+Shard_Backend_Recovery_Result :: enum u8 {
+	Recovered,
+	Reinit_Failed,
+	Quiescence_Unproven,
+}
+
+@(private = "file")
+_shard_close_all_reactor_fds :: proc(shard: ^Shard) {
+	for &entry in shard.reactor.fd_table.entries {
+		if entry.state != .Free {
+			_ = backend_control_close(&shard.reactor.backend, entry.os_fd)
+		}
+	}
+	for entry in shard.handoff_table.entries {
+		if entry.state == .In_Flight && entry.cleanup_fd != OS_FD_INVALID {
+			_ = backend_control_close(&shard.reactor.backend, entry.cleanup_fd)
+		}
+	}
+}
+
+@(private = "file")
+_shard_clear_quiesced_io_ownership :: proc(shard: ^Shard) {
+	when TINA_ASAN_POISONING {
+		io_slot_pool_reset_tina_owned(&shard.reactor.receive_pool)
+		io_slot_pool_reset_tina_owned(&shard.reactor.staging_pool)
+	} else {
+		io_slot_pool_reset(&shard.reactor.receive_pool)
+		io_slot_pool_reset(&shard.reactor.staging_pool)
+	}
+	fd_table_init(&shard.reactor.fd_table, shard.reactor.fd_table.entries)
+	fd_handoff_table_init(&shard.handoff_table, shard.handoff_table.entries)
+	shard.reactor.pending_count = 0
+	shard.reactor.io_in_flight_count = 0
+
+	for type_descriptor in shard.type_descriptors {
+		soa_meta := shard.metadata[type_descriptor.id]
+		for slot_index in 0 ..< type_descriptor.slot_count {
+			soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+			soa_meta[slot_index].io_result = 0
+			soa_meta[slot_index].io_operation_kind = .None
+			soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
+			soa_meta[slot_index].io_peer_address = {}
+			soa_meta[slot_index].flags -= {.IO_Completion_Ready}
+		}
+	}
+}
+
+@(private = "package")
+shard_recover_faulted_backend :: proc(
+	shard: ^Shard,
+) -> Shard_Backend_Recovery_Result {
+	assert(shard.reactor.backend_state == .Collect_Faulted, "backend recovery requires a collect fault")
+
+	// Handles are closed before quiescence so cancellation begins while every
+	// OVERLAPPED/buffer remains valid. No arena memory is reused until the
+	// backend proves that all kernel ownership ended.
+	_shard_close_all_reactor_fds(shard)
+	quiesce_result := backend_quiesce_after_collect_fault(&shard.reactor.backend)
+	if quiesce_result != .Quiesced {
+		return .Quiescence_Unproven
+	}
+	shard.reactor.backend_state = .Uninitialized
+
+	_shard_clear_quiesced_io_ownership(shard)
+	backend_error := backend_init(&shard.reactor.backend, shard.reactor.backend_config)
+	if backend_error != .None {
+		return .Reinit_Failed
+	}
+	shard.reactor.backend_state = .Initialized
+	return .Recovered
+}
+
+@(private = "package")
+shard_retry_backend_init :: proc(shard: ^Shard) -> Backend_Error {
+	assert(shard.reactor.backend_state == .Uninitialized, "backend retry requires uninitialized state")
+	error := backend_init(&shard.reactor.backend, shard.reactor.backend_config)
+	if error == .None {
+		shard.reactor.backend_state = .Initialized
+	}
+	return error
+}
+
+@(private = "file")
+_shard_mass_teardown_defer_accepted_io_fds :: proc(shard: ^Shard) {
+	for type_descriptor in shard.type_descriptors {
+		soa_meta := shard.metadata[type_descriptor.id]
+		for slot_index in 0 ..< type_descriptor.slot_count {
+			meta := &soa_meta[slot_index]
+			if meta.io_operation_kind == .None ||
+			   .IO_Completion_Ready in meta.flags ||
+			   meta.io_fd == FD_HANDLE_NONE {
+				continue
+			}
+
+			if meta.io_operation_kind != .Close_Complete {
+				token := submission_token_pack(
+					u8(type_descriptor.id), u32(slot_index), u8(meta.generation),
+					meta.io_sequence, meta.io_slot_index, meta.io_operation_kind,
+				)
+				_ = backend_cancel(&shard.reactor.backend, token)
+			}
+
+			entry_index, lookup_error := fd_table_lookup_index(&shard.reactor.fd_table, meta.io_fd)
+			if lookup_error != .None {
+				continue
+			}
+			entry := &shard.reactor.fd_table.entries[entry_index]
+			if entry.state == .Open {
+				mark_error := fd_table_mark_close_after_current_io(&shard.reactor.fd_table, meta.io_fd)
+				assert(mark_error == .None, "accepted I/O FD must defer close until completion")
+			}
+		}
+	}
+}
+
 @(private = "package")
 shard_mass_teardown :: proc(shard: ^Shard) {
 	log_flush(shard)
@@ -2382,13 +2501,23 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		if int(type_index) < len(shard.metadata) &&
 		   int(slot_index) < len(shard.metadata[type_index]) {
 			shard.metadata[type_index][slot_index].io_slot_index = IO_SLOT_INDEX_NONE
+			shard.metadata[type_index][slot_index].io_operation_kind = .None
 		}
 	}
 	shard.reactor.pending_count = 0
-	shard.reactor.io_in_flight_count = 0
+	_shard_mass_teardown_defer_accepted_io_fds(shard)
 
 	for i in 0 ..< shard.reactor.fd_table.slot_count {
 		entry := &shard.reactor.fd_table.entries[i]
+		if entry.state == .Free {
+			continue
+		}
+		if entry.state == .Close_In_Flight ||
+		   entry.state == .Close_After_Current_IO {
+			// Accepted I/O still owns this descriptor. Its stale completion
+			// closes or releases the table slot at the ownership boundary.
+			continue
+		}
 
 		if entry.reader_isolate != ISOLATE_HANDLE_NONE ||
 		   entry.writer_isolate != ISOLATE_HANDLE_NONE {
@@ -2407,6 +2536,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 		}
 	}
 	fd_handoff_table_init(&shard.handoff_table, shard.handoff_table.entries)
+	io_pending_reuse_count: u64 = 0
 	for type_desc in shard.type_descriptors {
 		type_id := type_desc.id
 		soa_meta := shard.metadata[type_id]
@@ -2432,8 +2562,30 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 
 			new_generation := (soa_meta[slot].generation + 1) & 0x0FFFFFFF
 			if new_generation == 0 do new_generation = 1
+			has_accepted_io :=
+				soa_meta[slot].io_operation_kind != .None &&
+				.IO_Completion_Ready not_in soa_meta[slot].flags
 
 			soa_meta[slot].generation = new_generation
+			soa_meta[slot].inbox_count = 0
+			soa_meta[slot].inbox_tail = POOL_NONE_INDEX
+			soa_meta[slot].pending_correlation = 0
+			soa_meta[slot].working_arena_offset = 0
+			soa_meta[slot].flags = {}
+
+			if has_accepted_io {
+				_slot_set_state_bare(
+					shard,
+					type_id,
+					Isolate_Slot_Index(slot),
+					.Pending_IO_Reuse,
+					"mass_teardown: accepted I/O retains slot until stale completion",
+				)
+				_sanitizer_address_poison_isolate_slot(shard, type_id, Isolate_Slot_Index(slot))
+				io_pending_reuse_count += 1
+				continue
+			}
+
 			_slot_set_state_bare(
 				shard,
 				type_id,
@@ -2441,14 +2593,12 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 				.Unallocated,
 				"mass_teardown: bulk io_awaiting+dispatchable reset after loop; poison called separately",
 			)
-			soa_meta[slot].inbox_count = 0
-			soa_meta[slot].inbox_tail = POOL_NONE_INDEX
-			soa_meta[slot].pending_correlation = 0
+			soa_meta[slot].io_fd = FD_HANDLE_NONE
+			soa_meta[slot].io_result = 0
 			soa_meta[slot].io_operation_kind = .None
-			soa_meta[slot].working_arena_offset = 0
-			soa_meta[slot].flags = {}
+			soa_meta[slot].io_slot_index = IO_SLOT_INDEX_NONE
+			soa_meta[slot].io_peer_address = {}
 
-			// Re-link the intrusive free list!
 			soa_meta[slot].inbox_head = shard.isolate_free_heads[type_id]
 			shard.isolate_free_heads[type_id] = u32(slot)
 			_sanitizer_address_poison_isolate_slot(shard, type_id, Isolate_Slot_Index(slot))
@@ -2468,7 +2618,7 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	for word_index in 0 ..< len(shard.dispatch_ready_type_words) {
 		shard.dispatch_ready_type_words[word_index] = 0
 	}
-	shard.counters.io_awaiting_count = 0
+	shard.counters.io_awaiting_count = io_pending_reuse_count
 	shard.dispatch_type_cursor = 0
 	shard.current_isolate_turn_frame = nil
 	shard.current_trap_environment = nil
@@ -2482,6 +2632,201 @@ shard_mass_teardown :: proc(shard: ^Shard) {
 	// Step 6: Notify peers through the control-plane liveness channel.
 	shard_broadcast_liveness_state(shard, .Running)
 	transport_flush_control_outbound(shard)
+}
+
+@(test)
+test_shard_mass_teardown_reclaims_close_queued_fd :: proc(t: ^testing.T) {
+	fixture := _make_teardown_test_shard(t)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+	owner := make_handle(shard.id, 0, 0, 1)
+	test_shard_slot_activate(fixture, owner, .Wait_Io)
+
+	fd, socket_error := reactor_control_socket(
+		&shard.reactor,
+		owner,
+		.AF_INET,
+		.STREAM,
+		.TCP,
+	)
+	testing.expect_value(t, socket_error, Reactor_Socket_Error.None)
+	testing.expect_value(
+		t,
+		reactor_submit_io(&shard.reactor, shard, owner, IoOp_Close{fd = fd}),
+		IO_ERR_NONE,
+	)
+	testing.expect_value(t, shard.reactor.pending_count, u16(1))
+
+	entry_index, lookup_error := fd_table_lookup_index(&shard.reactor.fd_table, fd)
+	testing.expect_value(t, lookup_error, FD_Table_Error.None)
+	testing.expect_value(
+		t,
+		shard.reactor.fd_table.entries[entry_index].state,
+		FD_Entry_State.Close_Queued,
+	)
+
+	shard_mass_teardown(shard)
+
+	_, lookup_error = fd_table_lookup_index(&shard.reactor.fd_table, fd)
+	testing.expect_value(t, lookup_error, FD_Table_Error.Stale_Generation)
+	testing.expect_value(t, shard.reactor.pending_count, u16(0))
+	testing.expect_value(t, shard.metadata[0]._state[0], Isolate_State.Unallocated)
+}
+
+@(test)
+test_shard_mass_teardown_preserves_close_in_flight_fd :: proc(t: ^testing.T) {
+	fixture := _make_teardown_test_shard(t)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+	owner := make_handle(shard.id, 0, 0, 1)
+	test_shard_slot_activate(fixture, owner, .Wait_Io)
+
+	fd, alloc_error := fd_table_alloc(&shard.reactor.fd_table, OS_FD(42), owner)
+	testing.expect_value(t, alloc_error, FD_Table_Error.None)
+	testing.expect_value(t, fd_table_mark_close_queued(&shard.reactor.fd_table, fd), FD_Table_Error.None)
+	testing.expect_value(t, fd_table_mark_close_in_flight(&shard.reactor.fd_table, fd), FD_Table_Error.None)
+	shard.metadata[0][0].io_fd = fd
+	shard.metadata[0][0].io_operation_kind = .Close_Complete
+	shard.reactor.io_in_flight_count = 1
+	free_count_before := shard.reactor.fd_table.free_count
+
+	shard_mass_teardown(shard)
+
+	entry_index, lookup_error := fd_table_lookup_index(&shard.reactor.fd_table, fd)
+	testing.expect_value(t, lookup_error, FD_Table_Error.None)
+	testing.expect_value(t, shard.reactor.fd_table.entries[entry_index].state, FD_Entry_State.Close_In_Flight)
+	testing.expect_value(t, shard.reactor.fd_table.free_count, free_count_before)
+	testing.expect_value(t, shard.metadata[0]._state[0], Isolate_State.Pending_IO_Reuse)
+}
+
+when TINA_SIMULATION_MODE {
+	@(test)
+	test_shard_recovers_faulted_backend_after_partial_completion :: proc(t: ^testing.T) {
+		fixture := _make_teardown_test_shard_with_slots(t, 2)
+		defer test_shard_fixture_deinit(fixture)
+		shard := &fixture.shard
+
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
+		backend_deinit(&shard.reactor.backend)
+		config := shard.reactor.backend_config
+		config.sim_config = Simulation_IO_Config {
+			delay_range_ticks = {100, 100},
+			world = cast(rawptr)world,
+		}
+		shard.reactor.backend_config = config
+		testing.expect_value(t, backend_init(&shard.reactor.backend, config), Backend_Error.None)
+
+		for slot_index in 0 ..< 2 {
+			owner := make_handle(shard.id, 0, Isolate_Slot_Index(slot_index), 1)
+			test_shard_slot_activate(fixture, owner, .Runnable)
+			fd, socket_error := reactor_control_socket(
+				&shard.reactor, owner, .AF_INET, .STREAM, .TCP,
+			)
+			testing.expect_value(t, socket_error, Reactor_Socket_Error.None)
+			io_error := reactor_submit_io(
+				&shard.reactor,
+				shard,
+				owner,
+				IoOp_Recv{fd = fd, buffer_size_max = 64},
+			)
+			testing.expect_value(t, io_error, IO_ERR_NONE)
+			_slot_set_state(shard, 0, Isolate_Slot_Index(slot_index), .Wait_Io)
+		}
+		testing.expect_value(
+			t,
+			reactor_flush_submissions(&shard.reactor, shard),
+			Backend_Error.None,
+		)
+		shard.reactor.backend.pending[0].delay_ticks = 0
+		shard.reactor.backend.pending[1].delay_ticks = 100
+		_sim_fail_next_collect(&shard.reactor.backend)
+
+		fault := reactor_collect_completions(&shard.reactor, shard, 0)
+		testing.expect_value(t, fault, Backend_Collect_Fault.System_Error)
+		testing.expect_value(t, shard.reactor.io_in_flight_count, u32(1))
+		testing.expect_value(t, shard.reactor.backend_state, Reactor_Backend_State.Collect_Faulted)
+
+		recovery_result := shard_recover_faulted_backend(shard)
+		testing.expect_value(t, recovery_result, Shard_Backend_Recovery_Result.Recovered)
+		testing.expect_value(t, shard.reactor.backend_state, Reactor_Backend_State.Initialized)
+		testing.expect_value(t, shard.reactor.io_in_flight_count, u32(0))
+		testing.expect_value(t, shard.reactor.pending_count, u16(0))
+		testing.expect_value(t, shard.reactor.receive_pool.free_count, shard.reactor.receive_pool.slot_count)
+		testing.expect_value(t, shard.reactor.fd_table.free_count, shard.reactor.fd_table.slot_count)
+		testing.expect_value(t, world.active_backend_count, u16(1))
+		for slot_index in 0 ..< 2 {
+			testing.expect_value(
+				t,
+				shard.metadata[0].io_operation_kind[slot_index],
+				IO_Operation_Kind.None,
+			)
+			testing.expect_value(
+				t,
+				shard.metadata[0].io_slot_index[slot_index],
+				IO_SLOT_INDEX_NONE,
+			)
+		}
+	}
+}
+
+// Split-owner teardown must not destroy the surviving owner's FD. When a
+// read-only or write-only owner exits, only its directional ownership is
+// released. The underlying descriptor stays open for the surviving owner.
+@(test)
+test_split_owner_teardown_preserves_surviving_owner :: proc(t: ^testing.T) {
+	fixture := _make_teardown_test_shard_with_slots(t, 2)
+	defer test_shard_fixture_deinit(fixture)
+	shard := &fixture.shard
+
+	reader := make_handle(shard.id, 0, 0, 1)
+	writer := make_handle(shard.id, 0, 1, 1)
+	test_shard_slot_activate(fixture, reader, .Runnable)
+	test_shard_slot_activate(fixture, writer, .Runnable)
+
+	fd, socket_error := reactor_control_socket(
+		&shard.reactor, reader, .AF_INET, .STREAM, .TCP,
+	)
+	testing.expect_value(t, socket_error, Reactor_Socket_Error.None)
+
+	split_error := fd_table_handoff(
+		&shard.reactor.fd_table, fd, writer, .Write_Only,
+	)
+	testing.expect_value(t, split_error, FD_Table_Error.None)
+
+	// Reader still owns read; writer now owns write.
+	reader_entry_index, _ := fd_table_lookup_index(&shard.reactor.fd_table, fd)
+	testing.expect_value(
+		t,
+		shard.reactor.fd_table.entries[reader_entry_index].reader_isolate,
+		reader,
+	)
+	testing.expect_value(
+		t,
+		shard.reactor.fd_table.entries[reader_entry_index].writer_isolate,
+		writer,
+	)
+
+	// Teardown the writer — must release only write direction.
+	_teardown_isolate(shard, 0, 1, .Normal)
+
+	entry_index, lookup_error := fd_table_lookup_index(&shard.reactor.fd_table, fd)
+	testing.expect_value(t, lookup_error, FD_Table_Error.None)
+	entry := &shard.reactor.fd_table.entries[entry_index]
+
+	// The FD stays Open for the surviving reader.
+	testing.expect_value(t, entry.state, FD_Entry_State.Open)
+	testing.expect_value(t, entry.reader_isolate, reader)
+	testing.expect_value(t, entry.writer_isolate, ISOLATE_HANDLE_NONE)
+	testing.expect(t, entry.os_fd != OS_FD_INVALID, "surviving owner must retain a valid descriptor")
+
+	// The writer slot is freed normally — no Pending_IO_Reuse.
+	testing.expect_value(t, shard.metadata[0]._state[1], Isolate_State.Unallocated)
+
+	// Releasing the final directional owner must close and free the FD.
+	_teardown_isolate(shard, 0, 0, .Normal)
+	_, final_lookup_error := fd_table_lookup_index(&shard.reactor.fd_table, fd)
+	testing.expect_value(t, final_lookup_error, FD_Table_Error.Stale_Generation)
 }
 
 // Checks if any Isolates are still alive across all types on this Shard.
@@ -2687,6 +3032,18 @@ _make_teardown_test_shard_with_slots :: proc(
 			handoff_entry_count = 8,
 		},
 	)
+
+	when TINA_SIMULATION_MODE {
+		world := new(Sim_IO_World, context.temp_allocator)
+		_sim_world_init(world)
+		backend_deinit(&fixture.shard.reactor.backend)
+		config := fixture.shard.reactor.backend_config
+		config.sim_config.world = cast(rawptr)world
+		fixture.shard.reactor.backend_config = config
+		backend_error := backend_init(&fixture.shard.reactor.backend, config)
+		testing.expect_value(t, backend_error, Backend_Error.None)
+	}
+
 	return fixture
 }
 

@@ -205,6 +205,10 @@ _test_shard_compute_memory :: proc(spec: Test_Shard_Spec) -> int {
 		total += config.fd_table_slot_count * _test_fd_entry_size
 		total += config.reactor_buffer_count * config.reactor_buffer_bytes
 		total += config.staging_slot_count * config.staging_slot_size
+		total += backend_boot_scratch_size(
+			config.reactor_buffer_count,
+			config.fd_table_slot_count,
+		)
 	}
 
 	if .Transfer_Pool in spec.subsystems {
@@ -373,8 +377,19 @@ test_shard_build :: proc(spec: Test_Shard_Spec, fixture: ^Test_Shard_Fixture) ->
 
 		rx_buf := grand_arena_alloc_slice(arena, "Reactor_Receive_Pool", config.reactor_buffer_count * config.reactor_buffer_bytes) or_return
 		staging_buf := grand_arena_alloc_slice(arena, "Reactor_Staging_Pool", config.staging_slot_count * config.staging_slot_size) or_return
+		backend_boot_scratch := grand_arena_alloc_slice(
+			arena,
+			"Reactor_Backend_Boot_Scratch",
+			backend_boot_scratch_size(
+				config.reactor_buffer_count,
+				config.fd_table_slot_count,
+			),
+		) or_return
 
-		backend_config := Backend_Config{queue_size = REACTOR_SUBMISSION_BATCH_COUNT}
+		backend_config := Backend_Config {
+			queue_size   = REACTOR_SUBMISSION_BATCH_COUNT,
+			boot_scratch = backend_boot_scratch,
+		}
 		reactor_error := reactor_init_tina_owned(
 			&shard.reactor,
 			backend_config,

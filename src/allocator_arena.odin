@@ -402,8 +402,18 @@ hydrate_shard :: proc(
 		spec.staging_slot_count * spec.staging_slot_size,
 	) or_return
 
+	backend_boot_scratch := grand_arena_alloc_slice(
+		arena,
+		"Reactor_Backend_Boot_Scratch",
+		backend_boot_scratch_size(
+			spec.reactor_buffer_slot_count,
+			spec.fd_table_slot_count,
+		),
+	) or_return
+
 	backend_config := Backend_Config {
-		queue_size = REACTOR_SUBMISSION_BATCH_COUNT,
+		queue_size   = REACTOR_SUBMISSION_BATCH_COUNT,
+		boot_scratch = backend_boot_scratch,
 	}
 	when TINA_SIMULATION_MODE {
 		if spec.simulation != nil {

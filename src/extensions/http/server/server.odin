@@ -850,7 +850,12 @@ _make_base_system_spec :: proc(
 	pool_system_demand := int(connection_slot_count) * HTTP_SYSTEM_MESSAGES_PER_CONNECTION
 	pool_slot_count := int(_next_power_of_two_u64(max(u64(1024), u64(pool_user_demand + pool_system_demand) * 2)))
 	timer_entry_count := _derive_timer_entry_count(connection_slot_count, shard_count)
-	reactor_buffer_slot_count := int(min(u64(4094), max(u64(64), u64(connection_slot_count))))
+	reactor_buffer_slot_count := int(
+		min(
+			u64(tina.IO_SLOT_COUNT_MAX),
+			max(u64(64), u64(connection_slot_count)),
+		),
+	)
 
 	fd_handoff_entry_count := 0
 	if shard_count > 1 {

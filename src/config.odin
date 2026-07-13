@@ -118,6 +118,13 @@ REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
 	REACTOR_LINUX_SENDFILE_ENTRY_COUNT_DEFAULT,
 )
 
+// Upper bound for the optional fixed-file table. Larger valid FD tables use
+// raw descriptors, avoiding unbounded registration scratch and kernel state.
+REACTOR_LINUX_FIXED_FILE_REGISTER_MAX :: #config(
+	TINA_REACTOR_LINUX_FIXED_FILE_REGISTER_MAX,
+	1024,
+)
+
 #assert(size_of(Shard_Id) == 1)
 #assert(size_of(Isolate_Type_Id) == 2)
 #assert(MAX_SHARD_COUNT > 0)
@@ -150,6 +157,8 @@ REACTOR_LINUX_SENDFILE_ENTRY_COUNT :: #config(
 #assert(REACTOR_LINUX_PENDING_ADDR_ENTRY_COUNT <= int(max(u16)))
 #assert(REACTOR_LINUX_SENDFILE_ENTRY_COUNT > 0)
 #assert(REACTOR_LINUX_SENDFILE_ENTRY_COUNT <= int(max(u16)))
+#assert(REACTOR_LINUX_FIXED_FILE_REGISTER_MAX > 0)
+#assert(REACTOR_LINUX_FIXED_FILE_REGISTER_MAX <= int(FD_TABLE_SLOT_COUNT_MAX))
 
 Init_Handler :: #type proc(self: rawptr, args: []u8) -> Isolate_Transition
 Handler_Fn :: #type proc(self: rawptr, message: ^Message) -> Isolate_Transition
@@ -398,11 +407,12 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 		return .ValueNotPowerOfTwo
 	}
 
-	// 12-bit buffer_index field in Submission_Token; 0x0FFF (4095) is the NONE sentinel
-	if spec.reactor_buffer_slot_count > 4094 {
+	// The sentinel excludes one index value but remains the maximum slot count.
+	if spec.reactor_buffer_slot_count > IO_SLOT_COUNT_MAX {
 		fmt.eprintfln(
-			"[FATAL] reactor_buffer_slot_count (%v) exceeds 12-bit max (4094)",
+			"[FATAL] reactor_buffer_slot_count (%v) exceeds token capacity (%v)",
 			spec.reactor_buffer_slot_count,
+			IO_SLOT_COUNT_MAX,
 		)
 		return .ValueOutOfBounds
 	}
@@ -419,22 +429,30 @@ _validate_globals_and_types :: proc(spec: ^SystemSpec) -> SystemSpecError {
 		)
 		return .ValueNotPowerOfTwo
 	}
-	// IO_Slot_Pool.slot_count is u16; IO_SLOT_INDEX_NONE = 0x0FFF (4095) is the empty sentinel
-	// buffer_index in Submission_Token is 12 bits (& 0x0FFF), so max usable index is 4094
-	if spec.staging_slot_count > 4094 {
+	if spec.staging_slot_count > IO_SLOT_COUNT_MAX {
 		fmt.eprintfln(
-			"[FATAL] staging_slot_count (%v) exceeds 12-bit token capacity (4094)",
+			"[FATAL] staging_slot_count (%v) exceeds token capacity (%v)",
 			spec.staging_slot_count,
+			IO_SLOT_COUNT_MAX,
+		)
+		return .ValueOutOfBounds
+	}
+
+	if spec.fd_table_slot_count < 0 || spec.fd_table_slot_count > FD_TABLE_SLOT_COUNT_MAX {
+		fmt.eprintfln(
+			"[FATAL] fd_table_slot_count (%v) must be 0-%v",
+			spec.fd_table_slot_count,
+			FD_TABLE_SLOT_COUNT_MAX,
 		)
 		return .ValueOutOfBounds
 	}
 
 	if spec.fd_handoff_entry_count < 0 ||
-	   spec.fd_handoff_entry_count > int(FD_HANDOFF_NONE_INDEX) - 1 {
+	   spec.fd_handoff_entry_count > FD_HANDOFF_ENTRY_COUNT_MAX {
 		fmt.eprintfln(
 			"[FATAL] fd_handoff_entry_count (%v) must be 0-%v",
 			spec.fd_handoff_entry_count,
-			int(FD_HANDOFF_NONE_INDEX) - 1,
+			FD_HANDOFF_ENTRY_COUNT_MAX,
 		)
 		return .ValueOutOfBounds
 	}
@@ -735,8 +753,8 @@ _validate_dio_config :: proc(spec: ^SystemSpec) -> SystemSpecError {
 compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	types_count := len(spec.types)
 	// 3 per type (Typed Arena, Isolate Metadata, Working Memory)
-	// + 23 static framework regions, including the SubRegion tracker array.
-	return (types_count * 3) + 23
+	// + 24 static framework regions, including the SubRegion tracker array.
+	return (types_count * 3) + 24
 	// FYI: Fixed system regions:
 	// 1. Regions Array (SubRegion tracker)
 	// 2-6. Slice headers for IsolateTypeDescriptor/isolate/working/metadata/free-head arrays
@@ -756,7 +774,8 @@ compute_max_sub_regions :: proc(spec: ^SystemSpec) -> int {
 	// 20. Scratch Arena
 	// 21. FD Table
 	// 22. Reactor Buffer Pool
-	// 23. Spare fixed region for optional platform/runtime allocation
+	// 23. Reactor backend boot scratch
+	// 24. Spare fixed region for optional platform/runtime allocation
 }
 
 // Computes an upper-bound capacity aligned to a multiple of 8.
@@ -817,6 +836,10 @@ compute_shard_memory_total :: proc(spec: ^SystemSpec) -> int {
 	total += spec.timer_entry_count * size_of(Correlation_Id)  // correlations
 	total += bitmap_word_count_from_bit_count(spec.timer_entry_count) * size_of(u64) // armed_words
 	total += spec.fd_table_slot_count * spec.fd_entry_size
+	total += backend_boot_scratch_size(
+		spec.reactor_buffer_slot_count,
+		spec.fd_table_slot_count,
+	)
 	total += spec.log_ring_size
 	total += spec.supervision_groups_max * size_of(Supervision_Group)
 	total += spec.scratch_memory_size
@@ -886,16 +909,7 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 	error = validate_system_spec(&spec)
 	testing.expect_value(t, error, SystemSpecError.None)
 
-	// Test reactor_buffer_slot_count exceeds 12-bit token capacity
-	spec.reactor_buffer_slot_count = 4095
-	error = validate_system_spec(&spec)
-	testing.expect_value(t, error, SystemSpecError.ValueOutOfBounds)
-
-	spec.reactor_buffer_slot_count = 4094 // Exactly at limit
-	error = validate_system_spec(&spec)
-	testing.expect_value(t, error, SystemSpecError.None)
-
-	spec.reactor_buffer_slot_count = 0 // Restore
+	test_system_spec_validation_count_bounds(t, &spec)
 
 	when !TINA_SIMULATION_MODE {
 		when ODIN_OS == .Windows {
@@ -910,6 +924,27 @@ test_system_spec_validation :: proc(t: ^testing.T) {
 			testing.expect_value(t, error, SystemSpecError.UnsupportedPlatform)
 		}
 	}
+}
+
+@(private = "file")
+test_system_spec_validation_count_bounds :: proc(t: ^testing.T, spec: ^SystemSpec) {
+	spec.reactor_buffer_slot_count = IO_SLOT_COUNT_MAX
+	testing.expect_value(t, validate_system_spec(spec), SystemSpecError.None)
+	spec.reactor_buffer_slot_count = IO_SLOT_COUNT_MAX + 1
+	testing.expect_value(t, validate_system_spec(spec), SystemSpecError.ValueOutOfBounds)
+	spec.reactor_buffer_slot_count = 0
+
+	spec.fd_table_slot_count = FD_TABLE_SLOT_COUNT_MAX
+	testing.expect_value(t, validate_system_spec(spec), SystemSpecError.None)
+	spec.fd_table_slot_count = FD_TABLE_SLOT_COUNT_MAX + 1
+	testing.expect_value(t, validate_system_spec(spec), SystemSpecError.ValueOutOfBounds)
+	spec.fd_table_slot_count = 0
+
+	spec.fd_handoff_entry_count = FD_HANDOFF_ENTRY_COUNT_MAX
+	testing.expect_value(t, validate_system_spec(spec), SystemSpecError.None)
+	spec.fd_handoff_entry_count = FD_HANDOFF_ENTRY_COUNT_MAX + 1
+	testing.expect_value(t, validate_system_spec(spec), SystemSpecError.ValueOutOfBounds)
+	spec.fd_handoff_entry_count = 0
 }
 
 @(test)

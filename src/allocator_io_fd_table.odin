@@ -14,6 +14,9 @@ import "core:testing"
 // Ginger Bill pool pattern — same as message pool and reactor buffer pool.
 
 FD_TABLE_NONE_INDEX :: u16(0xFFFF)
+FD_TABLE_SLOT_COUNT_MAX :: int(FD_TABLE_NONE_INDEX)
+
+#assert(FD_TABLE_SLOT_COUNT_MAX == int(FD_TABLE_NONE_INDEX))
 
 FD_Table :: struct {
 	entries:    []FD_Entry,
@@ -33,6 +36,10 @@ FD_Table_Error :: enum u8 {
 // Initialize the FD table with a backing slice of FD_Entry.
 // All slots start on the free list. Entries must be pre-allocated.
 fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
+	assert(
+		len(backing) <= FD_TABLE_SLOT_COUNT_MAX,
+		"FD table slot count exceeds FD_Handle index capacity",
+	)
 	table.entries = backing
 	table.slot_count = u16(len(backing))
 	table.free_count = table.slot_count
@@ -42,13 +49,20 @@ fd_table_init :: proc(table: ^FD_Table, backing: []FD_Entry) {
 	// Repurpose os_fd field as next-free index (intrusive).
 	for i := len(backing) - 1; i >= 0; i -= 1 {
 		entry := &table.entries[i]
+		when TINA_ASAN_POISONING {
+			_sanitizer_address_unpoison_raw(rawptr(&entry.payload), size_of(entry.payload))
+		}
 		entry^ = FD_Entry{}
 		entry.os_fd = _fd_table_encode_next(table.free_head)
 		entry.generation = 1
 		entry.reader_isolate = ISOLATE_HANDLE_NONE
 		entry.writer_isolate = ISOLATE_HANDLE_NONE
 		entry.peer_address = {}
-		entry.flags = {}
+		entry.state = .Free
+		entry.attributes = {}
+		when TINA_ASAN_POISONING {
+			_sanitizer_address_poison_raw(rawptr(&entry.payload), size_of(entry.payload))
+		}
 		table.free_head = u16(i)
 	}
 }
@@ -69,17 +83,18 @@ fd_table_alloc :: proc "contextless" (
 
 	index := table.free_head
 	entry := &table.entries[index]
-
 	// Advance free list
 	table.free_head = _fd_table_decode_next(entry.os_fd)
 	table.free_count -= 1
 
 	// Initialize the entry
+	_sanitizer_address_unpoison_raw(rawptr(&entry.payload), size_of(entry.payload))
 	entry.os_fd = os_fd
 	entry.reader_isolate = owner
 	entry.writer_isolate = owner
 	entry.peer_address = {}
-	entry.flags = {}
+	entry.state = .Open
+	entry.attributes = {}
 	// generation already set from previous free or init
 
 	return fd_handle_make(index, entry.generation), .None
@@ -104,6 +119,9 @@ fd_table_lookup_index :: proc "contextless" (
 
 	if table.entries[index].generation != fd_handle_generation(handle) {
 		return FD_TABLE_NONE_INDEX, .Stale_Generation
+	}
+	if table.entries[index].state == .Free {
+		return FD_TABLE_NONE_INDEX, .Invalid_Index
 	}
 
 	return index, .None
@@ -155,6 +173,9 @@ fd_table_handoff :: proc "contextless" (
 ) -> FD_Table_Error {
 	index := fd_table_lookup_index(table, handle) or_return
 	entry := &table.entries[index]
+	if entry.state != .Open {
+		return .Invalid_Index
+	}
 
 	switch mode {
 	case .Full:
@@ -185,6 +206,9 @@ fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_
 	if entry.generation != fd_handle_generation(handle) {
 		return .Stale_Generation
 	}
+	if entry.state == .Free {
+		return .Invalid_Index
+	}
 
 	// Bump generation to invalidate all outstanding FD_Handles.
 	// Skip 0 on wrap: fd_handle_make(0, 0) == 0 == FD_HANDLE_NONE, so a
@@ -196,7 +220,9 @@ fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_
 	entry.reader_isolate = ISOLATE_HANDLE_NONE
 	entry.writer_isolate = ISOLATE_HANDLE_NONE
 	entry.peer_address = {}
-	entry.flags = {}
+	entry.state = .Free
+	entry.attributes = {}
+	_sanitizer_address_poison_raw(rawptr(&entry.payload), size_of(entry.payload))
 
 	table.free_head = index
 	table.free_count += 1
@@ -204,20 +230,60 @@ fd_table_free :: proc "contextless" (table: ^FD_Table, handle: FD_Handle) -> FD_
 	return .None
 }
 
-// Mark an FD for close-on-completion (§6.6.1 §3).
-// Used during teardown_isolate when I/O is in-flight on the FD.
-fd_table_mark_close_on_completion :: proc "contextless" (
+fd_table_mark_close_after_current_io :: proc "contextless" (
 	table: ^FD_Table,
 	handle: FD_Handle,
 ) -> FD_Table_Error {
 	index := fd_table_lookup_index(table, handle) or_return
-	table.entries[index].flags += {.Close_On_Completion}
+	entry := &table.entries[index]
+	if entry.state != .Open {
+		return .Invalid_Index
+	}
+	entry.state = .Close_After_Current_IO
 	return .None
 }
 
-// Check if an FD is marked for close-on-completion.
-fd_table_is_close_on_completion :: #force_inline proc "contextless" (entry: ^FD_Entry) -> bool {
-	return .Close_On_Completion in entry.flags
+fd_table_is_close_after_current_io :: #force_inline proc "contextless" (entry: ^FD_Entry) -> bool {
+	return entry.state == .Close_After_Current_IO
+}
+
+fd_table_mark_close_queued :: proc "contextless" (
+	table: ^FD_Table,
+	handle: FD_Handle,
+) -> FD_Table_Error {
+	index := fd_table_lookup_index(table, handle) or_return
+	entry := &table.entries[index]
+	if entry.state != .Open {
+		return .Invalid_Index
+	}
+	entry.state = .Close_Queued
+	return .None
+}
+
+fd_table_restore_open_from_close_queued :: proc "contextless" (
+	table: ^FD_Table,
+	handle: FD_Handle,
+) -> FD_Table_Error {
+	index := fd_table_lookup_index(table, handle) or_return
+	entry := &table.entries[index]
+	if entry.state != .Close_Queued {
+		return .Invalid_Index
+	}
+	entry.state = .Open
+	return .None
+}
+
+fd_table_mark_close_in_flight :: proc "contextless" (
+	table: ^FD_Table,
+	handle: FD_Handle,
+) -> FD_Table_Error {
+	index := fd_table_lookup_index(table, handle) or_return
+	entry := &table.entries[index]
+	if entry.state != .Close_Queued {
+		return .Invalid_Index
+	}
+	entry.state = .Close_In_Flight
+	return .None
 }
 
 fd_table_mark_fresh_accept :: #force_inline proc "contextless" (
@@ -227,8 +293,11 @@ fd_table_mark_fresh_accept :: #force_inline proc "contextless" (
 ) -> FD_Table_Error {
 	index := fd_table_lookup_index(table, handle) or_return
 	entry := &table.entries[index]
+	if entry.state != .Open {
+		return .Invalid_Index
+	}
 	entry.peer_address = peer_address
-	entry.flags += {.Fresh_Accept}
+	entry.attributes += {.Fresh_Accept}
 	return .None
 }
 
@@ -238,13 +307,16 @@ fd_table_clear_fresh_accept :: #force_inline proc "contextless" (
 ) -> FD_Table_Error {
 	index := fd_table_lookup_index(table, handle) or_return
 	entry := &table.entries[index]
-	entry.flags -= {.Fresh_Accept}
+	if entry.state != .Open {
+		return .Invalid_Index
+	}
+	entry.attributes -= {.Fresh_Accept}
 	entry.peer_address = {}
 	return .None
 }
 
 fd_table_is_fresh_accept :: #force_inline proc "contextless" (entry: ^FD_Entry) -> bool {
-	return .Fresh_Accept in entry.flags
+	return .Fresh_Accept in entry.attributes
 }
 
 // Find all FDs owned by a given Isolate (for teardown).
@@ -256,6 +328,9 @@ fd_table_for_each_owned :: proc(
 ) {
 	for i in 0 ..< table.slot_count {
 		entry := &table.entries[i]
+		if entry.state == .Free {
+			continue
+		}
 		if entry.reader_isolate == owner || entry.writer_isolate == owner {
 			h := fd_handle_make(i, entry.generation)
 			if !visitor(h, entry) {
@@ -378,7 +453,7 @@ test_fd_table_direction_affinity :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_fd_table_close_on_completion :: proc(t: ^testing.T) {
+test_fd_table_close_after_current_io :: proc(t: ^testing.T) {
 	backing: [4]FD_Entry
 	table: FD_Table
 	fd_table_init(&table, backing[:])
@@ -388,10 +463,37 @@ test_fd_table_close_on_completion :: proc(t: ^testing.T) {
 
 	entry_index, _ := fd_table_lookup_index(&table, handle)
 	entry := &table.entries[entry_index]
-	testing.expect(t, !fd_table_is_close_on_completion(entry), "should not be marked initially")
+	testing.expect(t, !fd_table_is_close_after_current_io(entry), "should not be marked initially")
 
-	fd_table_mark_close_on_completion(&table, handle)
-	testing.expect(t, fd_table_is_close_on_completion(entry), "should be marked after set")
+	mark_error := fd_table_mark_close_after_current_io(&table, handle)
+	testing.expect_value(t, mark_error, FD_Table_Error.None)
+	testing.expect(t, fd_table_is_close_after_current_io(entry), "should be marked after set")
+}
+
+@(test)
+test_fd_table_close_submission_state_machine :: proc(t: ^testing.T) {
+	backing: [1]FD_Entry
+	table: FD_Table
+	fd_table_init(&table, backing[:])
+
+	owner := make_handle(0, 1, 0, 0)
+	handle, allocate_error := fd_table_alloc(&table, OS_FD(5), owner)
+	testing.expect_value(t, allocate_error, FD_Table_Error.None)
+	entry := &backing[0]
+
+	queue_error := fd_table_mark_close_queued(&table, handle)
+	testing.expect_value(t, queue_error, FD_Table_Error.None)
+	testing.expect_value(t, entry.state, FD_Entry_State.Close_Queued)
+
+	restore_error := fd_table_restore_open_from_close_queued(&table, handle)
+	testing.expect_value(t, restore_error, FD_Table_Error.None)
+	testing.expect_value(t, entry.state, FD_Entry_State.Open)
+
+	queue_error = fd_table_mark_close_queued(&table, handle)
+	testing.expect_value(t, queue_error, FD_Table_Error.None)
+	in_flight_error := fd_table_mark_close_in_flight(&table, handle)
+	testing.expect_value(t, in_flight_error, FD_Table_Error.None)
+	testing.expect_value(t, entry.state, FD_Entry_State.Close_In_Flight)
 }
 
 @(test)

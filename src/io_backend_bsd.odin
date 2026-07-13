@@ -31,13 +31,18 @@ when !TINA_SIMULATION_MODE {
 
 	MAX_POSIX_PENDING :: 1024
 
-	// Derivation: up to REACTOR_SUBMISSION_BATCH_COUNT submissions may complete
-	// immediately during _backend_submit, and one collect pass may harvest up to
-	// REACTOR_COMPLETION_BATCH_COUNT readiness events. Size the completion staging
-	// explicitly from those configured reactor bounds so the backend never silently
-	// truncates the configured batch size.
-	// TODO: Consider exposing via Backend_Config if workloads require larger bursts.
-	MAX_POSIX_COMPLETED :: REACTOR_SUBMISSION_BATCH_COUNT + REACTOR_COMPLETION_BATCH_COUNT
+	@(private = "package")
+	_backend_boot_scratch_size :: #force_inline proc "contextless" (
+		receive_slot_count: int,
+		fd_slot_count: int,
+	) -> int {
+		return 0
+	}
+
+	// Every accepted operation is either pending or represented by one unread
+	// completion. Equal capacities let cancellation and close move obligations
+	// between those states without requiring additional cleanup capacity.
+	MAX_POSIX_COMPLETED :: MAX_POSIX_PENDING
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_POSIX_PENDING)
 	#assert(REACTOR_SUBMISSION_BATCH_COUNT <= MAX_POSIX_COMPLETED)
 	#assert(REACTOR_COMPLETION_BATCH_COUNT <= MAX_POSIX_COMPLETED)
@@ -182,17 +187,31 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
+	_backend_quiesce_after_collect_fault :: proc(
+		backend: ^Platform_Backend,
+	) -> Backend_Quiesce_Result {
+		// kqueue tracks readiness only; no kernel operation retains user memory.
+		_backend_deinit(backend)
+		return .Quiesced
+	}
+
+	@(private = "package")
 	_backend_submit :: proc(
 		backend: ^Platform_Backend,
 		submissions: []Submission,
-	) -> Backend_Error {
-		// All-or-error: pre-check worst-case capacity.
-		// Each submission may go to either completed or pending.
-		submission_count := u16(len(submissions))
-		completed_available := MAX_POSIX_COMPLETED - backend.completed_count
-		pending_available := MAX_POSIX_PENDING - backend.pending_count
-		if submission_count > completed_available || submission_count > pending_available {
-			return .Queue_Full
+	) -> Backend_Submit_Result {
+		_posix_compact_completed(backend)
+
+		// Accepted obligations occupy exactly one pending or unread-completion
+		// entry. A close converts matching pending entries into completions; it
+		// does not increase the obligation count beyond its own submission.
+		submission_count := len(submissions)
+		completion_count_unread := int(backend.completed_count - backend.completed_read)
+		obligation_count := int(backend.pending_count) + completion_count_unread
+		pending_available := MAX_POSIX_PENDING - int(backend.pending_count)
+		if obligation_count + submission_count > MAX_POSIX_COMPLETED ||
+		   submission_count > pending_available {
+			return backend_submit_rejected(.Queue_Full)
 		}
 
 		for &submission in submissions {
@@ -244,7 +263,7 @@ when !TINA_SIMULATION_MODE {
 				}
 			}
 		}
-		return .None
+		return backend_submit_accepted()
 	}
 
 	@(private = "package")
@@ -252,10 +271,7 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		completions: []Raw_Completion,
 		timeout_ns: i64,
-	) -> (
-		u32,
-		Backend_Error,
-	) {
+	) -> Backend_Collect_Result {
 		out: u32 = 0
 		output_max := u32(len(completions))
 
@@ -273,7 +289,7 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		if out >= output_max {
-			return out, .None
+			return Backend_Collect_Result{completion_count = out}
 		}
 
 		// Call kevent for readiness events.
@@ -299,9 +315,9 @@ when !TINA_SIMULATION_MODE {
 		n, kerr := kq.kevent(kq.KQ(backend.kq_fd), nil, events_buf[:], time_spec_pointer)
 		if kerr != nil {
 			if kerr == .EINTR {
-				return out, .None
+				return Backend_Collect_Result{completion_count = out}
 			}
-			return out, .System_Error
+			return Backend_Collect_Result{completion_count = out, fault = .System_Error}
 		}
 
 		for i in 0 ..< n {
@@ -318,13 +334,17 @@ when !TINA_SIMULATION_MODE {
 			// The data field carries the errno specifically when this flag is set.
 			if .Error in event.flags {
 				if found_pending {
-					out = _posix_deliver_completion(
+					store_result: Backend_Completion_Store_Result
+					out, store_result = _posix_deliver_completion(
 						backend,
 						completions,
 						out,
 						output_max,
 						Raw_Completion{token = token, result = -i32(posix.Errno(event.data))},
 					)
+					if store_result != .Stored {
+						return Backend_Collect_Result{completion_count = out, fault = .System_Error}
+					}
 					_remove_pending(backend, pending_index)
 				}
 				continue
@@ -360,7 +380,11 @@ when !TINA_SIMULATION_MODE {
 				} else {
 					conn_result.result = 0
 				}
-				out = _posix_deliver_completion(backend, completions, out, output_max, conn_result)
+				store_result: Backend_Completion_Store_Result
+				out, store_result = _posix_deliver_completion(backend, completions, out, output_max, conn_result)
+				if store_result != .Stored {
+					return Backend_Collect_Result{completion_count = out, fault = .System_Error}
+				}
 				_remove_pending(backend, u16(pending_index))
 				continue
 			}
@@ -372,18 +396,26 @@ when !TINA_SIMULATION_MODE {
 
 			if immediate {
 				_posix_tracking_note_readiness_success(tracking)
-				out = _posix_deliver_completion(backend, completions, out, output_max, result)
+				store_result: Backend_Completion_Store_Result
+				out, store_result = _posix_deliver_completion(backend, completions, out, output_max, result)
+				if store_result != .Stored {
+					return Backend_Collect_Result{completion_count = out, fault = .System_Error}
+				}
 				_remove_pending(backend, pending_index)
 			} else if event_has_eof {
 				// Peer closed but syscall returned EWOULDBLOCK — complete as EOF.
 				// Re-registering would be pointless: no further data will arrive.
-				out = _posix_deliver_completion(
+				store_result: Backend_Completion_Store_Result
+				out, store_result = _posix_deliver_completion(
 					backend,
 					completions,
 					out,
 					output_max,
 					Raw_Completion{token = pending_operation.submission.token, result = 0},
 				)
+				if store_result != .Stored {
+					return Backend_Collect_Result{completion_count = out, fault = .System_Error}
+				}
 				_remove_pending(backend, pending_index)
 			} else if .Edge_Clear in pending_operation.flags {
 				// EV_CLEAR remains armed. The next kernel edge will wake this pending op.
@@ -394,19 +426,23 @@ when !TINA_SIMULATION_MODE {
 				if rearm_error != .None {
 					// Re-registration failed — complete as error to avoid stranding
 					// this operation in pending forever with no kqueue wakeup.
-					out = _posix_deliver_completion(
+					store_result: Backend_Completion_Store_Result
+					out, store_result = _posix_deliver_completion(
 						backend,
 						completions,
 						out,
 						output_max,
 						Raw_Completion{token = pending_operation.submission.token, result = -i32(posix.Errno.EIO)},
 					)
+					if store_result != .Stored {
+						return Backend_Collect_Result{completion_count = out, fault = .System_Error}
+					}
 					_remove_pending(backend, pending_index)
 				}
 			}
 		}
 
-		return out, .None
+		return Backend_Collect_Result{completion_count = out}
 	}
 
 	@(private = "package")
@@ -422,14 +458,15 @@ when !TINA_SIMULATION_MODE {
 				// dispatching the completion to a slot. This mirrors the
 				// Linux/Windows behaviour where the kernel delivers an
 				// equivalent completion (e.g. -ECANCELED CQE on io_uring).
-				if backend.completed_count < MAX_POSIX_COMPLETED {
-					backend.completed[backend.completed_count] = Raw_Completion {
-						token  = token,
-						result = -i32(posix.Errno.ECANCELED),
-						extra  = nil,
-						flags  = {.Synthesized},
-					}
-					backend.completed_count += 1
+				completion := Raw_Completion {
+					token  = token,
+					result = -i32(posix.Errno.ECANCELED),
+					extra  = nil,
+					flags  = {.Synthesized},
+				}
+				store_result := _posix_store_completion(backend, completion)
+				if store_result != .Stored {
+					return .Resource_Exhausted
 				}
 				_remove_pending(backend, i)
 				return .None
@@ -677,7 +714,10 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		fd: OS_FD,
 	) -> Backend_Error {
-		_sweep_pending_for_fd(backend, fd)
+		sweep_error := _sweep_pending_for_fd(backend, fd)
+		if sweep_error != .None {
+			return sweep_error
+		}
 		_posix_forget_fd_io_state(backend, fd)
 
 		if posix.close(posix.FD(fd)) != .OK {
@@ -706,29 +746,18 @@ when !TINA_SIMULATION_MODE {
 		backend: ^Platform_Backend,
 		slot_index: u16,
 		fd: OS_FD,
-	) {
+	) -> Backend_Fixed_File_Update_Result {
 		// No-op: kqueue has no fixed-file table.
+		return .Updated
 	}
 
 	@(private = "package")
 	_backend_unregister_fixed_fd :: proc "contextless" (
 		backend: ^Platform_Backend,
 		slot_index: u16,
-	) {
+	) -> Backend_Fixed_File_Update_Result {
 		// No-op: kqueue has no fixed-file table.
-	}
-
-	@(private = "package")
-	_backend_recv_uses_provided_buffers :: #force_inline proc "contextless" (backend: ^Platform_Backend) -> bool {
-		return false
-	}
-
-	@(private = "package")
-	_backend_replenish_recv_buffer :: #force_inline proc "contextless" (
-		backend: ^Platform_Backend,
-		buffer_index: IO_Slot_Index,
-	) {
-		// No provided buffer ring on BSD — receive pool free-list manages slots.
+		return .Updated
 	}
 
 	// ============================================================================
@@ -744,15 +773,40 @@ when !TINA_SIMULATION_MODE {
 		out_count: u32,
 		output_max: u32,
 		raw: Raw_Completion,
-	) -> u32 {
+	) -> (u32, Backend_Completion_Store_Result) {
 		if out_count < output_max {
 			completions[out_count] = raw
-			return out_count + 1
-		} else if backend.completed_count < MAX_POSIX_COMPLETED {
-			backend.completed[backend.completed_count] = raw
-			backend.completed_count += 1
+			return out_count + 1, .Stored
 		}
-		return out_count
+		store_result := _posix_store_completion(backend, raw)
+		return out_count, store_result
+	}
+
+	@(private = "file")
+	_posix_store_completion :: proc "contextless" (
+		backend: ^Platform_Backend,
+		raw: Raw_Completion,
+	) -> Backend_Completion_Store_Result {
+		_posix_compact_completed(backend)
+		if backend.completed_count >= MAX_POSIX_COMPLETED {
+			return .Capacity_Exhausted
+		}
+		backend.completed[backend.completed_count] = raw
+		backend.completed_count += 1
+		return .Stored
+	}
+
+	@(private = "file")
+	_posix_compact_completed :: proc "contextless" (backend: ^Platform_Backend) {
+		if backend.completed_read == 0 {
+			return
+		}
+		completion_count_unread := backend.completed_count - backend.completed_read
+		for completion_index: u16 = 0; completion_index < completion_count_unread; completion_index += 1 {
+			backend.completed[completion_index] = backend.completed[backend.completed_read + completion_index]
+		}
+		backend.completed_count = completion_count_unread
+		backend.completed_read = 0
 	}
 
 	// Configure an accepted client socket: non-blocking, close-on-exec, SIGPIPE suppression.
@@ -887,7 +941,14 @@ when !TINA_SIMULATION_MODE {
 			// their buffers would otherwise be orphaned. The sweep
 			// synthesizes .Synthesized completions that the reactor's
 			// collection path reclaims.
-			_sweep_pending_for_fd(backend, op.fd)
+			sweep_error := _sweep_pending_for_fd(backend, op.fd)
+			when TINA_RUNTIME_ASSERTIONS {
+				assert(sweep_error == .None, "kqueue close submit preflight must reserve synthetic completion capacity")
+			}
+			if sweep_error != .None {
+				result.result = -i32(posix.Errno.ENOBUFS)
+				return result, true
+			}
 			_posix_forget_fd_io_state(backend, op.fd)
 			if posix.close(posix.FD(op.fd)) != .OK {
 				result.result = -i32(posix.errno())
@@ -1327,18 +1388,30 @@ when !TINA_SIMULATION_MODE {
 	// Called before close() because on kqueue, close() silently removes
 	// kevents without firing events.
 	@(private = "file")
-	_sweep_pending_for_fd :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) {
+	_sweep_pending_for_fd :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
+		_posix_compact_completed(backend)
+		completion_count_required: u16 = 0
+		for pending_index: u16 = 0; pending_index < backend.pending_count; pending_index += 1 {
+			if backend.pending[pending_index].subject_fd == fd {
+				completion_count_required += 1
+			}
+		}
+		if int(backend.completed_count) + int(completion_count_required) > MAX_POSIX_COMPLETED {
+			return .Resource_Exhausted
+		}
+
 		i: u16 = 0
 		for i < backend.pending_count {
 			if backend.pending[i].subject_fd == fd {
-				if backend.completed_count < MAX_POSIX_COMPLETED {
-					backend.completed[backend.completed_count] = Raw_Completion {
-						token  = backend.pending[i].submission.token,
-						result = -i32(posix.Errno.ECANCELED),
-						extra  = nil,
-						flags  = {.Synthesized},
-					}
-					backend.completed_count += 1
+				completion := Raw_Completion {
+					token  = backend.pending[i].submission.token,
+					result = -i32(posix.Errno.ECANCELED),
+					extra  = nil,
+					flags  = {.Synthesized},
+				}
+				store_result := _posix_store_completion(backend, completion)
+				if store_result != .Stored {
+					return .Resource_Exhausted
 				}
 				_remove_pending(backend, i)
 				// Don't increment — swapped-in element needs checking
@@ -1346,6 +1419,7 @@ when !TINA_SIMULATION_MODE {
 				i += 1
 			}
 		}
+		return .None
 	}
 
 	@(private = "file")

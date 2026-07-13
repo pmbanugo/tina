@@ -277,6 +277,58 @@ when TINA_ASAN_POISONING {
 	}
 
 	@(test)
+	test_fd_entry_lifetime_poison_and_reuse :: proc(t: ^testing.T) {
+		backing: [2]FD_Entry
+		table: FD_Table
+		fd_table_init(&table, backing[:])
+
+		entry := &backing[0]
+		testing.expect(
+			t,
+			sanitizer.address_region_is_poisoned_rawptr(
+				rawptr(&entry.payload),
+				size_of(entry.payload),
+			) != nil,
+			"free FD entry lifetime must be poisoned",
+		)
+		testing.expect(
+			t,
+			sanitizer.address_region_is_poisoned_rawptr(rawptr(&entry.os_fd), size_of(entry.os_fd)) == nil,
+			"FD free-list metadata must remain addressable",
+		)
+
+		owner := make_handle(0, 1, 0, 1)
+		handle, allocate_error := fd_table_alloc(&table, OS_FD(7), owner)
+		testing.expect_value(t, allocate_error, FD_Table_Error.None)
+		testing.expect(
+			t,
+			sanitizer.address_region_is_poisoned_rawptr(
+				rawptr(&entry.payload),
+				size_of(entry.payload),
+			) == nil,
+			"allocated FD entry lifetime must be addressable",
+		)
+
+		free_error := fd_table_free(&table, handle)
+		testing.expect_value(t, free_error, FD_Table_Error.None)
+		testing.expect(
+			t,
+			sanitizer.address_region_is_poisoned_rawptr(
+				rawptr(&entry.payload),
+				size_of(entry.payload),
+			) != nil,
+			"released FD entry lifetime must be re-poisoned",
+		)
+
+		for &backing_entry in backing {
+			_sanitizer_address_unpoison_raw(
+				rawptr(&backing_entry.payload),
+				size_of(backing_entry.payload),
+			)
+		}
+	}
+
+	@(test)
 	test_fully_poisoned_io_slot_can_return_to_free_list :: proc(t: ^testing.T) {
 		backing: [64]u8
 		pool: IO_Slot_Pool
@@ -313,9 +365,8 @@ when TINA_ASAN_POISONING {
 		io_slot_pool_init_tina_owned(&pool, backing[:], 64, 2)
 		defer _sanitizer_address_unpoison_io_pool_slots(&pool)
 
-		// The provided-buffer reactor path fully poisons receive slots,
-		// including the intrusive free-list word. Allocation must unpoison
-		// that word before reading the next free index.
+		// Exercise the cleanup-tolerant case where the intrusive link word was
+		// poisoned with the rest of a logically freed slot.
 		_sanitizer_address_poison_io_slot(&pool, IO_Slot_Index(0))
 		_sanitizer_address_poison_io_slot(&pool, IO_Slot_Index(1))
 

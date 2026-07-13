@@ -31,13 +31,67 @@ Backend_Error :: enum u8 {
 	Unsupported,
 }
 
+Backend_Submit_Status :: enum u8 {
+	Accepted,
+	Rejected,
+}
+
+Backend_Submit_Result :: struct {
+	status: Backend_Submit_Status,
+	error:  Backend_Error,
+}
+
+Backend_Collect_Fault :: enum u8 {
+	None,
+	System_Error,
+}
+
+Backend_Collect_Result :: struct {
+	completion_count: u32,
+	fault:            Backend_Collect_Fault,
+}
+
+Backend_Quiesce_Result :: enum u8 {
+	Quiesced,
+	Unproven,
+}
+
+Backend_Completion_Store_Result :: enum u8 {
+	Stored,
+	Capacity_Exhausted,
+}
+
+Backend_Fixed_File_Update_Result :: enum u8 {
+	Updated,
+	Optimization_Disabled,
+}
+
+backend_submit_accepted :: #force_inline proc "contextless" () -> Backend_Submit_Result {
+	return Backend_Submit_Result{status = .Accepted}
+}
+
+backend_submit_rejected :: #force_inline proc "contextless" (error: Backend_Error) -> Backend_Submit_Result {
+	return Backend_Submit_Result{status = .Rejected, error = error}
+}
+
+backend_submit_error :: #force_inline proc "contextless" (result: Backend_Submit_Result) -> Backend_Error {
+	switch result.status {
+	case .Accepted:
+		return .None
+	case .Rejected:
+		return result.error
+	}
+	return .System_Error
+}
+
 // --- Backend Configuration ---
 
 Backend_Config :: struct {
 	queue_size:        u32, // submission/completion queue depth (default 256)
 	sim_config:        Simulation_IO_Config, // only used when TINA_SIM=true
+	boot_scratch:      []u8, // backend init scratch carved from startup memory
 	// Receive-pool memory layout, used for the registered-buffer optimization
-	// (io_uring IORING_REGISTER_BUFFERS / provided buffer rings, §6.6.2 §8).
+	// (io_uring IORING_REGISTER_BUFFERS).
 	// Currently consumed ONLY by the Linux backend; the BSD, Windows, and
 	// simulated backends ignore these fields (their _Platform_State no longer
 	// stores them). They live in the shared config rather
@@ -52,6 +106,13 @@ Backend_Config :: struct {
 }
 
 DEFAULT_BACKEND_QUEUE_SIZE :: 256
+
+backend_boot_scratch_size :: #force_inline proc "contextless" (
+	receive_slot_count: int,
+	fd_slot_count: int,
+) -> int {
+	return _backend_boot_scratch_size(receive_slot_count, fd_slot_count)
+}
 
 // --- SimulatedIO Configuration (§6.6.2 §5.4) ---
 
@@ -105,6 +166,14 @@ backend_deinit :: proc(backend: ^Platform_Backend) {
 	_backend_deinit(backend)
 }
 
+// Ends every backend-owned memory access after an unrecoverable collect fault.
+// Callers may reclaim accepted-operation memory only after Quiesced.
+backend_quiesce_after_collect_fault :: proc(
+	backend: ^Platform_Backend,
+) -> Backend_Quiesce_Result {
+	return _backend_quiesce_after_collect_fault(backend)
+}
+
 backend_error_label :: #force_inline proc "contextless" (error: Backend_Error) -> string {
 	@(static, rodata)
 	labels := [Backend_Error]string {
@@ -124,11 +193,20 @@ backend_error_label :: #force_inline proc "contextless" (error: Backend_Error) -
 }
 
 // Submit a batch of I/O operations. All-or-error semantics.
-backend_submit :: proc(backend: ^Platform_Backend, submissions: []Submission) -> Backend_Error {
+backend_submit :: proc(backend: ^Platform_Backend, submissions: []Submission) -> Backend_Submit_Result {
 	if len(submissions) == 0 {
-		return .None
+		return backend_submit_accepted()
 	}
-	return _backend_submit(backend, submissions)
+	result := _backend_submit(backend, submissions)
+	when TINA_RUNTIME_ASSERTIONS {
+		switch result.status {
+		case .Accepted:
+			assert(result.error == .None, "accepted backend submission must not carry an error")
+		case .Rejected:
+			assert(result.error != .None, "rejected backend submission must carry an error")
+		}
+	}
+	return result
 }
 
 // Collect completed operations into the output slice. Non-blocking when timeout_ns == 0.
@@ -136,14 +214,16 @@ backend_collect :: proc(
 	backend: ^Platform_Backend,
 	completions: []Raw_Completion,
 	timeout_ns: i64,
-) -> (
-	u32,
-	Backend_Error,
-) {
-	if len(completions) == 0 {
-		return 0, .None
+) -> Backend_Collect_Result {
+    completion_capacity := len(completions)
+	if completion_capacity == 0 {
+		return Backend_Collect_Result{}
 	}
-	return _backend_collect(backend, completions, timeout_ns)
+	result := _backend_collect(backend, completions, timeout_ns)
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(result.completion_count <= u32(completion_capacity), "backend reported more completions than caller capacity")
+	}
+	return result
 }
 
 backend_set_current_tick :: #force_inline proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {
@@ -247,34 +327,13 @@ backend_register_fixed_fd :: #force_inline proc "contextless" (
 	backend: ^Platform_Backend,
 	slot_index: u16,
 	fd: OS_FD,
-) {
-	_backend_register_fixed_fd(backend, slot_index, fd)
+) -> Backend_Fixed_File_Update_Result {
+	return _backend_register_fixed_fd(backend, slot_index, fd)
 }
 
 backend_unregister_fixed_fd :: #force_inline proc "contextless" (
 	backend: ^Platform_Backend,
 	slot_index: u16,
-) {
-	_backend_unregister_fixed_fd(backend, slot_index)
-}
-
-// --- Provided Buffer Ring Hooks (io_uring provided buffer rings) ---
-// On Linux with a registered provided buffer ring, the kernel picks a receive
-// buffer from the ring instead of userspace allocating one from the pool.
-// On non-Linux backends, these are no-ops.
-
-// Returns true when the recv path should skip IO_Slot_Pool allocation and
-// let the kernel select a buffer from the provided ring.
-backend_recv_uses_provided_buffers :: #force_inline proc "contextless" (backend: ^Platform_Backend) -> bool {
-	return _backend_recv_uses_provided_buffers(backend)
-}
-
-// Returns a consumed buffer back to the provided buffer ring so the kernel
-// can reuse it for future recv operations. MUST only be called when
-// backend_recv_uses_provided_buffers returns true.
-backend_replenish_recv_buffer :: #force_inline proc "contextless" (
-	backend: ^Platform_Backend,
-	buffer_index: IO_Slot_Index,
-) {
-	_backend_replenish_recv_buffer(backend, buffer_index)
+) -> Backend_Fixed_File_Update_Result {
+	return _backend_unregister_fixed_fd(backend, slot_index)
 }

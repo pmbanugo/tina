@@ -266,22 +266,40 @@ IoOp :: union {
 // Direction-partitioned ownership: reader_isolate and writer_isolate tracked separately.
 // For single-owner FDs (common case), both point to the same Isolate.
 
-FD_Flag :: enum {
-	Close_On_Completion, // bit 0
+FD_Entry_State :: enum u8 {
+	Free,
+	Open,
+	Close_After_Current_IO,
+	Close_Queued,
+	Close_In_Flight,
+}
+
+FD_Entry_Attribute :: enum u8 {
 	Fresh_Accept, // newly accepted socket, eligible for v1 cross-shard handoff
 }
 
-FD_Flags :: bit_set[FD_Flag;u8]
+FD_Entry_Attributes :: bit_set[FD_Entry_Attribute;u8]
 
-FD_Entry :: struct {
+// A named region gives ASan one contiguous logical lifetime; `using` below
+// preserves flat field access without adding storage or indirection.
+FD_Entry_Payload :: struct {
 	reader_isolate: Isolate_Handle,
 	writer_isolate: Isolate_Handle,
 	peer_address:   Peer_Address,
-	os_fd:          OS_FD,
-	generation:     u16,
-	flags:          FD_Flags,
-	_padding:       [5]u8,
 }
+
+FD_Entry :: struct {
+	using payload: FD_Entry_Payload,
+	os_fd:           OS_FD,
+	generation:      u16,
+	state:           FD_Entry_State,
+	attributes:      FD_Entry_Attributes,
+	_padding:        [4]u8,
+}
+
+#assert(offset_of(FD_Entry, payload) == 0)
+#assert(size_of(FD_Entry_Payload) % ASAN_POISON_GRANULE_SIZE == 0)
+#assert(offset_of(FD_Entry, os_fd) >= size_of(FD_Entry_Payload))
 
 FD_Handoff_Result :: enum u8 {
 	ok,
@@ -309,6 +327,9 @@ FD_Handoff_State :: enum u8 {
 }
 
 FD_HANDOFF_NONE_INDEX :: u16(0xFFFF)
+FD_HANDOFF_ENTRY_COUNT_MAX :: int(FD_HANDOFF_NONE_INDEX)
+
+#assert(FD_HANDOFF_ENTRY_COUNT_MAX == int(FD_HANDOFF_NONE_INDEX))
 
 @(private = "package")
 FD_Handoff_Ref :: struct {
@@ -412,8 +433,15 @@ Submission_Token :: distinct u64
 // (counts, offsets, sizes). The compiler enforces explicit conversion at
 // I/O boundaries (e.g. submission_token_pack, pool alloc return).
 IO_Slot_Index :: distinct u16
+IO_SLOT_INDEX_BITS :: 12
 IO_SLOT_INDEX_NONE :: IO_Slot_Index(0x0FFF) // 12-bit max value (4095)
+IO_SLOT_COUNT_MAX :: int(u16(IO_SLOT_INDEX_NONE))
+IO_SLOT_INDEX_MASK :: u64(0x0FFF)
 FIXED_FILE_INDEX_NONE :: u16(0xFFFF)
+
+#assert(u16(IO_SLOT_INDEX_NONE) == (1 << IO_SLOT_INDEX_BITS) - 1)
+#assert(IO_SLOT_COUNT_MAX == int(u16(IO_SLOT_INDEX_NONE)))
+#assert(IO_SLOT_COUNT_MAX <= int(max(u16)))
 
 submission_token_pack :: #force_inline proc(
 	type_index: u8,
@@ -423,12 +451,17 @@ submission_token_pack :: #force_inline proc(
 	buf_index: IO_Slot_Index,
 	op_kind: IO_Operation_Kind,
 ) -> Submission_Token {
+	when TINA_RUNTIME_ASSERTIONS {
+		assert(slot_index <= 0xFFFFF, "isolate slot index exceeds Submission_Token capacity")
+		assert(u16(buf_index) <= u16(IO_SLOT_INDEX_NONE), "I/O slot index exceeds Submission_Token capacity")
+		assert(u8(op_kind) < 0x80, "user completion operation kind overlaps Linux internal user-data tags")
+	}
 	return Submission_Token(
 		u64(type_index & 0xFF) |
 		(u64(slot_index & 0xFFFFF) << 8) |
 		(u64(generation & 0xFF) << 28) |
 		(u64(sequence & 0xFF) << 36) |
-		(u64(buf_index & 0x0FFF) << 44) |
+		((u64(buf_index) & IO_SLOT_INDEX_MASK) << 44) |
 		(u64(op_kind) << 56),
 	)
 }
@@ -450,7 +483,7 @@ submission_token_io_sequence :: #force_inline proc(t: Submission_Token) -> u8 {
 }
 
 submission_token_buffer_index :: #force_inline proc(t: Submission_Token) -> IO_Slot_Index {
-	return IO_Slot_Index((u64(t) >> 44) & 0x0FFF)
+	return IO_Slot_Index((u64(t) >> 44) & IO_SLOT_INDEX_MASK)
 }
 
 submission_token_operation_kind :: #force_inline proc(t: Submission_Token) -> IO_Operation_Kind {
@@ -568,7 +601,6 @@ Completion_Extra :: union {
 // kernel-side counterpart was dropped) rather than delivered by the kernel.
 Completion_Flag :: enum u8 {
 	Synthesized = 0, // Diagnostic: backend-generated (kqueue cancel, SimulatedIO cancel), not kernel-delivered.
-	No_Buffer   = 1, // Control: kernel returned -ENOBUFS from provided buffer ring, needs re-submit.
 }
 Completion_Flags :: distinct bit_set[Completion_Flag; u8]
 
@@ -700,7 +732,7 @@ test_submission_token_round_trip :: proc(t: ^testing.T) {
 		generation = 0x78,
 		sequence = 0x9A,
 		buf_index = 0x0CDE, // Fits in 12 bits!
-		op_kind = IO_Operation_Kind(0xF0),
+		op_kind = IO_Operation_Kind(0x70),
 	)
 
 	testing.expect_value(t, submission_token_type_index(token), 0x12)
@@ -708,7 +740,7 @@ test_submission_token_round_trip :: proc(t: ^testing.T) {
 	testing.expect_value(t, submission_token_generation(token), 0x78)
 	testing.expect_value(t, submission_token_io_sequence(token), 0x9A)
 	testing.expect_value(t, u16(submission_token_buffer_index(token)), 0x0CDE)
-	testing.expect_value(t, submission_token_operation_kind(token), IO_Operation_Kind(0xF0))
+	testing.expect_value(t, submission_token_operation_kind(token), IO_Operation_Kind(0x70))
 }
 
 @(test)

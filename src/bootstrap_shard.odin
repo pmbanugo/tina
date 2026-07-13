@@ -179,18 +179,41 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 			// non-signal recovery safe point before any further logging.
 			_sanitizer_address_refresh_log_ring_poison(&shard.log_ring)
 
-			// 1. Evaluate Shard Restart Intensity using shard-owned policy.
+			// 1. Quiesce a failed backend before any accepted-operation memory
+			// can be reclaimed by ordinary shard recovery.
+			backend_reinit_failed := false
+			if recovery_reason == RECOVERY_BACKEND_COLLECT {
+				backend_recovery_result := shard_recover_faulted_backend(shard)
+				switch backend_recovery_result {
+				case .Recovered:
+				case .Reinit_Failed:
+					backend_reinit_failed = true
+				case .Quiescence_Unproven:
+					fmt.eprintfln(
+						"[FATAL] Shard %d I/O backend could not prove quiescence. Force Killing Process.",
+						shard.id,
+					)
+					os_force_exit(1)
+				}
+			}
+
+			// 2. Evaluate Shard Restart Intensity using shard-owned policy.
 			wall_now_ns := os_monotonic_time_ns()
-			if _check_and_record_shard_restart(report, config.system_spec, wall_now_ns) {
+			restart_limit_exceeded := _check_and_record_shard_restart(
+				report,
+				config.system_spec,
+				wall_now_ns,
+			)
+			if restart_limit_exceeded || backend_reinit_failed {
 				if config.system_spec.quarantine_policy == .Abort {
 					fmt.eprintfln(
-						"[FATAL] Shard %d exceeded restart limits. Policy: Abort. Force Killing Process.",
+						"[FATAL] Shard %d recovery failed. Policy: Abort. Force Killing Process.",
 						shard.id,
 					)
 					os_force_exit(1)
 				} else {
 					fmt.eprintfln(
-						"[QUARANTINE] Shard %d exceeded restart limits. Quarantining.",
+						"[QUARANTINE] Shard %d recovery requires operator retry. Quarantining.",
 						shard.id,
 					)
 					store_reported_state(report, .Quarantined)
@@ -233,6 +256,15 @@ shard_thread_entry :: proc(t: ^thread.Thread) {
 
 				if load_shard_control_signal(shard) == .Recover {
 					store_shard_control_signal(shard, .None)
+					if shard.reactor.backend_state == .Uninitialized {
+						if shard_retry_backend_init(shard) != .None {
+							fmt.eprintfln(
+								"[QUARANTINE] Shard %d I/O backend reinitialization failed.",
+								shard.id,
+							)
+							continue dormant
+						}
+					}
 					break dormant
 				}
 

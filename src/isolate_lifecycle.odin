@@ -88,6 +88,9 @@ _make_isolate :: proc(shard: ^Shard, spec: Spawn_Spec, spawner_handle: Isolate_H
 	soa_meta[slot_index].inbox_head = POOL_NONE_INDEX
 	soa_meta[slot_index].inbox_tail = POOL_NONE_INDEX
 	soa_meta[slot_index].inbox_count = 0
+	soa_meta[slot_index].io_peer_address = {}
+	soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+	soa_meta[slot_index].io_result = 0
 	soa_meta[slot_index].io_operation_kind = .None
 	soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 	soa_meta[slot_index].flags -= ISOLATE_FLAGS_CLEARED_ON_ALLOC
@@ -290,66 +293,108 @@ _teardown_isolate :: proc(shard: ^Shard, type_id: Isolate_Type_Id, slot_index: I
 		}
 	}
 	// Step 2c: FD Table Cleanup
+	//
+	// FD ownership is direction-partitioned. The dying isolate may own read,
+	// write, or both. Close requires both-direction authority — a split owner
+	// (only one direction) may not destroy the FD. It releases only its own
+	// directional claim and the surviving owner continues unaffected. A
+	// whole-FD owner may close or defer close as before.
 	handle_to_match := make_handle(shard.id, type_id, slot_index, old_generation)
 	in_flight_fd := soa_meta[slot_index].io_fd
 
-		for i in 0 ..< shard.reactor.fd_table.slot_count {
-			entry := &shard.reactor.fd_table.entries[i]
-			if entry.reader_isolate == ISOLATE_HANDLE_NONE && entry.writer_isolate == ISOLATE_HANDLE_NONE {
-				continue
-			}
-			if entry.reader_isolate == handle_to_match || entry.writer_isolate == handle_to_match {
-				fd_h := fd_handle_make(u16(i), entry.generation)
+	for i in 0 ..< shard.reactor.fd_table.slot_count {
+		entry := &shard.reactor.fd_table.entries[i]
+		if entry.state == .Free {
+			continue
+		}
+		if entry.reader_isolate == ISOLATE_HANDLE_NONE && entry.writer_isolate == ISOLATE_HANDLE_NONE {
+			continue
+		}
 
-				if has_io_tag && !is_io_completion_ready && fd_h == in_flight_fd {
-					io_token := submission_token_pack(
-						u8(type_id),
-						u32(slot_index),
-						u8(old_generation),
-						soa_meta[slot_index].io_sequence,
-						soa_meta[slot_index].io_slot_index,
-						soa_meta[slot_index].io_operation_kind,
-					)
-					backend_cancel(&shard.reactor.backend, io_token)
+		owns_read := entry.reader_isolate == handle_to_match
+		owns_write := entry.writer_isolate == handle_to_match
+		if !owns_read && !owns_write {
+			continue
+		}
 
-					if io_operation_pool_affinity(soa_meta[slot_index].io_operation_kind) == .Receive {
-						reactor_internal_close_fd(&shard.reactor, fd_h)
-					} else {
-						fd_table_mark_close_on_completion(&shard.reactor.fd_table, fd_h)
-					}
-				} else {
-					reactor_internal_close_fd(&shard.reactor, fd_h)
+		fd_h := fd_handle_make(u16(i), entry.generation)
+
+		// Split owner: release its direction. A surviving directional owner
+		// retains the FD; the final directional owner retires it below.
+		if owns_read != owns_write {
+			if owns_read {
+				entry.reader_isolate = ISOLATE_HANDLE_NONE
+				if entry.writer_isolate != ISOLATE_HANDLE_NONE {
+					continue
+				}
+			} else {
+				assert(owns_write, "matched split owner must own the write direction")
+				entry.writer_isolate = ISOLATE_HANDLE_NONE
+				if entry.reader_isolate != ISOLATE_HANDLE_NONE {
+					continue
 				}
 			}
+			assert(entry.reader_isolate == ISOLATE_HANDLE_NONE)
+			assert(entry.writer_isolate == ISOLATE_HANDLE_NONE)
+		} else {
+			assert(owns_read, "matched whole-FD owner must own the read direction")
+			assert(owns_write, "matched whole-FD owner must own the write direction")
 		}
+
+		// The dying isolate is now the only authority that can retire this FD.
+		if has_io_tag && !is_io_completion_ready && fd_h == in_flight_fd {
+			io_token := submission_token_pack(
+				u8(type_id),
+				u32(slot_index),
+				u8(old_generation),
+				soa_meta[slot_index].io_sequence,
+				soa_meta[slot_index].io_slot_index,
+				soa_meta[slot_index].io_operation_kind,
+			)
+			// Cancellation is advisory: success creates a cancellation completion;
+			// failure leaves the original accepted completion responsible for cleanup.
+			// Close must execute rather than be replaced by cancellation because its
+			// completion is also the descriptor ownership transfer boundary.
+			if soa_meta[slot_index].io_operation_kind != .Close_Complete {
+				_ = backend_cancel(&shard.reactor.backend, io_token)
+			}
+
+			if entry.state == .Open {
+				mark_error := fd_table_mark_close_after_current_io(&shard.reactor.fd_table, fd_h)
+				assert(mark_error == .None, "in-flight FD must transition from Open to Close_After_Current_IO")
+			} else if entry.state != .Close_Queued && entry.state != .Close_In_Flight {
+				assert(false, "in-flight FD must be Open or already closing")
+			}
+		} else {
+			reactor_internal_close_fd(&shard.reactor, fd_h)
+		}
+	}
 
 	// Extract supervision metadata BEFORE freeing the slot
 	group_id := soa_meta[slot_index].group_id
 	old_handle := make_handle(shard.id, type_id, slot_index, old_generation)
 
-	// Step 2d: Deferred slot reuse for zero-copy writes (§5.3)
+	// Step 2d: Accepted I/O completion cleanup still depends on this metadata.
+	// Keep the slot sealed until the stale completion retires the obligation.
 	if has_io_tag && !is_io_completion_ready {
-		existing_op_kind := soa_meta[slot_index].io_operation_kind
+		_slot_track_io_awaiting_transition(shard, soa_meta[slot_index]._state, .Pending_IO_Reuse)
+		_slot_set_state_bare(shard, type_id, slot_index, .Pending_IO_Reuse,
+			"teardown: deferred slot for accepted I/O cleanup; track_io+dispatchable handled separately")
+		_dispatchable_refresh_slot(shard, type_id, slot_index)
 
-		is_struct_source_write :=
-			io_operation_pool_affinity(existing_op_kind) == .Staging &&
-			soa_meta[slot_index].io_slot_index == IO_SLOT_INDEX_NONE
+		// The isolate is logically dead. Payload and working memory will not be
+		// accessed by any legitimate code path while the slot is sealed — only
+		// SOA metadata (operation_kind, io_fd, io_slot_index) is read by the
+		// stale completion reclamation. Poison now so ASan catches stray
+		// accesses during the I/O latency window.
+		_sanitizer_address_poison_isolate_slot(shard, type_id, slot_index)
 
-		if is_struct_source_write {
-			_slot_track_io_awaiting_transition(shard, soa_meta[slot_index]._state, .Pending_IO_Reuse)
-			_slot_set_state_bare(shard, type_id, slot_index, .Pending_IO_Reuse,
-				"teardown: deferred slot for in-flight write; track_io+dispatchable handled separately")
-			_dispatchable_refresh_slot(shard, type_id, slot_index)
+		_drain_mailbox(shard, soa_meta, slot_index)
 
-			_drain_mailbox(shard, soa_meta, slot_index)
-
-			if group_id != SUPERVISION_GROUP_ID_NONE {
-				_on_child_exit(shard, group_id, old_handle, exit_kind)
-			}
-			return
+		if group_id != SUPERVISION_GROUP_ID_NONE {
+			_on_child_exit(shard, group_id, old_handle, exit_kind)
 		}
-		soa_meta[slot_index].io_operation_kind = .None
-		soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
+		return
 	}
 
 	// Step 3: Drain mailbox

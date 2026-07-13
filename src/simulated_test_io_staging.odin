@@ -611,15 +611,14 @@ when TINA_SIMULATION_MODE {
 	}
 
 	// =========================================================================
-	// Test 7: Non-struct-write teardown does NOT enter Pending_IO_Reuse
+	// Test 7: Receive teardown preserves completion-owned metadata
 	//
-	// Negative test: an in-flight recv (receive-pool buffer, not struct memory)
-	// should go directly to Unallocated on teardown, since the kernel reads
-	// from the receive pool slot, not the Isolate struct. The receive pool
-	// slot is reclaimed by the stale completion path independently.
+	// The stale completion needs both the pool index and FD lifecycle identity.
+	// Therefore receive I/O seals the slot exactly like zero-copy writes until
+	// the accepted obligation reaches the common stale-completion path.
 	// =========================================================================
 	@(test)
-	test_recv_teardown_does_not_enter_pending_io_reuse :: proc(t: ^testing.T) {
+	test_recv_teardown_preserves_metadata_until_completion :: proc(t: ^testing.T) {
 		fixture := _make_teardown_test_shard_with_slots(t, 1)
 		defer test_shard_fixture_deinit(fixture)
 		shard := &fixture.shard
@@ -657,13 +656,13 @@ when TINA_SIMULATION_MODE {
 			assert(shard.counters.io_awaiting_count == 1)
 		}
 
-		// Teardown: recv is NOT struct memory — should go directly to Unallocated.
+		// Teardown seals the metadata until the stale completion can reclaim it.
 		_teardown_isolate(shard, type_id, Isolate_Slot_Index(slot_index), .Normal)
 
-		testing.expect_value(t, soa_meta[slot_index]._state, Isolate_State.Unallocated)
-		testing.expect_value(t, shard.counters.io_awaiting_count, u64(0))
-		testing.expect_value(t, shard.isolate_free_heads[type_id], slot_index)
+		testing.expect_value(t, soa_meta[slot_index]._state, Isolate_State.Pending_IO_Reuse)
+		testing.expect_value(t, shard.counters.io_awaiting_count, u64(1))
+		testing.expect_value(t, shard.isolate_free_heads[type_id], u32(POOL_NONE_INDEX))
 
-		fmt.println("\n[TEST SUCCESS] Recv teardown correctly skips Pending_IO_Reuse — slot immediately freed.")
+		fmt.println("\n[TEST SUCCESS] Recv teardown preserved metadata for stale completion cleanup.")
 	}
 }

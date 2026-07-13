@@ -1070,8 +1070,8 @@ ctx_getsockopt :: #force_inline proc(
 	Socket_Option_Value,
 	Backend_Error,
 ) {
-	shard, _ := _current_isolate_turn_frame()
-	return reactor_control_getsockopt(&shard.reactor, fd, level, option)
+	shard, frame := _current_isolate_turn_frame_require_handle()
+	return reactor_control_getsockopt(&shard.reactor, fd, frame.isolate_handle, level, option)
 }
 
 @(private = "package")

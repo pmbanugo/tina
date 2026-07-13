@@ -21,6 +21,7 @@ Death_Case :: struct {
 _death_cases := [?]Death_Case{
 	{"message_pool_use_after_free", _death_message_pool_use_after_free},
 	{"io_slot_use_after_free", _death_io_slot_use_after_free},
+	{"fd_entry_use_after_free", _death_fd_entry_use_after_free},
 	{"isolate_payload_use_after_release", _death_isolate_payload_use_after_release},
 	{"working_arena_use_after_reset", _death_working_arena_use_after_reset},
 	{"inflight_io_slot_use_after_submit_poison", _death_inflight_io_slot_use_after_submit_poison},
@@ -149,6 +150,21 @@ _death_io_slot_use_after_free :: proc() {
 	// ASan must intercept this write to freed poisoned memory (past the
 	// intrusive free-list link that remains addressable).
 	intrinsics.volatile_store(&slot[size_of(IO_Slot_Link)], 0xAB)
+}
+
+@(private = "file")
+_death_fd_entry_use_after_free :: proc() {
+	backing: [1]FD_Entry
+	table: FD_Table
+	fd_table_init(&table, backing[:])
+
+	owner := make_handle(0, 1, 0, 1)
+	handle, _ := fd_table_alloc(&table, OS_FD(7), owner)
+	entry := &backing[0]
+	_ = fd_table_free(&table, handle)
+
+	// ASan must intercept stale raw-pointer access to the released lifetime.
+	intrinsics.volatile_store(&entry.reader_isolate, owner)
 }
 
 @(private = "file")

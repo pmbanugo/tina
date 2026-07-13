@@ -68,6 +68,8 @@ Tina-owned logical lifetimes covered by ASan poisoning include:
 - **Typed isolate payloads and per-isolate working memory** — poisoned when the slot becomes `.Unallocated`, unpoisoned before handler code can access it.
 - **Working-arena sub-allocations** — poisoned on reset, unpoisoned for each fresh allocation.
 - **In-flight kernel-owned I/O buffers** — poisoned after a successful submission on completion-style backends, unpoisoned on completion.
+- **Socket I/O Backend operation-entry payloads** — poisoned while their fixed-capacity entry is free; kernel-owned address and overlapped regions are re-poisoned from accepted submission through completion reclamation.
+- **FD table entry lifetimes** — isolate ownership and peer-address payloads are poisoned while free; generation, state, and the intrusive free-list link remain addressable.
 - **Cross-shard SPSC ring slots** — poisoned while free, unpoisoned on producer claim, and re-poisoned by the consumer before it publishes the released slot via `read_sequence`.
 - **Per-shard log-ring bytes** — poisoned while reusable, unpoisoned while they belong to a committed live record in `[read_cursor, write_cursor)`, and re-poisoned only after a successful `log_flush` advances `read_cursor`. Signal-path emergency flushes advance `read_cursor` without touching ASan shadow state; the poison invariant is repaired at the next non-signal recovery safe point.
 

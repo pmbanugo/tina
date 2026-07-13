@@ -1,6 +1,10 @@
 package tina
 
+import "base:sanitizer"
 import "core:fmt"
+
+_ :: sanitizer
+
 when TINA_SIMULATION_MODE {
 
 	// Helper for during-run payload inspection by user checkers.
@@ -115,29 +119,72 @@ when TINA_SIMULATION_MODE {
 					return true
 				}
 
+				free_by_state: u16 = 0
 				for slot in 0 ..< int(fd_table.slot_count) {
 					entry := &fd_table.entries[slot]
-					active :=
-						entry.reader_isolate != ISOLATE_HANDLE_NONE ||
-						entry.writer_isolate != ISOLATE_HANDLE_NONE
-					if active {
+
+					switch entry.state {
+					case .Free:
+						free_by_state += 1
+						when TINA_ASAN_POISONING {
+							if sanitizer.address_region_is_poisoned_rawptr(
+								rawptr(&entry.payload),
+								size_of(entry.payload),
+							) == nil {
+								fmt.eprintfln(
+									"[CHECKER] Shard %d: free FD entry lifetime is addressable at slot %d",
+									i, slot,
+								)
+								return true
+							}
+						} else {
+							if entry.reader_isolate != ISOLATE_HANDLE_NONE {
+								fmt.eprintfln(
+									"[CHECKER] Shard %d: free FD entry has reader_isolate at slot %d",
+									i, slot,
+								)
+								return true
+							}
+							if entry.writer_isolate != ISOLATE_HANDLE_NONE {
+								fmt.eprintfln(
+									"[CHECKER] Shard %d: free FD entry has writer_isolate at slot %d",
+									i, slot,
+								)
+								return true
+							}
+						}
+					case .Open, .Close_After_Current_IO, .Close_Queued, .Close_In_Flight:
 						if entry.generation == 0 {
 							fmt.eprintfln(
-								"[CHECKER] Shard %d: fd table active entry has generation zero at slot %d",
-								i,
-								slot,
+								"[CHECKER] Shard %d: fd table non-free entry has generation zero at slot %d (state=%v)",
+								i, slot, entry.state,
 							)
 							return true
 						}
 						if entry.os_fd == OS_FD_INVALID {
 							fmt.eprintfln(
-								"[CHECKER] Shard %d: fd table active entry has invalid os fd at slot %d",
-								i,
-								slot,
+								"[CHECKER] Shard %d: fd table non-free entry has invalid os fd at slot %d (state=%v)",
+								i, slot, entry.state,
+							)
+							return true
+						}
+						if entry.reader_isolate == ISOLATE_HANDLE_NONE &&
+						   entry.writer_isolate == ISOLATE_HANDLE_NONE {
+							fmt.eprintfln(
+								"[CHECKER] Shard %d: non-free fd entry has no owners at slot %d (state=%v)",
+								i, slot, entry.state,
 							)
 							return true
 						}
 					}
+				}
+
+				if free_by_state != fd_table.free_count {
+					fmt.eprintfln(
+						"[CHECKER] Shard %d: fd table free_count mismatch (free_count=%d free_by_state=%d)",
+						i, fd_table.free_count, free_by_state,
+					)
+					return true
 				}
 			}
 
@@ -318,6 +365,25 @@ when TINA_SIMULATION_MODE {
 						i,
 						expected_io_awaiting,
 						shard.counters.io_awaiting_count,
+						round,
+					)
+					return true
+				}
+
+				// Completion accounting invariant (§2.2): every accepted
+				// operation increments io_in_flight_count exactly once, and
+				// every reactor-visible completion decrements it exactly once.
+				// The simulated backend's obligation ledger (pending +
+				// completed) must match the reactor's in-flight count.
+				backend := &shard.reactor.backend
+				expected_in_flight := u32(backend.pending_count) + u32(backend.completed_count)
+				if shard.reactor.io_in_flight_count != expected_in_flight {
+					fmt.eprintfln(
+						"[CHECKER] Shard %d: io_in_flight_count ledger mismatch (in_flight=%d pending=%d completed=%d, round %d)",
+						i,
+						shard.reactor.io_in_flight_count,
+						backend.pending_count,
+						backend.completed_count,
 						round,
 					)
 					return true

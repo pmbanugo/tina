@@ -34,6 +34,10 @@ io_slot_pool_init :: proc(
 	slot_size: u32,
 	slot_count: u16,
 ) {
+	assert(
+		int(slot_count) <= IO_SLOT_COUNT_MAX,
+		"IO slot count exceeds Submission_Token buffer_index capacity",
+	)
 	if slot_count == 0 {
 		pool.backing_memory = backing_memory
 		pool.slot_size = slot_size
@@ -173,9 +177,8 @@ io_slot_pool_alloc_tina_owned :: #force_inline proc(
 	index := pool.free_head
 	slot_pointer := _io_slot_pool_pointer(pool, index)
 
-	// Unpoison the free-list link word before reading it. The provided-buffer
-	// init path poisons entire slots (link word included), so reading the link
-	// word before unpoisoning would trigger ASan. Symmetric with the free path.
+	// A logically freed slot has a poisoned payload, including the intrusive
+	// link word, so ownership must be restored before reading the link.
 	_sanitizer_address_unpoison_raw(rawptr(slot_pointer), size_of(IO_Slot_Link))
 	slot_link := cast(^IO_Slot_Link)slot_pointer
 	pool.free_head = slot_link.next_free

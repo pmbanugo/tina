@@ -6,6 +6,7 @@ import "core:mem"
 _ :: sanitizer
 
 TINA_ASAN_POISONING :: .Address in ODIN_SANITIZER_FLAGS
+ASAN_POISON_GRANULE_SIZE :: 8
 
 @(private = "package")
 _sanitizer_address_poison_raw :: #force_inline proc "contextless" (pointer: rawptr, size: int) {
@@ -320,6 +321,9 @@ _sanitizer_address_unpoison_shard_memory :: proc "contextless" (shard: ^Shard) {
 		_sanitizer_address_unpoison_io_pool_slots(&shard.transfer_pool)
 		_sanitizer_address_unpoison_io_pool_slots(&shard.reactor.receive_pool)
 		_sanitizer_address_unpoison_io_pool_slots(&shard.reactor.staging_pool)
+		for &entry in shard.reactor.fd_table.entries {
+			_sanitizer_address_unpoison_raw(rawptr(&entry.payload), size_of(entry.payload))
+		}
 		_sanitizer_address_unpoison_log_ring(&shard.log_ring)
 	}
 }

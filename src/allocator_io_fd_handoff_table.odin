@@ -11,6 +11,10 @@ FD_Handoff_Table_Error :: enum u8 {
 }
 
 fd_handoff_table_init :: proc(table: ^FD_Handoff_Table, backing: []FD_Handoff_Entry) {
+	assert(
+		len(backing) <= FD_HANDOFF_ENTRY_COUNT_MAX,
+		"FD handoff entry count exceeds index capacity",
+	)
 	table.entries = backing
 	table.entry_count = u16(len(backing))
 	table.free_count = table.entry_count
