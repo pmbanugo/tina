@@ -223,7 +223,7 @@ when !TINA_SIMULATION_MODE {
 	_backend_submit :: proc(
 		backend: ^Platform_Backend,
 		submissions: []Submission,
-	) -> Backend_Submit_Result {
+	) -> Backend_Error {
 		// All-or-error: pre-check overlapped entry capacity. Close is synchronous
 		// and completes through backend.completed, so it must not consume an
 		// OVERLAPPED entry or be rejected because the async entry pool is full.
@@ -251,12 +251,12 @@ when !TINA_SIMULATION_MODE {
 			}
 		}
 		if available < async_submission_count {
-			return backend_submit_rejected(.Queue_Full)
+			return .Queue_Full
 		}
 		// Every operation can complete immediately once ownership transfers.
 		// Reserve that worst case before issuing the first kernel operation.
 		if int(MAX_WIN_COMPLETED - backend.completed_count) < len(submissions) {
-			return backend_submit_rejected(.Queue_Full)
+			return .Queue_Full
 		}
 
 		for &sub in submissions {
@@ -526,7 +526,7 @@ when !TINA_SIMULATION_MODE {
 			}
 		}
 
-		return backend_submit_accepted()
+		return .None
 	}
 
 	@(private = "package")
@@ -591,7 +591,7 @@ when !TINA_SIMULATION_MODE {
 				continue
 			}
 
-			entry := _win_entry_from_overlapped(event.lpOverlapped)
+			entry := cast(^Win_Overlapped_Entry)event.lpOverlapped
 			assert(entry.state == .In_Flight, "IOCP completion must reference an in-flight entry")
 			_win_reclaim_entry(entry)
 
@@ -708,7 +708,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
+	_backend_set_current_tick :: #force_inline proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
 
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
@@ -957,7 +957,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_control_dup :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> (
+	_backend_control_dup :: #force_inline proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> (
 		OS_FD,
 		Backend_Error,
 	) {
@@ -965,13 +965,13 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_register_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) -> Backend_Fixed_File_Update_Result {
+	_backend_register_fixed_fd :: #force_inline proc "contextless" (backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) -> Backend_Fixed_File_Update_Result {
 		// No-op: IOCP has no fixed-file table.
 		return .Optimization_Disabled
 	}
 
 	@(private = "package")
-	_backend_unregister_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16) -> Backend_Fixed_File_Update_Result {
+	_backend_unregister_fixed_fd :: #force_inline proc "contextless" (backend: ^Platform_Backend, slot_index: u16) -> Backend_Fixed_File_Update_Result {
 		// No-op: IOCP has no fixed-file table.
 		return .Optimization_Disabled
 	}
@@ -1180,13 +1180,6 @@ when !TINA_SIMULATION_MODE {
 		_sanitizer_address_unpoison_raw(rawptr(&entry.overlapped), size_of(entry.overlapped))
 		_sanitizer_address_unpoison_raw(rawptr(&entry.op_data), size_of(entry.op_data))
 		entry.state = .Prepared
-	}
-
-	@(private = "file")
-	_win_entry_from_overlapped :: proc(
-		overlapped: ^win.OVERLAPPED,
-	) -> ^Win_Overlapped_Entry {
-		return cast(^Win_Overlapped_Entry)overlapped
 	}
 
 	@(private = "file")
@@ -1411,11 +1404,13 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_win_is_pending :: proc(error: win.INT) -> bool {
-		return(
-			error == i32(win.System_Error.IO_PENDING) ||
-			error == i32(win.System_Error.WSAEWOULDBLOCK) \
-		)
+	_win_is_pending :: #force_inline proc "contextless" (error: win.INT) -> bool {
+		switch error {
+		case i32(win.System_Error.IO_PENDING), i32(win.System_Error.WSAEWOULDBLOCK):
+			return true
+		case:
+			return false
+		}
 	}
 
 	@(private = "file")
@@ -1503,25 +1498,25 @@ when !TINA_SIMULATION_MODE {
 	// --- Address Conversion ---
 
 	@(private = "file")
-	_win_socket_address_to_sockaddr :: proc(
+	_win_socket_address_to_sockaddr :: proc "contextless" (
 		address: Socket_Address,
 	) -> (
 		win.SOCKADDR_STORAGE_LH,
 		win.INT,
 	) {
 		storage: win.SOCKADDR_STORAGE_LH
-		switch addr in address {
+		switch socket_address in address {
 		case Socket_Address_Inet4:
-			sa := (^win.sockaddr_in)(&storage)
-			sa.sin_family = u16(win.AF_INET)
-			sa.sin_port = u16be(addr.port)
-			sa.sin_addr = transmute(win.in_addr)addr.address
+			internet4 := (^win.sockaddr_in)(&storage)
+			internet4.sin_family = u16(win.AF_INET)
+			internet4.sin_port = u16be(socket_address.port)
+			internet4.sin_addr = transmute(win.in_addr)socket_address.address
 			return storage, size_of(win.sockaddr_in)
 		case Socket_Address_Inet6:
-			sa := (^win.sockaddr_in6)(&storage)
-			sa.sin6_family = u16(win.AF_INET6)
-			sa.sin6_port = u16be(addr.port)
-			sa.sin6_addr = transmute(win.in6_addr)addr.address
+			internet6 := (^win.sockaddr_in6)(&storage)
+			internet6.sin6_family = u16(win.AF_INET6)
+			internet6.sin6_port = u16be(socket_address.port)
+			internet6.sin6_addr = transmute(win.in6_addr)socket_address.address
 			return storage, size_of(win.sockaddr_in6)
 		case Socket_Address_Unix:
 			return storage, 0
@@ -1530,29 +1525,29 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_win_sockaddr_to_socket_address :: proc(native: ^win.SOCKADDR_STORAGE_LH) -> Socket_Address {
+	_win_sockaddr_to_socket_address :: proc "contextless" (native: ^win.SOCKADDR_STORAGE_LH) -> Socket_Address {
 		if native == nil {
 			return nil
 		}
 		switch native.ss_family {
 		case u16(win.AF_INET):
-			sa := (^win.sockaddr_in)(native)
+			internet4 := (^win.sockaddr_in)(native)
 			return Socket_Address_Inet4 {
-				address = transmute([4]u8)sa.sin_addr,
-				port = u16(u16be(sa.sin_port)),
+				address = transmute([4]u8)internet4.sin_addr,
+				port = u16(u16be(internet4.sin_port)),
 			}
 		case u16(win.AF_INET6):
-			sa := (^win.sockaddr_in6)(native)
+			internet6 := (^win.sockaddr_in6)(native)
 			return Socket_Address_Inet6 {
-				address = transmute([16]u8)sa.sin6_addr,
-				port = u16(u16be(sa.sin6_port)),
+				address = transmute([16]u8)internet6.sin6_addr,
+				port = u16(u16be(internet6.sin6_port)),
 			}
 		}
 		return nil
 	}
 
 	@(private = "file")
-	_win_map_socket_level :: proc(level: Socket_Level) -> i32 {
+	_win_map_socket_level :: #force_inline proc "contextless" (level: Socket_Level) -> i32 {
 		switch level {
 		case .SOL_SOCKET:
 			return win.SOL_SOCKET
@@ -1567,7 +1562,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_win_map_socket_option :: proc(option: Socket_Option) -> i32 {
+	_win_map_socket_option :: #force_inline proc "contextless" (option: Socket_Option) -> i32 {
 		switch option {
 		case .SO_REUSEADDR:
 			return win.SO_REUSEADDR
@@ -1630,7 +1625,7 @@ when !TINA_SIMULATION_MODE {
 			{token = token, operation = Submission_Op_Close{fd = fd}},
 		}
 		sub_error := backend_submit(backend, submissions[:])
-		testing.expect_value(t, sub_error.status, Backend_Submit_Status.Accepted)
+		testing.expect_value(t, sub_error, Backend_Error.None)
 
 		// Collect the close completion
 		completions: [4]Raw_Completion
@@ -1982,7 +1977,7 @@ when !TINA_SIMULATION_MODE {
 			{token = token, operation = Submission_Op_Close{fd = OS_FD(uintptr(0xDEADBEEF))}},
 		}
 		sub_error := backend_submit(backend, submissions[:])
-		if !testing.expect_value(t, sub_error.status, Backend_Submit_Status.Accepted) do return
+		if !testing.expect_value(t, sub_error, Backend_Error.None) do return
 		if !testing.expect_value(t, backend.completed_count, u16(1)) do return
 		testing.expect_value(t, backend.completed_read, u16(0))
 

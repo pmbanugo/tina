@@ -555,11 +555,11 @@ when !TINA_SIMULATION_MODE {
 	_backend_submit :: proc(
 		backend: ^Platform_Backend,
 		submissions: []Submission,
-	) -> Backend_Submit_Result {
+	) -> Backend_Error {
 		// All-or-error: pre-check worst-case capacity.
 		// In the worst case, every submission overflows to unqueued.
 		if int(backend.unqueued_count) + len(submissions) > MAX_LINUX_UNQUEUED {
-			return backend_submit_rejected(.Queue_Full)
+			return .Queue_Full
 		}
 
 		required_addr_entry_count := 0
@@ -604,10 +604,10 @@ when !TINA_SIMULATION_MODE {
 			}
 		}
 		if int(backend.addr_entry_count_in_use) + unqueued_addr_needs + required_addr_entry_count > MAX_LINUX_PENDING_ADDRS {
-			return backend_submit_rejected(.Resource_Exhausted)
+			return .Resource_Exhausted
 		}
 		if int(backend.sendfile_entry_count_in_use) + unqueued_sendfile_needs + required_sendfile_entry_count > MAX_LINUX_SENDFILE_ENTRIES {
-			return backend_submit_rejected(.Resource_Exhausted)
+			return .Resource_Exhausted
 		}
 
 		for &submission in submissions {
@@ -621,7 +621,7 @@ when !TINA_SIMULATION_MODE {
 		// Ownership is committed above. A submit syscall fault leaves SQEs in the
 		// ring for collect to retry; rejecting here would create dual ownership.
 		uring.submit(&backend.ring, 0, nil)
-		return backend_submit_accepted()
+		return .None
 	}
 
 	@(private = "file")
@@ -762,7 +762,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
+	_backend_set_current_tick :: #force_inline proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
 
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
@@ -1804,7 +1804,7 @@ when !TINA_SIMULATION_MODE {
 	// Apply fixed-file optimization to an SQE if registered files are available.
 	// Called after the uring helper has filled the SQE with the raw OS_FD.
 	@(private = "file")
-	_linux_apply_fixed_file :: #force_inline proc(
+	_linux_apply_fixed_file :: #force_inline proc "contextless" (
 		sqe: ^linux.IO_Uring_SQE,
 		fixed_file_index: u16,
 	) {
@@ -1927,16 +1927,16 @@ when !TINA_SIMULATION_MODE {
 
 	// Convert linux.Sock_Addr_Any → Socket_Address
 	@(private = "file")
-	_linux_sockaddr_to_socket_address :: proc(addr: ^linux.Sock_Addr_Any) -> Socket_Address {
-		#partial switch addr.family {
+	_linux_sockaddr_to_socket_address :: proc "contextless" (native: ^linux.Sock_Addr_Any) -> Socket_Address {
+		#partial switch native.family {
 		case .INET:
-			return Socket_Address_Inet4{address = addr.sin_addr, port = u16(addr.sin_port)}
+			return Socket_Address_Inet4{address = native.sin_addr, port = u16(native.sin_port)}
 		case .INET6:
 			return Socket_Address_Inet6 {
-				address = transmute([16]u8)addr.sin6_addr,
-				port = u16(addr.sin6_port),
-				flow = addr.sin6_flowinfo,
-				scope = addr.sin6_scope_id,
+				address = transmute([16]u8)native.sin6_addr,
+				port = u16(native.sin6_port),
+				flow = native.sin6_flowinfo,
+				scope = native.sin6_scope_id,
 			}
 		}
 		return nil
@@ -1944,29 +1944,29 @@ when !TINA_SIMULATION_MODE {
 
 	// Convert Socket_Address → linux.Sock_Addr_Any
 	@(private = "file")
-	_linux_socket_address_to_sockaddr :: proc(address: Socket_Address) -> linux.Sock_Addr_Any {
-		sa: linux.Sock_Addr_Any
-		switch addr in address {
+	_linux_socket_address_to_sockaddr :: proc "contextless" (address: Socket_Address) -> linux.Sock_Addr_Any {
+		native: linux.Sock_Addr_Any
+		switch socket_address in address {
 		case Socket_Address_Inet4:
-			sa.sin_family = .INET
-			sa.sin_port = u16be(addr.port)
-			sa.sin_addr = addr.address
+			native.sin_family = .INET
+			native.sin_port = u16be(socket_address.port)
+			native.sin_addr = socket_address.address
 		case Socket_Address_Inet6:
-			sa.sin6_family = .INET6
-			sa.sin6_port = u16be(addr.port)
-			sa.sin6_addr = transmute([16]u8)addr.address
-			sa.sin6_flowinfo = addr.flow
-			sa.sin6_scope_id = addr.scope
+			native.sin6_family = .INET6
+			native.sin6_port = u16be(socket_address.port)
+			native.sin6_addr = transmute([16]u8)socket_address.address
+			native.sin6_flowinfo = socket_address.flow
+			native.sin6_scope_id = socket_address.scope
 		case Socket_Address_Unix:
-			sa.sun_family = .UNIX
-			sa.sun_path = addr.path
+			native.sun_family = .UNIX
+			native.sun_path = socket_address.path
 		}
-		return sa
+		return native
 	}
 
 	// Return the sockaddr length for bind/connect syscalls.
 	@(private = "file")
-	_linux_sockaddr_len :: proc(address: Socket_Address) -> i32 {
+	_linux_sockaddr_len :: #force_inline proc "contextless" (address: Socket_Address) -> i32 {
 		switch _ in address {
 		case Socket_Address_Inet4:
 			return size_of(linux.Sock_Addr_In)
@@ -2078,7 +2078,7 @@ when !TINA_SIMULATION_MODE {
 			},
 		}
 		sub_error := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_error.status, Backend_Submit_Status.Accepted)
+		testing.expect_value(t, sub_error, Backend_Error.None)
 		// If IOSQE_FIXED_FILE was applied incorrectly, the kernel would return EBADF
 		// on the CQE. The submit succeeding means the SQE was accepted.
 
@@ -2119,7 +2119,7 @@ when !TINA_SIMULATION_MODE {
 			},
 		}
 		sub_error := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, sub_error.status, Backend_Submit_Status.Accepted)
+		testing.expect_value(t, sub_error, Backend_Error.None)
 
 		// Collect the close completion — should succeed (not EBADF)
 		completions: [4]Raw_Completion

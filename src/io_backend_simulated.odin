@@ -38,27 +38,47 @@ when TINA_SIMULATION_MODE {
 		return 0
 	}
 
+	Sim_FD_Object_State :: enum u8 {
+		Free,
+		Open,
+		Bound,
+		Listening,
+	}
+
+	Sim_FD_Object_Attribute :: enum u8 {
+		Reuse_Port,
+		Exclusive_Address_Use,
+	}
+
+	Sim_FD_Object_Attributes :: bit_set[Sim_FD_Object_Attribute; u8]
+
 	Sim_FD_Object :: struct {
-		ref_count:                    u16,
-		inflight_count:               u16,
-		next_free_index:              u16,
-		alive:                        bool,
-		bound:                        bool,
-		listening:                    bool,
-		reuse_port_enabled:           bool,
-		exclusive_address_use_enabled: bool,
-		_padding:                     [3]u8,
-		bind_address:                 Socket_Address,
+		ref_count:       u16,
+		inflight_count:  u16,
+		next_free_index: u16,
+		state:           Sim_FD_Object_State,
+		attributes:      Sim_FD_Object_Attributes,
+		bind_address:    Socket_Address,
+	}
+
+	Sim_FD_Descriptor_State :: enum u8 {
+		Free,
+		Open_Close_On_Exec,
 	}
 
 	Sim_FD_Descriptor :: struct {
 		fd_number:       OS_FD,
 		object_index:    u16,
 		next_free_index: u16,
-		active:          bool,
-		cloexec:         bool,
-		_padding:        [6]u8,
+		state:           Sim_FD_Descriptor_State,
+		_padding:        [3]u8,
 	}
+	#assert(size_of(Sim_FD_Object_State) == 1)
+	#assert(size_of(Sim_FD_Object_Attributes) == 1)
+	#assert(offset_of(Sim_FD_Object, bind_address) == 8)
+	#assert(size_of(Sim_FD_Object) == 8 + size_of(Socket_Address))
+	#assert(size_of(Sim_FD_Descriptor_State) == 1)
+	#assert(size_of(Sim_FD_Descriptor) == size_of(OS_FD) + 8)
 
 	Simulated_Operation :: struct {
 		token:          Submission_Token,
@@ -162,11 +182,11 @@ when TINA_SIMULATION_MODE {
 		for _ in 0 ..< backend.completed_count {
 			completion := &backend.completed[completion_index]
 			if accept_extra, ok := completion.extra.(Completion_Extra_Accept); ok {
-				descriptor_index, descriptor_ok := _sim_lookup_descriptor_index(
+				descriptor_index := _sim_lookup_descriptor_index(
 					backend,
 					accept_extra.client_fd,
 				)
-				if descriptor_ok {
+				if descriptor_index != SIM_DESCRIPTOR_NONE_INDEX {
 					_ = _sim_close_descriptor_index(backend, descriptor_index)
 				}
 			}
@@ -186,10 +206,10 @@ when TINA_SIMULATION_MODE {
 	_backend_submit :: proc(
 		backend: ^Platform_Backend,
 		submissions: []Submission,
-	) -> Backend_Submit_Result {
+	) -> Backend_Error {
 		obligation_count := int(backend.pending_count) + int(backend.completed_count)
 		if obligation_count + len(submissions) > MAX_SIMULATED_COMPLETED {
-			return backend_submit_rejected(.Queue_Full)
+			return .Queue_Full
 		}
 
 		prepared: [REACTOR_SUBMISSION_BATCH_COUNT]Simulated_Submission_Targets
@@ -197,14 +217,14 @@ when TINA_SIMULATION_MODE {
 			assert(len(submissions) <= len(prepared), "sim backend submit batch exceeds reactor submission batch")
 		}
 		if len(submissions) > len(prepared) {
-			return backend_submit_rejected(.Queue_Full)
+			return .Queue_Full
 		}
 
 		for submission, submission_index in submissions {
 			submission_operation := submission.operation
 			targets, valid := _sim_validate_submission_targets(backend, &submission_operation)
 			if !valid {
-				return backend_submit_rejected(.System_Error)
+				return .System_Error
 			}
 			prepared[submission_index] = targets
 		}
@@ -251,7 +271,7 @@ when TINA_SIMULATION_MODE {
 			backend.pending_count += 1
 		}
 
-		return backend_submit_accepted()
+		return .None
 	}
 
 	@(private = "package")
@@ -363,7 +383,7 @@ when TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {
+	_backend_set_current_tick :: #force_inline proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {
 		backend.tick_count = tick_count
 		backend.time_controlled = true
 	}
@@ -430,12 +450,12 @@ when TINA_SIMULATION_MODE {
 			backend.sim_world != nil,
 			"simulated socket creation requires an initialized I/O world",
 		)
-		object_index, ok := _sim_alloc_object(backend)
-		if !ok {
+		object_index := _sim_alloc_object(backend)
+		if object_index == SIM_OBJECT_NONE_INDEX {
 			return OS_FD_INVALID, .System_Error
 		}
-		fd, descriptor_ok := _sim_alloc_descriptor(backend, object_index, true)
-		if !descriptor_ok {
+		fd := _sim_alloc_descriptor(backend, object_index)
+		if fd == OS_FD_INVALID {
 			_sim_object_release_ref(backend, object_index)
 			return OS_FD_INVALID, .System_Error
 		}
@@ -448,20 +468,20 @@ when TINA_SIMULATION_MODE {
 		fd: OS_FD,
 		address: Socket_Address,
 	) -> Backend_Error {
-		desc, ok := _sim_lookup_descriptor(backend, fd)
-		if !ok do return .System_Error
+		descriptor := _sim_lookup_descriptor(backend, fd)
+		if descriptor == nil do return .System_Error
 
 		world := backend.sim_world
-		object := &world.objects[desc.object_index]
-		if object.bound {
+		object := &world.objects[descriptor.object_index]
+		if object.state != .Open {
 			return .Invalid_Argument
 		}
 
 		for object_index in 0 ..< MAX_SIMULATED_OBJECTS {
 			other := &world.objects[object_index]
-			if !other.alive || !other.bound || u16(object_index) == desc.object_index {
-				continue
-			}
+			if other.state == .Free do continue
+			if other.state == .Open do continue
+			if u16(object_index) == descriptor.object_index do continue
 			if !_sim_bind_addresses_overlap(address, other.bind_address) {
 				continue
 			}
@@ -471,7 +491,7 @@ when TINA_SIMULATION_MODE {
 			return .Address_In_Use
 		}
 
-		object.bound = true
+		object.state = .Bound
 		object.bind_address = address
 		return .None
 	}
@@ -482,14 +502,13 @@ when TINA_SIMULATION_MODE {
 		fd: OS_FD,
 		backlog: u32,
 	) -> Backend_Error {
-		desc, ok := _sim_lookup_descriptor(backend, fd)
-		if !ok do return .System_Error
+		descriptor := _sim_lookup_descriptor(backend, fd)
+		if descriptor == nil do return .System_Error
 		world := backend.sim_world
-		object := &world.objects[desc.object_index]
-		if !object.bound {
-			return .Invalid_Argument
-		}
-		object.listening = true
+		object := &world.objects[descriptor.object_index]
+		if object.state == .Free do return .Invalid_Argument
+		if object.state == .Open do return .Invalid_Argument
+		object.state = .Listening
 		return .None
 	}
 
@@ -501,20 +520,28 @@ when TINA_SIMULATION_MODE {
 		option: Socket_Option,
 		value: Socket_Option_Value,
 	) -> Backend_Error {
-		desc, ok := _sim_lookup_descriptor(backend, fd)
-		if !ok do return .System_Error
+		descriptor := _sim_lookup_descriptor(backend, fd)
+		if descriptor == nil do return .System_Error
 		world := backend.sim_world
-		object := &world.objects[desc.object_index]
+		object := &world.objects[descriptor.object_index]
 
 		if level == .SOL_SOCKET {
 			#partial switch option {
 			case .SO_REUSEPORT:
 				if enabled, enabled_ok := value.(bool); enabled_ok {
-					object.reuse_port_enabled = enabled
+					if enabled {
+						object.attributes += {.Reuse_Port}
+					} else {
+						object.attributes -= {.Reuse_Port}
+					}
 				}
 			case .SO_EXCLUSIVEADDRUSE:
 				if enabled, enabled_ok := value.(bool); enabled_ok {
-					object.exclusive_address_use_enabled = enabled
+					if enabled {
+						object.attributes += {.Exclusive_Address_Use}
+					} else {
+						object.attributes -= {.Exclusive_Address_Use}
+					}
 				}
 			case:
 			}
@@ -533,7 +560,7 @@ when TINA_SIMULATION_MODE {
 		Socket_Option_Value,
 		Backend_Error,
 	) {
-		if _, ok := _sim_lookup_descriptor(backend, fd); !ok do return nil, .System_Error
+		if _sim_lookup_descriptor(backend, fd) == nil do return nil, .System_Error
 		// Simulation returns a default value
 		return i32(0), .None
 	}
@@ -544,14 +571,14 @@ when TINA_SIMULATION_MODE {
 		fd: OS_FD,
 		how: Shutdown_How,
 	) -> Backend_Error {
-		if _, ok := _sim_lookup_descriptor(backend, fd); !ok do return .System_Error
+		if _sim_lookup_descriptor(backend, fd) == nil do return .System_Error
 		return .None
 	}
 
 	@(private = "package")
 	_backend_control_close :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> Backend_Error {
-		descriptor_index, ok := _sim_lookup_descriptor_index(backend, fd)
-		if !ok do return .System_Error
+		descriptor_index := _sim_lookup_descriptor_index(backend, fd)
+		if descriptor_index == SIM_DESCRIPTOR_NONE_INDEX do return .System_Error
 		if !_sim_close_descriptor_index(backend, descriptor_index) {
 			return .System_Error
 		}
@@ -563,29 +590,29 @@ when TINA_SIMULATION_MODE {
 		OS_FD,
 		Backend_Error,
 	) {
-		desc, ok := _sim_lookup_descriptor(backend, fd)
-		if !ok {
+		descriptor := _sim_lookup_descriptor(backend, fd)
+		if descriptor == nil {
 			return OS_FD_INVALID, .System_Error
 		}
 		world := backend.sim_world
-		object := &world.objects[desc.object_index]
+		object := &world.objects[descriptor.object_index]
 		object.ref_count += 1
-		dup_fd, alloc_ok := _sim_alloc_descriptor(backend, desc.object_index, true)
-		if !alloc_ok {
+		duplicate_fd := _sim_alloc_descriptor(backend, descriptor.object_index)
+		if duplicate_fd == OS_FD_INVALID {
 			object.ref_count -= 1
 			return OS_FD_INVALID, .System_Error
 		}
-		return dup_fd, .None
+		return duplicate_fd, .None
 	}
 
 	@(private = "package")
-	_backend_register_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) -> Backend_Fixed_File_Update_Result {
+	_backend_register_fixed_fd :: #force_inline proc "contextless" (backend: ^Platform_Backend, slot_index: u16, fd: OS_FD) -> Backend_Fixed_File_Update_Result {
 		// No-op: SimulatedIO has no kernel fixed-file table.
 		return .Updated
 	}
 
 	@(private = "package")
-	_backend_unregister_fixed_fd :: proc "contextless" (backend: ^Platform_Backend, slot_index: u16) -> Backend_Fixed_File_Update_Result {
+	_backend_unregister_fixed_fd :: #force_inline proc "contextless" (backend: ^Platform_Backend, slot_index: u16) -> Backend_Fixed_File_Update_Result {
 		// No-op: SimulatedIO has no kernel fixed-file table.
 		return .Updated
 	}
@@ -618,78 +645,69 @@ when TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_sim_alloc_object :: proc "contextless" (backend: ^Platform_Backend) -> (u16, bool) {
+	_sim_alloc_object :: proc "contextless" (backend: ^Platform_Backend) -> u16 {
 		world := backend.sim_world
 		if world.object_free_head == SIM_OBJECT_NONE_INDEX {
-			return SIM_OBJECT_NONE_INDEX, false
+			return SIM_OBJECT_NONE_INDEX
 		}
 		index := world.object_free_head
 		object := &world.objects[index]
 		world.object_free_head = object.next_free_index
 		world.object_free_count -= 1
 		object^ = Sim_FD_Object {
-			ref_count                     = 1,
-			inflight_count                = 0,
-			next_free_index               = SIM_OBJECT_NONE_INDEX,
-			alive                         = true,
-			bound                         = false,
-			listening                     = false,
-			reuse_port_enabled            = false,
-			exclusive_address_use_enabled = false,
+			ref_count       = 1,
+			inflight_count  = 0,
+			next_free_index = SIM_OBJECT_NONE_INDEX,
+			state           = .Open,
 		}
-		return index, true
+		return index
 	}
 
 	@(private = "file")
 	_sim_alloc_descriptor :: proc "contextless" (
 		backend: ^Platform_Backend,
 		object_index: u16,
-		cloexec: bool,
-	) -> (
-		OS_FD,
-		bool,
-	) {
+	) -> OS_FD {
 		world := backend.sim_world
 		if world.descriptor_free_head == SIM_DESCRIPTOR_NONE_INDEX {
-			return OS_FD_INVALID, false
+			return OS_FD_INVALID
 		}
 		index := world.descriptor_free_head
-		desc := &world.descriptors[index]
-		world.descriptor_free_head = desc.next_free_index
+		descriptor := &world.descriptors[index]
+		world.descriptor_free_head = descriptor.next_free_index
 		world.descriptor_free_count -= 1
 
 		fd_number := OS_FD(world.next_sim_fd)
 		world.next_sim_fd += 1
-		desc^ = Sim_FD_Descriptor {
+		descriptor^ = Sim_FD_Descriptor {
 			fd_number = fd_number,
 			object_index = object_index,
 			next_free_index = SIM_DESCRIPTOR_NONE_INDEX,
-			active = true,
-			cloexec = cloexec,
+			state = .Open_Close_On_Exec,
 		}
-		return fd_number, true
+		return fd_number
 	}
 
 	@(private = "package")
-	_sim_lookup_descriptor_index :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> (u16, bool) {
+	_sim_lookup_descriptor_index :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> u16 {
 		world := backend.sim_world
 		for i in 0 ..< MAX_SIMULATED_DESCRIPTORS {
-			desc := &world.descriptors[i]
-			if desc.active && desc.fd_number == fd {
-				return u16(i), true
+			descriptor := &world.descriptors[i]
+			if descriptor.state == .Open_Close_On_Exec && descriptor.fd_number == fd {
+				return u16(i)
 			}
 		}
-		return SIM_DESCRIPTOR_NONE_INDEX, false
+		return SIM_DESCRIPTOR_NONE_INDEX
 	}
 
 	@(private = "package")
-	_sim_lookup_descriptor :: proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> (^Sim_FD_Descriptor, bool) {
+	_sim_lookup_descriptor :: #force_inline proc "contextless" (backend: ^Platform_Backend, fd: OS_FD) -> ^Sim_FD_Descriptor {
 		world := backend.sim_world
-		index, ok := _sim_lookup_descriptor_index(backend, fd)
-		if !ok {
-			return nil, false
+		index := _sim_lookup_descriptor_index(backend, fd)
+		if index == SIM_DESCRIPTOR_NONE_INDEX {
+			return nil
 		}
-		return &world.descriptors[index], true
+		return &world.descriptors[index]
 	}
 
 	@(private = "file")
@@ -697,8 +715,10 @@ when TINA_SIMULATION_MODE {
 		world := backend.sim_world
 		if object_index == SIM_OBJECT_NONE_INDEX do return
 		object := &world.objects[object_index]
-		if !object.alive || object.ref_count != 0 || object.inflight_count != 0 do return
-		object.alive = false
+		if object.state == .Free do return
+		if object.ref_count != 0 do return
+		if object.inflight_count != 0 do return
+		object.state = .Free
 		object.next_free_index = world.object_free_head
 		world.object_free_head = object_index
 		world.object_free_count += 1
@@ -716,11 +736,11 @@ when TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_sim_pin_object :: proc "contextless" (backend: ^Platform_Backend, object_index: u16) -> bool {
+	_sim_pin_object :: #force_inline proc "contextless" (backend: ^Platform_Backend, object_index: u16) -> bool {
 		world := backend.sim_world
 		if object_index == SIM_OBJECT_NONE_INDEX do return false
 		object := &world.objects[object_index]
-		if !object.alive do return false
+		if object.state == .Free do return false
 		object.inflight_count += 1
 		return true
 	}
@@ -739,44 +759,22 @@ when TINA_SIMULATION_MODE {
 	@(private = "file")
 	_sim_close_descriptor_index :: proc "contextless" (backend: ^Platform_Backend, descriptor_index: u16) -> bool {
 		world := backend.sim_world
-		if descriptor_index == SIM_DESCRIPTOR_NONE_INDEX || descriptor_index >= MAX_SIMULATED_DESCRIPTORS {
+		if descriptor_index == SIM_DESCRIPTOR_NONE_INDEX do return false
+		if descriptor_index >= MAX_SIMULATED_DESCRIPTORS do return false
+		descriptor := &world.descriptors[descriptor_index]
+		if descriptor.state == .Free {
 			return false
 		}
-	desc := &world.descriptors[descriptor_index]
-		if !desc.active {
-			return false
-		}
-		object_index := desc.object_index
-		desc.active = false
-		desc^ = Sim_FD_Descriptor {
+		object_index := descriptor.object_index
+		descriptor^ = Sim_FD_Descriptor {
+			fd_number = OS_FD_INVALID,
+			object_index = SIM_OBJECT_NONE_INDEX,
 			next_free_index = world.descriptor_free_head,
 		}
 		world.descriptor_free_head = descriptor_index
 		world.descriptor_free_count += 1
 		_sim_object_release_ref(backend, object_index)
 		return true
-	}
-
-	@(private = "file")
-	_sim_pin_submission_targets :: proc "contextless" (
-		backend: ^Platform_Backend,
-		op: ^Submission_Operation,
-	) -> (
-		u16,
-		u16,
-		bool,
-	) {
-		world := backend.sim_world
-		fd := _sim_submission_fd(op)
-		descriptor_index, ok := _sim_lookup_descriptor_index(backend, fd)
-		if !ok {
-			return SIM_DESCRIPTOR_NONE_INDEX, SIM_OBJECT_NONE_INDEX, false
-		}
-		object_index := world.descriptors[descriptor_index].object_index
-		if !_sim_pin_object(backend, object_index) {
-			return SIM_DESCRIPTOR_NONE_INDEX, SIM_OBJECT_NONE_INDEX, false
-		}
-		return descriptor_index, object_index, true
 	}
 
 	@(private = "file")
@@ -789,14 +787,13 @@ when TINA_SIMULATION_MODE {
 	) {
 		world := backend.sim_world
 		fd := _sim_submission_fd(op)
-		descriptor_index, ok := _sim_lookup_descriptor_index(backend, fd)
-		if !ok {
+		descriptor_index := _sim_lookup_descriptor_index(backend, fd)
+		if descriptor_index == SIM_DESCRIPTOR_NONE_INDEX {
 			return {}, false
 		}
 		object_index := world.descriptors[descriptor_index].object_index
-		if object_index == SIM_OBJECT_NONE_INDEX || !world.objects[object_index].alive {
-			return {}, false
-		}
+		if object_index == SIM_OBJECT_NONE_INDEX do return {}, false
+		if world.objects[object_index].state == .Free do return {}, false
 
 		targets := Simulated_Submission_Targets {
 			descriptor_index    = descriptor_index,
@@ -805,14 +802,13 @@ when TINA_SIMULATION_MODE {
 		}
 
 		if sf, is_sendfile := op.(Submission_Op_Sendfile); is_sendfile {
-			file_descriptor_index, file_descriptor_ok := _sim_lookup_descriptor_index(backend, sf.fd_file)
-			if !file_descriptor_ok {
+			file_descriptor_index := _sim_lookup_descriptor_index(backend, sf.fd_file)
+			if file_descriptor_index == SIM_DESCRIPTOR_NONE_INDEX {
 				return {}, false
 			}
 			file_object_index := world.descriptors[file_descriptor_index].object_index
-			if file_object_index == SIM_OBJECT_NONE_INDEX || !world.objects[file_object_index].alive {
-				return {}, false
-			}
+			if file_object_index == SIM_OBJECT_NONE_INDEX do return {}, false
+			if world.objects[file_object_index].state == .Free do return {}, false
 			targets.object_index_second = file_object_index
 			targets.has_second_pin = true
 		}
@@ -834,7 +830,7 @@ when TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_sim_submission_fd :: proc "contextless" (op: ^Submission_Operation) -> OS_FD {
+	_sim_submission_fd :: #force_inline proc "contextless" (op: ^Submission_Operation) -> OS_FD {
 		switch o in op^ {
 		case Submission_Op_Read:     return o.fd
 		case Submission_Op_Write:    return o.fd
@@ -855,11 +851,12 @@ when TINA_SIMULATION_MODE {
 		candidate: ^Sim_FD_Object,
 		existing: ^Sim_FD_Object,
 	) -> bool {
-		if candidate == nil || existing == nil do return false
-		if candidate.exclusive_address_use_enabled || existing.exclusive_address_use_enabled {
-			return false
-		}
-		return candidate.reuse_port_enabled && existing.reuse_port_enabled
+		if candidate == nil do return false
+		if existing == nil do return false
+		if .Exclusive_Address_Use in candidate.attributes do return false
+		if .Exclusive_Address_Use in existing.attributes do return false
+		if .Reuse_Port not_in candidate.attributes do return false
+		return .Reuse_Port in existing.attributes
 	}
 
 	@(private = "file")
@@ -943,16 +940,14 @@ when TINA_SIMULATION_MODE {
 		case Submission_Op_Write:
 			completion.result = i32(op.data_size)
 		case Submission_Op_Accept:
-			object_index, object_ok := _sim_alloc_object(backend)
-			if !object_ok {
+			object_index := _sim_alloc_object(backend)
+			if object_index == SIM_OBJECT_NONE_INDEX {
 				completion.result = SIM_ERR_NFILE
 				break
 			}
-			client_fd, descriptor_ok := _sim_alloc_descriptor(backend, object_index, true)
-			if !descriptor_ok {
-				if object_ok {
-					_sim_object_release_ref(backend, object_index)
-				}
+			client_fd := _sim_alloc_descriptor(backend, object_index)
+			if client_fd == OS_FD_INVALID {
+				_sim_object_release_ref(backend, object_index)
 				completion.result = SIM_ERR_NFILE
 				break
 			}
@@ -1069,7 +1064,7 @@ when TINA_SIMULATION_MODE {
 			},
 		}
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, backend_submit_error(submit_result), Backend_Error.None)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 		testing.expect_value(t, backend.pending_count, 1)
 
 		completions: [8]Raw_Completion
@@ -1105,7 +1100,7 @@ when TINA_SIMULATION_MODE {
 			{token = token, data_size = 4096, operation = Submission_Op_Recv{fd_socket = fd}},
 		}
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, backend_submit_error(submit_result), Backend_Error.None)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 		testing.expect_value(t, backend.pending_count, 1)
 
 		cancel_error := backend_cancel(&backend, token)
@@ -1173,7 +1168,7 @@ when TINA_SIMULATION_MODE {
 				}
 			}
 			submit_result := backend_submit(&backend, submissions[:])
-			if backend_submit_error(submit_result) != .None {
+			if submit_result != .None {
 				return [4]Raw_Completion{}
 			}
 
@@ -1237,7 +1232,7 @@ when TINA_SIMULATION_MODE {
 			},
 		}
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, backend_submit_error(submit_result), Backend_Error.None)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 
 		completions: [1]Raw_Completion
 		collect_result := backend_collect(&backend, completions[:], 0)
@@ -1290,7 +1285,7 @@ when TINA_SIMULATION_MODE {
 			{token = token, data_size = 1024, operation = Submission_Op_Recv{fd_socket = fd}},
 		}
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, backend_submit_error(submit_result), Backend_Error.None)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 
 		completions: [4]Raw_Completion
 		collect_result := backend_collect(&backend, completions[:], 0)
@@ -1327,9 +1322,11 @@ when TINA_SIMULATION_MODE {
 		testing.expect_value(t, dup_error, Backend_Error.None)
 		testing.expect(t, dup_fd != fd, "simulated dup must return a distinct descriptor")
 
-		desc, ok := _sim_lookup_descriptor(&backend, dup_fd)
-		testing.expect(t, ok, "dup fd should resolve in simulated descriptor table")
-		testing.expect(t, desc.cloexec, "simulated dup must set close-on-exec")
+		descriptor := _sim_lookup_descriptor(&backend, dup_fd)
+		testing.expect(t, descriptor != nil, "dup fd should resolve in simulated descriptor table")
+		if descriptor != nil {
+			testing.expect_value(t, descriptor.state, Sim_FD_Descriptor_State.Open_Close_On_Exec)
+		}
 	}
 
 	@(test)
@@ -1346,16 +1343,24 @@ when TINA_SIMULATION_MODE {
 
 		fd, sock_error := backend_control_socket(&backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, sock_error, Backend_Error.None)
+		descriptor_index := _sim_lookup_descriptor_index(&backend, fd)
+		testing.expect(t, descriptor_index != SIM_DESCRIPTOR_NONE_INDEX, "open descriptor must have a table index")
 		dup_fd, dup_error := backend_control_dup(&backend, fd)
 		testing.expect_value(t, dup_error, Backend_Error.None)
 
 		close_error := backend_control_close(&backend, fd)
 		testing.expect_value(t, close_error, Backend_Error.None)
 
-		_, original_ok := _sim_lookup_descriptor(&backend, fd)
-		testing.expect(t, !original_ok, "closed descriptor should be invalidated")
-		_, dup_ok := _sim_lookup_descriptor(&backend, dup_fd)
-		testing.expect(t, dup_ok, "duplicate descriptor should remain active")
+		original_descriptor := _sim_lookup_descriptor(&backend, fd)
+		testing.expect(t, original_descriptor == nil, "closed descriptor should be invalidated")
+		if descriptor_index != SIM_DESCRIPTOR_NONE_INDEX {
+			freed_descriptor := &world.descriptors[descriptor_index]
+			testing.expect_value(t, freed_descriptor.state, Sim_FD_Descriptor_State.Free)
+			testing.expect_value(t, freed_descriptor.fd_number, OS_FD_INVALID)
+			testing.expect_value(t, freed_descriptor.object_index, SIM_OBJECT_NONE_INDEX)
+		}
+		duplicate_descriptor := _sim_lookup_descriptor(&backend, dup_fd)
+		testing.expect(t, duplicate_descriptor != nil, "duplicate descriptor should remain active")
 
 		shutdown_error := backend_control_shutdown(&backend, dup_fd, .SHUT_BOTH)
 		testing.expect_value(t, shutdown_error, Backend_Error.None)
@@ -1387,7 +1392,7 @@ when TINA_SIMULATION_MODE {
 			{token = token, data_size = 256, operation = Submission_Op_Recv{fd_socket = fd}},
 		}
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, backend_submit_error(submit_result), Backend_Error.None)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 
 		close_error := backend_control_close(&backend, dup_fd)
 		testing.expect_value(t, close_error, Backend_Error.None)
@@ -1430,7 +1435,7 @@ when TINA_SIMULATION_MODE {
 			{token = token, operation = Submission_Op_Accept{listen_fd = listen_fd}},
 		}
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, backend_submit_error(submit_result), Backend_Error.None)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 
 		completions: [2]Raw_Completion
 		collect_result := backend_collect(&backend, completions[:], 0)
@@ -1440,8 +1445,8 @@ when TINA_SIMULATION_MODE {
 
 		accept_extra, ok := completions[0].extra.(Completion_Extra_Accept)
 		testing.expect(t, ok, "accept completion should carry accept extra")
-		_, descriptor_ok := _sim_lookup_descriptor(&backend, accept_extra.client_fd)
-		testing.expect(t, descriptor_ok, "accepted client fd should be tracked by simulated backend")
+		descriptor := _sim_lookup_descriptor(&backend, accept_extra.client_fd)
+		testing.expect(t, descriptor != nil, "accepted client fd should be tracked by simulated backend")
 	}
 
 	@(test)
@@ -1478,7 +1483,7 @@ when TINA_SIMULATION_MODE {
 			}
 		}
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, submit_result.status, Backend_Submit_Status.Accepted)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 
 		completions: [1]Raw_Completion
 		collect_result := backend_collect(&backend, completions[:], 0)
@@ -1589,7 +1594,7 @@ when TINA_SIMULATION_MODE {
 		}
 
 		submit_result := backend_submit(&backend, submissions[:])
-		testing.expect_value(t, submit_result.status, Backend_Submit_Status.Accepted)
+		testing.expect_value(t, submit_result, Backend_Error.None)
 
 		collected: u32 = 0
 		seen: [8]bool

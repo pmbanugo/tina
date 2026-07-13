@@ -199,7 +199,7 @@ when !TINA_SIMULATION_MODE {
 	_backend_submit :: proc(
 		backend: ^Platform_Backend,
 		submissions: []Submission,
-	) -> Backend_Submit_Result {
+	) -> Backend_Error {
 		_posix_compact_completed(backend)
 
 		// Accepted obligations occupy exactly one pending or unread-completion
@@ -211,7 +211,7 @@ when !TINA_SIMULATION_MODE {
 		pending_available := MAX_POSIX_PENDING - int(backend.pending_count)
 		if obligation_count + submission_count > MAX_POSIX_COMPLETED ||
 		   submission_count > pending_available {
-			return backend_submit_rejected(.Queue_Full)
+			return .Queue_Full
 		}
 
 		for &submission in submissions {
@@ -235,7 +235,7 @@ when !TINA_SIMULATION_MODE {
 				backend.completed_count += 1
 			} else {
 				pending_flags: Pending_Posix_Op_Flags
-				if _is_connect_op(&submission.operation) {
+				if _, is_connect := submission.operation.(Submission_Op_Connect); is_connect {
 					pending_flags = {.Connect_In_Progress}
 				}
 				subject_fd, kq_ident, kq_filter := _submission_op_metadata(submission.operation)
@@ -263,7 +263,7 @@ when !TINA_SIMULATION_MODE {
 				}
 			}
 		}
-		return backend_submit_accepted()
+		return .None
 	}
 
 	@(private = "package")
@@ -446,7 +446,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_set_current_tick :: proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
+	_backend_set_current_tick :: #force_inline proc "contextless" (backend: ^Platform_Backend, tick_count: u64) {}
 
 	@(private = "package")
 	_backend_cancel :: proc(backend: ^Platform_Backend, token: Submission_Token) -> Backend_Error {
@@ -742,7 +742,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_register_fixed_fd :: proc "contextless" (
+	_backend_register_fixed_fd :: #force_inline proc "contextless" (
 		backend: ^Platform_Backend,
 		slot_index: u16,
 		fd: OS_FD,
@@ -752,7 +752,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "package")
-	_backend_unregister_fixed_fd :: proc "contextless" (
+	_backend_unregister_fixed_fd :: #force_inline proc "contextless" (
 		backend: ^Platform_Backend,
 		slot_index: u16,
 	) -> Backend_Fixed_File_Update_Result {
@@ -1140,7 +1140,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_posix_stream_op_metadata :: proc "contextless" (
+	_posix_stream_op_metadata :: #force_inline proc "contextless" (
 		op: ^Submission_Operation,
 	) -> (
 		OS_FD,
@@ -1158,7 +1158,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_posix_fd_io_state :: proc "contextless" (
+	_posix_fd_io_state :: #force_inline proc "contextless" (
 		backend: ^Platform_Backend,
 		fd: OS_FD,
 	) -> ^Posix_FD_IO_State {
@@ -1178,7 +1178,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_posix_stream_tracking :: proc "contextless" (
+	_posix_stream_tracking :: #force_inline proc "contextless" (
 		backend: ^Platform_Backend,
 		op: ^Submission_Operation,
 	) -> Posix_Stream_Tracking {
@@ -1194,7 +1194,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_posix_tracking_should_skip_optimistic_try :: proc "contextless" (
+	_posix_tracking_should_skip_optimistic_try :: #force_inline proc "contextless" (
 		tracking: Posix_Stream_Tracking,
 	) -> bool {
 		if tracking.state == nil {
@@ -1423,60 +1423,60 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_socket_address_to_sockaddr :: proc(
-		addr: Socket_Address,
+	_socket_address_to_sockaddr :: proc "contextless" (
+		address: Socket_Address,
 	) -> (
 		posix.sockaddr_storage,
 		posix.socklen_t,
 	) {
-		sa: posix.sockaddr_storage
+		native: posix.sockaddr_storage
 
-		switch a in addr {
+		switch socket_address in address {
 		case Socket_Address_Inet4:
-			sin := (^posix.sockaddr_in)(&sa)
-			sin.sin_family = .INET
-			sin.sin_port = u16be(a.port)
-			sin.sin_addr = transmute(posix.in_addr)a.address
-			sin.sin_len = size_of(posix.sockaddr_in)
-			return sa, posix.socklen_t(size_of(posix.sockaddr_in))
+			internet4 := (^posix.sockaddr_in)(&native)
+			internet4.sin_family = .INET
+			internet4.sin_port = u16be(socket_address.port)
+			internet4.sin_addr = transmute(posix.in_addr)socket_address.address
+			internet4.sin_len = size_of(posix.sockaddr_in)
+			return native, posix.socklen_t(size_of(posix.sockaddr_in))
 		case Socket_Address_Inet6:
-			sin6 := (^posix.sockaddr_in6)(&sa)
-			sin6.sin6_family = .INET6
-			sin6.sin6_port = u16be(a.port)
-			sin6.sin6_addr = transmute(posix.in6_addr)a.address
-			sin6.sin6_flowinfo = a.flow
-			sin6.sin6_scope_id = a.scope
-			sin6.sin6_len = size_of(posix.sockaddr_in6)
-			return sa, posix.socklen_t(size_of(posix.sockaddr_in6))
+			internet6 := (^posix.sockaddr_in6)(&native)
+			internet6.sin6_family = .INET6
+			internet6.sin6_port = u16be(socket_address.port)
+			internet6.sin6_addr = transmute(posix.in6_addr)socket_address.address
+			internet6.sin6_flowinfo = socket_address.flow
+			internet6.sin6_scope_id = socket_address.scope
+			internet6.sin6_len = size_of(posix.sockaddr_in6)
+			return native, posix.socklen_t(size_of(posix.sockaddr_in6))
 		case Socket_Address_Unix:
-			sun := (^posix.sockaddr_un)(&sa)
-			sun.sun_family = .UNIX
-			sun.sun_len = size_of(posix.sockaddr_un)
-			for i in 0 ..< len(a.path) {
-				sun.sun_path[i] = c.char(a.path[i])
+			unix_address := (^posix.sockaddr_un)(&native)
+			unix_address.sun_family = .UNIX
+			unix_address.sun_len = size_of(posix.sockaddr_un)
+			for path_index in 0 ..< len(socket_address.path) {
+				unix_address.sun_path[path_index] = c.char(socket_address.path[path_index])
 			}
-			return sa, posix.socklen_t(size_of(posix.sockaddr_un))
+			return native, posix.socklen_t(size_of(posix.sockaddr_un))
 		case:
-			return sa, 0
+			return native, 0
 		}
 	}
 
 	@(private = "file")
-	_sockaddr_to_socket_address :: proc(native: ^posix.sockaddr_storage) -> Socket_Address {
+	_sockaddr_to_socket_address :: proc "contextless" (native: ^posix.sockaddr_storage) -> Socket_Address {
 		#partial switch native.ss_family {
 		case .INET:
-			sin := (^posix.sockaddr_in)(native)
+			internet4 := (^posix.sockaddr_in)(native)
 			return Socket_Address_Inet4 {
-				address = transmute([4]u8)sin.sin_addr,
-				port = u16(u16be(sin.sin_port)),
+				address = transmute([4]u8)internet4.sin_addr,
+				port = u16(u16be(internet4.sin_port)),
 			}
 		case .INET6:
-			sin6 := (^posix.sockaddr_in6)(native)
+			internet6 := (^posix.sockaddr_in6)(native)
 			return Socket_Address_Inet6 {
-				address = transmute([16]u8)sin6.sin6_addr,
-				port = u16(u16be(sin6.sin6_port)),
-				flow = sin6.sin6_flowinfo,
-				scope = sin6.sin6_scope_id,
+				address = transmute([16]u8)internet6.sin6_addr,
+				port = u16(u16be(internet6.sin6_port)),
+				flow = internet6.sin6_flowinfo,
+				scope = internet6.sin6_scope_id,
 			}
 		case:
 			return nil
@@ -1484,13 +1484,7 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_is_connect_op :: #force_inline proc(op: ^Submission_Operation) -> bool {
-		_, ok := op.(Submission_Op_Connect)
-		return ok
-	}
-
-	@(private = "file")
-	_map_socket_option_int :: proc(option: Socket_Option) -> (c.int, bool) {
+	_map_socket_option_int :: proc "contextless" (option: Socket_Option) -> (c.int, bool) {
 		#partial switch option {
 		case .SO_REUSEADDR:
 			return c.int(posix.SO_REUSEADDR), true

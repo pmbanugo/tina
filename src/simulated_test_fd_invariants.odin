@@ -115,8 +115,9 @@ when TINA_SIMULATION_MODE {
 		fd, socket_error := backend_control_socket(backend, .AF_INET, .STREAM, .TCP)
 		testing.expect_value(t, socket_error, Backend_Error.None)
 
-		descriptor, ok := _sim_lookup_descriptor(backend, fd)
-		testing.expect(t, ok, "simulated descriptor should resolve")
+		descriptor := _sim_lookup_descriptor(backend, fd)
+		testing.expect(t, descriptor != nil, "simulated descriptor should resolve")
+		if descriptor == nil do return
 		backend.sim_world.objects[descriptor.object_index].ref_count += 1
 	}
 

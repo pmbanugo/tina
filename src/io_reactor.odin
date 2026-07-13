@@ -497,31 +497,36 @@ _reactor_completion_apply_accept :: proc (
 }
 
 @(private = "file")
-_reactor_completion_apply_recvfrom :: proc (
-	soa_meta: #soa[]Isolate_Metadata,
-	slot_index: u32,
-	completion: ^Raw_Completion,
-) {
-	#partial switch e in completion.extra {
-	case Completion_Extra_Recvfrom:
-		soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(e.peer_address)
-	}
-}
-
-@(private = "file")
-_reactor_completion_is_live :: #force_inline proc(
+_reactor_completion_is_live :: #force_inline proc "contextless" (
 	shard: ^Shard,
 	type_index: u8,
 	slot_index: u32,
 	token: Submission_Token,
-	backend_faulted: bool,
 ) -> bool {
-	if backend_faulted do return false
 	meta := &shard.metadata[type_index][slot_index]
 	if meta._state == .Unallocated do return false
 	if meta._state == .Pending_IO_Reuse do return false
 	if u8(meta.generation) != submission_token_generation(token) do return false
 	return meta.io_sequence == submission_token_io_sequence(token)
+}
+
+@(private = "file")
+_reactor_completion_prepare_retire :: proc(
+	reactor: ^Reactor,
+	shard: ^Shard,
+	token: Submission_Token,
+) -> (
+	type_index: u8,
+	slot_index: u32,
+) {
+	assert(reactor.io_in_flight_count > 0, "completion arrived without an accepted submission")
+	reactor.io_in_flight_count -= 1
+
+	type_index = submission_token_type_index(token)
+	slot_index = submission_token_slot_index(token)
+	assert(int(type_index) < len(shard.metadata), "completion token type index exceeds metadata")
+	assert(int(slot_index) < len(shard.metadata[type_index]), "completion token slot index exceeds metadata")
+	return
 }
 
 @(private = "file")
@@ -579,7 +584,10 @@ _reactor_completion_publish_live :: proc(
 			reactor, shard, soa_meta, type_index, slot_index, completion,
 		)
 	} else if operation_kind == .Recvfrom_Complete {
-		_reactor_completion_apply_recvfrom(soa_meta, slot_index, completion)
+		#partial switch extra in completion.extra {
+		case Completion_Extra_Recvfrom:
+			soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(extra.peer_address)
+		}
 	} else if operation_kind == .Close_Complete {
 		_reactor_completion_apply_close(reactor, soa_meta, slot_index)
 	}
@@ -590,19 +598,11 @@ _reactor_completion_retire :: proc(
 	reactor: ^Reactor,
 	shard: ^Shard,
 	completion: ^Raw_Completion,
-	backend_faulted: bool,
 ) {
-	// Every completion retires one accepted operation before disposition.
-	assert(reactor.io_in_flight_count > 0, "completion arrived without an accepted submission")
-	reactor.io_in_flight_count -= 1
-
 	token := completion.token
-	type_index := submission_token_type_index(token)
-	slot_index := submission_token_slot_index(token)
-	assert(int(type_index) < len(shard.metadata), "completion token type index exceeds metadata")
-	assert(int(slot_index) < len(shard.metadata[type_index]), "completion token slot index exceeds metadata")
+	type_index, slot_index := _reactor_completion_prepare_retire(reactor, shard, token)
 
-	if _reactor_completion_is_live(shard, type_index, slot_index, token, backend_faulted) {
+	if _reactor_completion_is_live(shard, type_index, slot_index, token) {
 		_reactor_completion_publish_live(reactor, shard, type_index, slot_index, completion)
 	} else {
 		_reactor_completion_retire_stale(reactor, shard, type_index, slot_index, completion)
@@ -618,17 +618,24 @@ reactor_collect_completions :: proc(
 	// so collection cannot short-circuit on io_in_flight_count.
 	completions: [MAX_REACTOR_COMPLETION_BATCH]Raw_Completion
 	collect_result := backend_collect(&reactor.backend, completions[:], timeout_ns)
-	backend_faulted := collect_result.fault != .None
-	if backend_faulted {
-		reactor.backend_state = .Collect_Faulted
+	if collect_result.fault == .None {
+		for completion_index in 0 ..< collect_result.completion_count {
+			_reactor_completion_retire(reactor, shard, &completions[completion_index])
+		}
+		return .None
 	}
 
-	for i in 0 ..< collect_result.completion_count {
-		_reactor_completion_retire(reactor, shard, &completions[i], backend_faulted)
+	reactor.backend_state = .Collect_Faulted
+	for completion_index in 0 ..< collect_result.completion_count {
+		completion := &completions[completion_index]
+		type_index, slot_index := _reactor_completion_prepare_retire(
+			reactor,
+			shard,
+			completion.token,
+		)
+		_reactor_completion_retire_stale(reactor, shard, type_index, slot_index, completion)
 	}
-	if backend_faulted {
-		shard.counters.io_backend_fault_count += 1
-	}
+	shard.counters.io_backend_fault_count += 1
 	return collect_result.fault
 }
 
@@ -665,9 +672,9 @@ _backend_error_to_io_error :: #force_inline proc "contextless" (error: Backend_E
 reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_Error {
 	if reactor.pending_count == 0 do return .None
 
-	submit_result := backend_submit(&reactor.backend, reactor.pending_submissions[:reactor.pending_count])
+	submit_error := backend_submit(&reactor.backend, reactor.pending_submissions[:reactor.pending_count])
 
-	if submit_result.status == .Accepted {
+	if submit_error == .None {
 		reactor.io_in_flight_count += u32(reactor.pending_count)
 		for i in 0 ..< reactor.pending_count {
 			submission := &reactor.pending_submissions[i]
@@ -697,12 +704,9 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 		return .None
 	}
 
-	error := backend_submit_error(submit_result)
-	assert(error != .None, "rejected backend submission must carry an error")
-
 	// Rejected before ownership: reclaim every pending operation locally.
 	shard.counters.io_submission_exhaustions += u64(reactor.pending_count)
-	io_error := _backend_error_to_io_error(error)
+	io_error := _backend_error_to_io_error(submit_error)
 
 	for i in 0 ..< reactor.pending_count {
 		sub := &reactor.pending_submissions[i]
@@ -747,7 +751,7 @@ reactor_flush_submissions :: proc(reactor: ^Reactor, shard: ^Shard) -> Backend_E
 	}
 
 	reactor.pending_count = 0
-	return error
+	return submit_error
 }
 
 reactor_flush_submissions_if_needed :: proc(reactor: ^Reactor, shard: ^Shard) {
@@ -779,17 +783,6 @@ _reactor_alloc_receive_slot :: proc(reactor: ^Reactor, shard: ^Shard) -> (IO_Slo
 		return IO_SLOT_INDEX_NONE, IO_ERR_RESOURCE_EXHAUSTED
 	}
 	return index, IO_ERR_NONE
-}
-
-@(private = "file")
-_reactor_validate_receive_size :: #force_inline proc "contextless" (
-	reactor: ^Reactor,
-	data_size_requested: u32,
-) -> IO_Error {
-	if data_size_requested > reactor.receive_pool.slot_size {
-		return IO_ERR_BOUNDS_VIOLATION
-	}
-	return IO_ERR_NONE
 }
 
 Reactor_Submission_Build :: struct {
@@ -841,8 +834,7 @@ _reactor_submission_build_receive :: proc(
 	buffer_size_max: u32,
 	build: ^Reactor_Submission_Build,
 ) -> IO_Error {
-	size_error := _reactor_validate_receive_size(reactor, buffer_size_max)
-	if size_error != IO_ERR_NONE do return size_error
+	if buffer_size_max > reactor.receive_pool.slot_size do return IO_ERR_BOUNDS_VIOLATION
 	buffer_index, alloc_error := _reactor_alloc_receive_slot(reactor, shard)
 	if alloc_error != IO_ERR_NONE do return alloc_error
 	build.buffer_index = buffer_index
@@ -1243,8 +1235,8 @@ _reactor_submission_finalize :: #force_inline proc (
 }
 
 @(private = "package")
-_io_op_to_operation_kind :: #force_inline proc(op: IoOp) -> IO_Operation_Kind {
-	switch _ in op {
+_io_op_to_operation_kind :: #force_inline proc "contextless" (operation: IoOp) -> IO_Operation_Kind {
+	switch _ in operation {
 	case IoOp_Read:     return .Read_Complete
 	case IoOp_Write:    return .Write_Complete
 	case IoOp_Accept:   return .Accept_Complete
@@ -1260,7 +1252,7 @@ _io_op_to_operation_kind :: #force_inline proc(op: IoOp) -> IO_Operation_Kind {
 }
 
 @(private = "file")
-_resolve_os_fd :: #force_inline proc(
+_resolve_os_fd :: #force_inline proc "contextless" (
 	reactor: ^Reactor,
 	fd: FD_Handle,
 	owner: Isolate_Handle,
@@ -1280,9 +1272,10 @@ _resolve_os_fd :: #force_inline proc(
 	case .Write_Direction:
 		if fd_table_validate_write_affinity(entry, owner) != .None do return OS_FD_INVALID, IO_ERR_AFFINITY_VIOLATION
 	case .Either_Direction:
-		if fd_table_validate_read_affinity(entry, owner) != .None &&
-		   fd_table_validate_write_affinity(entry, owner) != .None {
-			return OS_FD_INVALID, IO_ERR_AFFINITY_VIOLATION
+		if fd_table_validate_read_affinity(entry, owner) != .None {
+			if fd_table_validate_write_affinity(entry, owner) != .None {
+				return OS_FD_INVALID, IO_ERR_AFFINITY_VIOLATION
+			}
 		}
 	case .Both_Directions:
 		if fd_table_validate_read_affinity(entry, owner) != .None do return OS_FD_INVALID, IO_ERR_AFFINITY_VIOLATION

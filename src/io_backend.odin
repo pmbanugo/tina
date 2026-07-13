@@ -31,16 +31,6 @@ Backend_Error :: enum u8 {
 	Unsupported,
 }
 
-Backend_Submit_Status :: enum u8 {
-	Accepted,
-	Rejected,
-}
-
-Backend_Submit_Result :: struct {
-	status: Backend_Submit_Status,
-	error:  Backend_Error,
-}
-
 Backend_Collect_Fault :: enum u8 {
 	None,
 	System_Error,
@@ -64,24 +54,6 @@ Backend_Completion_Store_Result :: enum u8 {
 Backend_Fixed_File_Update_Result :: enum u8 {
 	Updated,
 	Optimization_Disabled,
-}
-
-backend_submit_accepted :: #force_inline proc "contextless" () -> Backend_Submit_Result {
-	return Backend_Submit_Result{status = .Accepted}
-}
-
-backend_submit_rejected :: #force_inline proc "contextless" (error: Backend_Error) -> Backend_Submit_Result {
-	return Backend_Submit_Result{status = .Rejected, error = error}
-}
-
-backend_submit_error :: #force_inline proc "contextless" (result: Backend_Submit_Result) -> Backend_Error {
-	switch result.status {
-	case .Accepted:
-		return .None
-	case .Rejected:
-		return result.error
-	}
-	return .System_Error
 }
 
 // --- Backend Configuration ---
@@ -192,21 +164,13 @@ backend_error_label :: #force_inline proc "contextless" (error: Backend_Error) -
 	return labels[error]
 }
 
-// Submit a batch of I/O operations. All-or-error semantics.
-backend_submit :: proc(backend: ^Platform_Backend, submissions: []Submission) -> Backend_Submit_Result {
+// A `.None` result transfers ownership of the whole batch to the backend;
+// every other result rejects the whole batch before ownership transfers.
+backend_submit :: proc(backend: ^Platform_Backend, submissions: []Submission) -> Backend_Error {
 	if len(submissions) == 0 {
-		return backend_submit_accepted()
+		return .None
 	}
-	result := _backend_submit(backend, submissions)
-	when TINA_RUNTIME_ASSERTIONS {
-		switch result.status {
-		case .Accepted:
-			assert(result.error == .None, "accepted backend submission must not carry an error")
-		case .Rejected:
-			assert(result.error != .None, "rejected backend submission must carry an error")
-		}
-	}
-	return result
+	return _backend_submit(backend, submissions)
 }
 
 // Collect completed operations into the output slice. Non-blocking when timeout_ns == 0.
@@ -215,7 +179,7 @@ backend_collect :: proc(
 	completions: []Raw_Completion,
 	timeout_ns: i64,
 ) -> Backend_Collect_Result {
-    completion_capacity := len(completions)
+	completion_capacity := len(completions)
 	if completion_capacity == 0 {
 		return Backend_Collect_Result{}
 	}
@@ -302,7 +266,7 @@ backend_control_shutdown :: proc(
 	return _backend_control_shutdown(backend, fd, how)
 }
 
-backend_control_close :: proc "contextless" (
+backend_control_close :: #force_inline proc "contextless" (
 	backend: ^Platform_Backend,
 	fd: OS_FD,
 ) -> Backend_Error {

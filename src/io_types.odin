@@ -448,46 +448,46 @@ submission_token_pack :: #force_inline proc(
 	slot_index: u32,
 	generation: u8,
 	sequence: u8,
-	buf_index: IO_Slot_Index,
-	op_kind: IO_Operation_Kind,
+	buffer_index: IO_Slot_Index,
+	operation_kind: IO_Operation_Kind,
 ) -> Submission_Token {
 	when TINA_RUNTIME_ASSERTIONS {
 		assert(slot_index <= 0xFFFFF, "isolate slot index exceeds Submission_Token capacity")
-		assert(u16(buf_index) <= u16(IO_SLOT_INDEX_NONE), "I/O slot index exceeds Submission_Token capacity")
-		assert(u8(op_kind) < 0x80, "user completion operation kind overlaps Linux internal user-data tags")
+		assert(u16(buffer_index) <= u16(IO_SLOT_INDEX_NONE), "I/O slot index exceeds Submission_Token capacity")
+		assert(u8(operation_kind) < 0x80, "user completion operation kind overlaps Linux internal user-data tags")
 	}
 	return Submission_Token(
 		u64(type_index & 0xFF) |
 		(u64(slot_index & 0xFFFFF) << 8) |
 		(u64(generation & 0xFF) << 28) |
 		(u64(sequence & 0xFF) << 36) |
-		((u64(buf_index) & IO_SLOT_INDEX_MASK) << 44) |
-		(u64(op_kind) << 56),
+		((u64(buffer_index) & IO_SLOT_INDEX_MASK) << 44) |
+		(u64(operation_kind) << 56),
 	)
 }
 
-submission_token_type_index :: #force_inline proc(t: Submission_Token) -> u8 {
-	return u8(u64(t) & 0xFF)
+submission_token_type_index :: #force_inline proc "contextless" (token: Submission_Token) -> u8 {
+	return u8(u64(token) & 0xFF)
 }
 
-submission_token_slot_index :: #force_inline proc(t: Submission_Token) -> u32 {
-	return u32((u64(t) >> 8) & 0xFFFFF)
+submission_token_slot_index :: #force_inline proc "contextless" (token: Submission_Token) -> u32 {
+	return u32((u64(token) >> 8) & 0xFFFFF)
 }
 
-submission_token_generation :: #force_inline proc(t: Submission_Token) -> u8 {
-	return u8((u64(t) >> 28) & 0xFF)
+submission_token_generation :: #force_inline proc "contextless" (token: Submission_Token) -> u8 {
+	return u8((u64(token) >> 28) & 0xFF)
 }
 
-submission_token_io_sequence :: #force_inline proc(t: Submission_Token) -> u8 {
-	return u8((u64(t) >> 36) & 0xFF)
+submission_token_io_sequence :: #force_inline proc "contextless" (token: Submission_Token) -> u8 {
+	return u8((u64(token) >> 36) & 0xFF)
 }
 
-submission_token_buffer_index :: #force_inline proc(t: Submission_Token) -> IO_Slot_Index {
-	return IO_Slot_Index((u64(t) >> 44) & IO_SLOT_INDEX_MASK)
+submission_token_buffer_index :: #force_inline proc "contextless" (token: Submission_Token) -> IO_Slot_Index {
+	return IO_Slot_Index((u64(token) >> 44) & IO_SLOT_INDEX_MASK)
 }
 
-submission_token_operation_kind :: #force_inline proc(t: Submission_Token) -> IO_Operation_Kind {
-	return IO_Operation_Kind((u64(t) >> 56) & 0xFF)
+submission_token_operation_kind :: #force_inline proc "contextless" (token: Submission_Token) -> IO_Operation_Kind {
+	return IO_Operation_Kind((u64(token) >> 56) & 0xFF)
 }
 
 // --- Submission (§6.6.2 §4) ---
@@ -638,64 +638,64 @@ Transfer_Handle :: distinct u32
 
 TRANSFER_HANDLE_NONE :: Transfer_Handle(0)
 
-transfer_handle_make :: #force_inline proc(index: IO_Slot_Index, generation: u16) -> Transfer_Handle {
+transfer_handle_make :: #force_inline proc "contextless" (index: IO_Slot_Index, generation: u16) -> Transfer_Handle {
 	return Transfer_Handle(u32(index) | (u32(generation) << 16))
 }
 
-transfer_handle_index :: #force_inline proc(h: Transfer_Handle) -> IO_Slot_Index {
-	return IO_Slot_Index(u32(h) & 0xFFFF)
+transfer_handle_index :: #force_inline proc "contextless" (handle: Transfer_Handle) -> IO_Slot_Index {
+	return IO_Slot_Index(u32(handle) & 0xFFFF)
 }
 
-transfer_handle_generation :: #force_inline proc(h: Transfer_Handle) -> u16 {
-	return u16(u32(h) >> 16)
+transfer_handle_generation :: #force_inline proc "contextless" (handle: Transfer_Handle) -> u16 {
+	return u16(u32(handle) >> 16)
 }
 
 // --- Helpers for SOA Address Storage ---
 
-socket_address_to_peer_address :: #force_inline proc(sa: Socket_Address) -> Peer_Address {
-	pa: Peer_Address
-	switch a in sa {
+socket_address_to_peer_address :: #force_inline proc "contextless" (address: Socket_Address) -> Peer_Address {
+	peer_address: Peer_Address
+	switch socket_address in address {
 	case Socket_Address_Inet4:
-		pa.family = .AF_INET
-		pa.port = a.port
+		peer_address.family = .AF_INET
+		peer_address.port = socket_address.port
 		// Explicit 4-byte assignment
-		pa.address_data[0] = a.address[0]
-		pa.address_data[1] = a.address[1]
-		pa.address_data[2] = a.address[2]
-		pa.address_data[3] = a.address[3]
+		peer_address.address_data[0] = socket_address.address[0]
+		peer_address.address_data[1] = socket_address.address[1]
+		peer_address.address_data[2] = socket_address.address[2]
+		peer_address.address_data[3] = socket_address.address[3]
 	case Socket_Address_Inet6:
-		pa.family = .AF_INET6
-		pa.port = a.port
-		pa.flow_info = a.flow
-		pa.scope_id = a.scope
+		peer_address.family = .AF_INET6
+		peer_address.port = socket_address.port
+		peer_address.flow_info = socket_address.flow
+		peer_address.scope_id = socket_address.scope
 		// Both are [16]u8, direct array assignment works
-		pa.address_data = a.address
+		peer_address.address_data = socket_address.address
 	case Socket_Address_Unix:
-		pa.family = .AF_UNIX
+		peer_address.family = .AF_UNIX
 	}
-	return pa
+	return peer_address
 }
 
-peer_address_to_socket_address :: #force_inline proc(pa: Peer_Address) -> Socket_Address {
-	switch pa.family {
+peer_address_to_socket_address :: #force_inline proc "contextless" (peer_address: Peer_Address) -> Socket_Address {
+	switch peer_address.family {
 	case .AF_INET:
-		a := Socket_Address_Inet4 {
-			port = pa.port,
+		address := Socket_Address_Inet4 {
+			port = peer_address.port,
 		}
 		// Explicit 4-byte assignment from the unaddressable parameter
-		a.address[0] = pa.address_data[0]
-		a.address[1] = pa.address_data[1]
-		a.address[2] = pa.address_data[2]
-		a.address[3] = pa.address_data[3]
-		return a
+		address.address[0] = peer_address.address_data[0]
+		address.address[1] = peer_address.address_data[1]
+		address.address[2] = peer_address.address_data[2]
+		address.address[3] = peer_address.address_data[3]
+		return address
 	case .AF_INET6:
-		a := Socket_Address_Inet6 {
-			port  = pa.port,
-			flow  = pa.flow_info,
-			scope = pa.scope_id,
+		address := Socket_Address_Inet6 {
+			port  = peer_address.port,
+			flow  = peer_address.flow_info,
+			scope = peer_address.scope_id,
 		}
-		a.address = pa.address_data
-		return a
+		address.address = peer_address.address_data
+		return address
 	case .AF_UNIX:
 		return Socket_Address_Unix{}
 	case:
@@ -731,8 +731,8 @@ test_submission_token_round_trip :: proc(t: ^testing.T) {
 		slot_index = 0x93456, // Testing a 20-bit value!
 		generation = 0x78,
 		sequence = 0x9A,
-		buf_index = 0x0CDE, // Fits in 12 bits!
-		op_kind = IO_Operation_Kind(0x70),
+		buffer_index = 0x0CDE, // Fits in 12 bits!
+		operation_kind = IO_Operation_Kind(0x70),
 	)
 
 	testing.expect_value(t, submission_token_type_index(token), 0x12)

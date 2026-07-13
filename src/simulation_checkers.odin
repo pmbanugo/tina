@@ -236,12 +236,26 @@ when TINA_SIMULATION_MODE {
 				pending_refs := make([]u16, MAX_SIMULATED_OBJECTS, context.temp_allocator)
 
 				for descriptor_index in 0 ..< MAX_SIMULATED_DESCRIPTORS {
-					desc := &sim.sim_io_world.descriptors[descriptor_index]
-					if !desc.active {
+					descriptor := &sim.sim_io_world.descriptors[descriptor_index]
+					if descriptor.state == .Free {
+						if descriptor.fd_number != OS_FD_INVALID {
+							fmt.eprintfln(
+								"[CHECKER] free simulated descriptor has a live fd number at index %d",
+								descriptor_index,
+							)
+							return true
+						}
+						if descriptor.object_index != SIM_OBJECT_NONE_INDEX {
+							fmt.eprintfln(
+								"[CHECKER] free simulated descriptor references an object at index %d",
+								descriptor_index,
+							)
+							return true
+						}
 						continue
 					}
-					if desc.fd_number == OS_FD_INVALID ||
-					   desc.object_index >= MAX_SIMULATED_OBJECTS {
+					if descriptor.fd_number == OS_FD_INVALID ||
+					   descriptor.object_index >= MAX_SIMULATED_OBJECTS {
 						fmt.eprintfln(
 							"[CHECKER] Shard %d: invalid simulated descriptor state at index %d",
 							i,
@@ -249,15 +263,15 @@ when TINA_SIMULATION_MODE {
 						)
 						return true
 					}
-					object := &sim.sim_io_world.objects[desc.object_index]
-					if !object.alive {
+					object := &sim.sim_io_world.objects[descriptor.object_index]
+					if object.state == .Free {
 						fmt.eprintfln(
 							"[CHECKER] simulated descriptor points to dead object at index %d",
-							desc.object_index,
+							descriptor.object_index,
 						)
 						return true
 					}
-					descriptor_refs[desc.object_index] += 1
+					descriptor_refs[descriptor.object_index] += 1
 				}
 
 				for shard_index in 0 ..< sim.spec.shard_count {
@@ -273,7 +287,7 @@ when TINA_SIMULATION_MODE {
 							return true
 						}
 						object := &sim.sim_io_world.objects[op.object_index]
-						if !object.alive {
+						if object.state == .Free {
 							fmt.eprintfln(
 								"[CHECKER] pending simulated op points to dead object at shard %d pending slot %d",
 								shard_index,
@@ -287,7 +301,7 @@ when TINA_SIMULATION_MODE {
 
 				for object_index in 0 ..< MAX_SIMULATED_OBJECTS {
 					object := &sim.sim_io_world.objects[object_index]
-					if !object.alive {
+					if object.state == .Free {
 						continue
 					}
 					if object.ref_count != descriptor_refs[object_index] ||
