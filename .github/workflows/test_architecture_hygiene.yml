@@ -35,7 +35,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - name: Self-test hygiene tool
         run: odin run scripts/check_test_hygiene.odin -file -strict-style -- --self-test
       - name: Run hygiene checks
