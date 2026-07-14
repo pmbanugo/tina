@@ -43,7 +43,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - name: odin check platform backend (${{ matrix.target }})
         run: odin check src/ -strict-style -no-entry-point -define:TINA_SIM=false -define:TINA_ASSERTS=true -target:${{ matrix.target }}
 
@@ -55,7 +55,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - name: odin check simulation backend
         run: odin check src/ -strict-style -no-entry-point -define:TINA_SIM=true -define:TINA_ASSERTS=true
 
@@ -74,7 +74,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - name: Run platform tests (${{ matrix.os }})
         run: odin test tests/ -all-packages -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
@@ -86,7 +86,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - name: Run simulation tests
         run: odin test tests/ -all-packages -define:TINA_SIM=true -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
@@ -123,7 +123,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - name: Run ${{ matrix.name }} tests
         run: odin test tests/ -all-packages -sanitize:${{ matrix.sanitizer }} -define:TINA_SIM=${{ matrix.tina_sim }} -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
@@ -135,7 +135,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - name: Run ASan death-test runner
         run: odin run tools/asan_death_tests
 
@@ -147,7 +147,7 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          release: dev-2026-07
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.7.14
