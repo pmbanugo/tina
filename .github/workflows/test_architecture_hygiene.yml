@@ -29,7 +29,14 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: macos-latest
+          - os: windows-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-06
+      - name: Self-test hygiene tool
+        run: odin run scripts/check_test_hygiene.odin -file -strict-style -- --self-test
       - name: Run hygiene checks
-        run: bash scripts/check_test_hygiene.sh
+        run: odin run scripts/check_test_hygiene.odin -file -strict-style

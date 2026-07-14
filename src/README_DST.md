@@ -402,8 +402,8 @@ Rules:
 Before making structural or sanitizer changes, collect verification evidence from these commands run **sequentially** in the same workspace. Do not run multiple `odin test` invocations concurrently when collecting gate evidence; the runner may share build/test artifacts.
 
 ```sh
-# 1. Structural hygiene (no Odin toolchain required)
-scripts/check_test_hygiene.sh
+# 1. Structural hygiene
+odin run scripts/check_test_hygiene.odin -file -strict-style
 
 # 2. Normal test suite
 odin test tests/ -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_FANCY=false
