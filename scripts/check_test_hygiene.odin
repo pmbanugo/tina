@@ -1232,6 +1232,12 @@ repository_root :: proc() -> (root_path: string, status: Root_Status) {
 		if absolute_error != nil { return "", .Resolution_Failure }
 		return root_path, .Success
 	}
+	if workspace_root, environment_error := os.lookup_env(environment_buffer[:], "GITHUB_WORKSPACE"); environment_error == nil {
+		absolute_error: os.Error
+		root_path, absolute_error = os.get_absolute_path(workspace_root, context.allocator)
+		if absolute_error != nil { return "", .Resolution_Failure }
+		return root_path, .Success
+	}
 	working_directory_error: os.Error
 	root_path, working_directory_error = os.get_working_directory(context.allocator)
 	if working_directory_error != nil { return "", .Resolution_Failure }
