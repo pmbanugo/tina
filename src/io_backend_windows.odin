@@ -262,7 +262,14 @@ when !TINA_SIMULATION_MODE {
 		for &sub in submissions {
 			switch op in sub.operation {
 			case Submission_Op_Close:
-				_win_store_completion_assert(backend, sub.token, _win_close_fd_result(op.fd), nil)
+				completion := Raw_Completion{token = sub.token}
+				close_result := _win_close_fd_result(op.fd)
+				if close_result < 0 {
+					completion.outcome = Completion_Failure{error_code = close_result}
+				} else {
+					completion.outcome = Completion_Success{}
+				}
+				_win_store_completion_assert(backend, &completion)
 				continue
 			case Submission_Op_Read,
 			     Submission_Op_Write,
@@ -459,20 +466,25 @@ when !TINA_SIMULATION_MODE {
 					continue
 				}
 				// Synchronous success — peer address is already in entry.op_data.recvfrom
-				bytes := i32(uintptr(entry.overlapped.InternalHigh))
-				_win_store_completion_assert(
-					backend,
-					entry.token,
-					bytes,
-					Completion_Extra_Recvfrom {
-						peer_address = _win_sockaddr_to_socket_address(&entry.op_data.recvfrom.peer_address),
+				completion := Raw_Completion {
+					token = entry.token,
+					outcome = Completion_Datagram {
+						byte_count = u32(uintptr(entry.overlapped.InternalHigh)),
+						peer_address = _win_sockaddr_to_peer_address(
+							&entry.op_data.recvfrom.peer_address,
+						),
 					},
-				)
+				}
+				_win_store_completion_assert(backend, &completion)
 				_win_release_entry(entry)
 
 			case Submission_Op_Sendfile:
 				if op.size == 0 {
-					_win_store_completion_assert(backend, sub.token, 0, nil)
+					completion := Raw_Completion {
+						token   = sub.token,
+						outcome = Completion_Transfer{byte_count = 0},
+					}
+					_win_store_completion_assert(backend, &completion)
 					_win_release_entry(entry)
 					continue
 				}
@@ -493,12 +505,13 @@ when !TINA_SIMULATION_MODE {
 					transmit_file = backend.transmit_file_ipv6
 				}
 				if transmit_file == nil {
-					_win_store_completion_assert(
-						backend,
-						sub.token,
-						i32(IO_ERR_RESOURCE_EXHAUSTED),
-						nil,
-					)
+					completion := Raw_Completion {
+						token = sub.token,
+						outcome = Completion_Failure {
+							error_code = i32(IO_ERR_RESOURCE_EXHAUSTED),
+						},
+					}
+					_win_store_completion_assert(backend, &completion)
 					_win_release_entry(entry)
 					continue
 				}
@@ -597,16 +610,13 @@ when !TINA_SIMULATION_MODE {
 
 			raw: Raw_Completion
 			raw.token = entry.token
-			raw.extra = nil
 
 			// Query the owning API so cancellation, connection, handle, and
 			// permission failures remain distinguishable negative OS codes.
-			bytes_transferred := i32(event.dwNumberOfBytesTransferred)
-			raw.result = _win_overlapped_result(entry, event.dwNumberOfBytesTransferred)
-
-			if raw.result >= 0 {
-
-				// Handle operation-specific completion data
+			result := _win_overlapped_result(entry, event.dwNumberOfBytesTransferred)
+			if result < 0 {
+				raw.outcome = Completion_Failure{error_code = result}
+			} else {
 				switch _ in entry.operation {
 				case Submission_Op_Accept:
 					when TINA_RUNTIME_ASSERTIONS { _, da_ok := entry.operation.(Submission_Op_Accept); assert(da_ok, "Win_Op_Data.accept variant read on non-Accept entry — raw union would return corrupt client_fd/sockaddr from overlapping Recvfrom memory") }
@@ -614,48 +624,39 @@ when !TINA_SIMULATION_MODE {
 					accept_fd := entry.op_data.accept.client_fd
 					assert(accept_fd != OS_FD_INVALID, "completed accept entry must own a client socket")
 
-					if bytes_transferred >= 0 {
-						// Inherit listen socket properties on the accepted socket
-						listen_sock := win.SOCKET(uintptr(op.listen_fd))
-						win.setsockopt(
-							win.SOCKET(uintptr(accept_fd)),
-							win.SOL_SOCKET,
-							win.SO_UPDATE_ACCEPT_CONTEXT,
-							(^win.CHAR)(&listen_sock),
-							size_of(listen_sock),
-						)
+					// Inherit listen socket properties on the accepted socket.
+					listen_sock := win.SOCKET(uintptr(op.listen_fd))
+					win.setsockopt(
+						win.SOCKET(uintptr(accept_fd)),
+						win.SOL_SOCKET,
+						win.SO_UPDATE_ACCEPT_CONTEXT,
+						(^win.CHAR)(&listen_sock),
+						size_of(listen_sock),
+					)
 
-						local_addr: ^win.sockaddr
-						local_len: win.INT
-						remote_addr: ^win.sockaddr
-						remote_len: win.INT
-						win.GetAcceptExSockaddrs(
-							&entry.op_data.accept.buf,
-							0,
-							size_of(win.sockaddr_in6) + 16,
-							size_of(win.sockaddr_in6) + 16,
-							&local_addr,
-							&local_len,
-							&remote_addr,
-							&remote_len,
-						)
-						client_address := _win_sockaddr_to_socket_address(
+					local_addr: ^win.sockaddr
+					local_len: win.INT
+					remote_addr: ^win.sockaddr
+					remote_len: win.INT
+					win.GetAcceptExSockaddrs(
+						&entry.op_data.accept.buf,
+						0,
+						size_of(win.sockaddr_in6) + 16,
+						size_of(win.sockaddr_in6) + 16,
+						&local_addr,
+						&local_len,
+						&remote_addr,
+						&remote_len,
+					)
+					raw.outcome = Completion_Accept {
+						client_fd    = accept_fd,
+						peer_address = _win_sockaddr_to_peer_address(
 							(^win.SOCKADDR_STORAGE_LH)(remote_addr),
-						)
-						raw.result = 0
-						raw.extra = Completion_Extra_Accept {
-							client_fd      = accept_fd,
-							client_address = client_address,
-						}
-
-						// The socket ownership transfers to the completion.
-						entry.op_data.accept.client_fd = OS_FD_INVALID
-					} else {
-						// Error path: close the pre-created socket. The entry release
-						// below will finish cleanup.
-						win.closesocket(win.SOCKET(uintptr(accept_fd)))
-						entry.op_data.accept.client_fd = OS_FD_INVALID
+						),
 					}
+
+					// The socket ownership transfers to the completion.
+					entry.op_data.accept.client_fd = OS_FD_INVALID
 
 				case Submission_Op_Connect:
 					// Enable full socket API on ConnectEx-completed socket
@@ -668,27 +669,23 @@ when !TINA_SIMULATION_MODE {
 						nil,
 						0,
 					)
-					raw.result = 0
+					raw.outcome = Completion_Success{}
 
 				case Submission_Op_Close:
-					raw.result = 0
+					raw.outcome = Completion_Success{}
 
 				case Submission_Op_Recvfrom:
 					when TINA_RUNTIME_ASSERTIONS { _, dr_ok := entry.operation.(Submission_Op_Recvfrom); assert(dr_ok, "Win_Op_Data.recvfrom variant read on non-Recvfrom entry — raw union would return corrupt peer_address from overlapping Accept memory") }
-					if bytes_transferred >= 0 {
-						raw.extra = Completion_Extra_Recvfrom {
-							peer_address = _win_sockaddr_to_socket_address(
-								&entry.op_data.recvfrom.peer_address,
-							),
-						}
+					raw.outcome = Completion_Datagram {
+						byte_count = u32(result),
+						peer_address = _win_sockaddr_to_peer_address(
+							&entry.op_data.recvfrom.peer_address,
+						),
 					}
 
-				case Submission_Op_Read:
-				case Submission_Op_Write:
-				case Submission_Op_Send:
-				case Submission_Op_Recv:
-				case Submission_Op_Sendto:
-				case Submission_Op_Sendfile:
+				case Submission_Op_Read, Submission_Op_Write, Submission_Op_Send,
+				     Submission_Op_Recv, Submission_Op_Sendto, Submission_Op_Sendfile:
+					raw.outcome = Completion_Transfer{byte_count = u32(result)}
 				}
 			}
 
@@ -699,7 +696,7 @@ when !TINA_SIMULATION_MODE {
 				completions[count] = raw
 				count += 1
 			} else {
-				store_result := _win_push_completion(backend, raw.token, raw.result, raw.extra)
+				store_result := _win_push_completion(backend, &raw)
 				assert(store_result == .Stored, "IOCP overflow capacity preflight is insufficient")
 			}
 		}
@@ -1036,7 +1033,13 @@ when !TINA_SIMULATION_MODE {
 		}
 
 		if accept_ex == nil {
-			_win_store_completion_assert(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED), nil)
+			completion := Raw_Completion {
+				token = sub.token,
+				outcome = Completion_Failure {
+					error_code = i32(IO_ERR_RESOURCE_EXHAUSTED),
+				},
+			}
+			_win_store_completion_assert(backend, &completion)
 			win.closesocket(client_sock)
 			entry.op_data.accept.client_fd = OS_FD_INVALID
 			_win_release_entry(entry)
@@ -1090,7 +1093,13 @@ when !TINA_SIMULATION_MODE {
 
 		sockaddr, socklen := _win_socket_address_to_sockaddr(op.address)
 		if connect_ex == nil {
-			_win_store_completion_assert(backend, sub.token, i32(IO_ERR_RESOURCE_EXHAUSTED), nil)
+			completion := Raw_Completion {
+				token = sub.token,
+				outcome = Completion_Failure {
+					error_code = i32(IO_ERR_RESOURCE_EXHAUSTED),
+				},
+			}
+			_win_store_completion_assert(backend, &completion)
 			_win_release_entry(entry)
 			return false
 		}
@@ -1291,15 +1300,10 @@ when !TINA_SIMULATION_MODE {
 	@(private = "file")
 	_win_push_completion :: proc(
 		backend: ^Platform_Backend,
-		token: Submission_Token,
-		result: i32,
-		extra: Completion_Extra,
+		completion: ^Raw_Completion,
 	) -> Backend_Completion_Store_Result {
 		if backend.completed_count < MAX_WIN_COMPLETED {
-			c := &backend.completed[backend.completed_count]
-			c.token = token
-			c.result = result
-			c.extra = extra
+			backend.completed[backend.completed_count] = completion^
 			backend.completed_count += 1
 			return .Stored
 		}
@@ -1309,11 +1313,9 @@ when !TINA_SIMULATION_MODE {
 	@(private = "file")
 	_win_store_completion_assert :: proc(
 		backend: ^Platform_Backend,
-		token: Submission_Token,
-		result: i32,
-		extra: Completion_Extra,
+		completion: ^Raw_Completion,
 	) {
-		store_result := _win_push_completion(backend, token, result, extra)
+		store_result := _win_push_completion(backend, completion)
 		assert(store_result == .Stored, "immediate completion capacity was preflighted")
 	}
 
@@ -1323,15 +1325,22 @@ when !TINA_SIMULATION_MODE {
 		token: Submission_Token,
 		error: i32,
 	) {
-		result := _win_push_completion(backend, token, -error, nil)
-		assert(result == .Stored, "immediate error completion capacity was preflighted")
+		assert(error > 0, "Windows completion error must be a positive platform code")
+		completion := Raw_Completion {
+			token   = token,
+			outcome = Completion_Failure{error_code = -error},
+		}
+		_win_store_completion_assert(backend, &completion)
 	}
 
 	@(private = "file")
 	_win_push_sync_completion :: proc(backend: ^Platform_Backend, entry: ^Win_Overlapped_Entry) {
-		bytes := i32(uintptr(entry.overlapped.InternalHigh))
-		result := _win_push_completion(backend, entry.token, bytes, nil)
-		assert(result == .Stored, "immediate completion capacity was preflighted")
+		byte_count := u32(uintptr(entry.overlapped.InternalHigh))
+		completion := Raw_Completion {
+			token   = entry.token,
+			outcome = Completion_Transfer{byte_count = byte_count},
+		}
+		_win_store_completion_assert(backend, &completion)
 		_win_release_entry(entry)
 	}
 
@@ -1355,11 +1364,14 @@ when !TINA_SIMULATION_MODE {
 			size_of(win.sockaddr_in6) + 16, &local_address, &local_size,
 			&remote_address, &remote_size,
 		)
-		result := _win_push_completion(backend, entry.token, 0, Completion_Extra_Accept {
-			client_fd = accept_fd,
-			client_address = _win_sockaddr_to_socket_address((^win.SOCKADDR_STORAGE_LH)(remote_address)),
-		})
-		assert(result == .Stored, "immediate accept completion capacity was preflighted")
+		completion := Raw_Completion {
+			token = entry.token,
+			outcome = Completion_Accept {
+				client_fd    = accept_fd,
+				peer_address = _win_sockaddr_to_peer_address((^win.SOCKADDR_STORAGE_LH)(remote_address)),
+			},
+		}
+		_win_store_completion_assert(backend, &completion)
 		entry.op_data.accept.client_fd = OS_FD_INVALID
 		_win_release_entry(entry)
 	}
@@ -1371,8 +1383,11 @@ when !TINA_SIMULATION_MODE {
 			win.SOCKET(uintptr(op.fd_socket)), win.SOL_SOCKET,
 			win.SO_UPDATE_CONNECT_CONTEXT, nil, 0,
 		)
-		result := _win_push_completion(backend, entry.token, 0, nil)
-		assert(result == .Stored, "immediate connect completion capacity was preflighted")
+		completion := Raw_Completion {
+			token   = entry.token,
+			outcome = Completion_Success{},
+		}
+		_win_store_completion_assert(backend, &completion)
 		_win_release_entry(entry)
 	}
 
@@ -1525,25 +1540,27 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_win_sockaddr_to_socket_address :: proc "contextless" (native: ^win.SOCKADDR_STORAGE_LH) -> Socket_Address {
+	_win_sockaddr_to_peer_address :: proc "contextless" (native: ^win.SOCKADDR_STORAGE_LH) -> Peer_Address {
+		peer_address: Peer_Address
 		if native == nil {
-			return nil
+			return peer_address
 		}
 		switch native.ss_family {
 		case u16(win.AF_INET):
 			internet4 := (^win.sockaddr_in)(native)
-			return Socket_Address_Inet4 {
-				address = transmute([4]u8)internet4.sin_addr,
-				port = u16(u16be(internet4.sin_port)),
-			}
+			peer_address.family = .AF_INET
+			peer_address.port = u16(u16be(internet4.sin_port))
+			address := transmute([4]u8)internet4.sin_addr
+			peer_address_set_inet4_address(&peer_address, address)
 		case u16(win.AF_INET6):
 			internet6 := (^win.sockaddr_in6)(native)
-			return Socket_Address_Inet6 {
-				address = transmute([16]u8)internet6.sin6_addr,
-				port = u16(u16be(internet6.sin6_port)),
-			}
+			peer_address.family = .AF_INET6
+			peer_address.port = u16(u16be(internet6.sin6_port))
+			peer_address.address_data = transmute([16]u8)internet6.sin6_addr
+		case 1: // AF_UNIX is not exposed by core:sys/windows.
+			peer_address.family = .AF_UNIX
 		}
-		return nil
+		return peer_address
 	}
 
 	@(private = "file")
@@ -1634,7 +1651,8 @@ when !TINA_SIMULATION_MODE {
 		testing.expect_value(t, collect_result.fault, Backend_Collect_Fault.None)
 		testing.expect(t, count >= 1, "close should produce a completion")
 		testing.expect_value(t, completions[0].token, token)
-		testing.expect(t, completions[0].result >= 0, "close of valid socket should succeed")
+		_, success := completions[0].outcome.(Completion_Success)
+		testing.expect(t, success, "close of valid socket should succeed")
 	}
 
 	@(test)
@@ -1703,17 +1721,16 @@ when !TINA_SIMULATION_MODE {
 		// Validate the accept completion carries client_fd and address
 		for i in 0 ..< collected {
 			if completions[i].token == accept_token {
-				testing.expect(t, completions[i].result >= 0, "accept should succeed")
-				extra, extra_ok := completions[i].extra.(Completion_Extra_Accept)
-				testing.expect(t, extra_ok, "accept should have Completion_Extra_Accept")
-				if extra_ok {
+				accept, accepted := completions[i].outcome.(Completion_Accept)
+				testing.expect(t, accepted, "accept should produce an accept outcome")
+				if accepted {
 					testing.expect(
 						t,
-						extra.client_fd != OS_FD_INVALID,
+						accept.client_fd != OS_FD_INVALID,
 						"accepted client_fd should be valid",
 					)
 					// Clean up accepted socket
-					backend_control_close(backend, extra.client_fd)
+					backend_control_close(backend, accept.client_fd)
 				}
 			}
 		}
@@ -1766,7 +1783,8 @@ when !TINA_SIMULATION_MODE {
 
 		testing.expect(t, collected >= 1, "connect should complete")
 		testing.expect_value(t, completions[0].token, token)
-		testing.expect_value(t, completions[0].result, 0)
+		_, success := completions[0].outcome.(Completion_Success)
+		testing.expect(t, success, "connect should produce a result-free success")
 
 		// Validate SO_UPDATE_CONNECT_CONTEXT was applied:
 		// getpeername succeeds only after SO_UPDATE_CONNECT_CONTEXT
@@ -1839,8 +1857,8 @@ when !TINA_SIMULATION_MODE {
 			for i in 0 ..< collected {
 				if completions[i].token == accept_token {
 					accept_done = true
-					extra, ok := completions[i].extra.(Completion_Extra_Accept)
-					if ok do server_fd = extra.client_fd
+					accept, ok := completions[i].outcome.(Completion_Accept)
+					if ok do server_fd = accept.client_fd
 				}
 				if completions[i].token == connect_token do connect_done = true
 			}
@@ -1886,7 +1904,7 @@ when !TINA_SIMULATION_MODE {
 		collected = 0
 		send_done := false
 		recv_done := false
-		recv_byte_count: i32 = 0
+		recv_byte_count: u32 = 0
 		for _ in 0 ..< 20 {
 			collect_result := backend_collect(backend, completions[collected:], 50_000_000)
 			collected += collect_result.completion_count
@@ -1894,7 +1912,8 @@ when !TINA_SIMULATION_MODE {
 				if completions[i].token == send_token do send_done = true
 				if completions[i].token == recv_token {
 					recv_done = true
-					recv_byte_count = completions[i].result
+					transfer, ok := completions[i].outcome.(Completion_Transfer)
+					if ok do recv_byte_count = transfer.byte_count
 				}
 			}
 			if send_done && recv_done do break
@@ -1984,7 +2003,36 @@ when !TINA_SIMULATION_MODE {
 		completions: [4]Raw_Completion
 		count := backend_collect(backend, completions[:], 0).completion_count
 		if !testing.expect(t, count >= 1, "close should produce a completion") do return
-		testing.expect(t, completions[0].result < 0, "close of invalid FD should yield negative result")
+		_, failed := completions[0].outcome.(Completion_Failure)
+		testing.expect(t, failed, "close of invalid FD should yield a failed completion")
+	}
+
+	@(test)
+	test_windows_release_accept_entry_closes_owned_socket :: proc(t: ^testing.T) {
+		win.ensure_winsock_initialized()
+		client_socket := win.WSASocketW(
+			win.AF_INET,
+			win.SOCK_STREAM,
+			win.IPPROTO_TCP,
+			nil,
+			0,
+			win.WSA_FLAG_OVERLAPPED,
+		)
+		if !testing.expect(t, client_socket != win.INVALID_SOCKET, "test socket must be created") {
+			return
+		}
+
+		entry: Win_Overlapped_Entry
+		entry.state = .Prepared
+		entry.operation = Submission_Op_Accept{}
+		entry.op_data.accept.client_fd = OS_FD(client_socket)
+		defer _sanitizer_address_unpoison_raw(rawptr(&entry.payload), size_of(entry.payload))
+
+		_win_release_entry(&entry)
+		testing.expect_value(t, entry.state, Win_Overlapped_State.Free)
+		close_result := win.closesocket(client_socket)
+		testing.expect_value(t, close_result, win.SOCKET_ERROR)
+		testing.expect_value(t, win.WSAGetLastError(), win.WSAENOTSOCK)
 	}
 
 	when TINA_ASAN_POISONING {

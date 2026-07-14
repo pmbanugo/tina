@@ -720,39 +720,35 @@ when !TINA_SIMULATION_MODE {
 			completion.token = token
 			completion.flags = {}
 
-			completion.result = cqe.res
-			completion.extra = nil
-
-			// Check for accept completion (res >= 0 means new FD)
-			op_kind := submission_token_operation_kind(token)
-			if op_kind == .Accept_Complete && cqe.res >= 0 {
-				entry := _linux_reclaim_addr_entry(backend, token)
-				if entry != nil {
-					completion.extra = Completion_Extra_Accept {
-						client_fd      = OS_FD(cqe.res),
-						client_address = _linux_sockaddr_to_socket_address(&entry.sockaddr),
-					}
-					_linux_release_addr_entry(backend, entry)
-				} else {
-					completion.extra = Completion_Extra_Accept {
-						client_fd = OS_FD(cqe.res),
-					}
-				}
-				completion.result = 0
-			} else if op_kind == .Recvfrom_Complete && cqe.res >= 0 {
-				entry := _linux_reclaim_addr_entry(backend, token)
-				if entry != nil {
-					completion.extra = Completion_Extra_Recvfrom {
-						peer_address = _linux_sockaddr_to_socket_address(&entry.sockaddr),
-					}
-					_linux_release_addr_entry(backend, entry)
-				}
+			operation_kind := submission_token_operation_kind(token)
+			address_entry := _linux_reclaim_addr_entry(backend, token)
+			if cqe.res < 0 {
+				completion.outcome = Completion_Failure{error_code = cqe.res}
 			} else {
-				// Free addr entry for connect/sendto completions
-				entry := _linux_reclaim_addr_entry(backend, token)
-				if entry != nil {
-					_linux_release_addr_entry(backend, entry)
+				switch operation_kind {
+				case .Read_Complete, .Write_Complete, .Send_Complete, .Recv_Complete,
+				     .Sendto_Complete:
+					completion.outcome = Completion_Transfer{byte_count = u32(cqe.res)}
+				case .Accept_Complete:
+					assert(address_entry != nil, "successful accept must retain its address entry")
+					completion.outcome = Completion_Accept {
+						client_fd    = OS_FD(cqe.res),
+						peer_address = _linux_sockaddr_to_peer_address(&address_entry.sockaddr),
+					}
+				case .Connect_Complete, .Close_Complete:
+					completion.outcome = Completion_Success{}
+				case .Recvfrom_Complete:
+					assert(address_entry != nil, "successful recvfrom must retain its address entry")
+					completion.outcome = Completion_Datagram {
+						byte_count   = u32(cqe.res),
+						peer_address = _linux_sockaddr_to_peer_address(&address_entry.sockaddr),
+					}
+				case .None, .Sendfile_Complete:
+					assert(false, "kernel CQE operation kind must have a direct completion outcome")
 				}
+			}
+			if address_entry != nil {
+				_linux_release_addr_entry(backend, address_entry)
 			}
 
 			count += 1
@@ -773,9 +769,9 @@ when !TINA_SIMULATION_MODE {
 				continue
 			}
 			completion := Raw_Completion {
-				token  = token,
-				result = -i32(linux.Errno.ECANCELED),
-				flags  = {.Synthesized},
+				token   = token,
+				outcome = Completion_Failure{error_code = -i32(linux.Errno.ECANCELED)},
+				flags   = {.Synthesized},
 			}
 			if _linux_store_completion(backend, completion) != .Stored {
 				return .Resource_Exhausted
@@ -1640,9 +1636,12 @@ when !TINA_SIMULATION_MODE {
 			_linux_discard_sendfile_pipe(entry)
 		}
 		completion := Raw_Completion {
-			token  = entry.token,
-			result = result,
-			extra  = nil,
+			token = entry.token,
+		}
+		if result < 0 {
+			completion.outcome = Completion_Failure{error_code = result}
+		} else {
+			completion.outcome = Completion_Transfer{byte_count = u32(result)}
 		}
 		count_next := count
 		if count < output_max {
@@ -1925,21 +1924,25 @@ when !TINA_SIMULATION_MODE {
 		return nil
 	}
 
-	// Convert linux.Sock_Addr_Any → Socket_Address
+	// Convert the native receive address directly into the reactor domain.
 	@(private = "file")
-	_linux_sockaddr_to_socket_address :: proc "contextless" (native: ^linux.Sock_Addr_Any) -> Socket_Address {
+	_linux_sockaddr_to_peer_address :: proc "contextless" (native: ^linux.Sock_Addr_Any) -> Peer_Address {
+		peer_address: Peer_Address
 		#partial switch native.family {
 		case .INET:
-			return Socket_Address_Inet4{address = native.sin_addr, port = u16(native.sin_port)}
+			peer_address.family = .AF_INET
+			peer_address.port = u16(native.sin_port)
+			peer_address_set_inet4_address(&peer_address, native.sin_addr)
 		case .INET6:
-			return Socket_Address_Inet6 {
-				address = transmute([16]u8)native.sin6_addr,
-				port = u16(native.sin6_port),
-				flow = native.sin6_flowinfo,
-				scope = native.sin6_scope_id,
-			}
+			peer_address.family = .AF_INET6
+			peer_address.port = u16(native.sin6_port)
+			peer_address.flow_info = native.sin6_flowinfo
+			peer_address.scope_id = native.sin6_scope_id
+			peer_address.address_data = transmute([16]u8)native.sin6_addr
+		case .UNIX:
+			peer_address.family = .AF_UNIX
 		}
-		return nil
+		return peer_address
 	}
 
 	// Convert Socket_Address → linux.Sock_Addr_Any
@@ -2125,7 +2128,8 @@ when !TINA_SIMULATION_MODE {
 		completions: [4]Raw_Completion
 		collect_result := backend_collect(&backend, completions[:], 100_000_000) // 100ms timeout
 		testing.expect(t, collect_result.completion_count >= 1, "close should complete")
-		testing.expect(t, completions[0].result >= 0, "close should succeed (not EBADF)")
+		_, success := completions[0].outcome.(Completion_Success)
+		testing.expect(t, success, "close should produce a result-free success")
 
 		_backend_unregister_fixed_fd(&backend, 0)
 	}

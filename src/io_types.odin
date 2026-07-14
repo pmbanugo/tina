@@ -579,20 +579,37 @@ when TINA_ASAN_POISONING {
 }
 
 // --- Raw Completion (§6.6.2 §4) ---
-// Backend → Reactor. Carries the correlation token and result.
+// Backend → Reactor. Carries the correlation token and one complete outcome.
 
-Completion_Extra_Accept :: struct {
-	client_fd:      OS_FD,
-	client_address: Socket_Address,
+Completion_Failure :: struct {
+	error_code: i32, // Negative platform or Tina error code.
 }
 
-Completion_Extra_Recvfrom :: struct {
-	peer_address: Socket_Address,
+Completion_Transfer :: struct {
+	byte_count: u32,
 }
 
-Completion_Extra :: union {
-	Completion_Extra_Accept,
-	Completion_Extra_Recvfrom,
+Completion_Accept :: struct {
+	client_fd:    OS_FD,
+	peer_address: Peer_Address,
+}
+
+Completion_Datagram :: struct {
+	byte_count:   u32,
+	peer_address: Peer_Address,
+}
+
+Completion_Success :: struct {}
+
+// The outcome owns the success/failure distinction so result and optional
+// metadata cannot contradict one another. The operation kind in the token
+// determines which success variant is valid at the backend/reactor boundary.
+Completion_Outcome :: union #no_nil {
+	Completion_Failure,
+	Completion_Transfer,
+	Completion_Accept,
+	Completion_Datagram,
+	Completion_Success,
 }
 
 // Per-completion flag bits. Set by the backend to signal provenance to the
@@ -605,11 +622,16 @@ Completion_Flag :: enum u8 {
 Completion_Flags :: distinct bit_set[Completion_Flag; u8]
 
 Raw_Completion :: struct {
-	token:  Submission_Token,
-	result: i32,
-	extra:  Completion_Extra,
-	flags:  Completion_Flags,
+	token:   Submission_Token,
+	outcome: Completion_Outcome,
+	flags:   Completion_Flags,
 }
+when ODIN_OS == .Windows {
+	#assert(size_of(Raw_Completion) == 64, "Windows raw completion layout drifted")
+} else {
+	#assert(size_of(Raw_Completion) == 48, "POSIX raw completion layout drifted")
+}
+#assert(size_of(Raw_Completion) <= CACHE_LINE_SIZE, "raw completion must fit within one target cache line")
 
 // --- I/O Error Codes (§6.6.1 §8) ---
 
@@ -652,17 +674,24 @@ transfer_handle_generation :: #force_inline proc "contextless" (handle: Transfer
 
 // --- Helpers for SOA Address Storage ---
 
+@(private = "package")
+peer_address_set_inet4_address :: #force_inline proc "contextless" (
+	peer_address: ^Peer_Address,
+	address: [4]u8,
+) {
+	#assert(len(Peer_Address{}.address_data) >= len(address))
+	#unroll for address_index in 0 ..< len(address) {
+		peer_address.address_data[address_index] = address[address_index]
+	}
+}
+
 socket_address_to_peer_address :: #force_inline proc "contextless" (address: Socket_Address) -> Peer_Address {
 	peer_address: Peer_Address
 	switch socket_address in address {
 	case Socket_Address_Inet4:
 		peer_address.family = .AF_INET
 		peer_address.port = socket_address.port
-		// Explicit 4-byte assignment
-		peer_address.address_data[0] = socket_address.address[0]
-		peer_address.address_data[1] = socket_address.address[1]
-		peer_address.address_data[2] = socket_address.address[2]
-		peer_address.address_data[3] = socket_address.address[3]
+		peer_address_set_inet4_address(&peer_address, socket_address.address)
 	case Socket_Address_Inet6:
 		peer_address.family = .AF_INET6
 		peer_address.port = socket_address.port
@@ -682,11 +711,9 @@ peer_address_to_socket_address :: #force_inline proc "contextless" (peer_address
 		address := Socket_Address_Inet4 {
 			port = peer_address.port,
 		}
-		// Explicit 4-byte assignment from the unaddressable parameter
-		address.address[0] = peer_address.address_data[0]
-		address.address[1] = peer_address.address_data[1]
-		address.address[2] = peer_address.address_data[2]
-		address.address[3] = peer_address.address_data[3]
+		#unroll for address_index in 0 ..< len(address.address) {
+			address.address[address_index] = peer_address.address_data[address_index]
+		}
 		return address
 	case .AF_INET6:
 		address := Socket_Address_Inet6 {
@@ -758,6 +785,31 @@ test_submission_token_buffer_none_sentinel :: proc(t: ^testing.T) {
 @(test)
 test_peer_address_size :: proc(t: ^testing.T) {
 	testing.expect_value(t, size_of(Peer_Address), 28)
+}
+
+@(test)
+test_socket_address_to_peer_address_inet4 :: proc(t: ^testing.T) {
+	address := [4]u8{192, 0, 2, 1}
+	peer_address := socket_address_to_peer_address(Socket_Address_Inet4 {
+		address = address,
+		port    = 8080,
+	})
+
+	testing.expect_value(t, peer_address.family, Socket_Domain.AF_INET)
+	testing.expect_value(t, peer_address.port, u16(8080))
+	for address_index in 0 ..< len(address) {
+		testing.expect_value(t, peer_address.address_data[address_index], address[address_index])
+	}
+	for address_index in len(address) ..< len(peer_address.address_data) {
+		testing.expect_value(t, peer_address.address_data[address_index], u8(0))
+	}
+
+	socket_address := peer_address_to_socket_address(peer_address)
+	internet4, ok := socket_address.(Socket_Address_Inet4)
+	if testing.expect(t, ok, "peer address must convert back to an IPv4 socket address") {
+		testing.expect_value(t, internet4.address, address)
+		testing.expect_value(t, internet4.port, u16(8080))
+	}
 }
 
 @(test)

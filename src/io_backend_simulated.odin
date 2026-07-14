@@ -181,10 +181,10 @@ when TINA_SIMULATION_MODE {
 		completion_index := backend.completed_head
 		for _ in 0 ..< backend.completed_count {
 			completion := &backend.completed[completion_index]
-			if accept_extra, ok := completion.extra.(Completion_Extra_Accept); ok {
+			if accept, ok := completion.outcome.(Completion_Accept); ok {
 				descriptor_index := _sim_lookup_descriptor_index(
 					backend,
-					accept_extra.client_fd,
+					accept.client_fd,
 				)
 				if descriptor_index != SIM_DESCRIPTOR_NONE_INDEX {
 					_ = _sim_close_descriptor_index(backend, descriptor_index)
@@ -301,7 +301,6 @@ when TINA_SIMULATION_MODE {
 
 				completion_ptr := &backend.completed[backend.completed_tail]
 				completion_ptr.token = op.token
-				completion_ptr.extra = nil
 
 				// Fault injection — hash-based derivation with a different phase
 				// to avoid correlation with delay (§6.6.2 §5.4)
@@ -314,7 +313,9 @@ when TINA_SIMULATION_MODE {
 						u64(backend.config.fault_rate.denominator),
 					)
 					if fault_val < threshold {
-						completion_ptr.result = _sim_sample_error(backend, op.token)
+						completion_ptr.outcome = Completion_Failure {
+							error_code = _sim_sample_error(backend, op.token),
+						}
 					} else {
 						_sim_generate_success(backend, op, completion_ptr)
 					}
@@ -324,8 +325,9 @@ when TINA_SIMULATION_MODE {
 
 				if _, is_close := op.operation.(Submission_Op_Close); is_close {
 					close_ok := _sim_close_descriptor_index(backend, op.descriptor_index)
-					if !close_ok && completion_ptr.result >= 0 {
-						completion_ptr.result = SIM_ERR_BADF
+					_, failed := completion_ptr.outcome.(Completion_Failure)
+					if !close_ok && !failed {
+						completion_ptr.outcome = Completion_Failure{error_code = SIM_ERR_BADF}
 					}
 				}
 
@@ -408,10 +410,9 @@ when TINA_SIMULATION_MODE {
 		for i: u16 = 0; i < backend.pending_count; i += 1 {
 			if backend.pending[i].token == token {
 				completion := Raw_Completion {
-					token  = token,
-					result = SIM_ERR_CANCELED,
-					extra  = nil,
-					flags  = {.Synthesized},
+					token   = token,
+					outcome = Completion_Failure{error_code = SIM_ERR_CANCELED},
+					flags   = {.Synthesized},
 				}
 				store_result := _sim_store_completion(backend, completion)
 				assert(store_result == .Stored, "accepted simulated obligation must retain completion capacity")
@@ -936,46 +937,53 @@ when TINA_SIMULATION_MODE {
 	) {
 		switch _ in op.operation {
 		case Submission_Op_Read:
-			completion.result = i32(min(op.data_size, 128))
+			completion.outcome = Completion_Transfer{byte_count = min(op.data_size, 128)}
 		case Submission_Op_Write:
-			completion.result = i32(op.data_size)
+			completion.outcome = Completion_Transfer{byte_count = op.data_size}
 		case Submission_Op_Accept:
 			object_index := _sim_alloc_object(backend)
 			if object_index == SIM_OBJECT_NONE_INDEX {
-				completion.result = SIM_ERR_NFILE
+				completion.outcome = Completion_Failure{error_code = SIM_ERR_NFILE}
 				break
 			}
 			client_fd := _sim_alloc_descriptor(backend, object_index)
 			if client_fd == OS_FD_INVALID {
 				_sim_object_release_ref(backend, object_index)
-				completion.result = SIM_ERR_NFILE
+				completion.outcome = Completion_Failure{error_code = SIM_ERR_NFILE}
 				break
 			}
-			completion.result = 0
-			completion.extra = Completion_Extra_Accept {
-				client_fd = client_fd,
-				client_address = Socket_Address_Inet4{address = {127, 0, 0, 1}, port = 9999},
+			completion.outcome = Completion_Accept {
+				client_fd    = client_fd,
+				peer_address = Peer_Address {
+					family       = .AF_INET,
+					port         = 9999,
+					address_data = {127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				},
 			}
 		case Submission_Op_Connect:
-			completion.result = 0
+			completion.outcome = Completion_Success{}
 		case Submission_Op_Close:
-			completion.result = 0
+			completion.outcome = Completion_Success{}
 		case Submission_Op_Send:
-			completion.result = i32(op.data_size)
+			completion.outcome = Completion_Transfer{byte_count = op.data_size}
 		case Submission_Op_Recv:
-			completion.result = i32(min(op.data_size, 128))
+			completion.outcome = Completion_Transfer{byte_count = min(op.data_size, 128)}
 		case Submission_Op_Sendto:
-			completion.result = i32(op.data_size)
+			completion.outcome = Completion_Transfer{byte_count = op.data_size}
 		case Submission_Op_Recvfrom:
-			completion.result = i32(min(op.data_size, 128))
-			completion.extra = Completion_Extra_Recvfrom {
-				peer_address = Socket_Address_Inet4{address = {10, 0, 0, 1}, port = 5000},
+			completion.outcome = Completion_Datagram {
+				byte_count = min(op.data_size, 128),
+				peer_address = Peer_Address {
+					family       = .AF_INET,
+					port         = 5000,
+					address_data = {10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				},
 			}
 		case Submission_Op_Sendfile:
 			sf := op.operation.(Submission_Op_Sendfile)
-			completion.result = i32(min(sf.size, 65536))
+			completion.outcome = Completion_Transfer{byte_count = min(sf.size, 65536)}
 		case:
-			completion.result = 0
+			assert(false, "simulated completion operation must be supported")
 		}
 	}
 
@@ -1073,7 +1081,8 @@ when TINA_SIMULATION_MODE {
 		count := collect_result.completion_count
 		testing.expect(t, count >= 1, "should have at least 1 completion")
 		testing.expect_value(t, completions[0].token, token)
-		testing.expect_value(t, completions[0].result, 0)
+		_, success := completions[0].outcome.(Completion_Success)
+		testing.expect(t, success, "connect should produce a result-free success")
 
 	}
 
@@ -1197,7 +1206,7 @@ when TINA_SIMULATION_MODE {
 		// Same seed → same sequence of completions
 		for i in 0 ..< 4 {
 			testing.expect_value(t, result1[i].token, result2[i].token)
-			testing.expect_value(t, result1[i].result, result2[i].result)
+			testing.expect_value(t, result1[i].outcome, result2[i].outcome)
 		}
 	}
 
@@ -1294,10 +1303,11 @@ when TINA_SIMULATION_MODE {
 		testing.expect(t, count >= 1, "should have at least 1 completion")
 
 		// With 100% fault rate, the result should be one of our distribution errors
-		result := completions[0].result
+		failure, failed := completions[0].outcome.(Completion_Failure)
+		testing.expect(t, failed, "fault injection should produce a failed completion")
 		testing.expect(
 			t,
-			result == -104 || result == -32,
+			failure.error_code == -104 || failure.error_code == -32,
 			"fault result should be from the error distribution",
 		)
 
@@ -1408,7 +1418,8 @@ when TINA_SIMULATION_MODE {
 		count = collect_result.completion_count
 		testing.expect_value(t, count, u32(1))
 		testing.expect_value(t, completions[0].token, token)
-		testing.expect(t, completions[0].result >= 0, "pending op should still complete after duplicate close")
+		_, transferred := completions[0].outcome.(Completion_Transfer)
+		testing.expect(t, transferred, "pending receive should still complete after duplicate close")
 	}
 
 	@(test)
@@ -1443,9 +1454,9 @@ when TINA_SIMULATION_MODE {
 		count := collect_result.completion_count
 		testing.expect_value(t, count, u32(1))
 
-		accept_extra, ok := completions[0].extra.(Completion_Extra_Accept)
-		testing.expect(t, ok, "accept completion should carry accept extra")
-		descriptor := _sim_lookup_descriptor(&backend, accept_extra.client_fd)
+		accept, ok := completions[0].outcome.(Completion_Accept)
+		testing.expect(t, ok, "accept operation should produce an accept outcome")
+		descriptor := _sim_lookup_descriptor(&backend, accept.client_fd)
 		testing.expect(t, descriptor != nil, "accepted client fd should be tracked by simulated backend")
 	}
 

@@ -221,7 +221,6 @@ when !TINA_SIMULATION_MODE {
 			if _posix_tracking_should_skip_optimistic_try(tracking) {
 				result = Raw_Completion {
 					token = submission.token,
-					extra = nil,
 				}
 				_posix_sanitizer_poison_pooled_submission_buffer(&submission)
 				immediate = false
@@ -255,9 +254,8 @@ when !TINA_SIMULATION_MODE {
 					// executed real syscalls (optimistic try) that cannot be rolled back.
 					backend.pending_count -= 1
 					backend.completed[backend.completed_count] = Raw_Completion {
-						token  = submission.token,
-						result = -i32(posix.Errno.EIO),
-						extra  = nil,
+						token   = submission.token,
+						outcome = Completion_Failure{error_code = -i32(posix.Errno.EIO)},
 					}
 					backend.completed_count += 1
 				}
@@ -340,7 +338,10 @@ when !TINA_SIMULATION_MODE {
 						completions,
 						out,
 						output_max,
-						Raw_Completion{token = token, result = -i32(posix.Errno(event.data))},
+						Raw_Completion {
+							token   = token,
+							outcome = Completion_Failure{error_code = -i32(posix.Errno(event.data))},
+						},
 					)
 					if store_result != .Stored {
 						return Backend_Collect_Result{completion_count = out, fault = .System_Error}
@@ -361,7 +362,6 @@ when !TINA_SIMULATION_MODE {
 			if .Connect_In_Progress in pending_operation.flags {
 				conn_result := Raw_Completion {
 					token = pending_operation.submission.token,
-					extra = nil,
 				}
 				socket_error: posix.Errno
 				socket_error_size := posix.socklen_t(size_of(socket_error))
@@ -374,11 +374,11 @@ when !TINA_SIMULATION_MODE {
 					&socket_error_size,
 				)
 				if getsockopt_result != .OK {
-					conn_result.result = -i32(posix.errno())
+					conn_result.outcome = Completion_Failure{error_code = -i32(posix.errno())}
 				} else if socket_error != nil {
-					conn_result.result = -i32(socket_error)
+					conn_result.outcome = Completion_Failure{error_code = -i32(socket_error)}
 				} else {
-					conn_result.result = 0
+					conn_result.outcome = Completion_Success{}
 				}
 				store_result: Backend_Completion_Store_Result
 				out, store_result = _posix_deliver_completion(backend, completions, out, output_max, conn_result)
@@ -405,13 +405,24 @@ when !TINA_SIMULATION_MODE {
 			} else if event_has_eof {
 				// Peer closed but syscall returned EWOULDBLOCK — complete as EOF.
 				// Re-registering would be pointless: no further data will arrive.
+				operation_kind := submission_token_operation_kind(pending_operation.submission.token)
+				switch operation_kind {
+				case .Read_Complete, .Write_Complete, .Send_Complete, .Recv_Complete,
+				     .Sendto_Complete, .Sendfile_Complete:
+				case .None, .Accept_Complete, .Connect_Complete, .Recvfrom_Complete,
+				     .Close_Complete:
+					assert(false, "EOF without syscall progress requires a transfer operation")
+				}
 				store_result: Backend_Completion_Store_Result
 				out, store_result = _posix_deliver_completion(
 					backend,
 					completions,
 					out,
 					output_max,
-					Raw_Completion{token = pending_operation.submission.token, result = 0},
+					Raw_Completion {
+						token   = pending_operation.submission.token,
+						outcome = Completion_Transfer{byte_count = 0},
+					},
 				)
 				if store_result != .Stored {
 					return Backend_Collect_Result{completion_count = out, fault = .System_Error}
@@ -432,7 +443,10 @@ when !TINA_SIMULATION_MODE {
 						completions,
 						out,
 						output_max,
-						Raw_Completion{token = pending_operation.submission.token, result = -i32(posix.Errno.EIO)},
+						Raw_Completion {
+							token   = pending_operation.submission.token,
+							outcome = Completion_Failure{error_code = -i32(posix.Errno.EIO)},
+						},
 					)
 					if store_result != .Stored {
 						return Backend_Collect_Result{completion_count = out, fault = .System_Error}
@@ -459,10 +473,9 @@ when !TINA_SIMULATION_MODE {
 				// Linux/Windows behaviour where the kernel delivers an
 				// equivalent completion (e.g. -ECANCELED CQE on io_uring).
 				completion := Raw_Completion {
-					token  = token,
-					result = -i32(posix.Errno.ECANCELED),
-					extra  = nil,
-					flags  = {.Synthesized},
+					token   = token,
+					outcome = Completion_Failure{error_code = -i32(posix.Errno.ECANCELED)},
+					flags   = {.Synthesized},
 				}
 				store_result := _posix_store_completion(backend, completion)
 				if store_result != .Stored {
@@ -854,7 +867,6 @@ when !TINA_SIMULATION_MODE {
 	_try_syscall :: proc(backend: ^Platform_Backend, submission: ^Submission) -> (Raw_Completion, bool) {
 		result := Raw_Completion {
 			token = submission.token,
-			extra = nil,
 		}
 
 		switch op in submission.operation {
@@ -872,10 +884,10 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
-			result.result = i32(n)
+			result.outcome = Completion_Transfer{byte_count = u32(n)}
 			return result, true
 
 		case Submission_Op_Write:
@@ -892,10 +904,10 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
-			result.result = i32(n)
+			result.outcome = Completion_Transfer{byte_count = u32(n)}
 			return result, true
 
 		case Submission_Op_Accept:
@@ -911,14 +923,13 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
 			_configure_accepted_socket(client_fd)
-			result.result = 0
-			result.extra = Completion_Extra_Accept {
-				client_fd      = OS_FD(client_fd),
-				client_address = _sockaddr_to_socket_address(&client_addr),
+			result.outcome = Completion_Accept {
+				client_fd    = OS_FD(client_fd),
+				peer_address = _sockaddr_to_peer_address(&client_addr),
 			}
 			return result, true
 
@@ -929,10 +940,10 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EINPROGRESS || errno == .EWOULDBLOCK {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
-			result.result = 0
+			result.outcome = Completion_Success{}
 			return result, true
 
 		case Submission_Op_Close:
@@ -946,14 +957,14 @@ when !TINA_SIMULATION_MODE {
 				assert(sweep_error == .None, "kqueue close submit preflight must reserve synthetic completion capacity")
 			}
 			if sweep_error != .None {
-				result.result = -i32(posix.Errno.ENOBUFS)
+				result.outcome = Completion_Failure{error_code = -i32(posix.Errno.ENOBUFS)}
 				return result, true
 			}
 			_posix_forget_fd_io_state(backend, op.fd)
 			if posix.close(posix.FD(op.fd)) != .OK {
-				result.result = -i32(posix.errno())
+				result.outcome = Completion_Failure{error_code = -i32(posix.errno())}
 			} else {
-				result.result = 0
+				result.outcome = Completion_Success{}
 			}
 			return result, true
 
@@ -966,10 +977,10 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
-			result.result = i32(n)
+			result.outcome = Completion_Transfer{byte_count = u32(n)}
 			return result, true
 
 		case Submission_Op_Recv:
@@ -981,10 +992,10 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
-			result.result = i32(n)
+			result.outcome = Completion_Transfer{byte_count = u32(n)}
 			return result, true
 
 		case Submission_Op_Sendto:
@@ -1004,10 +1015,10 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
-			result.result = i32(n)
+			result.outcome = Completion_Transfer{byte_count = u32(n)}
 			return result, true
 
 		case Submission_Op_Recvfrom:
@@ -1028,18 +1039,18 @@ when !TINA_SIMULATION_MODE {
 				if errno == .EWOULDBLOCK || errno == .EAGAIN {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			}
-			result.result = i32(n)
-			result.extra = Completion_Extra_Recvfrom {
-				peer_address = _sockaddr_to_socket_address(&peer_addr),
+			result.outcome = Completion_Datagram {
+				byte_count   = u32(n),
+				peer_address = _sockaddr_to_peer_address(&peer_addr),
 			}
 			return result, true
 
 		case Submission_Op_Sendfile:
 			if op.size == 0 {
-				result.result = 0
+				result.outcome = Completion_Transfer{byte_count = 0}
 				return result, true
 			}
 			nbytes_to_send := op.size
@@ -1058,19 +1069,19 @@ when !TINA_SIMULATION_MODE {
 					0,
 				)
 				if rc == 0 {
-					result.result = i32(len_val)
+					result.outcome = Completion_Transfer{byte_count = u32(len_val)}
 					return result, true
 				}
 				errno := posix.errno()
 				// Partial progress takes priority — report bytes sent even on fatal errors.
 				if len_val > 0 {
-					result.result = i32(len_val)
+					result.outcome = Completion_Transfer{byte_count = u32(len_val)}
 					return result, true
 				}
 				if errno == .EAGAIN || errno == .EWOULDBLOCK {
 					return result, false
 				}
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			} else when ODIN_OS == .FreeBSD {
 				sbytes: posix.off_t
@@ -1084,13 +1095,13 @@ when !TINA_SIMULATION_MODE {
 					0,
 				)
 				if rc == 0 {
-					result.result = i32(sbytes)
+					result.outcome = Completion_Transfer{byte_count = u32(sbytes)}
 					return result, true
 				}
 				errno := posix.errno()
 
 				if sbytes > 0 {
-					result.result = i32(sbytes)
+					result.outcome = Completion_Transfer{byte_count = u32(sbytes)}
 					return result, true
 				}
 
@@ -1098,15 +1109,15 @@ when !TINA_SIMULATION_MODE {
 					return result, false
 				}
 
-				result.result = -i32(errno)
+				result.outcome = Completion_Failure{error_code = -i32(errno)}
 				return result, true
 			} else {
-				result.result = -i32(posix.Errno.EOPNOTSUPP)
+				result.outcome = Completion_Failure{error_code = -i32(posix.Errno.EOPNOTSUPP)}
 				return result, true
 			}
 
 		case:
-			result.result = 0
+			assert(false, "POSIX completion operation must be supported")
 			return result, true
 		}
 	}
@@ -1404,10 +1415,9 @@ when !TINA_SIMULATION_MODE {
 		for i < backend.pending_count {
 			if backend.pending[i].subject_fd == fd {
 				completion := Raw_Completion {
-					token  = backend.pending[i].submission.token,
-					result = -i32(posix.Errno.ECANCELED),
-					extra  = nil,
-					flags  = {.Synthesized},
+					token   = backend.pending[i].submission.token,
+					outcome = Completion_Failure{error_code = -i32(posix.Errno.ECANCELED)},
+					flags   = {.Synthesized},
 				}
 				store_result := _posix_store_completion(backend, completion)
 				if store_result != .Stored {
@@ -1462,25 +1472,26 @@ when !TINA_SIMULATION_MODE {
 	}
 
 	@(private = "file")
-	_sockaddr_to_socket_address :: proc "contextless" (native: ^posix.sockaddr_storage) -> Socket_Address {
+	_sockaddr_to_peer_address :: proc "contextless" (native: ^posix.sockaddr_storage) -> Peer_Address {
+		peer_address: Peer_Address
 		#partial switch native.ss_family {
 		case .INET:
 			internet4 := (^posix.sockaddr_in)(native)
-			return Socket_Address_Inet4 {
-				address = transmute([4]u8)internet4.sin_addr,
-				port = u16(u16be(internet4.sin_port)),
-			}
+			peer_address.family = .AF_INET
+			peer_address.port = u16(u16be(internet4.sin_port))
+			address := transmute([4]u8)internet4.sin_addr
+			peer_address_set_inet4_address(&peer_address, address)
 		case .INET6:
 			internet6 := (^posix.sockaddr_in6)(native)
-			return Socket_Address_Inet6 {
-				address = transmute([16]u8)internet6.sin6_addr,
-				port = u16(u16be(internet6.sin6_port)),
-				flow = internet6.sin6_flowinfo,
-				scope = internet6.sin6_scope_id,
-			}
-		case:
-			return nil
+			peer_address.family = .AF_INET6
+			peer_address.port = u16(u16be(internet6.sin6_port))
+			peer_address.flow_info = internet6.sin6_flowinfo
+			peer_address.scope_id = internet6.sin6_scope_id
+			peer_address.address_data = transmute([16]u8)internet6.sin6_addr
+		case .UNIX:
+			peer_address.family = .AF_UNIX
 		}
+		return peer_address
 	}
 
 	@(private = "file")
@@ -1593,7 +1604,9 @@ when !TINA_SIMULATION_MODE {
 
 		completion := &backend.completed[0]
 		testing.expect_value(t, completion.token, test_token)
-		testing.expect_value(t, completion.result, -i32(posix.Errno.ECANCELED))
+		failure, failed := completion.outcome.(Completion_Failure)
+		testing.expect(t, failed, "cancellation should produce a failed completion")
+		testing.expect_value(t, failure.error_code, -i32(posix.Errno.ECANCELED))
 		testing.expect(
 			t,
 			.Synthesized in completion.flags,
@@ -1650,11 +1663,9 @@ when !TINA_SIMULATION_MODE {
 				.Synthesized in backend.completed[i].flags,
 				"sweep completion must have .Synthesized flag",
 			)
-			testing.expect_value(
-				t,
-				backend.completed[i].result,
-				-i32(posix.Errno.ECANCELED),
-			)
+			failure, failed := backend.completed[i].outcome.(Completion_Failure)
+			testing.expect(t, failed, "sweep should produce failed completions")
+			testing.expect_value(t, failure.error_code, -i32(posix.Errno.ECANCELED))
 		}
 	}
 

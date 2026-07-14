@@ -589,10 +589,9 @@ when TINA_SIMULATION_MODE {
 
 		backend := &shard.reactor.backend
 		backend.completed[backend.completed_tail] = Raw_Completion {
-			token  = stale_token,
-			result = 42, // bytes sent (irrelevant for stale path)
-			extra  = nil,
-			flags  = {},
+			token   = stale_token,
+			outcome = Completion_Transfer{byte_count = 42},
+			flags   = {},
 		}
 		backend.completed_tail = (backend.completed_tail + 1) % MAX_SIMULATED_COMPLETED
 		backend.completed_count += 1

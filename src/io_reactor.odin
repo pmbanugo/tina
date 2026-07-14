@@ -434,66 +434,87 @@ _reactor_release_pending_io_reuse :: proc(
 }
 
 @(private = "file")
-_reactor_completion_close_stale_accept_fd :: proc "contextless" (
-	reactor: ^Reactor,
-	completion: ^Raw_Completion,
-) {
-	if completion.result < 0 {
-		return
-	}
-
-	#partial switch e in completion.extra {
-	case Completion_Extra_Accept:
-		if e.client_fd != OS_FD_INVALID {
-			backend_control_close(&reactor.backend, e.client_fd)
-		}
-	}
-}
-
-@(private = "file")
 _reactor_completion_apply_accept :: proc (
 	reactor: ^Reactor,
 	shard: ^Shard,
 	soa_meta: #soa[]Isolate_Metadata,
 	type_index: u8,
 	slot_index: u32,
-	completion: ^Raw_Completion,
+	accept: ^Completion_Accept,
 ) {
-	#partial switch e in completion.extra {
-	case Completion_Extra_Accept:
-		soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(e.client_address)
+	soa_meta[slot_index].io_peer_address = accept.peer_address
 
-		if completion.result < 0 || e.client_fd == OS_FD_INVALID {
-			soa_meta[slot_index].io_fd = FD_HANDLE_NONE
-			return
-		}
-
-		owner := make_handle(
-			shard.id,
-			Isolate_Type_Id(type_index),
-			Isolate_Slot_Index(slot_index),
-			soa_meta[slot_index].generation,
+	owner := make_handle(
+		shard.id,
+		Isolate_Type_Id(type_index),
+		Isolate_Slot_Index(slot_index),
+		soa_meta[slot_index].generation,
+	)
+	fd_handle, fd_error := fd_table_alloc(&reactor.fd_table, accept.client_fd, owner)
+	if fd_error == .None {
+		backend_register_fixed_fd(
+			&reactor.backend,
+			fd_handle_index(fd_handle),
+			accept.client_fd,
 		)
-		fd_handle, fd_error := fd_table_alloc(&reactor.fd_table, e.client_fd, owner)
-		if fd_error == .None {
-			backend_register_fixed_fd(
-				&reactor.backend,
-				fd_handle_index(fd_handle),
-				e.client_fd,
-			)
-			_ = fd_table_mark_fresh_accept(
-				&reactor.fd_table,
-				fd_handle,
-				soa_meta[slot_index].io_peer_address,
-			)
-			soa_meta[slot_index].io_fd = fd_handle
-			return
-		}
-
-		backend_control_close(&reactor.backend, e.client_fd)
-		soa_meta[slot_index].io_result = i32(IO_ERR_RESOURCE_EXHAUSTED)
-		soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+		_ = fd_table_mark_fresh_accept(
+			&reactor.fd_table,
+			fd_handle,
+			soa_meta[slot_index].io_peer_address,
+		)
+		soa_meta[slot_index].io_fd = fd_handle
+		return
 	}
+
+	backend_control_close(&reactor.backend, accept.client_fd)
+	soa_meta[slot_index].io_result = i32(IO_ERR_RESOURCE_EXHAUSTED)
+	soa_meta[slot_index].io_fd = FD_HANDLE_NONE
+}
+
+@(private = "file")
+_reactor_completion_result :: proc(completion: ^Raw_Completion) -> i32 {
+	operation_kind := submission_token_operation_kind(completion.token)
+	switch &outcome in completion.outcome {
+	case Completion_Failure:
+		assert(outcome.error_code < 0, "failed completion must carry a negative error code")
+		switch operation_kind {
+		case .Read_Complete, .Write_Complete, .Accept_Complete, .Connect_Complete,
+		     .Send_Complete, .Recv_Complete, .Sendto_Complete,
+		     .Recvfrom_Complete, .Close_Complete, .Sendfile_Complete:
+			return outcome.error_code
+		case .None:
+			assert(false, "failed completion token must identify an operation")
+		}
+	case Completion_Transfer:
+		assert(outcome.byte_count <= u32(max(i32)), "completion byte count exceeds i32 result capacity")
+		switch operation_kind {
+		case .Read_Complete, .Write_Complete, .Send_Complete, .Recv_Complete,
+		     .Sendto_Complete, .Sendfile_Complete:
+			return i32(outcome.byte_count)
+		case .None, .Accept_Complete, .Connect_Complete, .Recvfrom_Complete,
+		     .Close_Complete:
+			assert(false, "operation kind cannot produce a transfer completion")
+		}
+	case Completion_Accept:
+		assert(operation_kind == .Accept_Complete, "accept outcome requires an accept operation")
+		assert(outcome.client_fd != OS_FD_INVALID, "accept outcome must carry a client fd")
+		return 0
+	case Completion_Datagram:
+		assert(operation_kind == .Recvfrom_Complete, "datagram outcome requires a recvfrom operation")
+		assert(outcome.byte_count <= u32(max(i32)), "datagram byte count exceeds i32 result capacity")
+		return i32(outcome.byte_count)
+	case Completion_Success:
+		switch operation_kind {
+		case .Connect_Complete, .Close_Complete:
+			return 0
+		case .None, .Read_Complete, .Write_Complete, .Accept_Complete,
+		     .Send_Complete, .Recv_Complete, .Sendto_Complete,
+		     .Recvfrom_Complete, .Sendfile_Complete:
+			assert(false, "operation kind cannot produce a result-free success")
+		}
+	}
+	assert(false, "completion outcome must produce a reactor result")
+	return i32(IO_ERR_BACKEND_FAILURE)
 }
 
 @(private = "file")
@@ -514,18 +535,21 @@ _reactor_completion_is_live :: #force_inline proc "contextless" (
 _reactor_completion_prepare_retire :: proc(
 	reactor: ^Reactor,
 	shard: ^Shard,
-	token: Submission_Token,
+	completion: ^Raw_Completion,
 ) -> (
 	type_index: u8,
 	slot_index: u32,
+	result: i32,
 ) {
 	assert(reactor.io_in_flight_count > 0, "completion arrived without an accepted submission")
 	reactor.io_in_flight_count -= 1
 
+	token := completion.token
 	type_index = submission_token_type_index(token)
 	slot_index = submission_token_slot_index(token)
 	assert(int(type_index) < len(shard.metadata), "completion token type index exceeds metadata")
 	assert(int(slot_index) < len(shard.metadata[type_index]), "completion token slot index exceeds metadata")
+	result = _reactor_completion_result(completion)
 	return
 }
 
@@ -557,8 +581,11 @@ _reactor_completion_retire_stale :: proc(
 		soa_meta[slot_index].io_slot_index = IO_SLOT_INDEX_NONE
 	}
 
-	if operation_kind == .Accept_Complete {
-		_reactor_completion_close_stale_accept_fd(reactor, completion)
+	switch &outcome in completion.outcome {
+	case Completion_Accept:
+		backend_control_close(&reactor.backend, outcome.client_fd)
+	case Completion_Failure, Completion_Transfer, Completion_Datagram,
+	     Completion_Success:
 	}
 	shard.counters.io_stale_completions += 1
 }
@@ -569,6 +596,7 @@ _reactor_completion_publish_live :: proc(
 	shard: ^Shard,
 	type_index: u8,
 	slot_index: u32,
+	result: i32,
 	completion: ^Raw_Completion,
 ) {
 	operation_kind := submission_token_operation_kind(completion.token)
@@ -577,18 +605,22 @@ _reactor_completion_publish_live :: proc(
 
 	_slot_set_io_completion_ready(
 		shard, Isolate_Type_Id(type_index), Isolate_Slot_Index(slot_index),
-		operation_kind, completion.result, buffer_index,
+		operation_kind, result, buffer_index,
 	)
-	if operation_kind == .Accept_Complete {
-		_reactor_completion_apply_accept(
-			reactor, shard, soa_meta, type_index, slot_index, completion,
-		)
-	} else if operation_kind == .Recvfrom_Complete {
-		#partial switch extra in completion.extra {
-		case Completion_Extra_Recvfrom:
-			soa_meta[slot_index].io_peer_address = socket_address_to_peer_address(extra.peer_address)
+	switch &outcome in completion.outcome {
+	case Completion_Failure:
+		if operation_kind == .Accept_Complete {
+			soa_meta[slot_index].io_fd = FD_HANDLE_NONE
 		}
-	} else if operation_kind == .Close_Complete {
+	case Completion_Accept:
+		_reactor_completion_apply_accept(
+			reactor, shard, soa_meta, type_index, slot_index, &outcome,
+		)
+	case Completion_Datagram:
+		soa_meta[slot_index].io_peer_address = outcome.peer_address
+	case Completion_Transfer, Completion_Success:
+	}
+	if operation_kind == .Close_Complete {
 		_reactor_completion_apply_close(reactor, soa_meta, slot_index)
 	}
 }
@@ -600,10 +632,10 @@ _reactor_completion_retire :: proc(
 	completion: ^Raw_Completion,
 ) {
 	token := completion.token
-	type_index, slot_index := _reactor_completion_prepare_retire(reactor, shard, token)
+	type_index, slot_index, result := _reactor_completion_prepare_retire(reactor, shard, completion)
 
 	if _reactor_completion_is_live(shard, type_index, slot_index, token) {
-		_reactor_completion_publish_live(reactor, shard, type_index, slot_index, completion)
+		_reactor_completion_publish_live(reactor, shard, type_index, slot_index, result, completion)
 	} else {
 		_reactor_completion_retire_stale(reactor, shard, type_index, slot_index, completion)
 	}
@@ -628,10 +660,10 @@ reactor_collect_completions :: proc(
 	reactor.backend_state = .Collect_Faulted
 	for completion_index in 0 ..< collect_result.completion_count {
 		completion := &completions[completion_index]
-		type_index, slot_index := _reactor_completion_prepare_retire(
+		type_index, slot_index, _ := _reactor_completion_prepare_retire(
 			reactor,
 			shard,
-			completion.token,
+			completion,
 		)
 		_reactor_completion_retire_stale(reactor, shard, type_index, slot_index, completion)
 	}
