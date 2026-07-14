@@ -62,7 +62,7 @@ Allowlist_Markers :: bit_set[Allowlist_Marker; u8]
 
 Scan_Status :: enum u8 {Success, Read_Failure, Parse_Failure, Allocation_Failure, Input_Too_Large, Capacity_Exhausted}
 Collect_Status :: enum u8 {Success, Traversal_Failure, Relative_Path_Failure, Allocation_Failure, Capacity_Exhausted}
-Root_Status :: enum u8 {Success, Resolution_Failure, Allocation_Failure}
+Root_Status :: enum u8 {Success, Resolution_Failure}
 Self_Test_Preparation_Status :: enum u8 {Success, Directory_Failure, Write_Failure, Allocation_Failure}
 Record_Status :: enum u8 {Success, Allocation_Failure, Capacity_Exhausted}
 
@@ -1232,13 +1232,8 @@ repository_root :: proc() -> (root_path: string, status: Root_Status) {
 		if absolute_error != nil { return "", .Resolution_Failure }
 		return root_path, .Success
 	}
-	source_directory := filepath.dir(#file)
-	root_candidate, join_error := filepath.join({source_directory, ".."}, context.temp_allocator)
-	if join_error != nil {
-		return "", .Allocation_Failure
-	}
-	absolute_error: os.Error
-	root_path, absolute_error = os.get_absolute_path(root_candidate, context.allocator)
-	if absolute_error != nil { return "", .Resolution_Failure }
+	working_directory_error: os.Error
+	root_path, working_directory_error = os.get_working_directory(context.allocator)
+	if working_directory_error != nil { return "", .Resolution_Failure }
 	return root_path, .Success
 }
